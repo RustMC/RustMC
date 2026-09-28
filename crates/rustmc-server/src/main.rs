@@ -16,8 +16,9 @@ use signal_hook::{
 const HELP: &str = "RustMC local development runtime (no Minecraft protocol)\n\nUsage:\n  rustmc-server --help\n  rustmc-server --version\n  rustmc-server --check-config <path>\n  rustmc-server --run <path>\n\nExit codes: 0 clean stop/success, 2 usage error, 3 configuration error, 4 listener startup error, 5 running listener error.";
 
 fn print_event(event: RuntimeEvent) {
-    println!("{}", event.log_line());
-    let _ = io::stdout().flush();
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{}", event.log_line());
+    let _ = stdout.flush();
 }
 
 fn control_event(kind: &'static str, state: LifecycleState, started: Instant) {

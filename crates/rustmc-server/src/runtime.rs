@@ -176,6 +176,27 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         stop(None, Vec::new(), started, &mut observe);
         return Ok(());
     }
+    if config.max_connections == 0
+        || config.max_connections > 64
+        || config.max_bytes_per_connection == 0
+        || config.max_bytes_per_connection > 65536
+        || !(10..=60000).contains(&config.idle_timeout_ms)
+        || !(10..=60000).contains(&config.max_connection_lifetime_ms)
+        || config.idle_timeout_ms > config.max_connection_lifetime_ms
+    {
+        observe(event(
+            "failed",
+            LifecycleState::Failed,
+            started,
+            None,
+            None,
+            Some("invalid_limits"),
+        ));
+        return Err(RuntimeError::Bind(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "development listener limits are invalid",
+        )));
+    }
     if !config.bind_address.is_loopback() {
         observe(event(
             "failed",
@@ -364,6 +385,24 @@ mod tests {
         assert_eq!(
             events.iter().map(|e| e.kind).collect::<Vec<_>>(),
             ["starting", "stopping", "stopped"]
+        );
+    }
+
+    #[test]
+    fn direct_invalid_limits_fail_before_binding() {
+        let config = ListenerConfig {
+            max_connections: usize::MAX,
+            ..ListenerConfig::default()
+        };
+        let flag = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let error =
+            run_listener(&config, &flag, Instant::now(), |event| events.push(event)).unwrap_err();
+        assert_eq!(error.exit_code(), 4);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.reason == Some("invalid_limits"))
         );
     }
 
