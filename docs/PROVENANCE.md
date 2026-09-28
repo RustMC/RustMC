@@ -29,3 +29,7 @@ On 29 September 2026, `cargo metadata --locked` reported the following license e
 | `unicode-ident 1.0.26` | (MIT OR Apache-2.0) AND Unicode-3.0 | Identifier parsing in macro/build support |
 
 Dependencies retain their own license terms and attribution. Recheck this ledger when the lockfile changes, and collect required third-party license texts and notices before distributing a binary. No Minecraft assets are included in the M0 source tree.
+
+## M1 dependency addition
+
+`signal-hook 0.4.4` is a direct dependency used only to set an atomic shutdown flag on Unix SIGINT/SIGTERM. It avoids first-party unsafe signal handlers; the development runtime remains Linux-first. Its declared license is `MIT OR Apache-2.0`. The new locked transitive packages are `errno 0.3.14`, `libc 0.2.189`, `signal-hook-registry 1.4.8`, `windows-link 0.2.1`, and `windows-sys 0.61.2`; each declares `MIT OR Apache-2.0` in Cargo metadata. The Windows packages are target-specific transitive entries, not a claim of tested Windows support. The current declared licenses are compatible with RustMC's Apache-2.0 source policy; future binary packages must collect applicable third-party notices. The [CI license policy](../scripts/check_dependency_licenses.py) fails on new or changed declarations until reviewed here.

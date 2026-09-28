@@ -1,17 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! Bootstrap configuration validation for RustMC. No game server exists yet.
+//! RustMC configuration and local development runtime. No Minecraft protocol exists yet.
 
-use std::path::Path;
+pub mod runtime;
 
-/// Configuration schema supported by the bootstrap CLI.
+use std::{net::IpAddr, path::Path};
+
+/// Configuration schema supported by the bootstrap and development CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub schema_version: u32,
     pub log_level: LogLevel,
+    pub listener: ListenerConfig,
 }
 
-/// Valid log levels for the future runtime.
+/// Diagnostic verbosity. Lifecycle control events are always emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Error,
@@ -19,6 +22,136 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+impl LogLevel {
+    /// Whether connection-level diagnostics should be emitted.
+    pub fn allows_connection_events(self) -> bool {
+        matches!(self, Self::Debug | Self::Trace)
+    }
+}
+
+/// Bounded, loopback-only development listener settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerConfig {
+    pub bind_address: IpAddr,
+    pub port: u16,
+    pub max_connections: usize,
+    pub max_bytes_per_connection: usize,
+    pub idle_timeout_ms: u64,
+    pub max_connection_lifetime_ms: u64,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            max_connections: 8,
+            max_bytes_per_connection: 4096,
+            idle_timeout_ms: 1000,
+            max_connection_lifetime_ms: 10000,
+        }
+    }
+}
+
+fn integer_field(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let Some(value) = table.get(key) else {
+        return Ok(default);
+    };
+    let Some(number) = value.as_integer().and_then(|n| u64::try_from(n).ok()) else {
+        return Err(format!(
+            "`listener.{key}` must be an integer from {min} to {max}"
+        ));
+    };
+    if !(min..=max).contains(&number) {
+        return Err(format!("`listener.{key}` must be from {min} to {max}"));
+    }
+    Ok(number)
+}
+
+fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String> {
+    let defaults = ListenerConfig::default();
+    let Some(value) = value else {
+        return Ok(defaults);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| "`listener` must be a TOML table".to_owned())?;
+    for key in table.keys() {
+        if !matches!(
+            key.as_str(),
+            "bind_address"
+                | "port"
+                | "max_connections"
+                | "max_bytes_per_connection"
+                | "idle_timeout_ms"
+                | "max_connection_lifetime_ms"
+        ) {
+            return Err(format!("unknown `listener` field `{key}`"));
+        }
+    }
+    let bind_address = match table.get("bind_address") {
+        None => defaults.bind_address,
+        Some(value) => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| "`listener.bind_address` must be a loopback IP string".to_owned())?;
+            let address: IpAddr = text.parse().map_err(|_| {
+                "`listener.bind_address` must be a loopback IP without a port; set `listener.port` separately".to_owned()
+            })?;
+            if !address.is_loopback() {
+                return Err("`listener.bind_address` must be a loopback IP in M1".to_owned());
+            }
+            address
+        }
+    };
+    let idle_timeout_ms = integer_field(
+        table,
+        "idle_timeout_ms",
+        defaults.idle_timeout_ms,
+        10,
+        60000,
+    )?;
+    let max_connection_lifetime_ms = integer_field(
+        table,
+        "max_connection_lifetime_ms",
+        defaults.max_connection_lifetime_ms,
+        10,
+        60000,
+    )?;
+    if idle_timeout_ms > max_connection_lifetime_ms {
+        return Err(
+            "`listener.idle_timeout_ms` cannot exceed `listener.max_connection_lifetime_ms`"
+                .to_owned(),
+        );
+    }
+    Ok(ListenerConfig {
+        bind_address,
+        port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
+        max_connections: integer_field(
+            table,
+            "max_connections",
+            defaults.max_connections as u64,
+            1,
+            64,
+        )? as usize,
+        max_bytes_per_connection: integer_field(
+            table,
+            "max_bytes_per_connection",
+            defaults.max_bytes_per_connection as u64,
+            1,
+            65536,
+        )? as usize,
+        idle_timeout_ms,
+        max_connection_lifetime_ms,
+    })
 }
 
 /// Parse and validate a configuration document without exposing raw values in errors.
@@ -30,7 +163,7 @@ pub fn parse_config(input: &str) -> Result<Config, String> {
         .as_table()
         .ok_or_else(|| "configuration must be a TOML table".to_owned())?;
     for key in table.keys() {
-        if key != "schema_version" && key != "log_level" {
+        if key != "schema_version" && key != "log_level" && key != "listener" {
             return Err(format!("unknown configuration field `{key}`"));
         }
     }
@@ -59,9 +192,11 @@ pub fn parse_config(input: &str) -> Result<Config, String> {
             );
         }
     };
+    let listener = parse_listener(table.get("listener"))?;
     Ok(Config {
         schema_version: 1,
         log_level,
+        listener,
     })
 }
 
@@ -77,9 +212,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_supported_values() {
+    fn accepts_supported_values_and_loopback_defaults() {
         let parsed = parse_config("schema_version = 1\nlog_level = 'trace'\n").unwrap();
         assert_eq!(parsed.log_level, LogLevel::Trace);
+        assert!(parsed.listener.bind_address.is_loopback());
+        assert_eq!(parsed.listener.port, 0);
     }
 
     #[test]
@@ -94,6 +231,47 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown")
         );
+        assert!(
+            parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nextra = 1")
+                .unwrap_err()
+                .contains("unknown")
+        );
+    }
+
+    #[test]
+    fn rejects_nonlocal_and_conflicting_address() {
+        for address in ["0.0.0.0", "192.0.2.1", "127.0.0.1:25565"] {
+            let input = format!(
+                "schema_version = 1\nlog_level = 'info'\n[listener]\nbind_address = '{address}'\n"
+            );
+            assert!(parse_config(&input).unwrap_err().contains("bind_address"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_limits_and_timeout() {
+        for (field, value) in [
+            ("port", "65536"),
+            ("port", "-1"),
+            ("max_connections", "0"),
+            ("max_connections", "65"),
+            ("max_bytes_per_connection", "0"),
+            ("max_bytes_per_connection", "65537"),
+            ("idle_timeout_ms", "9"),
+            ("idle_timeout_ms", "60001"),
+            ("max_connection_lifetime_ms", "9"),
+            ("max_connection_lifetime_ms", "60001"),
+        ] {
+            let input =
+                format!("schema_version = 1\nlog_level = 'info'\n[listener]\n{field} = {value}\n");
+            assert!(parse_config(&input).unwrap_err().contains(field));
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_timeouts() {
+        let input = "schema_version = 1\nlog_level = 'info'\n[listener]\nidle_timeout_ms = 200\nmax_connection_lifetime_ms = 100\n";
+        assert!(parse_config(input).unwrap_err().contains("cannot exceed"));
     }
 
     #[test]
