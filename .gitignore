@@ -1,0 +1,7 @@
+/target/
+*.log
+.env
+.env.*
+*.secret
+/world/
+/worlds/

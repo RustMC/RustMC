@@ -1,0 +1,3 @@
+# RustMC bootstrap configuration. No listener or world settings exist yet.
+schema_version = 1
+log_level = "info"

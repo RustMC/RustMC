@@ -1,0 +1,9 @@
+[package]
+name = "rustmc-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "RustMC bootstrap configuration validator"
+
+[dependencies]
+toml = "=0.8.23"

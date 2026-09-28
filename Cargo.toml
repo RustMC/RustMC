@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/rustmc-server"]
+resolver = "3"
