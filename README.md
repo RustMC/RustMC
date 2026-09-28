@@ -55,7 +55,7 @@ The final command starts a loopback development TCP listener on an ephemeral por
 
 ## Development checklist
 
-This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet verified, even if some design work exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. The owner authorized M1 infrastructure only. Later protocol and gameplay milestones remain unapproved.
+This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet verified, even if some design work exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. M1 infrastructure has passed its local and GitHub CI gates; later protocol and gameplay milestones remain unapproved.
 
 ### Completed M0 foundation
 

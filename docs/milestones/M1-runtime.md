@@ -1,6 +1,6 @@
 # M1 — Runtime and startup baseline
 
-Status: local implementation and evidence complete; published CI verification pending. M1 adds infrastructure for a development process, not a Minecraft server. The Java/Bedrock gateways, gameplay rules, world, plugins, and `protocol_ready`/`world_ready` states remain unimplemented. Proposed gameplay and protocol choices stay proposed.
+Status: M1 implementation gate verified; owner review pending. GitHub [foundation CI run 36495576589](https://github.com/RustMC/RustMC/actions/runs/36495576589) passed for the M1 code and documentation after the license-check fix. M1 adds infrastructure for a development process, not a Minecraft server. The Java/Bedrock gateways, gameplay rules, world, plugins, and `protocol_ready`/`world_ready` states remain unimplemented. Proposed gameplay and protocol choices stay proposed.
 
 ## Implementation plan
 
@@ -19,6 +19,6 @@ Status: local implementation and evidence complete; published CI verification pe
 - [x] SIGINT/SIGTERM and injected pre-bind shutdown reach stopped state, release sockets/connections, and leave no worker tasks. Bind conflict and runtime failure paths produce documented nonzero exit codes.
 - [x] Unit and isolated CLI/integration tests cover the above behavior with ephemeral ports and event-based synchronization, not fixed-port sleeps.
 - [x] Logs expose lifecycle, admission, closure/rejection, and timings without config contents or secrets. Raw repeatable cold/warm measurements and method are documented as local observations, not a record.
-- [ ] Cargo format, check, clippy with denied warnings, tests, build, rustdoc, documentation links, and Git diff checks pass locally; reviewed M1 commits are pushed only after acceptance and GitHub CI passes.
+- [x] Cargo format, check, clippy with denied warnings, tests, build, rustdoc, documentation links, and Git diff checks passed locally; the reviewed M1 commits were pushed and GitHub CI run 36495576589 passed.
 
-The [README checklist](../../README.md#development-checklist) remains the canonical feature status. M1 can satisfy only its infrastructure entries; every Java, Bedrock, world, gameplay, and playable-readiness entry stays unchecked.
+Evidence: 10 Rust unit tests, 7 CLI/process integration tests, and 2 license-policy tests passed locally and in CI. The [benchmark record](../BENCHMARKS.md#m1-local-startup-observations-29-september-2026) contains ten raw startup observations with cache limitations. The [README checklist](../../README.md#development-checklist) remains the canonical feature status. M1 can satisfy only its infrastructure entries; every Java, Bedrock, world, gameplay, and playable-readiness entry stays unchecked.
