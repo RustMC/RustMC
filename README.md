@@ -2,7 +2,7 @@
 
 RustMC is an independently developed Minecraft-compatible server project written in Rust. The goal is a vanilla-style multiplayer world for Java and Bedrock clients, with compatibility and performance claims backed by tests and measurements.
 
-> **Foundation / pre-alpha:** the repository currently contains a bootstrap CLI and configuration validator. It cannot accept Minecraft clients or run a world. Do not use it for production worlds.
+> **Development runtime / pre-alpha:** RustMC validates configuration and runs a bounded loopback-only TCP listener. It cannot speak a Minecraft protocol, accept game clients, or run a world. Do not use it for production worlds.
 
 The proposed shared-world baseline is Java-style gameplay with Bedrock client translation. That choice still needs owner approval; Bedrock support would not mean identical edition rules. Exact protocol versions are also undecided. See the [compatibility matrix](docs/COMPATIBILITY.md).
 
@@ -32,8 +32,9 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 
 | Capability | Status |
 | --- | --- |
-| `--help`, `--version`, and `--check-config` | Implemented and tested in M0; config has only `schema_version` and `log_level` |
-| Java or Bedrock discovery, login, and play | Planned; no network listener exists |
+| `--help`, `--version`, and `--check-config` | Implemented and tested; schema 1 now includes M1 listener settings |
+| `--run` local development listener | Implemented and tested on Linux; raw TCP only, bounded and loopback-only |
+| Java or Bedrock discovery, login, and play | Planned; no Minecraft protocol endpoint exists |
 | World, chunks, players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |
@@ -47,13 +48,14 @@ cargo test --workspace --locked
 cargo run -p rustmc-server --locked -- --help
 cargo run -p rustmc-server --locked -- --version
 cargo run -p rustmc-server --locked -- --check-config config/rustmc.example.toml
+cargo run -p rustmc-server --locked -- --run config/rustmc.example.toml
 ```
 
-These commands build and validate the scaffold. Running without arguments reports bootstrap-only status and exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
+The final command starts a loopback development TCP listener on an ephemeral port; it has no Minecraft protocol response. Stop it with Ctrl-C. Running without arguments exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
 
 ## Development checklist
 
-This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet verified, even if some design work exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. This checklist authorizes no implementation; M1 still requires explicit approval.
+This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet verified, even if some design work exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. The owner authorized M1 infrastructure only. Later protocol and gameplay milestones remain unapproved.
 
 ### Completed M0 foundation
 
@@ -71,12 +73,13 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
 ### Configuration and server operations
 
 - **M1 runtime; M8 operating guidance**
-  - [ ] Define versioned runtime settings, defaults, validation, and actionable failures; test bad and missing values without exposing secrets.
-  - [ ] Start local development listeners only after configuration and resource checks; report process start, bound sockets, protocol readiness, and playable world readiness separately.
-  - [ ] Define lifecycle states and graceful shutdown; test startup failure, cancellation, signal handling, and cleanup of sockets and files.
-  - [ ] Add structured logging and metrics for lifecycle, tick duration, queues, I/O, and failures without leaking identities or credentials.
-  - [ ] Give every queue and worker pool capacity, admission policy, timeout, and overload response; test bounded behavior under saturation.
-  - [ ] Set and document configurable memory, file, connection, and work limits; test rejection and recovery at limits.
+  - [x] Validate schema 1 runtime settings, loopback address, port, connection/read/time limits, unknown fields, and conflicting timeouts without echoing raw values.
+  - [x] Start a local development listener after configuration validation; report process start and socket bind while explicitly marking protocol and world readiness false.
+  - [x] Expose configuring, starting, bound, stopping, stopped, and failed states; test startup failure, injected cancellation, SIGINT/SIGTERM, socket cleanup, and exit codes.
+  - [x] Emit structured lifecycle and connection diagnostics plus monotonic process-to-bind timings without client payloads or raw configuration.
+  - [x] Bound development connections, bytes read, idle time, and total connection life; test capacity rejection and closure.
+  - [ ] Add tick, queue, disk, and gameplay metrics when those subsystems exist.
+  - [ ] Define process-wide memory, file, and work budgets beyond the current connection limits before wider deployment.
 
 ### Java protocol
 
@@ -185,7 +188,8 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
 ### Performance, concurrency, and recovery
 
 - **M1 measurements; M4 recovery; M6 experiment; M8 release evidence**
-  - [ ] Measure process start, bind, protocol readiness, world readiness, first playable join, first chunk, and dirty recovery separately.
+  - [x] Record raw repeated M1 code-entry-to-bind and parent-observed bind measurements with method and cache limitations; keep build time separate.
+  - [ ] Measure protocol/world readiness, first playable join/chunk, and dirty recovery when those features exist.
   - [ ] Benchmark spread-out, clustered, movement-heavy, and entity-heavy player scenarios with hardware, build, versions, raw timings, and adequate samples.
   - [ ] Profile tick critical path, visibility/output, queue depth, barrier wait, disk backpressure, and overload behavior; publish limits rather than a single unsupported player count.
   - [ ] Compare any Boot Image or other startup optimization with simple loading, including generation cost and first-join latency.

@@ -1,6 +1,6 @@
 # RustMC roadmap
 
-This is the professional M0–M8 sequence of outcome gates, separate from the [README development checklist](README.md#development-checklist). Dates and performance targets are not promises. M0 is the only implemented milestone; M1 requires explicit authorization. The first usable vanilla multiplayer scope must be demonstrated before any release claim, and plugin work follows the core gameplay work.
+This is the professional M0–M8 sequence of outcome gates, separate from the [README development checklist](README.md#development-checklist). Dates and performance targets are not promises. M0 is complete and M1 infrastructure has been implemented locally; M1 acceptance still requires the published CI gate. The first usable vanilla multiplayer scope must be demonstrated before any release claim, and plugin work follows the core gameplay work.
 
 | Milestone | Outcome | Exit evidence |
 | --- | --- | --- |
