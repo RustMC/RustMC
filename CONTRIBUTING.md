@@ -1,0 +1,3 @@
+# Contributing to RustMC
+
+External contributions are paused until a license and private security route are approved. For future contributions, open a focused issue or PR describing scope, exact version if relevant, reproduction, expected behavior, tests, and provenance. Every change needs review, meaningful tests, and source/license attribution regardless of authoring tools. Avoid copying competing server source or architecture, decompiled proprietary code, and unapproved game assets. Claims of compatibility or speed need reproducible evidence. Run the commands in [development](docs/DEVELOPMENT.md); document unsupported platforms. PRs should be small enough to review and preserve existing history. See [provenance](docs/PROVENANCE.md) and [security](SECURITY.md).
