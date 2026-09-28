@@ -66,7 +66,7 @@ def review_packages(packages: list[dict], reviewed: dict[str, str] = REVIEWED) -
 
 def main() -> int:
     result = subprocess.run(
-        ["cargo", "metadata", "--locked", "--offline", "--format-version", "1"],
+        ["cargo", "metadata", "--locked", "--format-version", "1"],
         capture_output=True,
         text=True,
         check=False,
