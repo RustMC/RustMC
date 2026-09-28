@@ -10,9 +10,9 @@ RustMC is an independently developed Rust server project. The long-term goal is 
 | Protocol targets | One exact Java and one exact Bedrock version | Before M2 protocol implementation |
 | Deployment | One process on one machine initially | Before runtime design is fixed |
 | Development platform | Linux/Fedora first; others untested | Before claiming wider support |
-| License | Undecided; no external contributions accepted yet | Before accepting contributions or releasing binaries |
+| License | **Accepted:** Apache-2.0 for RustMC original source; current Cargo dependency metadata reviewed in [provenance](PROVENANCE.md) | Recheck new dependencies and distribution notices before binaries |
 | Security reporting | Private route undecided | Before inviting reports or public release |
 | Repository/visibility | Public source repository at `RustMC/RustMC`; M0 published with passing CI | Revisit before any visibility change |
 | Libraries | General-purpose dependencies allowed after provenance/license review | Before adding each dependency |
 
-No proposed decision is recorded as approved. See the [architecture](ARCHITECTURE.md) and [ADRs](decisions/ADR-0001.md).
+The license decision is accepted; other proposed decisions remain unapproved. See the [architecture](ARCHITECTURE.md) and [ADRs](decisions/ADR-0001.md).

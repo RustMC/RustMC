@@ -11,7 +11,7 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 - [Current status and quick start](#current-status-and-quick-start)
 - [Development checklist](#development-checklist)
   - [Completed M0 foundation](#completed-m0-foundation)
-  - [Open decisions](#open-decisions)
+  - [Decisions](#decisions)
   - [Configuration and server operations](#configuration-and-server-operations)
   - [Java protocol](#java-protocol)
   - [Bedrock protocol](#bedrock-protocol)
@@ -61,9 +61,9 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
 - [x] Build the one-package bootstrap CLI with a pinned toolchain, example TOML configuration, unit tests, and isolated CLI failure tests. Its configuration check does not start a server.
 - [x] Publish the reviewed M0 commits and pass formatting, lint, build, test, rustdoc, and [foundation CI](https://github.com/RustMC/RustMC/actions/runs/36492068809).
 
-### Open decisions
+### Decisions
 
-- [ ] Select the project license and complete compatible dependency-license review before external contributions or binaries.
+- [x] Adopt Apache-2.0 for RustMC original source and review current Cargo dependency license metadata; preserve third-party notices for future binaries.
 - [ ] Establish a working private security-reporting route before inviting reports or a public release.
 - [ ] Approve shared-world gameplay rules, including how Bedrock differences are represented, before gameplay implementation.
 - [ ] Select exact Java and Bedrock target versions and approved protocol/data sources before protocol implementation.
@@ -214,6 +214,6 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
 
 ## Architecture, roadmap, and contribution
 
-The [architecture](docs/ARCHITECTURE.md) and [ADRs](docs/decisions/ADR-0001.md) describe proposed boundaries; [testing](docs/TESTING.md), [benchmark methodology](docs/BENCHMARKS.md), and the [roadmap](ROADMAP.md) define evidence and milestone gates. Read [contribution guidance](CONTRIBUTING.md), [provenance](docs/PROVENANCE.md), and [security guidance](SECURITY.md) before proposing work. External contributions await a selected license and private reporting route.
+The [architecture](docs/ARCHITECTURE.md) and [ADRs](docs/decisions/ADR-0001.md) describe proposed boundaries; [testing](docs/TESTING.md), [benchmark methodology](docs/BENCHMARKS.md), and the [roadmap](ROADMAP.md) define evidence and milestone gates. Read [contribution guidance](CONTRIBUTING.md), [provenance](docs/PROVENANCE.md), and [security guidance](SECURITY.md) before proposing work. External contributions remain paused until a private reporting route and contribution process are approved.
 
-The license is awaiting maintainer selection. RustMC is an independent, unofficial project, neither approved by nor associated with Mojang or Microsoft.
+RustMC original source code is licensed under [Apache License 2.0](LICENSE). Dependencies keep their own licenses; this grant does not cover Minecraft assets or third-party code. RustMC is an independent, unofficial project, neither approved by nor associated with Mojang or Microsoft.
