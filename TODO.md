@@ -1,3 +1,3 @@
 # RustMC TODO
 
-The [README project checklist](README.md#project-checklist) is the canonical list of completed work, open decisions, and planned milestone tasks. Update that checklist when evidence changes; this file does not maintain a second copy.
+The [README development checklist](README.md#development-checklist) is the canonical feature-status and open-decision checklist. The [roadmap](ROADMAP.md) gives separate M0–M8 milestone outcomes and exit gates. This file deliberately does not duplicate either list.
