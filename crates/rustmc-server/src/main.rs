@@ -21,10 +21,12 @@ fn print_event(event: RuntimeEvent) {
 }
 
 fn control_event(kind: &'static str, state: LifecycleState, started: Instant) {
+    let elapsed_us = started.elapsed().as_micros();
     print_event(RuntimeEvent {
         kind,
         state,
-        elapsed_ms: started.elapsed().as_millis(),
+        elapsed_us,
+        elapsed_ms: elapsed_us / 1000,
         address: None,
         active_connections: None,
         reason: None,

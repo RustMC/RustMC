@@ -43,6 +43,7 @@ impl fmt::Display for LifecycleState {
 pub struct RuntimeEvent {
     pub kind: &'static str,
     pub state: LifecycleState,
+    pub elapsed_us: u128,
     pub elapsed_ms: u128,
     pub address: Option<SocketAddr>,
     pub active_connections: Option<usize>,
@@ -53,8 +54,8 @@ impl RuntimeEvent {
     /// Render stable key-value fields suitable for line-oriented logs.
     pub fn log_line(self) -> String {
         let mut line = format!(
-            "event={} state={} elapsed_ms={}",
-            self.kind, self.state, self.elapsed_ms
+            "event={} state={} elapsed_us={} elapsed_ms={}",
+            self.kind, self.state, self.elapsed_us, self.elapsed_ms
         );
         if let Some(address) = self.address {
             line.push_str(&format!(" listen_addr={address}"));
@@ -113,10 +114,12 @@ fn event(
     active_connections: Option<usize>,
     reason: Option<&'static str>,
 ) -> RuntimeEvent {
+    let elapsed_us = started.elapsed().as_micros();
     RuntimeEvent {
         kind,
         state,
-        elapsed_ms: started.elapsed().as_millis(),
+        elapsed_us,
+        elapsed_ms: elapsed_us / 1000,
         address,
         active_connections,
         reason,
