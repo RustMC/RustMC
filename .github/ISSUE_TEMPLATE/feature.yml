@@ -1,0 +1,17 @@
+name: Feature proposal
+description: Propose a scoped RustMC feature.
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: User need and proposed behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Relevant Java or Bedrock version, if applicable
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance tests, compatibility impact, and source provenance
