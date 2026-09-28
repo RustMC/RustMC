@@ -5,3 +5,6 @@
 *.secret
 /world/
 /worlds/
+
+__pycache__/
+*.pyc
