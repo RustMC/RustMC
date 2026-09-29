@@ -73,8 +73,8 @@ The [fixed-seed comparison worksheet](docs/research/java-26.3-seed-comparison.md
 - [x] Establish an opt-in, unauthenticated loopback identity and complete Java 26.3 login, registry configuration, and initial Creative preview play transition with a real client. This does not establish secure login or multiplayer.
 - [x] Send Java 26.3 initial position, chunk, biome, heightmap, and direct skylight data and observe original chunks rendered in the matching client; full lighting correctness remains open.
 - [x] Generate deterministic seeded ground layers, clearings, trees, and eight preview biome regions by world coordinate, with tested chunk-border decoration. This is not vanilla generation parity.
-- [ ] Load nearby chunks as the player moves, within documented view, work, memory, and queue limits; test disconnect and rejoin.
-- [ ] Pass protocol, generation, malformed-input, process, shutdown, and repository CI checks; record generation, encoding, and delivery timings separately.
+- [x] Load preview chunks as the player moves within documented view, work, memory, and queue limits; a real Java 26.3 client rendered terrain after moving over 30 chunk widths, then disconnected and rejoined to rendered terrain. This does not measure completion of the entire 32-chunk view or client-visible latency.
+- [x] Pass the current protocol, generation, malformed-input, process, shutdown, and repository CI checks; record generation, encoding, and socket-flush timings separately. Client receipt and render timing remain unmeasured.
 - [x] Observe a Java 26.3 client join and visibly render RustMC chunks on 29 September 2026, including a 32-chunk view and multiple preview surface regions. The client screenshot and local process log establish this narrow claim.
 
 ## Development checklist

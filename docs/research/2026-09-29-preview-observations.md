@@ -20,8 +20,13 @@ and forgets coordinates outside the 32-chunk radius. The [bounded-view unit
 tests](../../crates/rustmc-server/src/java_preview.rs) check a distant movement,
 then a one-chunk move that emits five forget packets and five replacement chunk
 packets for a radius-two view. A fresh session reproduces the same first batch.
-Real-client disconnect/rejoin evidence is still open. We have **not** measured before/after
-client-visible loading time, so no speedup factor is claimed.
+An assistant-controlled Java 26.3 flight moved from approximately X=96, Z=707
+to X=625, Z=779 while terrain remained visible. The same client disconnected
+through Multiplayer, rejoined the loopback server, and rendered terrain near
+X=0.5, Y=81, Z=0.5. This single-session visual check does not prove every
+chunk in the 32-chunk radius arrived, nor does it measure receipt or render
+latency. We have **not** measured before/after client-visible loading time,
+so no speedup factor is claimed.
 
 The generator currently offers eight independently derived preview surface
 regions. Their visual labels do not establish vanilla 26.3 terrain, cave,
