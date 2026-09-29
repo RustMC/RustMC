@@ -64,6 +64,10 @@ This dated slice tracks the next evidence gate; it does not declare vanilla pari
 
 **First Java 26.3 preview recording:** [watch the 34-second local Creative flight and chunk-loading capture](assets/demos/rustmc-java-26.3-preview-2026-09-29.mp4). It shows the pre-alpha terrain stream during movement, including visible loading delay. This is a user-provided observation, not a vanilla-parity or performance benchmark.
 
+[![RustMC Java 26.3 Creative preview showing chunks loading during flight](assets/demos/rustmc-java-26.3-preview-2026-09-29.webp)](assets/demos/rustmc-java-26.3-preview-2026-09-29.mp4)
+
+The [dated research note](docs/research/2026-09-29-preview-observations.md) records the sources, observed behavior, and limits of any performance claim.
+
 - [x] Implement bounded Java 26.3 status and Bedrock 1.26.51 UDP discovery with malformed-input, shutdown, and source evidence; Java was also checked with a real client, while Bedrock client evidence remains open.
 - [x] Establish an opt-in, unauthenticated loopback identity and complete Java 26.3 login, registry configuration, and initial Creative preview play transition with a real client. This does not establish secure login or multiplayer.
 - [x] Send Java 26.3 initial position, chunk, biome, heightmap, and direct skylight data and observe original chunks rendered in the matching client; full lighting correctness remains open.
