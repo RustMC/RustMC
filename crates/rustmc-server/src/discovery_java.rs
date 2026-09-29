@@ -1,4 +1,4 @@
-//! Bounded Java Edition 26.3 status exchange. Login and play are absent.
+//! Bounded Java Edition 26.3 status and optional local login experiment.
 
 pub const PROTOCOL: i32 = 777;
 pub const VERSION: &str = "26.3";
@@ -9,6 +9,10 @@ pub enum State {
     Handshake,
     Status,
     Ping,
+    Login,
+    LoginAcknowledgement,
+    Configuration,
+    ConfigurationData,
     Done,
 }
 
@@ -64,10 +68,64 @@ fn frame(id: u32, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn status() -> Vec<u8> {
+fn put_string(value: &str, out: &mut Vec<u8>) {
+    put_varint(value.len() as u32, out);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn read_string(input: &[u8]) -> Result<(&str, &[u8]), Error> {
+    let Some((length, prefix)) = varint(input)? else {
+        return Err(Error::Malformed);
+    };
+    let length = length as usize;
+    if length > 255 || input.len() < prefix + length {
+        return Err(Error::Malformed);
+    }
+    let value =
+        std::str::from_utf8(&input[prefix..prefix + length]).map_err(|_| Error::Malformed)?;
+    Ok((value, &input[prefix + length..]))
+}
+
+fn known_packs() -> Vec<u8> {
+    let mut body = Vec::new();
+    put_varint(1, &mut body);
+    for text in ["minecraft", "core", VERSION] {
+        put_string(text, &mut body);
+    }
+    frame(15, &body)
+}
+
+fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
+    let Some((count, prefix)) = varint(body)? else {
+        return Err(Error::Malformed);
+    };
+    if count > 16 {
+        return Err(Error::Oversized);
+    }
+    let mut remaining = &body[prefix..];
+    let mut recognized = false;
+    for _ in 0..count {
+        let (namespace, rest) = read_string(remaining)?;
+        let (id, rest) = read_string(rest)?;
+        let (version, rest) = read_string(rest)?;
+        recognized |= namespace == "minecraft" && id == "core" && version == VERSION;
+        remaining = rest;
+    }
+    if !remaining.is_empty() {
+        return Err(Error::Malformed);
+    }
+    Ok(recognized)
+}
+
+fn status(local_preview: bool) -> Vec<u8> {
     // Static ASCII is intentionally used; no untrusted content is interpolated.
+    let description = if local_preview {
+        "RustMC local Java preview; world unavailable"
+    } else {
+        "RustMC discovery only; login unavailable"
+    };
     let json = format!(
-        "{{\"version\":{{\"name\":\"{VERSION}\",\"protocol\":{PROTOCOL}}},\"players\":{{\"max\":0,\"online\":0}},\"description\":{{\"text\":\"RustMC discovery only; login unavailable\"}}}}"
+        "{{\"version\":{{\"name\":\"{VERSION}\",\"protocol\":{PROTOCOL}}},\"players\":{{\"max\":0,\"online\":0}},\"description\":{{\"text\":\"{description}\"}}}}"
     );
     let mut body = Vec::new();
     put_varint(json.len() as u32, &mut body);
@@ -79,6 +137,8 @@ pub struct Session {
     state: State,
     input: Vec<u8>,
     bytes: usize,
+    local_preview: bool,
+    session_id: [u8; 16],
 }
 impl Default for Session {
     fn default() -> Self {
@@ -86,10 +146,23 @@ impl Default for Session {
             state: State::Handshake,
             input: Vec::new(),
             bytes: 0,
+            local_preview: false,
+            session_id: [0; 16],
         }
     }
 }
 impl Session {
+    pub fn new(local_preview: bool) -> Self {
+        Self {
+            local_preview,
+            session_id: if local_preview {
+                uuid::Uuid::new_v4().into_bytes()
+            } else {
+                [0; 16]
+            },
+            ..Self::default()
+        }
+    }
     pub fn state(&self) -> State {
         self.state
     }
@@ -122,7 +195,7 @@ impl Session {
             let body = &packet[id_len..];
             match (self.state, id) {
                 (State::Handshake, 0) => {
-                    let Some((_version, n)) = varint(body)? else {
+                    let Some((version, n)) = varint(body)? else {
                         return Err(Error::Malformed);
                     };
                     let body = &body[n..];
@@ -140,18 +213,62 @@ impl Session {
                     let Some((next, n)) = varint(rest)? else {
                         return Err(Error::Malformed);
                     };
-                    if n != rest.len() || next != 1 {
+                    if n != rest.len() {
                         return Err(Error::WrongState);
                     }
-                    self.state = State::Status;
+                    self.state = match next {
+                        1 => State::Status,
+                        2 if self.local_preview && version == PROTOCOL as u32 => State::Login,
+                        _ => return Err(Error::WrongState),
+                    };
                 }
                 (State::Status, 0) if body.is_empty() => {
-                    responses.push(status());
+                    responses.push(status(self.local_preview));
                     self.state = State::Ping;
                 }
                 (State::Ping, 1) if body.len() == 8 => {
                     responses.push(frame(1, body));
                     self.state = State::Done;
+                }
+                (State::Login, 0) => {
+                    let Some((name_len, prefix)) = varint(body)? else {
+                        return Err(Error::Malformed);
+                    };
+                    let name_len = name_len as usize;
+                    if !(3..=16).contains(&name_len) || body.len() != prefix + name_len + 16 {
+                        return Err(Error::Malformed);
+                    }
+                    let name = &body[prefix..prefix + name_len];
+                    if !name
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        return Err(Error::Malformed);
+                    }
+                    // The client UUID is an opaque, unverified local-session value.
+                    let mut success = body[prefix + name_len..].to_vec();
+                    put_varint(name_len as u32, &mut success);
+                    success.extend_from_slice(name);
+                    put_varint(0, &mut success); // No profile properties or signed textures.
+                    // 26.3 appends a separate connection-scoped session UUID. This is
+                    // only a local identifier; it grants no authenticated identity.
+                    success.extend_from_slice(&self.session_id);
+                    responses.push(frame(2, &success));
+                    self.state = State::LoginAcknowledgement;
+                }
+                (State::LoginAcknowledgement, 3) if body.is_empty() => {
+                    self.state = State::Configuration;
+                    responses.push(known_packs());
+                }
+                (State::Configuration, 0 | 2) => {} // No effect; bounded by the frame cap.
+                (State::Configuration, 7) => {
+                    if !recognizes_core_pack(body)? {
+                        return Err(Error::WrongState);
+                    }
+                    self.state = State::ConfigurationData;
+                }
+                (State::Configuration | State::ConfigurationData, _) => {
+                    return Err(Error::WrongState);
                 }
                 _ => return Err(Error::WrongState),
             }
@@ -221,6 +338,44 @@ mod tests {
         let mut h = handshake(777);
         *h.last_mut().unwrap() = 2;
         assert_eq!(Session::default().receive(&h, 4096), Err(Error::WrongState));
+    }
+
+    #[test]
+    fn local_preview_login_is_version_gated_and_unverified() {
+        let mut old = handshake(766);
+        *old.last_mut().unwrap() = 2;
+        assert_eq!(
+            Session::new(true).receive(&old, 4096),
+            Err(Error::WrongState)
+        );
+        let mut current = handshake(777);
+        *current.last_mut().unwrap() = 2;
+        let mut s = Session::new(true);
+        s.receive(&current, 4096).unwrap();
+        assert_eq!(s.state(), State::Login);
+        let mut login = vec![4];
+        login.extend_from_slice(b"Test");
+        login.extend_from_slice(&[7; 16]);
+        let reply = s.receive(&frame(0, &login), 4096).unwrap();
+        assert_eq!(reply.len(), 1);
+        assert!(reply[0].windows(16).any(|w| w == [7; 16]));
+        assert_eq!(s.state(), State::LoginAcknowledgement);
+        s.receive(&frame(3, &[]), 4096).unwrap();
+        assert_eq!(s.state(), State::Configuration);
+        let mut known = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known);
+        }
+        s.receive(&frame(7, &known), 4096).unwrap();
+        assert_eq!(s.state(), State::ConfigurationData);
+    }
+
+    #[test]
+    fn known_pack_reply_rejects_oversized_and_malformed_lists() {
+        assert_eq!(recognizes_core_pack(&[17]), Err(Error::Oversized));
+        assert_eq!(recognizes_core_pack(&[1, 255, 255]), Err(Error::Malformed));
+        assert_eq!(recognizes_core_pack(&[0, 1]), Err(Error::Malformed));
+        assert_eq!(recognizes_core_pack(&[0]), Ok(false));
     }
 
     #[test]

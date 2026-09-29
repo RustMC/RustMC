@@ -1,6 +1,6 @@
 # M3 slice — local Java 26.3 world preview
 
-Status: in development; this is a Java-only preview slice, not the M3 dual-edition join gate in [ROADMAP](../../ROADMAP.md). The first observable goal is one Java 26.3 client entering a generated world and rendering nearby chunks. A successful status ping is insufficient.
+Status: in development; opt-in login and known-pack exchange were observed with a Java 26.3 client on 29 September 2026. The client then timed out waiting for registry data. This is a Java-only preview slice, not the M3 dual-edition join gate in [ROADMAP](../../ROADMAP.md). The first observable goal is one Java 26.3 client entering a generated world and rendering nearby chunks. A successful status ping or login packet is insufficient.
 
 ## Scope and sequence
 
@@ -12,7 +12,7 @@ Status: in development; this is a Java-only preview slice, not the M3 dual-editi
 
 ## Acceptance criteria
 
-- [ ] Explicit local development identity setting and clear security warnings; remote access remains disallowed.
+- [x] Explicit local development identity setting and clear security warnings; remote access remains disallowed. This is unauthenticated and has no permissions or playable world.
 - [ ] Java 26.3 client completes login, configuration, and play transitions with malformed/version mismatch tests.
 - [ ] Client visibly renders independently generated grass terrain and trees from a configured seed; chunk borders and negative coordinates are deterministic.
 - [ ] Bounded view loading follows movement; shutdown and rejoin preserve correctness in covered cases.

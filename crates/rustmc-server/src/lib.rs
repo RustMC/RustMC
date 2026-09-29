@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! RustMC configuration and local discovery runtime. No login or world exists yet.
+//! RustMC configuration and local discovery runtime. The opt-in Java login
+//! experiment stops before world configuration; no playable world exists.
 
 pub mod discovery_bedrock;
 pub mod discovery_java;
@@ -43,6 +44,8 @@ pub struct ListenerConfig {
     pub max_bytes_per_connection: usize,
     pub idle_timeout_ms: u64,
     pub max_connection_lifetime_ms: u64,
+    /// Explicitly allow an unauthenticated Java login experiment on loopback.
+    pub local_java_preview: bool,
 }
 
 impl Default for ListenerConfig {
@@ -54,6 +57,7 @@ impl Default for ListenerConfig {
             max_bytes_per_connection: 4096,
             idle_timeout_ms: 1000,
             max_connection_lifetime_ms: 10000,
+            local_java_preview: false,
         }
     }
 }
@@ -96,6 +100,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "max_bytes_per_connection"
                 | "idle_timeout_ms"
                 | "max_connection_lifetime_ms"
+                | "local_java_preview"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -135,6 +140,12 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 .to_owned(),
         );
     }
+    let local_java_preview = match table.get("local_java_preview") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "`listener.local_java_preview` must be true or false".to_owned())?,
+    };
     Ok(ListenerConfig {
         bind_address,
         port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
@@ -154,6 +165,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         )? as usize,
         idle_timeout_ms,
         max_connection_lifetime_ms,
+        local_java_preview,
     })
 }
 
@@ -281,5 +293,25 @@ mod tests {
     fn does_not_echo_invalid_value() {
         let error = parse_config("schema_version = 1\nlog_level = 'private-token'").unwrap_err();
         assert!(!error.contains("private-token"));
+    }
+
+    #[test]
+    fn preview_requires_explicit_boolean_and_stays_on_loopback() {
+        let config = parse_config("schema_version = 1\nlog_level = 'info'\n").unwrap();
+        assert!(!config.listener.local_java_preview);
+        let config = parse_config(
+            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n",
+        )
+        .unwrap();
+        assert!(config.listener.local_java_preview);
+        assert!(config.listener.bind_address.is_loopback());
+        assert!(
+            parse_config(
+                "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = 'yes'\n"
+            )
+            .unwrap_err()
+            .contains("local_java_preview")
+        );
+        assert!(parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nbind_address = '0.0.0.0'\nlocal_java_preview = true\n").is_err());
     }
 }

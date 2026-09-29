@@ -37,7 +37,8 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | `--run` local discovery listener | Bounded loopback TCP and UDP; process tests pass on Linux |
 | Java 26.3 status | Tested with a real client on 29 September 2026; server-list entry displayed, join unavailable |
 | Bedrock 1.26.51 discovery | Partial: synthetic UDP socket tests pass; real client not yet checked |
-| Java or Bedrock login and play | Planned; no playable endpoint exists |
+| Java login and play | Partial opt-in loopback offline login and known-pack exchange, observed with a 26.3 client; registry configuration, play, and world absent; no authenticated identity |
+| Bedrock login and play | Planned; no session or playable endpoint exists |
 | Original terrain prototype | Seeded generator API and cross-chunk tests pass; no client encoding or playable world |
 | Players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |

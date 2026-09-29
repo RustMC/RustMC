@@ -11,14 +11,17 @@ import sys
 # Names and SPDX expressions reviewed for the current lockfile. New packages or
 # changed declarations require a human review and an update to docs/PROVENANCE.md.
 REVIEWED = {
+    "cfg-if": "MIT OR Apache-2.0",
     "equivalent": "Apache-2.0 OR MIT",
     "errno": "MIT OR Apache-2.0",
     "hashbrown": "MIT OR Apache-2.0",
+    "getrandom": "MIT OR Apache-2.0",
     "indexmap": "Apache-2.0 OR MIT",
     "libc": "MIT OR Apache-2.0",
     "memchr": "Unlicense OR MIT",
     "proc-macro2": "MIT OR Apache-2.0",
     "quote": "MIT OR Apache-2.0",
+    "r-efi": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
     "serde": "MIT OR Apache-2.0",
     "serde_core": "MIT OR Apache-2.0",
     "serde_derive": "MIT OR Apache-2.0",
@@ -31,6 +34,7 @@ REVIEWED = {
     "toml_edit": "MIT OR Apache-2.0",
     "toml_write": "MIT OR Apache-2.0",
     "unicode-ident": "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "uuid": "Apache-2.0 OR MIT",
     "windows-link": "MIT OR Apache-2.0",
     "windows-sys": "MIT OR Apache-2.0",
     "winnow": "MIT",

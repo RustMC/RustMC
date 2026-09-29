@@ -13,7 +13,7 @@ These identifiers select discovery responses only. Java's handshake carries a cl
 | Area | Java 26.3 | Bedrock 1.26.51 | Current evidence |
 | --- | --- | --- | --- |
 | Discovery | tested: 26.3 server-list status and ping | partial: UDP ping/pong synthetic socket test | Java 26.3 client showed `RustMC discovery only; login unavailable` and `0/0` with a green connection indicator on 29 September 2026; RustMC logged completed status exchanges. Bedrock real-client observation remains open. |
-| Connection and authentication | planned | planned | No login or session support |
+| Connection and authentication | partial: opt-in loopback offline login-finished and known-pack exchange; registry configuration and play absent, no authentication | planned | A Java 26.3 client decoded login success, acknowledged `minecraft:core` 26.3, then timed out awaiting registry data on 29 September 2026. RustMC logged both transitions. |
 | Rules and update ordering | planned | planned translation; native parity unknown | None |
 | Inventory, commands, recipes, interactions | planned | planned translation | None |
 | Generation and seed behavior | partial: original coordinate-derived terrain prototype, not transmitted | unknown | Determinism and border tests only; no client-visible world or vanilla parity |

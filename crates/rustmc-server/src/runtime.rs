@@ -1,4 +1,4 @@
-//! Bounded loopback discovery supervisor. It does not implement login or play.
+//! Bounded loopback discovery supervisor with an optional incomplete Java login experiment.
 
 use crate::{ListenerConfig, discovery_bedrock, discovery_java};
 use std::{
@@ -353,7 +353,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     }
                     connections.push(Connection {
                         stream,
-                        discovery: discovery_java::Session::default(),
+                        discovery: discovery_java::Session::new(config.local_java_preview),
                         pending: Vec::new(),
                         bytes_read: 0,
                         last_activity: Instant::now(),
@@ -402,11 +402,34 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     Ok(count) => {
                         connection.bytes_read += count;
                         connection.last_activity = Instant::now();
+                        let state_before = connection.discovery.state();
                         match connection
                             .discovery
                             .receive(&buffer[..count], config.max_bytes_per_connection)
                         {
                             Ok(replies) => {
+                                let state_after = connection.discovery.state();
+                                if state_before != state_after {
+                                    let milestone = match state_after {
+                                        discovery_java::State::Configuration => {
+                                            Some("java_configuration_started")
+                                        }
+                                        discovery_java::State::ConfigurationData => {
+                                            Some("java_known_pack_acknowledged")
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(kind) = milestone {
+                                        observe(event(
+                                            kind,
+                                            LifecycleState::Bound,
+                                            started,
+                                            None,
+                                            None,
+                                            None,
+                                        ));
+                                    }
+                                }
                                 for reply in replies {
                                     connection.pending.extend(reply);
                                 }
@@ -421,7 +444,16 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                             Err(_) if connection.bytes_read >= config.max_bytes_per_connection => {
                                 Some("read_limit")
                             }
-                            Err(_) => Some("invalid_java_discovery"),
+                            Err(_)
+                                if matches!(
+                                    connection.discovery.state(),
+                                    discovery_java::State::Configuration
+                                        | discovery_java::State::ConfigurationData
+                                ) =>
+                            {
+                                Some("unsupported_java_configuration")
+                            }
+                            Err(_) => Some("invalid_java_packet"),
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {

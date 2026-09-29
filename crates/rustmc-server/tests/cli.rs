@@ -288,6 +288,52 @@ mod runtime_cli {
     }
 
     #[test]
+    fn local_java_preview_requires_opt_in_and_advances_to_configuration() {
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096\nlocal_java_preview = true",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // The independently constructed handshake switches to login state 2.
+        socket
+            .write_all(&[8, 0, 0x89, 0x06, 1, b'x', 0x63, 0xdd, 2])
+            .unwrap();
+        let mut hello = vec![22, 0, 4];
+        hello.extend_from_slice(b"Test");
+        hello.extend_from_slice(&[7; 16]);
+        socket.write_all(&hello).unwrap();
+        let mut reply = [0u8; 64];
+        let count = socket.read(&mut reply).unwrap();
+        assert_eq!(reply[0], 39); // 26.3 also carries a connection-session UUID.
+        assert_eq!(reply[1], 2);
+        assert_eq!(&reply[2..18], &[7; 16]);
+        assert_eq!(&reply[19..23], b"Test");
+        assert_eq!(reply[30] & 0xf0, 0x40); // RFC 9562 version 4.
+        assert_eq!(reply[32] & 0xc0, 0x80); // RFC variant.
+        assert_eq!(count, 40);
+        socket.write_all(&[1, 3]).unwrap(); // Login Acknowledged.
+        let count = socket.read(&mut reply).unwrap();
+        assert_eq!(count, 23);
+        assert_eq!(&reply[..3], &[22, 15, 1]); // One known pack.
+        assert!(String::from_utf8_lossy(&reply[..count]).contains("minecraft"));
+        socket.write_all(&[1, 127]).unwrap(); // Unsupported configuration packet.
+        assert_eq!(socket.read(&mut reply).unwrap(), 0);
+        server.stop();
+    }
+
+    #[test]
     fn binds_limits_times_out_and_stops_cleanly() {
         let dir = TempDir::new();
         let path = dir.file(&config(0));
