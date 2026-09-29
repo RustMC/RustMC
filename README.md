@@ -35,9 +35,11 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | --- | --- |
 | `--help`, `--version`, and `--check-config` | Implemented and tested; schema 1 now includes M1 listener settings |
 | `--run` local discovery listener | Bounded loopback TCP and UDP; process tests pass on Linux |
-| Java 26.3 status and Bedrock 1.26.51 discovery | Partial: synthetic socket tests pass; real clients not yet checked |
+| Java 26.3 status | Tested with a real client on 29 September 2026; server-list entry displayed, join unavailable |
+| Bedrock 1.26.51 discovery | Partial: synthetic UDP socket tests pass; real client not yet checked |
 | Java or Bedrock login and play | Planned; no playable endpoint exists |
-| World, chunks, players, inventory, and survival | Planned; no gameplay exists |
+| Original terrain prototype | Seeded generator API and cross-chunk tests pass; no client encoding or playable world |
+| Players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |
 | Server performance or player capacity | No results |
@@ -59,7 +61,7 @@ The final command binds loopback TCP and UDP on the reported ephemeral port, ans
 
 This dated slice tracks the next evidence gate; it does not declare vanilla parity or multiplayer support. The [development checklist](#development-checklist) remains the canonical feature status.
 
-- [ ] Finish bounded Java 26.3 status and Bedrock 1.26.51 UDP discovery, including malformed input, shutdown, and source evidence.
+- [x] Implement bounded Java 26.3 status and Bedrock 1.26.51 UDP discovery with malformed-input, shutdown, and source evidence; Java was also checked with a real client, while Bedrock client evidence remains open.
 - [ ] Establish a documented local development identity path and complete Java 26.3 login, configuration, and play transitions with a real client.
 - [ ] Send version-correct initial position, chunk, biome, heightmap, and lighting data and observe original chunks rendered in a matching client.
 - [ ] Generate deterministic seeded grass terrain, ground layers, clearings, and trees by world coordinate, including seam-free chunk borders.
@@ -101,7 +103,7 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
   - [ ] Implement transport accept/read/write limits and disconnect handling for the selected Java version; test partial, slow, and oversized input.
   - [ ] Implement packet framing, bounded decoding, encoding, and compression negotiation for the selected version; round-trip and malformed-input tests must pass.
   - [ ] Enforce protocol-state transitions through handshake, status, login, configuration, and play as applicable to the selected version; reject out-of-state packets.
-  - [ ] Return version-correct status/discovery responses and verify them with a real Java client.
+  - [x] Return Java 26.3 status/discovery response (protocol 777) and verify the server-list entry with a real Java 26.3 client; joining remains unavailable.
   - [ ] Authenticate login sessions using an approved identity flow; test invalid, expired, and replayed credentials without inventing cryptography.
   - [ ] Translate validated play packets into sequenced core intents and committed outputs; test permissions, ordering, and disconnect/rejoin behavior.
   - [ ] Record exact packet/data sources and unsupported Java versions in [compatibility](docs/COMPATIBILITY.md).

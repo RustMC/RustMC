@@ -10,12 +10,13 @@ RustMC core design and code are developed independently. Do not copy competing s
 | Java/Bedrock differences | [Microsoft Learn](https://learn.microsoft.com/en-us/minecraft/creator/documents/differencesbetweenbedrockandjava?view=minecraft-bedrock-stable) | Motivation for separate compatibility claims; not a protocol specification |
 | GitHub Actions security | [GitHub Docs](https://docs.github.com/en/actions/reference/security/secure-use) | CI permissions and action pinning |
 | M2 Java 26.3 release and protocol 777 | [Mojang version manifest](https://piston-meta.mojang.com/mc/game/version_manifest_v2.json) and `version.json` in the [official server archive](https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar) | Version metadata only; no server code or assets copied |
+| Java 26.3 packet IDs for the preview investigation | `generated/reports/packets.json` emitted by the [official server archive](https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar) using `java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --reports` | Generated report inspected locally in `/tmp`, not copied into RustMC; IDs must still be paired with client-observed field behavior |
 | M2 Bedrock 1.26.51 protocol 2193 | [Mojang protocol release](https://github.com/Mojang/bedrock-protocol-docs/releases/tag/v1.26.51) | Network identifier for discovery response; 26.52 hotfix not claimed |
 | Unconnected UDP ping/pong envelope | [RakNet message identifiers](https://github.com/facebookarchive/RakNet/blob/master/Source/MessageIdentifiers.h) | Primary transport reference; RustMC codec and tests written independently |
 
 No game data, protocol fixtures, or generated assets are distributed in M0. Dependency updates require a new license and advisory review; unavailable advisory databases must be reported as unavailable.
 
-M2's checked-in test bytes are independently constructed protocol probes, not captured client assets. Java status field order and Bedrock discovery text still need real-client observation before compatibility is marked tested. No new Cargo dependency was added for M2 discovery; the existing locked license policy remains unchanged.
+M2's checked-in test bytes are independently constructed protocol probes, not captured client assets. Java 26.3 status was observed in the owner's running client on 29 September 2026. Bedrock discovery text still needs real-client observation before compatibility is marked tested. No new Cargo dependency was added for M2 discovery; the existing locked license policy remains unchanged.
 
 ## License and locked Cargo dependency review
 
