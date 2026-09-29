@@ -1,4 +1,4 @@
-//! Bounded loopback discovery supervisor with an optional incomplete Java login experiment.
+//! Bounded loopback discovery supervisor with an opt-in local Java terrain preview.
 
 use crate::{ListenerConfig, discovery_bedrock, discovery_java, preview_data};
 use std::{
@@ -113,6 +113,7 @@ struct Connection {
     bytes_read: usize,
     last_activity: Instant,
     created: Instant,
+    pending_chunk_since: Option<Instant>,
 }
 
 fn event(
@@ -185,7 +186,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         stop(None, Vec::new(), started, &mut observe);
         return Ok(());
     }
-    if config.max_connections == 0
+    if !(2..=32).contains(&config.preview_view_distance)
+        || (config.preview_registry_manifest.is_some() && !config.local_java_preview)
+        || config.max_connections == 0
         || config.max_connections > 64
         || config.max_bytes_per_connection == 0
         || config.max_bytes_per_connection > 65536
@@ -375,7 +378,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         ));
                         continue;
                     }
-                    let mut discovery = discovery_java::Session::new(config.local_java_preview);
+                    let mut discovery = discovery_java::Session::new(config.local_java_preview)
+                        .with_world(config.preview_seed, config.preview_view_distance);
                     if let Some(manifest) = &registry_manifest {
                         discovery = discovery.with_registry_manifest(Arc::clone(manifest));
                     }
@@ -386,6 +390,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         bytes_read: 0,
                         last_activity: Instant::now(),
                         created: Instant::now(),
+                        pending_chunk_since: None,
                     });
                     observe(event(
                         "connection_accepted",
@@ -417,12 +422,21 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         let mut index = 0;
         while index < connections.len() {
             let connection = &mut connections[index];
-            let remaining = config.max_bytes_per_connection - connection.bytes_read;
+            let playing = connection.discovery.state() == discovery_java::State::Play;
+            let byte_limit = if playing {
+                1024 * 1024
+            } else {
+                config.max_bytes_per_connection
+            };
+            let lifetime_ms = if playing {
+                600_000
+            } else {
+                config.max_connection_lifetime_ms
+            };
+            let remaining = byte_limit.saturating_sub(connection.bytes_read);
             let mut buffer = [0u8; 4096];
             let read_len = remaining.min(buffer.len());
-            let reason = if connection.created.elapsed()
-                >= Duration::from_millis(config.max_connection_lifetime_ms)
-            {
+            let reason = if connection.created.elapsed() >= Duration::from_millis(lifetime_ms) {
                 Some("lifetime_timeout")
             } else {
                 match connection.stream.read(&mut buffer[..read_len]) {
@@ -431,10 +445,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         connection.bytes_read += count;
                         connection.last_activity = Instant::now();
                         let state_before = connection.discovery.state();
-                        match connection
-                            .discovery
-                            .receive(&buffer[..count], config.max_bytes_per_connection)
-                        {
+                        match connection.discovery.receive(&buffer[..count], byte_limit) {
                             Ok(replies) => {
                                 let state_after = connection.discovery.state();
                                 if state_before != state_after {
@@ -466,15 +477,13 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                 }
                                 if connection.pending.len() > MAX_PENDING_BYTES {
                                     Some("write_limit")
-                                } else if connection.bytes_read >= config.max_bytes_per_connection {
+                                } else if connection.bytes_read >= byte_limit {
                                     Some("read_limit")
                                 } else {
                                     None
                                 }
                             }
-                            Err(_) if connection.bytes_read >= config.max_bytes_per_connection => {
-                                Some("read_limit")
-                            }
+                            Err(_) if connection.bytes_read >= byte_limit => Some("read_limit"),
                             Err(_)
                                 if matches!(
                                     connection.discovery.state(),
@@ -483,7 +492,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                         | discovery_java::State::Play
                                 ) =>
                             {
-                                Some("unsupported_java_configuration")
+                                Some("unsupported_java_configuration_or_play")
                             }
                             Err(_) => Some("invalid_java_packet"),
                         }
@@ -497,11 +506,35 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     Err(_) => Some("read_error"),
                 }
             };
+            if reason.is_none()
+                && connection.pending.is_empty()
+                && let Some(preview) = &mut connection.discovery.preview
+            {
+                if let Some(packet) = preview.keepalive() {
+                    connection.pending.extend(packet);
+                }
+                if let Some((packet, generation_us, encoding_us)) = preview.next_chunk() {
+                    connection.pending_chunk_since = Some(Instant::now());
+                    eprintln!(
+                        "event=preview_chunk_encoded generation_us={generation_us} encoding_us={encoding_us} bytes={}",
+                        packet.len()
+                    );
+                    connection.pending.extend(packet);
+                }
+            }
             let reason = if reason.is_none() && !connection.pending.is_empty() {
                 match connection.stream.write(&connection.pending) {
                     Ok(0) => Some("write_closed"),
                     Ok(n) => {
                         connection.pending.drain(..n);
+                        if connection.pending.is_empty()
+                            && let Some(since) = connection.pending_chunk_since.take()
+                        {
+                            eprintln!(
+                                "event=preview_chunk_socket_flushed queue_and_write_us={}",
+                                since.elapsed().as_micros()
+                            );
+                        }
                         None
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,

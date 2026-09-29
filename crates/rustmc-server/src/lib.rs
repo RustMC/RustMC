@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! RustMC configuration and local discovery runtime. The opt-in Java login
-//! experiment stops before world configuration; no playable world exists.
+//! RustMC configuration, discovery, and opt-in local Java terrain preview.
+//! The preview is unauthenticated and has no authoritative gameplay world.
 
 pub mod discovery_bedrock;
 pub mod discovery_java;
+pub mod java_preview;
 pub mod preview_data;
 pub mod runtime;
 pub mod world;
@@ -48,6 +49,8 @@ pub struct ListenerConfig {
     /// Explicitly allow an unauthenticated Java login experiment on loopback.
     pub local_java_preview: bool,
     /// Local identifier-only registry manifest used only by the preview path.
+    pub preview_seed: u64,
+    pub preview_view_distance: u8,
     pub preview_registry_manifest: Option<std::path::PathBuf>,
 }
 
@@ -62,6 +65,8 @@ impl Default for ListenerConfig {
             max_connection_lifetime_ms: 10000,
             local_java_preview: false,
             preview_registry_manifest: None,
+            preview_seed: 0,
+            preview_view_distance: 4,
         }
     }
 }
@@ -106,6 +111,8 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "max_connection_lifetime_ms"
                 | "local_java_preview"
                 | "preview_registry_manifest"
+                | "preview_seed"
+                | "preview_view_distance"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -157,7 +164,11 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             || "`listener.preview_registry_manifest` must be a file path string".to_owned(),
         )?)),
     };
-    if preview_registry_manifest.is_some() && !local_java_preview {
+    if (preview_registry_manifest.is_some()
+        || table.contains_key("preview_seed")
+        || table.contains_key("preview_view_distance"))
+        && !local_java_preview
+    {
         return Err(
             "`listener.preview_registry_manifest` requires `listener.local_java_preview = true`"
                 .to_owned(),
@@ -184,6 +195,20 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         max_connection_lifetime_ms,
         local_java_preview,
         preview_registry_manifest,
+        preview_seed: integer_field(
+            table,
+            "preview_seed",
+            defaults.preview_seed,
+            0,
+            i64::MAX as u64,
+        )?,
+        preview_view_distance: integer_field(
+            table,
+            "preview_view_distance",
+            defaults.preview_view_distance.into(),
+            2,
+            32,
+        )? as u8,
     })
 }
 

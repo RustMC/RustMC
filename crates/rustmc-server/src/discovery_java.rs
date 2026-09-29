@@ -48,7 +48,7 @@ fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
     }
 }
 
-fn put_varint(mut value: u32, out: &mut Vec<u8>) {
+pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -62,7 +62,7 @@ fn put_varint(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
-fn frame(id: u32, body: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(id: u32, body: &[u8]) -> Vec<u8> {
     let mut packet = Vec::new();
     put_varint(id, &mut packet);
     packet.extend_from_slice(body);
@@ -72,7 +72,7 @@ fn frame(id: u32, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn put_string(value: &str, out: &mut Vec<u8>) {
+pub(crate) fn put_string(value: &str, out: &mut Vec<u8>) {
     put_varint(value.len() as u32, out);
     out.extend_from_slice(value.as_bytes());
 }
@@ -165,7 +165,7 @@ fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
 fn status(local_preview: bool) -> Vec<u8> {
     // Static ASCII is intentionally used; no untrusted content is interpolated.
     let description = if local_preview {
-        "RustMC local Java preview; world unavailable"
+        "RustMC local terrain preview; read-only"
     } else {
         "RustMC discovery only; login unavailable"
     };
@@ -185,6 +185,9 @@ pub struct Session {
     local_preview: bool,
     session_id: [u8; 16],
     registry_manifest: Option<Arc<RegistryManifest>>,
+    pub preview: Option<crate::java_preview::Preview>,
+    preview_seed: u64,
+    preview_radius: u8,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -195,6 +198,9 @@ impl Default for Session {
             local_preview: false,
             session_id: [0; 16],
             registry_manifest: None,
+            preview: None,
+            preview_seed: 0,
+            preview_radius: 2,
         }
     }
 }
@@ -209,6 +215,11 @@ impl Session {
             },
             ..Self::default()
         }
+    }
+    pub fn with_world(mut self, seed: u64, radius: u8) -> Self {
+        self.preview_seed = seed;
+        self.preview_radius = radius;
+        self
     }
     pub fn state(&self) -> State {
         self.state
@@ -322,9 +333,94 @@ impl Session {
                     }
                 }
                 (State::ConfigurationData, 3) if body.is_empty() => {
+                    let manifest = self.registry_manifest.as_ref().ok_or(Error::WrongState)?;
+                    let preview = crate::java_preview::Preview::new(
+                        self.preview_seed,
+                        self.preview_radius,
+                        manifest,
+                    )
+                    .ok_or(Error::Malformed)?;
+                    responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
+                    self.preview = Some(preview);
                     self.state = State::Play;
                 }
-                (State::Configuration | State::ConfigurationData | State::Play, _) => {
+                (State::Play, id) => {
+                    let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
+                    match id {
+                        0 if body.len() == 33 && body[0] == 1 => {
+                            if !body[1..25]
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .all(|v| f64::from_be_bytes(*v).is_finite())
+                                || !body[25..]
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .all(|v| f32::from_be_bytes(*v).is_finite())
+                            {
+                                return Err(Error::Malformed);
+                            }
+                            preview.teleport_acknowledged = true;
+                        }
+                        44 if body.is_empty() => preview.client_loaded = true,
+                        13 if body.is_empty() => {}
+                        30 | 31 if body.len() == (if id == 30 { 25 } else { 33 }) => {
+                            let xyz: Vec<f64> = body[..24]
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .map(|v| f64::from_be_bytes(*v))
+                                .collect();
+                            preview
+                                .move_to(xyz[0], xyz[1], xyz[2])
+                                .map_err(|_| Error::Malformed)?;
+                        }
+                        32 if body.len() == 9 => {}
+                        33 | 40 | 43 if body.len() == 1 => {}
+                        11 if body.len() == 4 => {
+                            let rate = f32::from_be_bytes(body.try_into().unwrap());
+                            if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
+                                return Err(Error::Malformed);
+                            }
+                            preview.awaiting_batch = false;
+                        }
+                        28 if body.len() == 8 => {
+                            let id = u64::from_be_bytes(body.try_into().unwrap());
+                            if preview.pending_keepalive != Some(id) {
+                                return Err(Error::Malformed);
+                            }
+                            preview.pending_keepalive = None;
+                        }
+                        42 => {
+                            let mut rest = body;
+                            for _ in 0..3 {
+                                let (_, n) = varint(rest)?.ok_or(Error::Malformed)?;
+                                rest = &rest[n..];
+                            }
+                            if !rest.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                            // Observer posture commands have no world effect.
+                        }
+                        46 if body.is_empty() => {} // Punch has no world effect in the preview.
+                        63 if body == [0] => {}     // Spectator action with no target.
+                        41 | 57 | 66 | 67 if !body.is_empty() => {
+                            // Creative inputs are bounded by the frame/session limits.
+                            // The preview is immutable and does not apply them.
+                        }
+                        54 if body.len() == 2 => {} // Selected hotbar slot is client-local here.
+                        14 | 22 => {} // Bounded information/custom payloads have no effect.
+                        _ => {
+                            eprintln!(
+                                "event=preview_unsupported_packet packet_id={id} bytes={}",
+                                body.len()
+                            );
+                            return Err(Error::WrongState);
+                        }
+                    }
+                }
+                (State::Configuration | State::ConfigurationData, _) => {
                     return Err(Error::WrongState);
                 }
                 _ => return Err(Error::WrongState),
