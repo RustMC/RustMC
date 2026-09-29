@@ -5,6 +5,7 @@
 
 pub mod discovery_bedrock;
 pub mod discovery_java;
+pub mod preview_data;
 pub mod runtime;
 pub mod world;
 
@@ -46,6 +47,8 @@ pub struct ListenerConfig {
     pub max_connection_lifetime_ms: u64,
     /// Explicitly allow an unauthenticated Java login experiment on loopback.
     pub local_java_preview: bool,
+    /// Local identifier-only registry manifest used only by the preview path.
+    pub preview_registry_manifest: Option<std::path::PathBuf>,
 }
 
 impl Default for ListenerConfig {
@@ -58,6 +61,7 @@ impl Default for ListenerConfig {
             idle_timeout_ms: 1000,
             max_connection_lifetime_ms: 10000,
             local_java_preview: false,
+            preview_registry_manifest: None,
         }
     }
 }
@@ -101,6 +105,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "idle_timeout_ms"
                 | "max_connection_lifetime_ms"
                 | "local_java_preview"
+                | "preview_registry_manifest"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -146,6 +151,18 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             .as_bool()
             .ok_or_else(|| "`listener.local_java_preview` must be true or false".to_owned())?,
     };
+    let preview_registry_manifest = match table.get("preview_registry_manifest") {
+        None => None,
+        Some(value) => Some(std::path::PathBuf::from(value.as_str().ok_or_else(
+            || "`listener.preview_registry_manifest` must be a file path string".to_owned(),
+        )?)),
+    };
+    if preview_registry_manifest.is_some() && !local_java_preview {
+        return Err(
+            "`listener.preview_registry_manifest` requires `listener.local_java_preview = true`"
+                .to_owned(),
+        );
+    }
     Ok(ListenerConfig {
         bind_address,
         port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
@@ -166,6 +183,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         idle_timeout_ms,
         max_connection_lifetime_ms,
         local_java_preview,
+        preview_registry_manifest,
     })
 }
 

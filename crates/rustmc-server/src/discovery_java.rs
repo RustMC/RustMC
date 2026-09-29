@@ -1,5 +1,8 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
+use crate::preview_data::RegistryManifest;
+use std::sync::Arc;
+
 pub const PROTOCOL: i32 = 777;
 pub const VERSION: &str = "26.3";
 pub const MAX_FRAME: usize = 4096;
@@ -13,6 +16,7 @@ pub enum State {
     LoginAcknowledgement,
     Configuration,
     ConfigurationData,
+    Play,
     Done,
 }
 
@@ -95,6 +99,47 @@ fn known_packs() -> Vec<u8> {
     frame(15, &body)
 }
 
+fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_string(registry, &mut body);
+    put_varint(entries.len() as u32, &mut body);
+    for entry in entries {
+        put_string(entry, &mut body);
+        body.push(0); // Entry definition comes from the negotiated core pack.
+    }
+    frame(7, &body)
+}
+
+fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
+    let mut features = Vec::new();
+    put_varint(1, &mut features);
+    put_string("minecraft:vanilla", &mut features);
+    let mut packets = vec![frame(13, &features)];
+    if let Some(manifest) = manifest {
+        for (registry, entries) in &manifest.registries {
+            packets.push(registry_data(registry, entries));
+        }
+    }
+    let mut tags = Vec::new();
+    put_varint(manifest.map_or(0, |m| m.tags.len()) as u32, &mut tags);
+    if let Some(manifest) = manifest {
+        for registry in &manifest.tags {
+            put_string(&registry.registry, &mut tags);
+            put_varint(registry.tags.len() as u32, &mut tags);
+            for (name, ids) in &registry.tags {
+                put_string(name, &mut tags);
+                put_varint(ids.len() as u32, &mut tags);
+                for id in ids {
+                    put_varint(*id, &mut tags);
+                }
+            }
+        }
+    }
+    packets.push(frame(14, &tags));
+    packets.push(frame(3, &[]));
+    packets
+}
+
 fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
     let Some((count, prefix)) = varint(body)? else {
         return Err(Error::Malformed);
@@ -139,6 +184,7 @@ pub struct Session {
     bytes: usize,
     local_preview: bool,
     session_id: [u8; 16],
+    registry_manifest: Option<Arc<RegistryManifest>>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -148,6 +194,7 @@ impl Default for Session {
             bytes: 0,
             local_preview: false,
             session_id: [0; 16],
+            registry_manifest: None,
         }
     }
 }
@@ -165,6 +212,10 @@ impl Session {
     }
     pub fn state(&self) -> State {
         self.state
+    }
+    pub fn with_registry_manifest(mut self, manifest: Arc<RegistryManifest>) -> Self {
+        self.registry_manifest = Some(manifest);
+        self
     }
     pub fn receive(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, Error> {
         self.bytes = self
@@ -266,8 +317,14 @@ impl Session {
                         return Err(Error::WrongState);
                     }
                     self.state = State::ConfigurationData;
+                    if self.registry_manifest.is_some() {
+                        responses.extend(initial_configuration(self.registry_manifest.as_deref()));
+                    }
                 }
-                (State::Configuration | State::ConfigurationData, _) => {
+                (State::ConfigurationData, 3) if body.is_empty() => {
+                    self.state = State::Play;
+                }
+                (State::Configuration | State::ConfigurationData | State::Play, _) => {
                     return Err(Error::WrongState);
                 }
                 _ => return Err(Error::WrongState),

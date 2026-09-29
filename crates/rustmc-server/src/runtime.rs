@@ -1,17 +1,21 @@
 //! Bounded loopback discovery supervisor with an optional incomplete Java login experiment.
 
-use crate::{ListenerConfig, discovery_bedrock, discovery_java};
+use crate::{ListenerConfig, discovery_bedrock, discovery_java, preview_data};
 use std::{
     fmt,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPT_BUDGET: usize = 32;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 /// Observable development-process states. `Bound` is not protocol or world readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +220,26 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             "M1 requires a loopback bind address",
         )));
     }
+    let registry_manifest = match &config.preview_registry_manifest {
+        Some(path) => match preview_data::load(path) {
+            Ok(manifest) => Some(Arc::new(manifest)),
+            Err(message) => {
+                observe(event(
+                    "failed",
+                    LifecycleState::Failed,
+                    started,
+                    None,
+                    None,
+                    Some("invalid_preview_manifest"),
+                ));
+                return Err(RuntimeError::Bind(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    message,
+                )));
+            }
+        },
+        None => None,
+    };
     let bind_address = SocketAddr::new(config.bind_address, config.port);
     let listener = match TcpListener::bind(bind_address) {
         Ok(listener) => listener,
@@ -351,9 +375,13 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         ));
                         continue;
                     }
+                    let mut discovery = discovery_java::Session::new(config.local_java_preview);
+                    if let Some(manifest) = &registry_manifest {
+                        discovery = discovery.with_registry_manifest(Arc::clone(manifest));
+                    }
                     connections.push(Connection {
                         stream,
-                        discovery: discovery_java::Session::new(config.local_java_preview),
+                        discovery,
                         pending: Vec::new(),
                         bytes_read: 0,
                         last_activity: Instant::now(),
@@ -417,6 +445,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                         discovery_java::State::ConfigurationData => {
                                             Some("java_known_pack_acknowledged")
                                         }
+                                        discovery_java::State::Play => {
+                                            Some("java_configuration_acknowledged")
+                                        }
                                         _ => None,
                                     };
                                     if let Some(kind) = milestone {
@@ -433,7 +464,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                 for reply in replies {
                                     connection.pending.extend(reply);
                                 }
-                                if connection.pending.len() > discovery_java::MAX_FRAME + 5 {
+                                if connection.pending.len() > MAX_PENDING_BYTES {
                                     Some("write_limit")
                                 } else if connection.bytes_read >= config.max_bytes_per_connection {
                                     Some("read_limit")
@@ -449,6 +480,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                     connection.discovery.state(),
                                     discovery_java::State::Configuration
                                         | discovery_java::State::ConfigurationData
+                                        | discovery_java::State::Play
                                 ) =>
                             {
                                 Some("unsupported_java_configuration")

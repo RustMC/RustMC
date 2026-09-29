@@ -19,3 +19,11 @@ Status: in development; opt-in login and known-pack exchange were observed with 
 - [ ] Full local checks and GitHub CI pass, with generation/encoding/delivery evidence separated.
 
 Bedrock world join, secure online authentication, vanilla generation/parity, persistence, multiplayer visibility, and release readiness are outside this slice.
+
+## Configuration evidence — 29 September 2026
+
+The real Java 26.3 client accepted the local registry/tag manifest and acknowledged
+finish-configuration; the screen reached “Joining world…”. Initial experiments
+failed with missing world-clock/timeline references, then missing static block
+and item tags. Sending resolved dynamic and static tag IDs fixed that boundary.
+See [ADR-0012](../decisions/ADR-0012.md). Play and visible terrain remain unverified.
