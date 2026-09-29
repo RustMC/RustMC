@@ -395,6 +395,28 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
 mod tests {
     use super::*;
 
+    fn read_varint(input: &[u8]) -> (u32, usize) {
+        let mut value = 0;
+        for (index, byte) in input.iter().take(5).enumerate() {
+            value |= u32::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                return (value, index + 1);
+            }
+        }
+        panic!("invalid test packet VarInt");
+    }
+
+    fn packet_ids(mut stream: &[u8]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        while !stream.is_empty() {
+            let (length, prefix) = read_varint(stream);
+            let packet = &stream[prefix..prefix + length as usize];
+            ids.push(read_varint(packet).0);
+            stream = &stream[prefix + length as usize..];
+        }
+        ids
+    }
+
     fn manifest() -> RegistryManifest {
         RegistryManifest {
             tags: Vec::new(),
@@ -434,6 +456,31 @@ mod tests {
         assert!(!preview.sent.contains(&(0, 0))); // Old view was unloaded.
         assert!(preview.sent.len() <= MAX_CHUNKS_PER_BATCH);
         assert!(preview.move_to(f64::NAN, 80.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn walking_one_chunk_forgets_old_edge_and_rejoin_starts_fresh() {
+        let mut preview = Preview::new(2026, 2, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let first = preview.next_chunk().unwrap().0;
+        preview.awaiting_batch = false;
+        while preview.sent.len() < 25 {
+            preview.next_chunk().unwrap();
+            preview.awaiting_batch = false;
+        }
+        assert!(preview.next_chunk().is_none());
+        preview.move_to(16.5, 80.0, 0.5).unwrap();
+        let moved = preview.next_chunk().unwrap().0;
+        let ids = packet_ids(&moved);
+        assert_eq!(ids.iter().filter(|id| **id == FORGET_CHUNK).count(), 5);
+        assert_eq!(ids.iter().filter(|id| **id == CHUNK).count(), 5);
+        assert_eq!(preview.sent.len(), 25);
+        assert!(!preview.sent.contains(&(-2, 0)));
+        assert!(preview.sent.contains(&(3, 0)));
+
+        let mut rejoined = Preview::new(2026, 2, &manifest()).unwrap();
+        rejoined.teleport_acknowledged = true;
+        assert_eq!(rejoined.next_chunk().unwrap().0, first);
     }
 
     #[test]

@@ -17,8 +17,10 @@ The first stream admitted one chunk and waited for an acknowledgement before
 sending the next. RustMC now sends up to 16 chunks per acknowledged batch within
 a 768 KiB encoded budget, updates the target center from validated movement,
 and forgets coordinates outside the 32-chunk radius. The [bounded-view unit
-test](../../crates/rustmc-server/src/java_preview.rs) checks a distant movement
-and removal of old coordinates. We have **not** measured before/after
+tests](../../crates/rustmc-server/src/java_preview.rs) check a distant movement,
+then a one-chunk move that emits five forget packets and five replacement chunk
+packets for a radius-two view. A fresh session reproduces the same first batch.
+Real-client disconnect/rejoin evidence is still open. We have **not** measured before/after
 client-visible loading time, so no speedup factor is claimed.
 
 The generator currently offers eight independently derived preview surface
