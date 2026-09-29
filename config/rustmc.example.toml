@@ -1,9 +1,9 @@
-# RustMC M1 local development process. This is not a Minecraft listener.
+# RustMC local discovery process. No login or world is available.
 schema_version = 1
 log_level = "info"
 
 [listener]
-# M1 accepts loopback IPs only. Port 0 asks the OS for an ephemeral port.
+# Loopback IPs only. Port 0 asks the OS for one TCP/UDP port.
 bind_address = "127.0.0.1"
 port = 0
 max_connections = 8

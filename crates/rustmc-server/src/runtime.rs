@@ -1,10 +1,10 @@
-//! Bounded loopback development listener. It never speaks a Minecraft protocol.
+//! Bounded loopback discovery supervisor. It does not implement login or play.
 
-use crate::ListenerConfig;
+use crate::{ListenerConfig, discovery_bedrock, discovery_java};
 use std::{
     fmt,
-    io::{self, Read},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    io::{self, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -69,6 +69,9 @@ impl RuntimeEvent {
         if self.kind == "listener_bound" {
             line.push_str(" protocol_ready=false world_ready=false");
         }
+        if self.kind == "discovery_bound" {
+            line.push_str(" java_status_ready=true bedrock_discovery_ready=true login_ready=false world_ready=false");
+        }
         line
     }
 }
@@ -101,6 +104,8 @@ impl fmt::Display for RuntimeError {
 
 struct Connection {
     stream: TcpStream,
+    discovery: discovery_java::Session,
+    pending: Vec<u8>,
     bytes_read: usize,
     last_activity: Instant,
     created: Instant,
@@ -251,6 +256,31 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             return Err(RuntimeError::Bind(error));
         }
     };
+    let udp = match UdpSocket::bind(address) {
+        Ok(socket) => socket,
+        Err(error) => {
+            observe(event(
+                "failed",
+                LifecycleState::Failed,
+                started,
+                None,
+                None,
+                Some("udp_bind_failed"),
+            ));
+            return Err(RuntimeError::Bind(error));
+        }
+    };
+    if let Err(error) = udp.set_nonblocking(true) {
+        observe(event(
+            "failed",
+            LifecycleState::Failed,
+            started,
+            None,
+            None,
+            Some("udp_nonblocking_failed"),
+        ));
+        return Err(RuntimeError::Bind(error));
+    }
     observe(event(
         "listener_bound",
         LifecycleState::Bound,
@@ -259,8 +289,41 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         Some(0),
         None,
     ));
+    observe(event(
+        "discovery_bound",
+        LifecycleState::Bound,
+        started,
+        Some(address),
+        Some(0),
+        None,
+    ));
     let mut connections: Vec<Connection> = Vec::with_capacity(config.max_connections);
     while !shutdown.load(Ordering::SeqCst) {
+        for _ in 0..ACCEPT_BUDGET {
+            let mut buffer = [0u8; discovery_bedrock::MAX_DATAGRAM + 1];
+            match udp.recv_from(&mut buffer) {
+                Ok((length, peer)) => {
+                    if let Some(reply) =
+                        discovery_bedrock::pong(&buffer[..length], 0x525553544d43, address.port())
+                    {
+                        let _ = udp.send_to(&reply, peer);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    observe(event(
+                        "failed",
+                        LifecycleState::Failed,
+                        started,
+                        None,
+                        Some(connections.len()),
+                        Some("udp_receive_failed"),
+                    ));
+                    return Err(RuntimeError::Io(error));
+                }
+            }
+        }
         for _ in 0..ACCEPT_BUDGET {
             match listener.accept() {
                 Ok((stream, _peer)) => {
@@ -290,6 +353,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     }
                     connections.push(Connection {
                         stream,
+                        discovery: discovery_java::Session::default(),
+                        pending: Vec::new(),
                         bytes_read: 0,
                         last_activity: Instant::now(),
                         created: Instant::now(),
@@ -337,8 +402,27 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     Ok(count) => {
                         connection.bytes_read += count;
                         connection.last_activity = Instant::now();
-                        (connection.bytes_read >= config.max_bytes_per_connection)
-                            .then_some("read_limit")
+                        match connection
+                            .discovery
+                            .receive(&buffer[..count], config.max_bytes_per_connection)
+                        {
+                            Ok(replies) => {
+                                for reply in replies {
+                                    connection.pending.extend(reply);
+                                }
+                                if connection.pending.len() > discovery_java::MAX_FRAME + 5 {
+                                    Some("write_limit")
+                                } else if connection.bytes_read >= config.max_bytes_per_connection {
+                                    Some("read_limit")
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) if connection.bytes_read >= config.max_bytes_per_connection => {
+                                Some("read_limit")
+                            }
+                            Err(_) => Some("invalid_java_discovery"),
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         (connection.last_activity.elapsed()
@@ -349,6 +433,24 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     Err(_) => Some("read_error"),
                 }
             };
+            let reason = if reason.is_none() && !connection.pending.is_empty() {
+                match connection.stream.write(&connection.pending) {
+                    Ok(0) => Some("write_closed"),
+                    Ok(n) => {
+                        connection.pending.drain(..n);
+                        None
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                    Err(_) => Some("write_error"),
+                }
+            } else {
+                reason
+            };
+            let reason = reason.or_else(|| {
+                (connection.discovery.state() == discovery_java::State::Done
+                    && connection.pending.is_empty())
+                .then_some("status_complete")
+            });
             if let Some(reason) = reason {
                 let connection = connections.swap_remove(index);
                 let _ = connection.stream.shutdown(Shutdown::Both);

@@ -13,7 +13,7 @@ use signal_hook::{
     flag,
 };
 
-const HELP: &str = "RustMC local development runtime (no Minecraft protocol)\n\nUsage:\n  rustmc-server --help\n  rustmc-server --version\n  rustmc-server --check-config <path>\n  rustmc-server --run <path>\n\nExit codes: 0 clean stop/success, 2 usage error, 3 configuration error, 4 listener startup error, 5 running listener error.";
+const HELP: &str = "RustMC local discovery runtime (no login or world)\n\nUsage:\n  rustmc-server --help\n  rustmc-server --version\n  rustmc-server --check-config <path>\n  rustmc-server --run <path>\n\nExit codes: 0 clean stop/success, 2 usage error, 3 configuration error, 4 listener startup error, 5 running listener error.";
 
 fn print_event(event: RuntimeEvent) {
     let mut stdout = io::stdout().lock();
@@ -82,7 +82,7 @@ fn main() {
         }
         [flag] if flag == "--version" => {
             println!(
-                "RustMC {} (development runtime; no Minecraft protocol)",
+                "RustMC {} (discovery runtime; no login or world)",
                 env!("CARGO_PKG_VERSION")
             );
             0

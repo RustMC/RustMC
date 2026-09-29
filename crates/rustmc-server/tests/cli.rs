@@ -129,7 +129,7 @@ mod runtime_cli {
     use super::*;
     use std::{
         io::{BufRead, BufReader, Read, Write},
-        net::{Ipv4Addr, TcpListener, TcpStream},
+        net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
         process::{Child, Stdio},
         sync::mpsc::{self, Receiver},
         thread,
@@ -206,6 +206,85 @@ mod runtime_cli {
         format!(
             "schema_version = 1\nlog_level = 'debug'\n[listener]\nbind_address = '127.0.0.1'\nport = {port}\nmax_connections = 1\nmax_bytes_per_connection = 4\nidle_timeout_ms = 500\nmax_connection_lifetime_ms = 2000\n"
         )
+    }
+
+    #[test]
+    fn java_and_bedrock_discovery_share_loopback_port_and_stop() {
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let ready = server.wait_for("event=discovery_bound");
+        assert!(ready.contains("java_status_ready=true"));
+        assert!(ready.contains("bedrock_discovery_ready=true"));
+        assert!(ready.contains("login_ready=false"));
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        assert!(bound.contains("protocol_ready=false"));
+        let mut java = TcpStream::connect(address).unwrap();
+        java.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Handshake: packet id 0, protocol 777, host "x", port 25565, status state 1.
+        java.write_all(&[8, 0, 0x89, 0x06, 1, b'x', 0x63, 0xdd, 1, 1, 0])
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let n = java.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("\"protocol\":777"));
+        java.write_all(&[9, 1, 1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(java.read(&mut buf).unwrap(), 10);
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut ping = vec![1];
+        ping.extend([7u8; 8]);
+        ping.extend([
+            0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
+        ]);
+        ping.extend([0u8; 8]);
+        udp.send_to(&ping, address).unwrap();
+        let n = udp.recv(&mut buf).unwrap();
+        assert_eq!(buf[0], 0x1c);
+        assert!(String::from_utf8_lossy(&buf[..n]).contains(";2193;1.26.51;"));
+        let mut bad_ping = ping.clone();
+        bad_ping[13] = 0;
+        udp.send_to(&bad_ping, address).unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        assert!(udp.recv(&mut buf).is_err());
+        udp.send_to(&vec![0u8; 513], address).unwrap();
+        assert!(udp.recv(&mut buf).is_err());
+        server.stop();
+        let rebound = UdpSocket::bind(address).unwrap();
+        drop(rebound);
+    }
+
+    #[test]
+    fn malformed_java_frame_is_closed_without_response() {
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket.write_all(&[0x81, 0x20]).unwrap(); // 4097-byte frame exceeds the codec cap.
+        assert_eq!(socket.read(&mut [0u8; 1]).unwrap(), 0);
+        server.stop();
     }
 
     #[test]

@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! RustMC configuration and local development runtime. No Minecraft protocol exists yet.
+//! RustMC configuration and local discovery runtime. No login or world exists yet.
 
+pub mod discovery_bedrock;
+pub mod discovery_java;
 pub mod runtime;
 
 use std::{net::IpAddr, path::Path};
