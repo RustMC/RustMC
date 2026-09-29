@@ -1,0 +1,10 @@
+[package]
+name = "rustmc-tools"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "RustMC development and verification utilities"
+
+[dependencies]
+serde_json = "=1.0.151"

@@ -22,10 +22,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check
         run: cargo check --workspace --all-targets --locked
-      - name: License policy tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Dependency license policy
-        run: python3 scripts/check_dependency_licenses.py
+        run: cargo run -p rustmc-tools --bin check_dependency_licenses --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test

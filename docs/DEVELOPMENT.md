@@ -11,7 +11,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --workspace --locked
 cargo doc --workspace --no-deps --locked
-python3 scripts/check_dependency_licenses.py
+cargo run -p rustmc-tools --bin check_dependency_licenses --locked
 cargo run -p rustmc-server --locked -- --check-config config/rustmc.example.toml
 cargo run -p rustmc-server --locked -- --run config/rustmc.example.toml
 ```
@@ -53,7 +53,7 @@ rustmc_preview_dir="$HOME/.cache/rustmc-preview"
 mkdir -p "$rustmc_preview_dir/reports"
 curl --fail --location --output "$rustmc_preview_dir/server-26.3.jar"   https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar
 (cd "$rustmc_preview_dir/reports" &&   java -DbundlerMainClass=net.minecraft.data.Main -jar "$rustmc_preview_dir/server-26.3.jar" --reports)
-python3 scripts/prepare_preview_registry.py   "$rustmc_preview_dir/server-26.3.jar"   "$rustmc_preview_dir/preview-registries.toml"   "$rustmc_preview_dir/reports/generated/reports/registries.json"
+cargo run -p rustmc-tools --bin prepare_preview_registry --locked --   "$rustmc_preview_dir/server-26.3.jar"   "$rustmc_preview_dir/preview-registries.toml"   "$rustmc_preview_dir/reports/generated/reports/registries.json"
 cat > "$rustmc_preview_dir/preview.toml" <<EOF
 schema_version = 1
 log_level = "info"
