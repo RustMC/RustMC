@@ -24,3 +24,15 @@ Method: `cargo build --release --workspace --locked`, then `python3 scripts/meas
 | 5 | warm_repeat | no | 0.100 | 0.786 |
 
 The large difference in parent-observed times reflects process/page-cache and host noise, not game readiness. Future measurements must add actual protocol and world readiness, client join, first chunk, dirty recovery, and representative workloads before any server-performance claim.
+
+## Original terrain prototype observations (29 September 2026)
+
+These numbers measure **generation only** for the independent `Generator` prototype; no Minecraft chunk encoding, network delivery, lighting, client rendering, or disk I/O exists in this path. On the same Fedora host and Rust 1.98.1 toolchain described above, `cargo build --release -p rustmc-server --example measure_generation --locked` reported 0.12 s for the final incremental example rebuild (an earlier build reported 0.44 s). Those build durations are separate from the measurements. Then `target/release/examples/measure_generation 2026 25` generated 25 adjacent 16×16×128 chunks in process order from coordinates (-5,-5) through (-1,-3), with seed 2026. Each number is the monotonic interval around one call to `Generator::generate`, including its block allocation; `black_box` keeps the complete result observable to the optimizer. No cache control, repetitions, or load isolation was attempted; these are raw development observations, not a throughput or latency claim.
+
+| Chunk coordinate order | Generation time (microseconds) |
+| --- | --- |
+| (-5,-5) through (4,-5) | 46, 24, 25, 24, 24, 24, 23, 23, 24, 23 |
+| (-5,-4) through (4,-4) | 22, 23, 23, 22, 21, 22, 21, 21, 22, 23 |
+| (-5,-3) through (-1,-3) | 21, 22, 23, 23, 23 |
+
+**Encoding: unavailable. Delivery: unavailable.** Both require a version-correct client join and chunk packet path. Future evidence must report generation, encoding, queue wait, socket delivery, and client-visible timing separately.

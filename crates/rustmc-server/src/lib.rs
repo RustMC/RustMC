@@ -5,6 +5,7 @@
 pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod runtime;
+pub mod world;
 
 use std::{net::IpAddr, path::Path};
 
