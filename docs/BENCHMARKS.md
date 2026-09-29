@@ -35,4 +35,28 @@ These numbers measure **generation only** for the independent `Generator` protot
 | (-5,-4) through (4,-4) | 22, 23, 23, 22, 21, 22, 21, 21, 22, 23 |
 | (-5,-3) through (-1,-3) | 21, 22, 23, 23, 23 |
 
-**Encoding: unavailable. Delivery: unavailable.** Both require a version-correct client join and chunk packet path. Future evidence must report generation, encoding, queue wait, socket delivery, and client-visible timing separately.
+**Encoding and delivery were unavailable for this prototype measurement.** Later preview observations are recorded below.
+
+## Java 26.3 local Creative preview observations (29 September 2026)
+
+A real Java 26.3 client joined the opt-in loopback preview with seed 2026 and
+server view radius 32. The development build was used; the client was also
+rendering and other desktop work was running. RustMC logged separate monotonic
+intervals for the first ten generated chunks. `generation_us` spans the pure
+terrain call; `encoding_us` spans protocol encoding; `queue_and_write_us`
+starts after encoding and ends when bytes are handed to the local TCP socket.
+Socket write completion is **not** client receipt, rendering, or a network
+latency measurement. There was no cache control or repetition, so these are
+raw diagnostic samples, not a startup, throughput, speed, or capacity claim.
+
+| Stage (microseconds, first ten chunks) | Raw observations |
+| --- | --- |
+| Generation | 1218, 1005, 1194, 1198, 772, 1228, 700, 756, 763, 705 |
+| Encoding | 9821, 12849, 12713, 10884, 8311, 9663, 7961, 8069, 8100, 9126 |
+| Queue plus socket write | 84, 106, 116, 88, 96, 93, 73, 79, 81, 100 |
+
+The user and agent visually observed chunks and several biome surfaces, but no
+client timestamp or first-render interval was captured. The current encoder
+sends direct vertical skylight and has no full light propagation. A proper
+performance study must use a release build, repeated runs, controlled client
+movement, profiling, and end-to-end delivery timestamps before comparison.

@@ -1,6 +1,6 @@
 # M3 slice — local Java 26.3 world preview
 
-Status: in development; opt-in login and known-pack exchange were observed with a Java 26.3 client on 29 September 2026. The client then timed out waiting for registry data. This is a Java-only preview slice, not the M3 dual-edition join gate in [ROADMAP](../../ROADMAP.md). The first observable goal is one Java 26.3 client entering a generated world and rendering nearby chunks. A successful status ping or login packet is insufficient.
+Status: in development; a real Java 26.3 client completed login and configuration and rendered opt-in Creative preview chunks on 29 September 2026. Movement, rejoin, and full check gates still require completion. This is a Java-only preview slice, not the M3 dual-edition join gate in [ROADMAP](../../ROADMAP.md). The first observable goal is one Java 26.3 client entering a generated world and rendering nearby chunks. A successful status ping or login packet is insufficient.
 
 ## Scope and sequence
 
@@ -13,8 +13,8 @@ Status: in development; opt-in login and known-pack exchange were observed with 
 ## Acceptance criteria
 
 - [x] Explicit local development identity setting and clear security warnings; remote access remains disallowed. This is unauthenticated and has no permissions or playable world.
-- [ ] Java 26.3 client completes login, configuration, and play transitions with malformed/version mismatch tests.
-- [ ] Client visibly renders independently generated grass terrain and trees from a configured seed; chunk borders and negative coordinates are deterministic.
+- [x] A real Java 26.3 client completes local offline login, configuration, and initial Creative play transition; version mismatch and malformed input have bounded tests. Authentication is absent.
+- [x] Client visibly renders original terrain and trees at a configured seed and 32-chunk view; deterministic seed, negative coordinates, and chunk borders have unit tests. Full vanilla generation is absent.
 - [ ] Bounded view loading follows movement; shutdown and rejoin preserve correctness in covered cases.
 - [ ] Full local checks and GitHub CI pass, with generation/encoding/delivery evidence separated.
 
@@ -22,8 +22,11 @@ Bedrock world join, secure online authentication, vanilla generation/parity, per
 
 ## Configuration evidence — 29 September 2026
 
-The real Java 26.3 client accepted the local registry/tag manifest and acknowledged
-finish-configuration; the screen reached “Joining world…”. Initial experiments
+The real Java 26.3 client accepted the local registry/tag manifest, acknowledged
+finish-configuration, entered the Creative preview, and visibly rendered chunks.
+Initial experiments
 failed with missing world-clock/timeline references, then missing static block
 and item tags. Sending resolved dynamic and static tag IDs fixed that boundary.
-See [ADR-0012](../decisions/ADR-0012.md). Play and visible terrain remain unverified.
+See [ADR-0012](../decisions/ADR-0012.md). Full play behavior remains unverified.
+
+The preview now uses eight labelled surface regions with coordinate-derived irregular borders, a 32-chunk maximum view, and Creative observer movement. The 26.3 client displayed grass, snow, sand, and red-sand/terracotta terrain after joining; the world remains read-only. See [ADR-0013](../decisions/ADR-0013.md).

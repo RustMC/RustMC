@@ -2,7 +2,7 @@
 
 RustMC is an independently developed Minecraft-compatible server project written in Rust. The goal is a vanilla-style multiplayer world for Java and Bedrock clients, with compatibility and performance claims backed by tests and measurements.
 
-> **Discovery runtime / pre-alpha:** RustMC validates configuration and answers bounded Java status and Bedrock UDP discovery probes on loopback. It cannot log in a game client or run a world. Do not use it for production worlds.
+> **Local preview / pre-alpha:** RustMC answers bounded Java status and Bedrock discovery on loopback. An opt-in Java 26.3 Creative client can inspect generated terrain, but identity is unauthenticated, actions have no world effect, and there is no persistent or shared gameplay world. Do not use it for production worlds.
 
 The proposed shared-world baseline is Java-style gameplay with Bedrock client translation. That choice still needs owner approval; Bedrock support would not mean identical edition rules. Initial discovery targets are Java 26.3 and Bedrock 1.26.51. See the [compatibility matrix](docs/COMPATIBILITY.md).
 
@@ -35,11 +35,11 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | --- | --- |
 | `--help`, `--version`, and `--check-config` | Implemented and tested; schema 1 now includes M1 listener settings |
 | `--run` local discovery listener | Bounded loopback TCP and UDP; process tests pass on Linux |
-| Java 26.3 status | Tested with a real client on 29 September 2026; server-list entry displayed, join unavailable |
+| Java 26.3 status | Tested with a real client on 29 September 2026; server-list entry displayed |
 | Bedrock 1.26.51 discovery | Partial: synthetic UDP socket tests pass; real client not yet checked |
-| Java login and play | Partial opt-in loopback offline login and known-pack exchange, observed with a 26.3 client; registry configuration, play, and world absent; no authenticated identity |
+| Java login and play | Partial opt-in Creative terrain preview: one real 26.3 client joined and rendered chunks; no authentication, authoritative actions, persistence, or shared multiplayer |
 | Bedrock login and play | Planned; no session or playable endpoint exists |
-| Original terrain prototype | Seeded generator API and cross-chunk tests pass; no client encoding or playable world |
+| Original terrain preview | Seeded coordinate-derived terrain with eight labelled surface regions and trees; real 26.3 client rendered it at a configured 32-chunk view. No vanilla generation parity |
 | Players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |
@@ -56,23 +56,23 @@ cargo run -p rustmc-server --locked -- --check-config config/rustmc.example.toml
 cargo run -p rustmc-server --locked -- --run config/rustmc.example.toml
 ```
 
-The final command binds loopback TCP and UDP on the reported ephemeral port, answering only discovery probes. Stop it with Ctrl-C. Running without arguments exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
+The final command binds loopback TCP and UDP on the reported ephemeral port, answering only discovery probes. The opt-in preview needs a separate local registry manifest; see [development](docs/DEVELOPMENT.md). Stop it with Ctrl-C. Running without arguments exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
 
 ## World generation and client join work — 29 September 2026
 
 This dated slice tracks the next evidence gate; it does not declare vanilla parity or multiplayer support. The [development checklist](#development-checklist) remains the canonical feature status.
 
 - [x] Implement bounded Java 26.3 status and Bedrock 1.26.51 UDP discovery with malformed-input, shutdown, and source evidence; Java was also checked with a real client, while Bedrock client evidence remains open.
-- [ ] Establish a documented local development identity path and complete Java 26.3 login, configuration, and play transitions with a real client.
-- [ ] Send version-correct initial position, chunk, biome, heightmap, and lighting data and observe original chunks rendered in a matching client.
-- [ ] Generate deterministic seeded grass terrain, ground layers, clearings, and trees by world coordinate, including seam-free chunk borders.
+- [x] Establish an opt-in, unauthenticated loopback identity and complete Java 26.3 login, registry configuration, and initial Creative preview play transition with a real client. This does not establish secure login or multiplayer.
+- [x] Send Java 26.3 initial position, chunk, biome, heightmap, and direct skylight data and observe original chunks rendered in the matching client; full lighting correctness remains open.
+- [x] Generate deterministic seeded ground layers, clearings, trees, and eight preview biome regions by world coordinate, with tested chunk-border decoration. This is not vanilla generation parity.
 - [ ] Load nearby chunks as the player moves, within documented view, work, memory, and queue limits; test disconnect and rejoin.
 - [ ] Pass protocol, generation, malformed-input, process, shutdown, and repository CI checks; record generation, encoding, and delivery timings separately.
-- [ ] Record direct evidence of a Java 26.3 client joining and visibly rendering RustMC chunks. Leave this unchecked until the real client has been observed.
+- [x] Observe a Java 26.3 client join and visibly render RustMC chunks on 29 September 2026, including a 32-chunk view and multiple preview surface regions. The client screenshot and local process log establish this narrow claim.
 
 ## Development checklist
 
-This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet fully verified, even if partial code exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. M1 infrastructure passed its local and GitHub CI gates; M2 discovery has local process evidence but no real-client evidence yet.
+This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet fully verified, even if partial code exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. M1 infrastructure passed its local and GitHub CI gates; M2 Java discovery has real-client evidence; Bedrock discovery still lacks it. The Java terrain preview is partial M3 work and does not close the dual-edition milestone.
 
 ### Completed M0 foundation
 
@@ -104,7 +104,7 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
   - [ ] Implement transport accept/read/write limits and disconnect handling for the selected Java version; test partial, slow, and oversized input.
   - [ ] Implement packet framing, bounded decoding, encoding, and compression negotiation for the selected version; round-trip and malformed-input tests must pass.
   - [ ] Enforce protocol-state transitions through handshake, status, login, configuration, and play as applicable to the selected version; reject out-of-state packets.
-  - [x] Return Java 26.3 status/discovery response (protocol 777) and verify the server-list entry with a real Java 26.3 client; joining remains unavailable.
+  - [x] Return Java 26.3 status/discovery response (protocol 777) and verify the server-list entry with a real Java 26.3 client; opt-in loopback preview joining is documented separately above.
   - [ ] Authenticate login sessions using an approved identity flow; test invalid, expired, and replayed credentials without inventing cryptography.
   - [ ] Translate validated play packets into sequenced core intents and committed outputs; test permissions, ordering, and disconnect/rejoin behavior.
   - [ ] Record exact packet/data sources and unsupported Java versions in [compatibility](docs/COMPATIBILITY.md).
