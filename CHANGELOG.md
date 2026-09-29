@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased — Milestone 1
+## Unreleased — Milestone 2 discovery
+
+- Added bounded Java 26.3 status/ping and Bedrock 1.26.51 UDP discovery paths with independent codec and process tests. Real-client checks are pending; login and world remain absent.
+
+## Milestone 1
 
 - Added a bounded loopback-only development listener, strict runtime configuration, lifecycle events, signal shutdown, and process integration tests.
-- Added raw startup measurement tooling and a locked dependency-license CI gate. No Minecraft protocol or playable world exists.
+- Added raw startup measurement tooling and a locked dependency-license CI gate. No playable world exists.
 
 ## Milestone 0 foundation
 

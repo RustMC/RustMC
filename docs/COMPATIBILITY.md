@@ -1,14 +1,23 @@
 # Compatibility matrix
 
-Statuses: `planned`, `partial`, `tested`, `unsupported`, `unknown`. `tested` requires exact version, scope, and test evidence. No game protocol version is selected in M0.
+Statuses: `planned`, `partial`, `tested`, `unsupported`, `unknown`. `tested` requires exact version, scope, and test evidence.
 
-| Area | Java | Bedrock | M0 evidence |
+## M2 discovery targets (checked 29 September 2026)
+
+Java Edition **26.3**, network protocol **777**, is the initial target. Mojang's [version manifest](https://piston-meta.mojang.com/mc/game/version_manifest_v2.json) lists 26.3 as the latest release; the [official 26.3 server download](https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar) contains `version.json` with `protocol_version: 777` and `stable: true`. The [release notes](https://www.minecraft.net/en-us/article/minecraft-java-edition-26-3) corroborate the release. The server archive was inspected as metadata only; no code or assets were copied.
+
+Bedrock Edition **1.26.51**, network protocol **2193**, is the initial target. Mojang's [1.26.51 protocol release](https://github.com/Mojang/bedrock-protocol-docs/releases/tag/v1.26.51) states the network identifier. Mojang's [26.52 hotfix announcement](https://feedback.minecraft.net/hc/en-us/articles/49175370527501-Minecraft-Bedrock-Edition-26-52-Hotfix-Changelog) establishes that 26.52 is newer, but no matching stable Mojang protocol schema was published at this check. Choosing the latest version with a published stable protocol identifier keeps the first target auditable. No claim of 26.52 compatibility follows from 1.26.51 discovery.
+
+These identifiers select discovery responses only. Java's handshake carries a client protocol number, so mismatches can receive a status naming 777; Bedrock's unconnected ping carries no game network version, so discovery cannot authenticate or reject a client version. Neither route enables login or play. Java packet fields and Bedrock ping wire behavior require independent observation against official clients/server and remain provisional until those checks are recorded.
+
+| Area | Java 26.3 | Bedrock 1.26.51 | Current evidence |
 | --- | --- | --- | --- |
-| Connection and authentication | planned | planned | None |
+| Discovery | partial: status/ping synthetic socket test | partial: UDP ping/pong synthetic socket test | Rust unit and process tests; no real-client observation |
+| Connection and authentication | planned | planned | No login or session support |
 | Rules and update ordering | planned | planned translation; native parity unknown | None |
 | Inventory, commands, recipes, interactions | planned | planned translation | None |
 | Generation and seed behavior | planned | unknown | None |
 | Save/import/export | planned | unknown | None |
 | Cross-edition translation differences | not applicable | planned | None |
 
-The proposed shared world uses Java-style game rules. Bedrock support would translate client actions and results; it does not promise identical edition mechanics. Version targets and rules baseline need owner approval before implementation. This matrix must grow into versioned feature entries backed by black-box observations and tests. M1 has no gameplay or Minecraft protocol. Its loopback development TCP socket accepts bounded raw connections, not Java or Bedrock clients.
+The proposed shared world uses Java-style game rules. Bedrock support would translate client actions and results; it does not promise identical edition mechanics. The discovery version targets are selected; the gameplay rules baseline still needs owner approval. The matrix must grow into versioned feature entries backed by black-box observations and tests. The current loopback process answers Java status and Bedrock unconnected pings only. It does not accept a game login or run a world.

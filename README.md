@@ -2,13 +2,14 @@
 
 RustMC is an independently developed Minecraft-compatible server project written in Rust. The goal is a vanilla-style multiplayer world for Java and Bedrock clients, with compatibility and performance claims backed by tests and measurements.
 
-> **Development runtime / pre-alpha:** RustMC validates configuration and runs a bounded loopback-only TCP listener. It cannot speak a Minecraft protocol, accept game clients, or run a world. Do not use it for production worlds.
+> **Discovery runtime / pre-alpha:** RustMC validates configuration and answers bounded Java status and Bedrock UDP discovery probes on loopback. It cannot log in a game client or run a world. Do not use it for production worlds.
 
-The proposed shared-world baseline is Java-style gameplay with Bedrock client translation. That choice still needs owner approval; Bedrock support would not mean identical edition rules. Exact protocol versions are also undecided. See the [compatibility matrix](docs/COMPATIBILITY.md).
+The proposed shared-world baseline is Java-style gameplay with Bedrock client translation. That choice still needs owner approval; Bedrock support would not mean identical edition rules. Initial discovery targets are Java 26.3 and Bedrock 1.26.51. See the [compatibility matrix](docs/COMPATIBILITY.md).
 
 ## Contents
 
 - [Current status and quick start](#current-status-and-quick-start)
+- [World generation and client join work — 29 September 2026](#world-generation-and-client-join-work--29-september-2026)
 - [Development checklist](#development-checklist)
   - [Completed M0 foundation](#completed-m0-foundation)
   - [Decisions](#decisions)
@@ -33,8 +34,9 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | Capability | Status |
 | --- | --- |
 | `--help`, `--version`, and `--check-config` | Implemented and tested; schema 1 now includes M1 listener settings |
-| `--run` local development listener | Implemented and tested on Linux; raw TCP only, bounded and loopback-only |
-| Java or Bedrock discovery, login, and play | Planned; no Minecraft protocol endpoint exists |
+| `--run` local discovery listener | Bounded loopback TCP and UDP; process tests pass on Linux |
+| Java 26.3 status and Bedrock 1.26.51 discovery | Partial: synthetic socket tests pass; real clients not yet checked |
+| Java or Bedrock login and play | Planned; no playable endpoint exists |
 | World, chunks, players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |
@@ -51,11 +53,23 @@ cargo run -p rustmc-server --locked -- --check-config config/rustmc.example.toml
 cargo run -p rustmc-server --locked -- --run config/rustmc.example.toml
 ```
 
-The final command starts a loopback development TCP listener on an ephemeral port; it has no Minecraft protocol response. Stop it with Ctrl-C. Running without arguments exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
+The final command binds loopback TCP and UDP on the reported ephemeral port, answering only discovery probes. Stop it with Ctrl-C. Running without arguments exits without opening sockets or creating world data. See [development](docs/DEVELOPMENT.md).
+
+## World generation and client join work — 29 September 2026
+
+This dated slice tracks the next evidence gate; it does not declare vanilla parity or multiplayer support. The [development checklist](#development-checklist) remains the canonical feature status.
+
+- [ ] Finish bounded Java 26.3 status and Bedrock 1.26.51 UDP discovery, including malformed input, shutdown, and source evidence.
+- [ ] Establish a documented local development identity path and complete Java 26.3 login, configuration, and play transitions with a real client.
+- [ ] Send version-correct initial position, chunk, biome, heightmap, and lighting data and observe original chunks rendered in a matching client.
+- [ ] Generate deterministic seeded grass terrain, ground layers, clearings, and trees by world coordinate, including seam-free chunk borders.
+- [ ] Load nearby chunks as the player moves, within documented view, work, memory, and queue limits; test disconnect and rejoin.
+- [ ] Pass protocol, generation, malformed-input, process, shutdown, and repository CI checks; record generation, encoding, and delivery timings separately.
+- [ ] Record direct evidence of a Java 26.3 client joining and visibly rendering RustMC chunks. Leave this unchecked until the real client has been observed.
 
 ## Development checklist
 
-This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet verified, even if some design work exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. M1 infrastructure has passed its local and GitHub CI gates; later protocol and gameplay milestones remain unapproved.
+This is the canonical **feature coverage map**, separate from the [M0–M8 roadmap](ROADMAP.md). Every unchecked item is planned or not yet fully verified, even if partial code exists. A checked feature must be implemented and tested for a stated edition/version and scope; partial or unknown behavior stays unchecked and is recorded in the [compatibility matrix](docs/COMPATIBILITY.md). Each future feature needs independent acceptance tests and source provenance. Version-dependent behavior must be pinned before implementation. M1 infrastructure passed its local and GitHub CI gates; M2 discovery has local process evidence but no real-client evidence yet.
 
 ### Completed M0 foundation
 
@@ -68,7 +82,7 @@ This is the canonical **feature coverage map**, separate from the [M0–M8 roadm
 - [x] Adopt Apache-2.0 for RustMC original source and review current Cargo dependency license metadata; preserve third-party notices for future binaries.
 - [ ] Establish a working private security-reporting route before inviting reports or a public release.
 - [ ] Approve shared-world gameplay rules, including how Bedrock differences are represented, before gameplay implementation.
-- [ ] Select exact Java and Bedrock target versions and approved protocol/data sources before protocol implementation.
+- [x] Select exact Java and Bedrock discovery targets and record primary version/protocol sources: Java 26.3 / 777 and Bedrock 1.26.51 / 2193. Gameplay data and rule sources remain undecided.
 
 ### Configuration and server operations
 
