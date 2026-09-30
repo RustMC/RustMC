@@ -12,17 +12,27 @@ fn main() {
         eprintln!("invalid non-negative seed");
         std::process::exit(2);
     };
+    let pairs: Result<Vec<_>, &str> = args[1..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let (Ok(x), Ok(z)) = (pair[0].parse::<i64>(), pair[1].parse::<i64>()) else {
+                return Err("invalid coordinate pair");
+            };
+            if !(-1_000_000..=1_000_000).contains(&x) || !(-1_000_000..=1_000_000).contains(&z) {
+                return Err("coordinates must be within one million blocks of origin");
+            }
+            Ok((x, z))
+        })
+        .collect();
+    let pairs = pairs.unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
     let generator = Generator::new(seed);
     println!("seed,x,z,preview_ground_y,preview_biome");
-    for pair in args[1..].as_chunks::<2>().0 {
-        let (Ok(x), Ok(z)) = (pair[0].parse::<i64>(), pair[1].parse::<i64>()) else {
-            eprintln!("invalid coordinate pair");
-            std::process::exit(2);
-        };
-        if x.unsigned_abs() > 1_000_000 || z.unsigned_abs() > 1_000_000 {
-            eprintln!("coordinates must be within one million blocks of origin");
-            std::process::exit(2);
-        }
+    for (x, z) in pairs {
         println!(
             "{seed},{x},{z},{},{}",
             generator.height(x, z),
