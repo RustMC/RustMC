@@ -1,18 +1,26 @@
 //! Small repository tools; never linked into the RustMC server.
 
+pub mod nbt;
+pub mod oracle;
+pub mod region;
+
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const REVIEWED: &[(&str, &str)] = &[
+    ("adler2", "0BSD OR MIT OR Apache-2.0"),
     ("cfg-if", "MIT OR Apache-2.0"),
+    ("crc32fast", "MIT OR Apache-2.0"),
     ("equivalent", "Apache-2.0 OR MIT"),
     ("errno", "MIT OR Apache-2.0"),
+    ("flate2", "MIT OR Apache-2.0"),
     ("getrandom", "MIT OR Apache-2.0"),
     ("hashbrown", "MIT OR Apache-2.0"),
     ("indexmap", "Apache-2.0 OR MIT"),
     ("itoa", "MIT OR Apache-2.0"),
     ("libc", "MIT OR Apache-2.0"),
     ("memchr", "Unlicense OR MIT"),
+    ("miniz_oxide", "MIT OR Zlib OR Apache-2.0"),
     ("proc-macro2", "MIT OR Apache-2.0"),
     ("quote", "MIT OR Apache-2.0"),
     ("r-efi", "MIT OR Apache-2.0 OR LGPL-2.1-or-later"),
@@ -23,6 +31,7 @@ pub const REVIEWED: &[(&str, &str)] = &[
     ("serde_spanned", "MIT OR Apache-2.0"),
     ("signal-hook", "MIT OR Apache-2.0"),
     ("signal-hook-registry", "MIT OR Apache-2.0"),
+    ("simd-adler32", "MIT"),
     ("syn", "MIT OR Apache-2.0"),
     ("toml", "MIT OR Apache-2.0"),
     ("toml_datetime", "MIT OR Apache-2.0"),
