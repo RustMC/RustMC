@@ -194,10 +194,11 @@ Measured against the same 2,401-column seed-2026 oracle sample:
   single-threaded in 57.1 s wall (≈24 ms/column including datapack load
   and save reads), reproducible run-to-run.
 
-T1's exit gate is met on the raw sample. T2 (biome placement and surface
-rules — the router already exposes the continents/erosion/depth/ridges/
-temperature/vegetation fields it needs) remains unauthorized pending the
-owner's go-ahead.
+T1's exit gate is met on the raw sample. The owner's standing instruction is
+to continue through the staged plan milestone by milestone, so T2 (biome
+placement and surface rules — the router already exposes the
+continents/erosion/depth/ridges/temperature/vegetation fields it needs) is
+the next workstream.
 
 ## Risks
 
