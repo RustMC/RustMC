@@ -371,6 +371,30 @@ mod tests {
     }
 
     #[test]
+    fn seed_2026_comparison_points_match_the_published_worksheet() {
+        // Pins the RustMC column of docs/research/java-26.3-seed-comparison.md.
+        // Changing the generator must update that worksheet (and its recorded
+        // vanilla 26.3 comparison) in the same change.
+        let generator = Generator::new(2026);
+        const POINTS: [(i64, i64, i64, &str); 6] = [
+            (0, 0, 71, "minecraft:badlands"),
+            (256, 0, 61, "minecraft:plains"),
+            (0, 256, 68, "minecraft:forest"),
+            (-256, 0, 73, "minecraft:plains"),
+            (0, -256, 65, "minecraft:badlands"),
+            (512, 512, 65, "minecraft:taiga"),
+        ];
+        for (x, z, height, biome) in POINTS {
+            assert_eq!(generator.height(x, z), height, "height at ({x}, {z})");
+            assert_eq!(
+                generator.biome(x, z).identifier(),
+                biome,
+                "biome at ({x}, {z})"
+            );
+        }
+    }
+
+    #[test]
     fn biomes_cover_all_preview_regions_and_are_coordinate_stable() {
         let generator = Generator::new(2026);
         let mut seen = std::collections::BTreeSet::new();
