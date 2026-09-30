@@ -8,6 +8,7 @@ pub mod discovery_java;
 pub mod java_preview;
 pub mod preview_data;
 pub mod runtime;
+pub mod vanilla;
 pub mod world;
 
 use std::{net::IpAddr, path::Path};

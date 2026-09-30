@@ -10,3 +10,4 @@ description = "RustMC local development runtime"
 toml = "=0.8.23"
 signal-hook = { version = "=0.4.4", default-features = false }
 uuid = { version = "=1.26.1", default-features = false, features = ["v4"] }
+md-5 = { version = "=0.10.6", default-features = false }
