@@ -6,10 +6,18 @@
 //! consultation and is recorded in `docs/PROVENANCE.md` (session 2).
 //! Everything here was written independently against those recorded facts.
 //!
-//! Evaluation is point-based (`sample` at block coordinates). Vanilla
-//! guarantees its volume-fill paths are value-identical to point sampling
-//! for pure nodes, and the min/max/mul/div short-circuit optimizations are
-//! likewise value-preserving, so this module does not replicate them.
+//! Evaluation has two paths, mirroring vanilla's samplers: point
+//! evaluation (`sample` at block coordinates) and block-volume filling
+//! (`sample_volume`). The paths are NOT always value-identical: the
+//! volume forms of `mul`/`div` skip the point path's left-zero guard,
+//! the volume forms of `min`/`max` replace only on a strict comparison
+//! (so `min(+0.0, -0.0)` keeps `+0.0` where the point path returns
+//! `-0.0`), and the interpolated volume path lerps per axis and fills
+//! the vertical direction by repeated addition of a value step. Vanilla
+//! world generation fills density caches through the volume path, so
+//! both are implemented and pinned bit-for-bit by the parity vector
+//! tests over the golden captures recorded in `docs/PROVENANCE.md`
+//! (session 3).
 //! Context nodes (`blend_alpha`, `blend_offset`, `beardifier`,
 //! `blend_density`) currently evaluate to their context-free defaults
 //! (1, 0, 0, and pass-through); slice C will attach real blender and
@@ -594,30 +602,29 @@ impl Density {
                 let origin_x = x - x_in_cell;
                 let origin_y = y - y_in_cell;
                 let origin_z = z - z_in_cell;
-                let x000 = input.sample(origin_x, origin_y, origin_z);
-                let x100 = input.sample(origin_x + cell_size_xz, origin_y, origin_z);
-                let x010 = input.sample(origin_x, origin_y + cell_size_y, origin_z);
-                let x110 = input.sample(origin_x + cell_size_xz, origin_y + cell_size_y, origin_z);
-                let x001 = input.sample(origin_x, origin_y, origin_z + cell_size_xz);
-                let x101 = input.sample(origin_x + cell_size_xz, origin_y, origin_z + cell_size_xz);
-                let x011 = input.sample(origin_x, origin_y + cell_size_y, origin_z + cell_size_xz);
-                let x111 = input.sample(
-                    origin_x + cell_size_xz,
-                    origin_y + cell_size_y,
-                    origin_z + cell_size_xz,
-                );
+                // Vanilla samples the corner grid through the input's
+                // volume path (an aligned 2×2×2 cell-step volume), not
+                // point-wise.
+                let corner_volume = DensityVolume {
+                    size: [2, 2, 2],
+                    min: [origin_x, origin_y, origin_z],
+                    step: [*cell_size_xz, *cell_size_y, *cell_size_xz],
+                };
+                let mut corner = vec![0.0f32; 8];
+                input.sample_volume(&corner_volume, &mut corner);
+                let at = |cx: usize, cy: usize, cz: usize| corner[corner_volume.index(cx, cy, cz)];
                 lerp3(
                     x_in_cell as f32 / *cell_size_xz as f32,
                     y_in_cell as f32 / *cell_size_y as f32,
                     z_in_cell as f32 / *cell_size_xz as f32,
-                    x000,
-                    x100,
-                    x010,
-                    x110,
-                    x001,
-                    x101,
-                    x011,
-                    x111,
+                    at(0, 0, 0),
+                    at(1, 0, 0),
+                    at(0, 1, 0),
+                    at(1, 1, 0),
+                    at(0, 0, 1),
+                    at(1, 0, 1),
+                    at(0, 1, 1),
+                    at(1, 1, 1),
                 )
             }
             Node::Slice {
@@ -689,6 +696,479 @@ impl Density {
             Node::BlendOffset => 0.0,
             Node::Beardifier => 0.0,
             Node::BlendDensity(input) => input.sample(x, y, z),
+        }
+    }
+
+    /// Fills `out` (length `volume.slot_count()`) with this function's
+    /// values over a strided block volume, reproducing vanilla's
+    /// `sampleVolume` operation order for the nodes whose volume path is
+    /// not value-identical to the point path. Other nodes fall back to a
+    /// naive per-block fill, which vanilla also uses with the same result.
+    pub fn sample_volume(&self, volume: &DensityVolume, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), volume.slot_count());
+        match &*self.0 {
+            Node::Binary(kind, left, right) => {
+                sample_binary_volume(*kind, left, right, volume, out)
+            }
+            Node::Interpolated {
+                input,
+                cell_size_xz,
+                cell_size_y,
+            } => sample_interpolated_volume(input, *cell_size_xz, *cell_size_y, volume, out),
+            _ => {
+                for z in 0..volume.size[2] {
+                    for x in 0..volume.size[0] {
+                        let block_x = volume.block(0, x);
+                        let block_z = volume.block(2, z);
+                        for y in 0..volume.size[1] {
+                            let index = volume.index(x as usize, y as usize, z as usize);
+                            out[index] = self.sample(block_x, volume.block(1, y), block_z);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Vanilla's `DensityVolume`: a strided sampling grid over block
+/// coordinates with the same y-fastest buffer layout (`index =
+/// y + (x + z·sizeX)·sizeY`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DensityVolume {
+    size: [i32; 3],
+    min: [i32; 3],
+    step: [i32; 3],
+}
+
+impl DensityVolume {
+    /// Mirrors the vanilla constructor validation: sizes and steps must
+    /// all be positive.
+    pub fn new(size: [i32; 3], min: [i32; 3], step: [i32; 3]) -> Option<Self> {
+        if size.iter().any(|s| *s <= 0) || step.iter().any(|s| *s <= 0) {
+            return None;
+        }
+        Some(Self { size, min, step })
+    }
+
+    pub fn slot_count(&self) -> usize {
+        (self.size[0] * self.size[1] * self.size[2]) as usize
+    }
+
+    /// `indexUnchecked` for in-grid indices.
+    pub fn index(&self, x: usize, y: usize, z: usize) -> usize {
+        y + (x + z * self.size[0] as usize) * self.size[1] as usize
+    }
+
+    fn block(&self, axis: usize, index: i32) -> i32 {
+        self.min[axis] + index * self.step[axis]
+    }
+
+    /// `maxBlock*`: one past the last covered block along the axis.
+    fn max_block(&self, axis: usize) -> i32 {
+        self.min[axis] + self.size[axis] * self.step[axis] - 1
+    }
+}
+
+fn volume_scratch(volume: &DensityVolume) -> Vec<f32> {
+    vec![0.0f32; volume.slot_count()]
+}
+
+/// The volume-path forms of the binary nodes, matching vanilla's
+/// specialized sampler volume loops: constant folds operate on the
+/// dynamic side in place, and the general `mul`/`div` loops apply the
+/// raw operation per slot without the point sampler's left-zero guard.
+fn sample_binary_volume(
+    kind: BinaryKind,
+    left: &Density,
+    right: &Density,
+    volume: &DensityVolume,
+    out: &mut [f32],
+) {
+    let left_const = left.as_constant();
+    let right_const = right.as_constant();
+    match kind {
+        BinaryKind::Add => match (left_const, right_const) {
+            (Some(c), _) => {
+                right.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot += c;
+                }
+            }
+            (None, Some(c)) => {
+                left.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot += c;
+                }
+            }
+            (None, None) => {
+                left.sample_volume(volume, out);
+                let mut scratch = volume_scratch(volume);
+                right.sample_volume(volume, &mut scratch);
+                for (slot, other) in out.iter_mut().zip(scratch) {
+                    *slot += other;
+                }
+            }
+        },
+        BinaryKind::Sub => match (left_const, right_const) {
+            (Some(c), _) => {
+                right.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot = c - *slot;
+                }
+            }
+            (None, Some(c)) => {
+                left.sample_volume(volume, out);
+                let negated = -c;
+                for slot in out.iter_mut() {
+                    *slot += negated;
+                }
+            }
+            (None, None) => {
+                left.sample_volume(volume, out);
+                let mut scratch = volume_scratch(volume);
+                right.sample_volume(volume, &mut scratch);
+                for (slot, other) in out.iter_mut().zip(scratch) {
+                    *slot += -other;
+                }
+            }
+        },
+        BinaryKind::Mul => match (left_const, right_const) {
+            (Some(c), _) => {
+                right.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot *= c;
+                }
+            }
+            (None, Some(c)) => {
+                left.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot *= c;
+                }
+            }
+            (None, None) => {
+                left.sample_volume(volume, out);
+                let mut scratch = volume_scratch(volume);
+                right.sample_volume(volume, &mut scratch);
+                for (slot, other) in out.iter_mut().zip(scratch) {
+                    *slot *= other;
+                }
+            }
+        },
+        BinaryKind::Div => match (left_const, right_const) {
+            (Some(c), _) => {
+                right.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot = c / *slot;
+                }
+            }
+            (None, Some(c)) => {
+                left.sample_volume(volume, out);
+                let reciprocal = 1.0f32 / c;
+                for slot in out.iter_mut() {
+                    *slot *= reciprocal;
+                }
+            }
+            (None, None) => {
+                left.sample_volume(volume, out);
+                let mut scratch = volume_scratch(volume);
+                right.sample_volume(volume, &mut scratch);
+                for (slot, other) in out.iter_mut().zip(scratch) {
+                    *slot /= other;
+                }
+            }
+        },
+        BinaryKind::Min => {
+            let const_replacement = match (left_const, right_const) {
+                (Some(c), _) => {
+                    right.sample_volume(volume, out);
+                    Some(c)
+                }
+                (None, Some(c)) => {
+                    left.sample_volume(volume, out);
+                    Some(c)
+                }
+                (None, None) => None,
+            };
+            match const_replacement {
+                Some(c) => {
+                    for slot in out.iter_mut() {
+                        if c < *slot {
+                            *slot = c;
+                        }
+                    }
+                }
+                None => {
+                    left.sample_volume(volume, out);
+                    let mut scratch = volume_scratch(volume);
+                    right.sample_volume(volume, &mut scratch);
+                    for (slot, other) in out.iter_mut().zip(scratch) {
+                        if other < *slot {
+                            *slot = other;
+                        }
+                    }
+                }
+            }
+        }
+        BinaryKind::Max => {
+            let const_replacement = match (left_const, right_const) {
+                (Some(c), _) => {
+                    right.sample_volume(volume, out);
+                    Some(c)
+                }
+                (None, Some(c)) => {
+                    left.sample_volume(volume, out);
+                    Some(c)
+                }
+                (None, None) => None,
+            };
+            match const_replacement {
+                Some(c) => {
+                    for slot in out.iter_mut() {
+                        if c > *slot {
+                            *slot = c;
+                        }
+                    }
+                }
+                None => {
+                    left.sample_volume(volume, out);
+                    let mut scratch = volume_scratch(volume);
+                    right.sample_volume(volume, &mut scratch);
+                    for (slot, other) in out.iter_mut().zip(scratch) {
+                        if other > *slot {
+                            *slot = other;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `InterpolatedFunction.Sampler.sampleVolume`: aligned cell-stepped
+/// volumes pass straight through to the input; block-stepped volumes
+/// fill cell corner grids and interpolate each cell; volumes with a
+/// non-unit step are filled at unit stride first, then gathered.
+fn sample_interpolated_volume(
+    input: &Density,
+    cell_size_xz: i32,
+    cell_size_y: i32,
+    volume: &DensityVolume,
+    out: &mut [f32],
+) {
+    let aligned = (volume.step[0] == cell_size_xz || volume.size[0] == 1)
+        && (volume.step[1] == cell_size_y || volume.size[1] == 1)
+        && (volume.step[2] == cell_size_xz || volume.size[2] == 1)
+        && volume.min[0].rem_euclid(cell_size_xz) == 0
+        && volume.min[1].rem_euclid(cell_size_y) == 0
+        && volume.min[2].rem_euclid(cell_size_xz) == 0;
+    if aligned {
+        input.sample_volume(volume, out);
+        return;
+    }
+    if volume.step == [1, 1, 1] {
+        sample_interpolated_block_step(input, cell_size_xz, cell_size_y, volume, out);
+        return;
+    }
+    let block_volume = DensityVolume {
+        size: [
+            volume.size[0] * volume.step[0],
+            volume.size[1] * volume.step[1],
+            volume.size[2] * volume.step[2],
+        ],
+        min: volume.min,
+        step: [1, 1, 1],
+    };
+    let mut block_buffer = volume_scratch(&block_volume);
+    sample_interpolated_block_step(
+        input,
+        cell_size_xz,
+        cell_size_y,
+        &block_volume,
+        &mut block_buffer,
+    );
+    for z in 0..volume.size[2] {
+        for x in 0..volume.size[0] {
+            for y in 0..volume.size[1] {
+                let value = block_buffer[block_volume.index(
+                    (x * volume.step[0]) as usize,
+                    (y * volume.step[1]) as usize,
+                    (z * volume.step[2]) as usize,
+                )];
+                let index = volume.index(x as usize, y as usize, z as usize);
+                out[index] = value;
+            }
+        }
+    }
+}
+
+fn sample_interpolated_block_step(
+    input: &Density,
+    cell_size_xz: i32,
+    cell_size_y: i32,
+    volume: &DensityVolume,
+    out: &mut [f32],
+) {
+    let min_cell = [
+        volume.min[0].div_euclid(cell_size_xz),
+        volume.min[1].div_euclid(cell_size_y),
+        volume.min[2].div_euclid(cell_size_xz),
+    ];
+    let max_block = [
+        volume.max_block(0),
+        volume.max_block(1),
+        volume.max_block(2),
+    ];
+    let max_cell = [
+        max_block[0].div_euclid(cell_size_xz),
+        max_block[1].div_euclid(cell_size_y),
+        max_block[2].div_euclid(cell_size_xz),
+    ];
+    let cell_count = [
+        max_cell[0] - min_cell[0] + 1,
+        max_cell[1] - min_cell[1] + 1,
+        max_cell[2] - min_cell[2] + 1,
+    ];
+    // The corner grid gains one extra sample on each axis unless the
+    // volume ends exactly on a cell boundary.
+    let cell_size = [
+        if max_block[0].rem_euclid(cell_size_xz) == 0 {
+            cell_count[0]
+        } else {
+            cell_count[0] + 1
+        },
+        if max_block[1].rem_euclid(cell_size_y) == 0 {
+            cell_count[1]
+        } else {
+            cell_count[1] + 1
+        },
+        if max_block[2].rem_euclid(cell_size_xz) == 0 {
+            cell_count[2]
+        } else {
+            cell_count[2] + 1
+        },
+    ];
+    let cell_volume = DensityVolume {
+        size: cell_size,
+        min: [
+            min_cell[0] * cell_size_xz,
+            min_cell[1] * cell_size_y,
+            min_cell[2] * cell_size_xz,
+        ],
+        step: [cell_size_xz, cell_size_y, cell_size_xz],
+    };
+    let mut cell_buffer = volume_scratch(&cell_volume);
+    input.sample_volume(&cell_volume, &mut cell_buffer);
+
+    let xz_inv = 1.0f32 / cell_size_xz as f32;
+    let y_inv = 1.0f32 / cell_size_y as f32;
+    for cell_z in 0..cell_count[2] {
+        let next_z = (cell_z + 1).min(cell_size[2] - 1);
+        for cell_x in 0..cell_count[0] {
+            let next_x = (cell_x + 1).min(cell_size[0] - 1);
+            let mut v000 = cell_buffer[cell_volume.index(cell_x as usize, 0, cell_z as usize)];
+            let mut v100 = cell_buffer[cell_volume.index(next_x as usize, 0, cell_z as usize)];
+            let mut v001 = cell_buffer[cell_volume.index(cell_x as usize, 0, next_z as usize)];
+            let mut v101 = cell_buffer[cell_volume.index(next_x as usize, 0, next_z as usize)];
+            for cell_y in 0..cell_count[1] {
+                let next_y = (cell_y + 1).min(cell_size[1] - 1);
+                let v010 = cell_buffer
+                    [cell_volume.index(cell_x as usize, next_y as usize, cell_z as usize)];
+                let v110 = cell_buffer
+                    [cell_volume.index(next_x as usize, next_y as usize, cell_z as usize)];
+                let v011 = cell_buffer
+                    [cell_volume.index(cell_x as usize, next_y as usize, next_z as usize)];
+                let v111 = cell_buffer
+                    [cell_volume.index(next_x as usize, next_y as usize, next_z as usize)];
+                fill_interpolated_cell(
+                    volume,
+                    out,
+                    &cell_volume,
+                    xz_inv,
+                    y_inv,
+                    cell_size_xz,
+                    cell_size_y,
+                    cell_x,
+                    cell_y,
+                    cell_z,
+                    v000,
+                    v100,
+                    v010,
+                    v110,
+                    v001,
+                    v101,
+                    v011,
+                    v111,
+                );
+                v000 = v010;
+                v100 = v110;
+                v001 = v011;
+                v101 = v111;
+            }
+        }
+    }
+}
+
+/// `InterpolatedFunction.Sampler.fillCell`: horizontal axes interpolate
+/// with the reciprocal-cell multiply, and the vertical direction is a
+/// repeated addition of `valueStep` — not per-point lerp evaluation.
+#[allow(clippy::too_many_arguments)]
+fn fill_interpolated_cell(
+    volume: &DensityVolume,
+    out: &mut [f32],
+    cell_volume: &DensityVolume,
+    xz_inv: f32,
+    y_inv: f32,
+    cell_size_xz: i32,
+    cell_size_y: i32,
+    cell_x: i32,
+    cell_y: i32,
+    cell_z: i32,
+    v000: f32,
+    v100: f32,
+    v010: f32,
+    v110: f32,
+    v001: f32,
+    v101: f32,
+    v011: f32,
+    v111: f32,
+) {
+    let cell_output_x = cell_volume.block(0, cell_x) - volume.min[0];
+    let cell_output_y = cell_volume.block(1, cell_y) - volume.min[1];
+    let cell_output_z = cell_volume.block(2, cell_z) - volume.min[2];
+    let x0 = (-cell_output_x).max(0);
+    let y0 = (-cell_output_y).max(0);
+    let z0 = (-cell_output_z).max(0);
+    let x1 = cell_size_xz.min(volume.size[0] - cell_output_x) - 1;
+    let y1 = cell_size_y.min(volume.size[1] - cell_output_y) - 1;
+    let z1 = cell_size_xz.min(volume.size[2] - cell_output_z) - 1;
+
+    for z in z0..=z1 {
+        let output_z = cell_output_z + z;
+        let alpha_z = z as f32 * xz_inv;
+        let v00 = lerp(alpha_z, v000, v001);
+        let v01 = lerp(alpha_z, v010, v011);
+        let v10 = lerp(alpha_z, v100, v101);
+        let v11 = lerp(alpha_z, v110, v111);
+
+        for x in x0..=x1 {
+            let output_x = cell_output_x + x;
+            let alpha_x = x as f32 * xz_inv;
+            let v_0 = lerp(alpha_x, v00, v10);
+            let v_1 = lerp(alpha_x, v01, v11);
+            let value_step = (v_1 - v_0) * y_inv;
+            // The volume layout is y-fastest, so the cell's vertical run
+            // is a contiguous slot range.
+            let first_slot = volume.index(
+                output_x as usize,
+                (cell_output_y + y0) as usize,
+                output_z as usize,
+            );
+            let mut value = v_0 + value_step * y0 as f32;
+            for slot in &mut out[first_slot..first_slot + (y1 - y0 + 1) as usize] {
+                *slot = value;
+                value += value_step;
+            }
         }
     }
 }
@@ -1884,6 +2364,85 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "{} parity mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// Bit-for-bit parity for the block-volume evaluation path, captured
+    /// from the real 26.3 `sampleVolume` pipeline by the same knowledge-only
+    /// consultation harness as the point vectors. Pins the interpolated
+    /// fast path, block-step fill (reciprocal-multiply alphas and the
+    /// vertical repeated-addition accumulation), the non-unit-step gather,
+    /// nested interpolated recursion, and the volume forms of mul/div/min
+    /// that intentionally differ from the point samplers.
+    #[test]
+    fn vanilla_volume_parity_vectors_match_bit_for_bit() {
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("testdata/density_volume_parity_vectors.json"))
+                .unwrap();
+        let mut expected = HashMap::<(String, i32, i32, i32), i32>::new();
+        for line in include_str!("testdata/density_volume_parity_expected.txt").lines() {
+            let mut it = line.split_whitespace();
+            let name = it.next().unwrap().to_owned();
+            let x: i32 = it.next().unwrap().parse().unwrap();
+            let y: i32 = it.next().unwrap().parse().unwrap();
+            let z: i32 = it.next().unwrap().parse().unwrap();
+            let bits: i32 = it.next().unwrap().parse().unwrap();
+            expected.insert((name, x, y, z), bits);
+        }
+
+        let engine = engine();
+        let reg = registry(&engine);
+        let mut mismatches = Vec::new();
+        let mut checked = 0usize;
+        for vector in &vectors {
+            let name = vector["name"].as_str().unwrap().to_owned();
+            let density = reg
+                .compile_value(&vector["function"])
+                .unwrap_or_else(|error| panic!("{name}: rust parse: {error}"));
+            let volume_spec = &vector["volume"];
+            let ints = |key: &str| {
+                volume_spec[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_i64().unwrap() as i32)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            };
+            let volume = DensityVolume::new(ints("size"), ints("min"), ints("step"))
+                .unwrap_or_else(|| panic!("{name}: invalid volume"));
+            let mut buffer = vec![0.0f32; volume.slot_count()];
+            density.sample_volume(&volume, &mut buffer);
+            for z in 0..volume.size[2] {
+                for x in 0..volume.size[0] {
+                    for y in 0..volume.size[1] {
+                        let got = buffer[volume.index(x as usize, y as usize, z as usize)].to_bits()
+                            as i32;
+                        let want = *expected.get(&(name.clone(), x, y, z)).unwrap_or_else(|| {
+                            panic!("no expectation for {name} at ({x},{y},{z})")
+                        });
+                        checked += 1;
+                        if got != want {
+                            mismatches.push(format!(
+                                "{name} ({x},{y},{z}): rust {:08x}, vanilla {:08x}",
+                                got as u32, want as u32
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            expected.len(),
+            "expectation table not fully consumed"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "{} volume parity mismatches:\n{}",
             mismatches.len(),
             mismatches.join("\n")
         );
