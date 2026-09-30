@@ -40,6 +40,19 @@ The preview flag is for local protocol testing only. It accepts an unverified na
 
 Exit codes: `0` clean stop or non-running success; `2` CLI usage; `3` configuration; `4` listener startup/bind or signal setup; `5` running listener I/O failure. Process tests use ephemeral ports and real signals. If the pinned toolchain or locked dependencies cannot be obtained, report the acquisition blocker rather than claiming tests passed.
 
+## Continuous integration
+
+`.github/workflows/` holds four workflows; third-party actions are pinned to commit SHAs and run with `contents: read` except where noted.
+
+| Workflow | Trigger | Checks |
+| --- | --- | --- |
+| `foundation` (`ci.yml`) | every branch push, PR, manual | format, check, dependency license gate, clippy `-D warnings`, tests, build, rustdoc on the pinned toolchain |
+| `security-audit` | pushes, PRs, weekly schedule, manual | `cargo-deny check advisories bans sources` against `deny.toml`; the schedule re-tests advisories because the vulnerability database changes over time |
+| `spellcheck` | pushes, PRs, manual | `typos` across the repository |
+| `release` | `v*` tag push | builds `rustmc-server` release binaries (Linux and Windows) with SHA-256 checksums and attaches them to a **draft** GitHub Release; publishing the draft is a manual owner action (`contents: write` is limited to this workflow) |
+
+`.github/dependabot.yml` opens weekly grouped PRs for Cargo and GitHub Actions updates.
+
 ## Opt-in Java 26.3 terrain preview
 
 Use a licensed matching Java 26.3 client. Java 25 is required to run Mojang's

@@ -1,0 +1,58 @@
+name: release
+# Tag pushes (v*) build portable release binaries and attach them to a DRAFT
+# GitHub Release. Nothing is published to end users until the owner reviews
+# and publishes the draft manually, per the project's release policy.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node.js 24
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build release binary
+        run: cargo build --release --locked -p rustmc-server --target ${{ matrix.target }}
+      - name: Package archive and checksum (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          tar -C "target/$TARGET/release" -czf "rustmc-server-$VERSION-$TARGET.tar.gz" rustmc-server
+          sha256sum "rustmc-server-$VERSION-$TARGET.tar.gz" > "rustmc-server-$VERSION-$TARGET.tar.gz.sha256"
+      - name: Package archive and checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          Compress-Archive -Path "target/$env:TARGET/release/rustmc-server.exe" -DestinationPath "rustmc-server-$env:VERSION-$env:TARGET.zip"
+          $zip = "rustmc-server-$env:VERSION-$env:TARGET.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          Set-Content -Encoding ascii -Path "$zip.sha256" -Value "$hash  $zip"
+      - name: Create draft release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          files: |
+            rustmc-server-*

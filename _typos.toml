@@ -1,0 +1,8 @@
+# typos configuration for RustMC (https://github.com/crate-ci/typos).
+[default.extend-identifiers]
+# Part of the `flate2` crate name referenced in docs/PROVENANCE.md.
+flate = "flate"
+flate2 = "flate2"
+# Arbitrary short NBT key used by the round-trip test in
+# crates/rustmc-tools/src/nbt.rs.
+ba = "ba"
