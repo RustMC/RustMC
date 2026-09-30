@@ -1,6 +1,6 @@
 # Independent development and provenance
 
-RustMC core design and code are developed independently. Do not copy competing server implementations or architecture as a template, use decompiled proprietary code, or redistribute unapproved game assets. Primary technical documentation and reviewed general-purpose libraries are allowed. This is a process policy, not proof that every concept is unprecedented. Contributions must identify source, usage, license, and fixture/data origin; do not invent cryptography.
+RustMC core design and code are developed independently. Do not copy competing server implementations or architecture as a template, use decompiled proprietary code, or redistribute unapproved game assets. Primary technical documentation and reviewed general-purpose libraries are allowed. This is a process policy, not proof that every concept is unprecedented. Contributions must identify source, usage, license, and fixture/data origin; do not invent cryptography. One scoped exception exists: [ADR-0014 as amended](decisions/ADR-0014.md) lets terrain work **read** deobfuscated vanilla or PaperMC generation code for understanding only; nothing consulted may enter git in any form, and each session is logged below.
 
 | Item | Origin | Use and review |
 | --- | --- | --- |
@@ -51,3 +51,9 @@ The `rustmc-tools` workspace package replaces the earlier developer Python scrip
 ## Vanilla oracle (T0, 30 September 2026)
 
 The `vanilla_oracle` tool reads Anvil region files from single-player saves the owner's licensed client generated, so RustMC can measure its generator against vanilla ground truth. Nothing from any save is copied into the repository; the tool prints only derived column facts (height, block name, biome name) and aggregate match percentages. Format facts about 26.3 saves — heightmaps relative to the world minimum Y, mixed string/compound blockstate palettes, exact-width biome palettes stored as low as one bit — were established by parsing the owner's own world and are documented in `docs/research/`. Region decompression uses `flate2 1.1.5` (`MIT OR Apache-2.0`) with its locked transitive packages `crc32fast 1.5.2` (`MIT OR Apache-2.0`), `miniz_oxide 0.8.9` (`MIT OR Zlib OR Apache-2.0`), `adler2 2.0.1` (`0BSD OR MIT OR Apache-2.0`), and `simd-adler32 0.3.10` (`MIT`); each has an Apache-2.0-compatible option and was reviewed against the policy gate. `rustmc-tools` now depends on `rustmc-server` read-only to compare the live generator; this links no new third-party code. The NBT and region readers in `crates/rustmc-tools/src/nbt.rs` and `region.rs` were written from the public Anvil/NBT format descriptions and verified against the owner's save, not translated from any server implementation.
+
+## Terrain generation consultation log (ADR-0014, knowledge only)
+
+Per the owner's 30 September 2026 direction, ADR-0014 was amended so terrain work may read deobfuscated vanilla or PaperMC generation code **for understanding only**. Nothing consulted enters git: no files, code fragments, or vendor references in tracked content. Each session appends an entry here: what was read, what was learned, and how RustMC implemented it independently.
+
+- 2026-09-30 — Policy amendment recorded; no code consulted yet. The T0 oracle results and the experimental noise field (both pre-amendment, black-box) are documented above and in `docs/research/`.
