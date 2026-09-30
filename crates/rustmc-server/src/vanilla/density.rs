@@ -127,6 +127,9 @@ impl UnaryKind {
                 clamped / 2.0 - clamped * clamped * clamped / 24.0
             }
             Self::Log => input.ln(),
+            // Java `Math.signum(float)`: NaN stays NaN and signed zeros
+            // map to themselves, unlike Rust's `signum` which returns ±1.
+            Self::Sign if input.is_nan() || input == 0.0 => input,
             Self::Sign => input.signum(),
         }
     }
@@ -164,10 +167,17 @@ impl BinaryKind {
         match self {
             Self::Add => left + right,
             Self::Sub => left - right,
-            // Java short-circuits `mul` to 0 when the left operand is 0;
-            // `0.0 * anything` is already 0 for every value reached here.
-            Self::Mul => left * right,
-            // Java returns 0 when the left operand is 0 (including 0/0).
+            // Java's general `mul` sampler short-circuits to +0.0 when the
+            // left operand is zero (either sign), so `0 * infinity` is 0.
+            Self::Mul => {
+                if left == 0.0 {
+                    0.0
+                } else {
+                    left * right
+                }
+            }
+            // The general `div` sampler likewise returns +0.0 for a zero
+            // left operand (including 0/0); constant folds bypass it.
             Self::Div => {
                 if left == 0.0 {
                     0.0
@@ -409,6 +419,15 @@ impl Density {
         Self(Rc::new(Node::Constant(value)))
     }
 
+    /// The literal value of a constant node, mirroring vanilla's
+    /// `instanceof ConstantFunction` compile-time fold checks.
+    fn as_constant(&self) -> Option<f32> {
+        match &*self.0 {
+            Node::Constant(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     /// Evaluates the function at absolute block coordinates.
     pub fn sample(&self, x: i32, y: i32, z: i32) -> f32 {
         match &*self.0 {
@@ -475,10 +494,25 @@ impl Density {
             }
             Node::Unary(kind, input) => kind.apply(input.sample(x, y, z)),
             Node::Binary(kind, left, right) => {
-                let left = left.sample(x, y, z);
-                // Java skips evaluating the right operand of mul/div when
-                // the left is 0; the result is identical.
-                kind.apply(left, right.sample(x, y, z))
+                // Vanilla folds compile-time-known constant operands into
+                // dedicated samplers: the folded mul/div forms drop the
+                // left-operand zero guard, division by a constant becomes a
+                // multiplication by the f32 reciprocal (which rounds
+                // differently), and the left-constant check runs first.
+                let folded = match kind {
+                    BinaryKind::Mul => match (left.as_constant(), right.as_constant()) {
+                        (Some(c), _) => Some(right.sample(x, y, z) * c),
+                        (None, Some(c)) => Some(left.sample(x, y, z) * c),
+                        (None, None) => None,
+                    },
+                    BinaryKind::Div => match (left.as_constant(), right.as_constant()) {
+                        (Some(c), _) => Some(c / right.sample(x, y, z)),
+                        (None, Some(c)) => Some(left.sample(x, y, z) * (1.0f32 / c)),
+                        (None, None) => None,
+                    },
+                    _ => None,
+                };
+                folded.unwrap_or_else(|| kind.apply(left.sample(x, y, z), right.sample(x, y, z)))
             }
             Node::PowConstExponent { input, exponent } => {
                 let base = input.sample(x, y, z);
@@ -1119,24 +1153,22 @@ impl<'e> DensityRegistry<'e> {
                 cell_height: positive_int(get("cell_height")?)?,
             },
             "distance_to_point" => {
-                let point_value = get("point")?;
-                let point = [
-                    point_value
-                        .get("x")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DensityError::Parse("point.x must be an int".to_owned()))?
-                        as i32,
-                    point_value
-                        .get("y")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DensityError::Parse("point.y must be an int".to_owned()))?
-                        as i32,
-                    point_value
-                        .get("z")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DensityError::Parse("point.z must be an int".to_owned()))?
-                        as i32,
-                ];
+                // Vanilla decodes `point` with the vec3 codec, which only
+                // accepts the three-element array form.
+                let coords = get("point")?
+                    .as_array()
+                    .ok_or_else(|| DensityError::Parse("point must be a json array".to_owned()))?;
+                if coords.len() != 3 {
+                    return Err(DensityError::Parse(
+                        "point must have exactly three coordinates".to_owned(),
+                    ));
+                }
+                let mut point = [0i32; 3];
+                for (slot, value) in point.iter_mut().zip(coords) {
+                    *slot = value.as_i64().ok_or_else(|| {
+                        DensityError::Parse("point coordinates must be ints".to_owned())
+                    })? as i32;
+                }
                 let metric =
                     DistanceMetric::parse(get("metric")?.as_str().ok_or_else(|| {
                         DensityError::Parse("metric must be a string".to_owned())
@@ -1794,5 +1826,66 @@ mod tests {
             cell_height: 2,
         }));
         assert_eq!(floor.sample(0, 0, 0), 3.0);
+    }
+
+    /// Bit-for-bit parity against the real vanilla 26.3 density-function
+    /// engine. Each vector is a pure (noise-free) density JSON tree plus
+    /// sample points; the expected column is the raw f32 bit pattern
+    /// (as signed i32) produced by vanilla's own compile+sample pipeline
+    /// with caches disabled. Vectors and expectations are generated by the
+    /// local knowledge-only consultation harness recorded in docs/PROVENANCE.md.
+    #[test]
+    fn vanilla_parity_vectors_match_bit_for_bit() {
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("testdata/density_parity_vectors.json")).unwrap();
+        let mut expected = HashMap::<(String, i32, i32, i32), i32>::new();
+        for line in include_str!("testdata/density_parity_expected.txt").lines() {
+            let mut it = line.split_whitespace();
+            let name = it.next().unwrap().to_owned();
+            let x: i32 = it.next().unwrap().parse().unwrap();
+            let y: i32 = it.next().unwrap().parse().unwrap();
+            let z: i32 = it.next().unwrap().parse().unwrap();
+            let bits: i32 = it.next().unwrap().parse().unwrap();
+            expected.insert((name, x, y, z), bits);
+        }
+
+        let engine = engine();
+        let reg = registry(&engine);
+        let mut mismatches = Vec::new();
+        let mut checked = 0usize;
+        for vector in &vectors {
+            let name = vector["name"].as_str().unwrap().to_owned();
+            let density = reg
+                .compile_value(&vector["function"])
+                .unwrap_or_else(|error| panic!("{name}: rust parse: {error}"));
+            for point in vector["points"].as_array().unwrap() {
+                let p = point.as_array().unwrap();
+                let x = p[0].as_i64().unwrap() as i32;
+                let y = p[1].as_i64().unwrap() as i32;
+                let z = p[2].as_i64().unwrap() as i32;
+                let got = density.sample(x, y, z).to_bits() as i32;
+                let want = *expected
+                    .get(&(name.clone(), x, y, z))
+                    .unwrap_or_else(|| panic!("no expectation for {name} at ({x},{y},{z})"));
+                checked += 1;
+                if got != want {
+                    mismatches.push(format!(
+                        "{name} ({x},{y},{z}): rust {:08x}, vanilla {:08x}",
+                        got as u32, want as u32
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            expected.len(),
+            "expectation table not fully consumed"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "{} parity mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 }

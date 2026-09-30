@@ -1,0 +1,2011 @@
+[
+  {
+    "name": "add_frac",
+    "function": {
+      "type": "minecraft:add",
+      "left": {
+        "type": "minecraft:constant",
+        "value": 0.1
+      },
+      "right": {
+        "type": "minecraft:constant",
+        "value": 0.2
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "sub_const_right",
+    "function": {
+      "type": "minecraft:sub",
+      "left": {
+        "type": "minecraft:constant",
+        "value": 0.3
+      },
+      "right": {
+        "type": "minecraft:constant",
+        "value": 0.1
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "mul_left_zero_guard",
+    "function": {
+      "type": "minecraft:mul",
+      "left": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "right": {
+        "type": "minecraft:div",
+        "left": {
+          "type": "minecraft:constant",
+          "value": 1.0
+        },
+        "right": {
+          "type": "minecraft:gradient",
+          "axis": "z",
+          "from_coordinate": -8,
+          "to_coordinate": 8,
+          "from_value": -8.0,
+          "to_value": 8.0
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        3,
+        1
+      ],
+      [
+        0,
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "div_left_zero_const",
+    "function": {
+      "type": "minecraft:div",
+      "left": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      },
+      "right": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        5,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "div_const_right",
+    "function": {
+      "type": "minecraft:div",
+      "left": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "right": {
+        "type": "minecraft:constant",
+        "value": 3.0
+      }
+    },
+    "points": [
+      [
+        7,
+        0,
+        0
+      ],
+      [
+        -7,
+        0,
+        0
+      ],
+      [
+        999,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "div_var",
+    "function": {
+      "type": "minecraft:div",
+      "left": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "right": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        6,
+        2,
+        0
+      ],
+      [
+        6,
+        0,
+        0
+      ],
+      [
+        0,
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "min_neg_zero",
+    "function": {
+      "type": "minecraft:min",
+      "left": {
+        "type": "minecraft:negate",
+        "input": {
+          "type": "minecraft:constant",
+          "value": 0.0
+        }
+      },
+      "right": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "max_neg_zero",
+    "function": {
+      "type": "minecraft:max",
+      "left": {
+        "type": "minecraft:negate",
+        "input": {
+          "type": "minecraft:constant",
+          "value": 0.0
+        }
+      },
+      "right": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "squeeze_pos",
+    "function": {
+      "type": "minecraft:squeeze",
+      "input": {
+        "type": "minecraft:constant",
+        "value": 2.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "squeeze_grad",
+    "function": {
+      "type": "minecraft:squeeze",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        0,
+        -3,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "half_neg_zero",
+    "function": {
+      "type": "minecraft:half_negative",
+      "input": {
+        "type": "minecraft:negate",
+        "input": {
+          "type": "minecraft:constant",
+          "value": 0.0
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "sqrt_neg",
+    "function": {
+      "type": "minecraft:sqrt",
+      "input": {
+        "type": "minecraft:constant",
+        "value": -2.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "log_2",
+    "function": {
+      "type": "minecraft:log",
+      "input": {
+        "type": "minecraft:constant",
+        "value": 2.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "sign_grad",
+    "function": {
+      "type": "minecraft:sign",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        0,
+        -3,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        4,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "sign_negzero",
+    "function": {
+      "type": "minecraft:sign",
+      "input": {
+        "type": "minecraft:negate",
+        "input": {
+          "type": "minecraft:constant",
+          "value": 0.0
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "recip_zero",
+    "function": {
+      "type": "minecraft:reciprocal",
+      "input": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "abs_neg",
+    "function": {
+      "type": "minecraft:abs",
+      "input": {
+        "type": "minecraft:constant",
+        "value": -2.5
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "square_35",
+    "function": {
+      "type": "minecraft:square",
+      "input": {
+        "type": "minecraft:constant",
+        "value": 3.5
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "cube_neg25",
+    "function": {
+      "type": "minecraft:cube",
+      "input": {
+        "type": "minecraft:constant",
+        "value": -2.5
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "floor_mode",
+    "function": {
+      "type": "minecraft:floor",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:constant",
+          "value": -2.5
+        },
+        "right": {
+          "type": "minecraft:mul",
+          "left": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          },
+          "right": {
+            "type": "minecraft:constant",
+            "value": 0.5
+          }
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "ceil_mode",
+    "function": {
+      "type": "minecraft:ceil",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:constant",
+          "value": -2.5
+        },
+        "right": {
+          "type": "minecraft:mul",
+          "left": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          },
+          "right": {
+            "type": "minecraft:constant",
+            "value": 0.5
+          }
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "round_mode",
+    "function": {
+      "type": "minecraft:round",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:constant",
+          "value": -2.5
+        },
+        "right": {
+          "type": "minecraft:mul",
+          "left": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          },
+          "right": {
+            "type": "minecraft:constant",
+            "value": 0.5
+          }
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "truncate_mode",
+    "function": {
+      "type": "minecraft:truncate",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:constant",
+          "value": -2.5
+        },
+        "right": {
+          "type": "minecraft:mul",
+          "left": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          },
+          "right": {
+            "type": "minecraft:constant",
+            "value": 0.5
+          }
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "floor_mult_01",
+    "function": {
+      "type": "minecraft:floor",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "multiple": {
+        "type": "minecraft:constant",
+        "value": 0.1
+      }
+    },
+    "points": [
+      [
+        7,
+        0,
+        0
+      ],
+      [
+        -7,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "floor_mult_zero",
+    "function": {
+      "type": "minecraft:floor",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:constant",
+          "value": -2.5
+        },
+        "right": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        }
+      },
+      "multiple": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_half",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "exponent": {
+        "type": "minecraft:constant",
+        "value": 0.5
+      }
+    },
+    "points": [
+      [
+        0,
+        4,
+        0
+      ],
+      [
+        0,
+        -4,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_neg2",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "exponent": {
+        "type": "minecraft:constant",
+        "value": -2.0
+      }
+    },
+    "points": [
+      [
+        0,
+        2,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_one",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "exponent": {
+        "type": "minecraft:constant",
+        "value": 1.0
+      }
+    },
+    "points": [
+      [
+        -5,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_neg1",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "exponent": {
+        "type": "minecraft:constant",
+        "value": -1.0
+      }
+    },
+    "points": [
+      [
+        4,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_var",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "exponent": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        2,
+        10,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "pow_const_base",
+    "function": {
+      "type": "minecraft:pow",
+      "base": {
+        "type": "minecraft:constant",
+        "value": 2.0
+      },
+      "exponent": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      }
+    },
+    "points": [
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "clamp_vals",
+    "function": {
+      "type": "minecraft:clamp",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "min": -1.5,
+      "max": 2.5
+    },
+    "points": [
+      [
+        0,
+        -5,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        5,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "lerp_a0",
+    "function": {
+      "type": "minecraft:lerp",
+      "alpha": {
+        "type": "minecraft:constant",
+        "value": 0.0
+      },
+      "first": {
+        "type": "minecraft:constant",
+        "value": -3.25
+      },
+      "second": {
+        "type": "minecraft:constant",
+        "value": 7.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "lerp_a1",
+    "function": {
+      "type": "minecraft:lerp",
+      "alpha": {
+        "type": "minecraft:constant",
+        "value": 1.0
+      },
+      "first": {
+        "type": "minecraft:constant",
+        "value": -3.25
+      },
+      "second": {
+        "type": "minecraft:constant",
+        "value": 7.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "lerp_a03",
+    "function": {
+      "type": "minecraft:lerp",
+      "alpha": {
+        "type": "minecraft:constant",
+        "value": 0.3
+      },
+      "first": {
+        "type": "minecraft:constant",
+        "value": -3.25
+      },
+      "second": {
+        "type": "minecraft:constant",
+        "value": 7.0
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "lerp_alpha_var",
+    "function": {
+      "type": "minecraft:lerp",
+      "alpha": {
+        "type": "minecraft:div",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "right": {
+          "type": "minecraft:constant",
+          "value": 4.0
+        }
+      },
+      "first": {
+        "type": "minecraft:gradient",
+        "axis": "x",
+        "from_coordinate": -1000,
+        "to_coordinate": 1000,
+        "from_value": -1000.0,
+        "to_value": 1000.0
+      },
+      "second": {
+        "type": "minecraft:mul",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        },
+        "right": {
+          "type": "minecraft:constant",
+          "value": 2.0
+        }
+      }
+    },
+    "points": [
+      [
+        5,
+        1,
+        0
+      ],
+      [
+        5,
+        0,
+        0
+      ],
+      [
+        5,
+        4,
+        0
+      ],
+      [
+        5,
+        2,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "range_choice",
+    "function": {
+      "type": "minecraft:range_choice",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "min_inclusive": 0.0,
+      "max_exclusive": 10.0,
+      "when_in_range": {
+        "type": "minecraft:constant",
+        "value": 100.0
+      },
+      "when_out_of_range": {
+        "type": "minecraft:constant",
+        "value": 200.0
+      }
+    },
+    "points": [
+      [
+        0,
+        -1,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        9,
+        0
+      ],
+      [
+        0,
+        10,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "interval_multi",
+    "function": {
+      "type": "minecraft:interval_select",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "thresholds": [
+        0.0,
+        5.0
+      ],
+      "functions": [
+        {
+          "type": "minecraft:constant",
+          "value": 1.0
+        },
+        {
+          "type": "minecraft:constant",
+          "value": 2.0
+        },
+        {
+          "type": "minecraft:constant",
+          "value": 3.0
+        }
+      ]
+    },
+    "points": [
+      [
+        0,
+        -1,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        4,
+        0
+      ],
+      [
+        0,
+        5,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "interval_single",
+    "function": {
+      "type": "minecraft:interval_select",
+      "input": {
+        "type": "minecraft:gradient",
+        "axis": "y",
+        "from_coordinate": -64,
+        "to_coordinate": 64,
+        "from_value": -64.0,
+        "to_value": 64.0
+      },
+      "thresholds": [
+        2.5
+      ],
+      "functions": [
+        {
+          "type": "minecraft:constant",
+          "value": 9.0
+        },
+        {
+          "type": "minecraft:constant",
+          "value": 8.0
+        }
+      ]
+    },
+    "points": [
+      [
+        0,
+        2,
+        0
+      ],
+      [
+        0,
+        3,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "dtp_euclid",
+    "function": {
+      "type": "minecraft:distance_to_point",
+      "point": [
+        3,
+        4,
+        5
+      ],
+      "metric": "euclidean"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        8,
+        10
+      ],
+      [
+        3,
+        4,
+        5
+      ]
+    ]
+  },
+  {
+    "name": "dtp_euclid_sq",
+    "function": {
+      "type": "minecraft:distance_to_point",
+      "point": [
+        3,
+        4,
+        5
+      ],
+      "metric": "euclidean_squared"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        8,
+        10
+      ]
+    ]
+  },
+  {
+    "name": "dtp_manhattan",
+    "function": {
+      "type": "minecraft:distance_to_point",
+      "point": [
+        3,
+        4,
+        5
+      ],
+      "metric": "manhattan"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        8,
+        10
+      ]
+    ]
+  },
+  {
+    "name": "dtp_chebyshev",
+    "function": {
+      "type": "minecraft:distance_to_point",
+      "point": [
+        3,
+        4,
+        5
+      ],
+      "metric": "chebyshev"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        8,
+        10
+      ]
+    ]
+  },
+  {
+    "name": "interp_point",
+    "function": {
+      "type": "minecraft:interpolated",
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        },
+        "right": {
+          "type": "minecraft:add",
+          "left": {
+            "type": "minecraft:mul",
+            "left": {
+              "type": "minecraft:gradient",
+              "axis": "y",
+              "from_coordinate": -64,
+              "to_coordinate": 64,
+              "from_value": -64.0,
+              "to_value": 64.0
+            },
+            "right": {
+              "type": "minecraft:constant",
+              "value": 0.5
+            }
+          },
+          "right": {
+            "type": "minecraft:gradient",
+            "axis": "z",
+            "from_coordinate": -8,
+            "to_coordinate": 8,
+            "from_value": -8.0,
+            "to_value": 8.0
+          }
+        }
+      },
+      "cell_size_xz": 4,
+      "cell_size_y": 8
+    },
+    "points": [
+      [
+        1,
+        3,
+        2
+      ],
+      [
+        4,
+        8,
+        0
+      ],
+      [
+        -3,
+        -5,
+        -2
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "slice_x",
+    "function": {
+      "type": "minecraft:slice",
+      "axis": "x",
+      "coordinate": 7,
+      "input": {
+        "type": "minecraft:sub",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "right": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        5,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "slice_y",
+    "function": {
+      "type": "minecraft:slice",
+      "axis": "y",
+      "coordinate": 3,
+      "input": {
+        "type": "minecraft:sub",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        },
+        "right": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        }
+      }
+    },
+    "points": [
+      [
+        1,
+        99,
+        2
+      ]
+    ]
+  },
+  {
+    "name": "slice_z",
+    "function": {
+      "type": "minecraft:slice",
+      "axis": "z",
+      "coordinate": -4,
+      "input": {
+        "type": "minecraft:add",
+        "left": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        },
+        "right": {
+          "type": "minecraft:gradient",
+          "axis": "z",
+          "from_coordinate": -8,
+          "to_coordinate": 8,
+          "from_value": -8.0,
+          "to_value": 8.0
+        }
+      }
+    },
+    "points": [
+      [
+        1,
+        2,
+        99
+      ]
+    ]
+  },
+  {
+    "name": "slice_xz_stack",
+    "function": {
+      "type": "minecraft:slice",
+      "axis": "z",
+      "coordinate": 11,
+      "input": {
+        "type": "minecraft:slice",
+        "axis": "x",
+        "coordinate": 7,
+        "input": {
+          "type": "minecraft:add",
+          "left": {
+            "type": "minecraft:add",
+            "left": {
+              "type": "minecraft:gradient",
+              "axis": "x",
+              "from_coordinate": -1000,
+              "to_coordinate": 1000,
+              "from_value": -1000.0,
+              "to_value": 1000.0
+            },
+            "right": {
+              "type": "minecraft:gradient",
+              "axis": "z",
+              "from_coordinate": -8,
+              "to_coordinate": 8,
+              "from_value": -8.0,
+              "to_value": 8.0
+            }
+          },
+          "right": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          }
+        }
+      }
+    },
+    "points": [
+      [
+        0,
+        5,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "fts_pos",
+    "function": {
+      "type": "minecraft:find_top_surface",
+      "density": {
+        "type": "minecraft:clamp",
+        "input": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "min": -100.0,
+        "max": 100.0
+      },
+      "upper_bound": {
+        "type": "minecraft:constant",
+        "value": 40.0
+      },
+      "lower_bound": -20,
+      "cell_height": 4
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        3,
+        7,
+        5
+      ]
+    ]
+  },
+  {
+    "name": "fts_never",
+    "function": {
+      "type": "minecraft:find_top_surface",
+      "density": {
+        "type": "minecraft:sub",
+        "left": {
+          "type": "minecraft:clamp",
+          "input": {
+            "type": "minecraft:gradient",
+            "axis": "y",
+            "from_coordinate": -64,
+            "to_coordinate": 64,
+            "from_value": -64.0,
+            "to_value": 64.0
+          },
+          "min": -100.0,
+          "max": 100.0
+        },
+        "right": {
+          "type": "minecraft:constant",
+          "value": 1000.0
+        }
+      },
+      "upper_bound": {
+        "type": "minecraft:constant",
+        "value": 40.0
+      },
+      "lower_bound": -20,
+      "cell_height": 4
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "fts_low",
+    "function": {
+      "type": "minecraft:find_top_surface",
+      "density": {
+        "type": "minecraft:clamp",
+        "input": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "min": -100.0,
+        "max": 100.0
+      },
+      "upper_bound": {
+        "type": "minecraft:constant",
+        "value": -1.0
+      },
+      "lower_bound": -10,
+      "cell_height": 4
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "fts_top_le_lower",
+    "function": {
+      "type": "minecraft:find_top_surface",
+      "density": {
+        "type": "minecraft:clamp",
+        "input": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "min": -100.0,
+        "max": 100.0
+      },
+      "upper_bound": {
+        "type": "minecraft:constant",
+        "value": -30.0
+      },
+      "lower_bound": -20,
+      "cell_height": 4
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "blend_alpha",
+    "function": {
+      "type": "minecraft:blend_alpha"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "blend_offset",
+    "function": {
+      "type": "minecraft:blend_offset"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "beardifier",
+    "function": {
+      "type": "minecraft:beardifier"
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "blend_density_pass",
+    "function": {
+      "type": "minecraft:blend_density",
+      "input": {
+        "type": "minecraft:constant",
+        "value": 0.5
+      }
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "spline_simple",
+    "function": {
+      "type": "minecraft:spline",
+      "spline": {
+        "coordinate": {
+          "type": "minecraft:gradient",
+          "axis": "y",
+          "from_coordinate": -64,
+          "to_coordinate": 64,
+          "from_value": -64.0,
+          "to_value": 64.0
+        },
+        "points": [
+          {
+            "location": -10.0,
+            "value": 5.0,
+            "derivative": 0.0
+          },
+          {
+            "location": 0.0,
+            "value": 2.0,
+            "derivative": 1.0
+          },
+          {
+            "location": 10.0,
+            "value": 8.0,
+            "derivative": 0.0
+          }
+        ]
+      }
+    },
+    "points": [
+      [
+        0,
+        -20,
+        0
+      ],
+      [
+        0,
+        -10,
+        0
+      ],
+      [
+        0,
+        -5,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        5,
+        0
+      ],
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        20,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "spline_nested",
+    "function": {
+      "type": "minecraft:spline",
+      "spline": {
+        "coordinate": {
+          "type": "minecraft:gradient",
+          "axis": "x",
+          "from_coordinate": -1000,
+          "to_coordinate": 1000,
+          "from_value": -1000.0,
+          "to_value": 1000.0
+        },
+        "points": [
+          {
+            "location": 0.0,
+            "value": 1.0,
+            "derivative": 0.0
+          },
+          {
+            "location": 5.0,
+            "value": {
+              "coordinate": {
+                "type": "minecraft:gradient",
+                "axis": "y",
+                "from_coordinate": -64,
+                "to_coordinate": 64,
+                "from_value": -64.0,
+                "to_value": 64.0
+              },
+              "points": [
+                {
+                  "location": 0.0,
+                  "value": 0.0,
+                  "derivative": 0.0
+                },
+                {
+                  "location": 10.0,
+                  "value": 3.0,
+                  "derivative": 0.0
+                }
+              ]
+            },
+            "derivative": 1.0
+          },
+          {
+            "location": 10.0,
+            "value": 7.0,
+            "derivative": 0.0
+          }
+        ]
+      }
+    },
+    "points": [
+      [
+        2,
+        3,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        10,
+        0
+      ],
+      [
+        11,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "grad_repeat",
+    "function": {
+      "type": "minecraft:gradient",
+      "axis": "x",
+      "tiling": "repeat",
+      "from_coordinate": 0,
+      "to_coordinate": 4,
+      "from_value": 0.0,
+      "to_value": 2.0
+    },
+    "points": [
+      [
+        -5,
+        0,
+        0
+      ],
+      [
+        -1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        3,
+        0,
+        0
+      ],
+      [
+        4,
+        0,
+        0
+      ],
+      [
+        7,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "grad_mirror",
+    "function": {
+      "type": "minecraft:gradient",
+      "axis": "x",
+      "tiling": "mirrored_repeat",
+      "from_coordinate": 0,
+      "to_coordinate": 3,
+      "from_value": 0.0,
+      "to_value": 6.0
+    },
+    "points": [
+      [
+        -4,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        2,
+        0,
+        0
+      ],
+      [
+        3,
+        0,
+        0
+      ],
+      [
+        4,
+        0,
+        0
+      ],
+      [
+        7,
+        0,
+        0
+      ],
+      [
+        8,
+        0,
+        0
+      ]
+    ]
+  },
+  {
+    "name": "grad_reversed",
+    "function": {
+      "type": "minecraft:gradient",
+      "axis": "y",
+      "tiling": "clamp_to_edge",
+      "from_coordinate": 64,
+      "to_coordinate": -64,
+      "from_value": 64.0,
+      "to_value": -64.0
+    },
+    "points": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        100,
+        0
+      ],
+      [
+        0,
+        -100,
+        0
+      ],
+      [
+        0,
+        30,
+        0
+      ]
+    ]
+  }
+]
