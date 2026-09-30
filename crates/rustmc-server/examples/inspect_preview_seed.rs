@@ -19,7 +19,7 @@ fn main() {
             eprintln!("invalid coordinate pair");
             std::process::exit(2);
         };
-        if x.unsigned_abs() > 1_000_000 || z.unsigned_abs() > 1_000_000 {
+        if !(-1_000_000..=1_000_000).contains(&x) || !(-1_000_000..=1_000_000).contains(&z) {
             eprintln!("coordinates must be within one million blocks of origin");
             std::process::exit(2);
         }
