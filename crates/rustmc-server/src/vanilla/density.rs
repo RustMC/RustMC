@@ -1369,6 +1369,13 @@ impl NoiseEngine {
         }
     }
 
+    /// The root positional random factory derived from the world seed.
+    /// Later phases derive named factories from it exactly as the
+    /// documented world-seed chain does (for example the aquifer grid).
+    pub fn positional(&self) -> PositionalRandomFactory {
+        self.positional
+    }
+
     fn stack(&self, id: &Id) -> Result<Rc<NoiseStack>, DensityError> {
         if let Some(stack) = self.stacks.borrow().get(id) {
             return Ok(Rc::clone(stack));

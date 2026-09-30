@@ -168,6 +168,37 @@ cave-carving `min` can dip a y-grid sample below zero while the surface
 block between samples stays positive, so the exhaustive per-block scan is
 the default.
 
+## T1 gate passed (1 October 2026, runtime aquifer slice)
+
+The surface rule was replaced with the fill rule the density pipeline is
+designed to feed: the highest position whose block *substance* is not air,
+where the substance is the raw `final_density` sample adjusted by an
+independently implemented runtime aquifer (`vanilla::aquifer`), and a
+dimension without an `aquifers` settings section degrades exactly to the
+previous sea rule. The consulted semantics and the recorded numeric facts
+behind the implementation are in `docs/PROVENANCE.md` (session 5); no
+vendor code or data entered the repository.
+
+Measured against the same 2,401-column seed-2026 oracle sample:
+
+- **96.00% exact height match (2,305 / 2,401)** — above the ≥95% tier
+  gate — with all six published worksheet heights still reproducing
+  exactly (117 / 64 / 73 / 84 / 71 / 71). The aquifer slice gained 34
+  columns over the density-only 94.59%.
+- The remaining 96 mismatches are dominated by the feature columns
+  (tree trunks, village-ruin blocks) that a density+aquifer surface
+  structurally cannot cover, plus lake-edge and mountain-slope offsets of
+  ±1–7 attributable to structure-footprint blending (T3 machinery) and
+  to cave carving below the surface interacting with the heightmap.
+- Timing record for this stage: the release build scans the whole sample
+  single-threaded in 57.1 s wall (≈24 ms/column including datapack load
+  and save reads), reproducible run-to-run.
+
+T1's exit gate is met on the raw sample. T2 (biome placement and surface
+rules — the router already exposes the continents/erosion/depth/ridges/
+temperature/vegetation fields it needs) remains unauthorized pending the
+owner's go-ahead.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

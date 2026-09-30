@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::vanilla::aquifer::{AquiferConfig, Fluid};
 use crate::vanilla::density::{Density, DensityRegistry, NoiseEngine, builtin_density_ids};
 use crate::vanilla::noise::NoiseParameters;
 use crate::vanilla::random::RandomSource;
@@ -148,6 +149,7 @@ pub struct NoiseRouter {
     pub min_y: i32,
     pub height: i32,
     pub sea_level: i32,
+    pub default_fluid: Fluid,
     pub final_density: Density,
     pub continents: Density,
     pub erosion: Density,
@@ -156,6 +158,8 @@ pub struct NoiseRouter {
     pub temperature: Density,
     pub vegetation: Density,
     pub chunk_surface_level: Option<Density>,
+    /// The compiled `aquifers` section when the settings provide one.
+    pub aquifers: Option<AquiferConfig>,
 }
 
 // The compiled densities are opaque graphs; the debug view shows the
@@ -198,6 +202,15 @@ impl NoiseRouter {
             )));
         }
         let sea_level = required_int(top, "sea_level", settings_id)?;
+        let default_fluid = top
+            .get("default_fluid")
+            .map(|value| {
+                value.as_str().map(parse_fluid_name).ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{settings_id}: default_fluid not a string"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(Fluid::Water);
         let router = top
             .get("noise_router")
             .and_then(Value::as_object)
@@ -221,10 +234,35 @@ impl NoiseRouter {
                 None => Ok(None),
             }
         };
+        let aquifers = match top.get("aquifers") {
+            None => None,
+            Some(value) => {
+                let section = value.as_object().ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{settings_id}: aquifers not an object"))
+                })?;
+                let field = |name: &str| -> Result<Density, WorldgenError> {
+                    let entry = section.get(name).ok_or_else(|| {
+                        WorldgenError::Invalid(format!("{settings_id}: aquifers missing {name}"))
+                    })?;
+                    registry
+                        .compile_slot(entry)
+                        .map_err(|error| WorldgenError::Invalid(format!("{settings_id}: {error}")))
+                };
+                Some(AquiferConfig {
+                    barrier: field("barrier")?,
+                    fluid_level_floodedness: field("fluid_level_floodedness")?,
+                    fluid_level_spread: field("fluid_level_spread")?,
+                    lava: field("lava")?,
+                    exclusion: field("exclusion")?,
+                    surface_level: field("surface_level")?,
+                })
+            }
+        };
         Ok(Self {
             min_y,
             height,
             sea_level,
+            default_fluid,
             final_density: compile("final_density")?,
             continents: compile("continents")?,
             erosion: compile("erosion")?,
@@ -233,7 +271,18 @@ impl NoiseRouter {
             temperature: compile("temperature")?,
             vegetation: compile("vegetation")?,
             chunk_surface_level: compile_optional("chunk_surface_level")?,
+            aquifers,
         })
+    }
+}
+
+/// Fluid kind from a namespaced block name; anything not named lava is
+/// treated as the dimension's ordinary flooding fluid.
+fn parse_fluid_name(name: &str) -> Fluid {
+    if name.contains("lava") {
+        Fluid::Lava
+    } else {
+        Fluid::Water
     }
 }
 
@@ -242,11 +291,13 @@ impl NoiseRouter {
 /// by tests and diagnostics; an empty vector means the wiring resolves.
 pub fn unresolved_references(data: &WorldgenData, settings_id: &str) -> Vec<String> {
     let mut missing = Vec::new();
-    if let Some(settings) = data.noise_settings(settings_id)
-        && let Some(router) = settings.get("noise_router").and_then(Value::as_object)
-    {
-        for (_, value) in router {
-            collect_missing(data, value, &mut missing);
+    if let Some(settings) = data.noise_settings(settings_id) {
+        for section in ["noise_router", "aquifers"] {
+            if let Some(router) = settings.get(section).and_then(Value::as_object) {
+                for (_, value) in router {
+                    collect_missing(data, value, &mut missing);
+                }
+            }
         }
     }
     missing
@@ -266,7 +317,9 @@ fn collect_missing(data: &WorldgenData, value: &Value, missing: &mut Vec<String>
         }
         Value::Object(map) => {
             for (key, child) in map {
-                if key == "type" {
+                if key == "type" || key == "noise" {
+                    // `noise` names a noise-registry definition, not a
+                    // density function.
                     continue;
                 }
                 collect_missing(data, child, missing);
@@ -490,6 +543,17 @@ mod tests {
                     "temperature": "testns:zero",
                     "vegetation": "testns:zero",
                     "chunk_surface_level": "testns:zero"
+                },
+                "aquifers": {
+                    "barrier": "testns:zero",
+                    "fluid_level_floodedness": "testns:zero",
+                    "fluid_level_spread": {
+                        "type": "noise", "noise": "testns:solo",
+                        "xz_scale": 1.0, "y_scale": 1.0
+                    },
+                    "lava": "testns:zero",
+                    "exclusion": "testns:zero",
+                    "surface_level": "testns:group/erosion"
                 }
             }"#,
         );
@@ -582,6 +646,15 @@ mod tests {
         assert_eq!(d, -0.3f32 - e);
         let final_ = router.final_density.sample(point.0, point.1, point.2);
         assert!(final_ == 0.0 || (d > 0.0 && final_ == d));
+        // The aquifers section compiles its six density fields; an inline
+        // noise node resolves through the noise registry, not density ids.
+        assert_eq!(router.default_fluid, Fluid::Water);
+        let aquifers = router.aquifers.as_ref().expect("aquifers section");
+        assert_eq!(aquifers.barrier.sample(point.0, point.1, point.2), 0.0);
+        let spread = aquifers
+            .fluid_level_spread
+            .sample(point.0, point.1, point.2);
+        assert!(spread.is_finite() && spread.abs() <= 2.0);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -634,6 +707,13 @@ mod tests {
         assert_eq!(router.min_y, -64);
         assert_eq!(router.height, 384);
         assert_eq!(router.sea_level, 63);
+        // The overworld wires its runtime aquifer: six density fields and
+        // the water flooding fluid (publicly documented dimension facts).
+        assert_eq!(router.default_fluid, Fluid::Water);
+        let aquifers = router.aquifers.as_ref().expect("overworld aquifers");
+        for sample in [&aquifers.barrier, &aquifers.surface_level] {
+            assert!(sample.sample(0, 0, 0).is_finite());
+        }
         // Sampling the real final-density graph must produce finite values
         // across the documented vertical range.
         for y in [-64, 0, 64, 200, 319] {
