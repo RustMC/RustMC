@@ -110,6 +110,21 @@ measure one strided sample of one world; they quantify the gap and imply no
 parity claim. T1 and later tiers remain unauthorized pending the ADR-0014
 decision.
 
+## T1 groundwork (30 September 2026, black-box only per accepted ADR-0014)
+
+`preview_terrain = "experimental"` is an opt-in configuration for the local
+preview. It switches column heights to an independently designed octave
+noise stack (smoothstep-interpolated lattice fields for continents, hills,
+and ridged mountains, all derived from seed and world coordinates). The
+default preview generator, its ADR-0013 worksheet pin, and every existing
+wire path are unchanged; biome placement and surface blocks still come from
+the preview rules, so this is terrain-shape groundwork, not vanilla
+generation. Measured against the same 2,401-column oracle sample, the
+experimental field reaches 2.75% exact height match (preview: 4.50%) while
+showing substantially wider relief — confirming that seed-exact parity needs
+the full density-function pipeline, not a tuned noise field. No vanilla
+constants were copied or consulted.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

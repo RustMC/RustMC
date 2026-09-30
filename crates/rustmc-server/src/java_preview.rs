@@ -55,7 +55,12 @@ pub struct Preview {
 }
 
 impl Preview {
-    pub fn new(seed: u64, radius: u8, manifest: &RegistryManifest) -> Option<Self> {
+    pub fn new(
+        seed: u64,
+        radius: u8,
+        terrain: crate::world::Terrain,
+        manifest: &RegistryManifest,
+    ) -> Option<Self> {
         if !(2..=32).contains(&radius) {
             return None;
         }
@@ -65,7 +70,7 @@ impl Preview {
             .collect::<Option<Vec<_>>>()?;
         let biomes: [u32; 8] = biomes.try_into().ok()?;
         Some(Self {
-            generator: Generator::new(seed),
+            generator: Generator::with_terrain(seed, terrain),
             radius: radius.into(),
             center: (0, 0),
             sent: BTreeSet::new(),
@@ -394,6 +399,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::Terrain;
 
     fn read_varint(input: &[u8]) -> (u32, usize) {
         let mut value = 0;
@@ -439,8 +445,8 @@ mod tests {
 
     #[test]
     fn maximum_view_uses_bounded_acknowledged_batches_and_unloads_old_view() {
-        assert!(Preview::new(2026, 33, &manifest()).is_none());
-        let mut preview = Preview::new(2026, 32, &manifest()).unwrap();
+        assert!(Preview::new(2026, 33, Terrain::Preview, &manifest()).is_none());
+        let mut preview = Preview::new(2026, 32, Terrain::Preview, &manifest()).unwrap();
         assert!(preview.next_chunk().is_none());
         preview.teleport_acknowledged = true;
         let (first, _, _) = preview.next_chunk().unwrap();
@@ -460,7 +466,7 @@ mod tests {
 
     #[test]
     fn walking_one_chunk_forgets_old_edge_and_rejoin_starts_fresh() {
-        let mut preview = Preview::new(2026, 2, &manifest()).unwrap();
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
         preview.teleport_acknowledged = true;
         let first = preview.next_chunk().unwrap().0;
         preview.awaiting_batch = false;
@@ -478,7 +484,7 @@ mod tests {
         assert!(!preview.sent.contains(&(-2, 0)));
         assert!(preview.sent.contains(&(3, 0)));
 
-        let mut rejoined = Preview::new(2026, 2, &manifest()).unwrap();
+        let mut rejoined = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
         rejoined.teleport_acknowledged = true;
         assert_eq!(rejoined.next_chunk().unwrap().0, first);
     }

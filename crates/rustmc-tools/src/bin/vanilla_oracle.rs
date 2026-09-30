@@ -2,9 +2,12 @@
 //! save and report how far RustMC's current generator is from it.
 //!
 //! usage:
-//!   vanilla_oracle inspect <world-dir> [X Z ...]
-//!   vanilla_oracle worksheet <world-dir> <seed>
-//!   vanilla_oracle compare <world-dir> <seed> <min> <max> <stride>
+//!
+//! ```text
+//! vanilla_oracle inspect <world-dir> [X Z ...]
+//! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental]
+//! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental]
+//! ```
 //!
 //! The world directory is a single-player save root (contains region/).
 //! Nothing from the save is copied into the repository; only aggregate
@@ -13,7 +16,7 @@
 
 use std::path::Path;
 
-use rustmc_server::world::Generator;
+use rustmc_server::world::{Generator, Terrain};
 use rustmc_tools::oracle;
 use rustmc_tools::region::RegionStore;
 
@@ -65,7 +68,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!(
                 "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome"
             );
-            let generator = Generator::new(seed);
+            let terrain = parse_terrain(args.get(3))?;
+            let generator = Generator::with_terrain(seed, terrain);
             for (x, z, result) in oracle::read_columns(&mut store, &points)? {
                 let (sy, tb, bi) = match result? {
                     None => return Err(format!("worksheet point ({x}, {z}) is not in the save")),
@@ -87,12 +91,13 @@ fn run(args: &[String]) -> Result<(), String> {
             let min = parse_i64(args.get(3).ok_or("missing <min>")?)?;
             let max = parse_i64(args.get(4).ok_or("missing <max>")?)?;
             let stride = parse_i64(args.get(5).ok_or("missing <stride>")?)?;
+            let terrain = parse_terrain(args.get(6))?;
             if min > max {
                 return Err("min must not exceed max".to_string());
             }
             let (columns, missing_chunks) =
                 oracle::sample_columns(&mut store, min, max, min, max, stride)?;
-            let generator = Generator::new(seed);
+            let generator = Generator::with_terrain(seed, terrain);
             let report = oracle::compare_columns(columns.iter().cloned(), &generator, 20);
             println!("columns={} missing_chunks={missing_chunks}", report.columns);
             println!(
@@ -121,6 +126,16 @@ fn run(args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown mode {other:?}")),
     }
     Ok(())
+}
+
+fn parse_terrain(value: Option<&String>) -> Result<Terrain, String> {
+    match value.map(String::as_str) {
+        None | Some("preview") => Ok(Terrain::Preview),
+        Some("experimental") => Ok(Terrain::Experimental),
+        Some(other) => Err(format!(
+            "unknown terrain {other:?}; use preview or experimental"
+        )),
+    }
 }
 
 fn parse_i64(value: &str) -> Result<i64, String> {

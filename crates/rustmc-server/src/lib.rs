@@ -51,6 +51,8 @@ pub struct ListenerConfig {
     /// Local identifier-only registry manifest used only by the preview path.
     pub preview_seed: u64,
     pub preview_view_distance: u8,
+    /// Terrain field for the local preview; defaults to the accepted preview.
+    pub preview_terrain: world::Terrain,
     pub preview_registry_manifest: Option<std::path::PathBuf>,
 }
 
@@ -67,6 +69,7 @@ impl Default for ListenerConfig {
             preview_registry_manifest: None,
             preview_seed: 0,
             preview_view_distance: 4,
+            preview_terrain: world::Terrain::Preview,
         }
     }
 }
@@ -113,6 +116,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "preview_registry_manifest"
                 | "preview_seed"
                 | "preview_view_distance"
+                | "preview_terrain"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -166,7 +170,8 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     };
     if (preview_registry_manifest.is_some()
         || table.contains_key("preview_seed")
-        || table.contains_key("preview_view_distance"))
+        || table.contains_key("preview_view_distance")
+        || table.contains_key("preview_terrain"))
         && !local_java_preview
     {
         return Err(
@@ -174,6 +179,18 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 .to_owned(),
         );
     }
+    let preview_terrain = match table.get("preview_terrain") {
+        None => defaults.preview_terrain,
+        Some(value) => match value.as_str() {
+            Some("preview") => world::Terrain::Preview,
+            Some("experimental") => world::Terrain::Experimental,
+            _ => {
+                return Err(
+                    "`listener.preview_terrain` must be \"preview\" or \"experimental\"".to_owned(),
+                );
+            }
+        },
+    };
     Ok(ListenerConfig {
         bind_address,
         port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
@@ -209,6 +226,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             2,
             32,
         )? as u8,
+        preview_terrain,
     })
 }
 
@@ -356,5 +374,32 @@ mod tests {
             .contains("local_java_preview")
         );
         assert!(parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nbind_address = '0.0.0.0'\nlocal_java_preview = true\n").is_err());
+    }
+
+    #[test]
+    fn preview_terrain_defaults_to_preview_and_opts_in_experimental() {
+        let base =
+            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
+        assert_eq!(
+            parse_config(base).unwrap().listener.preview_terrain,
+            world::Terrain::Preview
+        );
+        assert_eq!(
+            parse_config(&format!("{base}preview_terrain = 'experimental'\n"))
+                .unwrap()
+                .listener
+                .preview_terrain,
+            world::Terrain::Experimental
+        );
+        // Unknown names are rejected without echoing the value.
+        let error = parse_config(&format!("{base}preview_terrain = 'vanilla'\n")).unwrap_err();
+        assert!(error.contains("preview_terrain"));
+        assert!(!error.contains("vanilla"));
+        // Setting terrain without the preview opt-in stays rejected.
+        assert!(parse_config(
+            "schema_version = 1\nlog_level = 'info'\n[listener]\npreview_terrain = 'experimental'\n"
+        )
+        .unwrap_err()
+        .contains("local_java_preview"));
     }
 }

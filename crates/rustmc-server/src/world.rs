@@ -102,13 +102,33 @@ impl Chunk {
     }
 }
 
+/// Which deterministic terrain field produces column heights. `Preview` is
+/// the accepted ADR-0013 surface; `Experimental` is the T1 groundwork noise
+/// stack (docs/research/vanilla-worldgen-feasibility.md) and is opt-in.
+/// Neither claims vanilla generation parity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terrain {
+    Preview,
+    Experimental,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Generator {
     seed: u64,
+    terrain: Terrain,
 }
 impl Generator {
     pub fn new(seed: u64) -> Self {
-        Self { seed }
+        Self {
+            seed,
+            terrain: Terrain::Preview,
+        }
+    }
+    pub fn with_terrain(seed: u64, terrain: Terrain) -> Self {
+        Self { seed, terrain }
+    }
+    pub fn terrain(self) -> Terrain {
+        self.terrain
     }
     pub fn seed(self) -> u64 {
         self.seed
@@ -162,9 +182,48 @@ impl Generator {
         let b = node(0, 1) * (spacing - fx) + node(1, 1) * fx;
         (a * (spacing - fz) + b * fz) / (spacing * spacing)
     }
+
+    /// Smoothstep-interpolated lattice noise on [-1.0, 1.0]. Only integer
+    /// divisions and IEEE add/multiply are used, so results are reproducible
+    /// for identical inputs.
+    fn eased(self, x: i64, z: i64, spacing: i64, salt: u64) -> f64 {
+        let gx = x.div_euclid(spacing);
+        let gz = z.div_euclid(spacing);
+        let u = x.rem_euclid(spacing) as f64 / spacing as f64;
+        let v = z.rem_euclid(spacing) as f64 / spacing as f64;
+        let su = u * u * (3.0 - 2.0 * u);
+        let sv = v * v * (3.0 - 2.0 * v);
+        let node = |dx: i64, dz: i64| {
+            (self.hash(gx + dx, gz + dz, salt) % 2_000_001) as f64 / 1_000_000.0 - 1.0
+        };
+        let n00 = node(0, 0);
+        let n10 = node(1, 0);
+        let n01 = node(0, 1);
+        let n11 = node(1, 1);
+        let a = n00 + (n10 - n00) * su;
+        let b = n01 + (n11 - n01) * su;
+        a + (b - a) * sv
+    }
+
     pub fn height(self, x: i64, z: i64) -> i64 {
-        (66 + self.sample(x, z, 48, 0x5445525241494e) / 3 + self.sample(x, z, 12, 0x48494c4c53) / 8)
-            .clamp(42, 91)
+        match self.terrain {
+            Terrain::Preview => (66
+                + self.sample(x, z, 48, 0x5445525241494e) / 3
+                + self.sample(x, z, 12, 0x48494c4c53) / 8)
+                .clamp(42, 91),
+            Terrain::Experimental => {
+                // Broad continents, rolling hills, and ridged mountains that
+                // only appear where a wide amplifier field is positive.
+                let continents = self.eased(x, z, 512, 0x434f4e54_494e454e) * 26.0;
+                let hills = self.eased(x, z, 96, 0x48494c4c535f4558) * 9.0;
+                let ridge = 1.0 - self.eased(x, z, 256, 0x52494447455f4558).abs();
+                let amplifier = self.eased(x, z, 384, 0x414d505f4558).max(0.0) * 2.0;
+                let mountains = (ridge * amplifier).min(1.0) * 28.0;
+                (64.0 + continents + hills + mountains)
+                    .round()
+                    .clamp(40.0, 108.0) as i64
+            }
+        }
     }
     fn clearing(self, x: i64, z: i64) -> bool {
         self.sample(x, z, 32, 0x434c454152) > 13
@@ -368,6 +427,41 @@ mod tests {
             }
         }
         assert!(clearings > 0);
+    }
+
+    #[test]
+    fn experimental_terrain_is_stable_varied_and_continuous() {
+        let g = Generator::with_terrain(2026, Terrain::Experimental);
+        assert_eq!(g.height(1234, -5678), g.height(1234, -5678));
+        assert_ne!(
+            g.height(0, 0),
+            Generator::with_terrain(2027, Terrain::Experimental).height(0, 0)
+        );
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        let mut prev = g.height(0, 37);
+        for x in 1..4096 {
+            let h = g.height(x, 37);
+            min = min.min(h);
+            max = max.max(h);
+            assert!((40..=108).contains(&h), "height {h} at x={x}");
+            assert!((h - prev).abs() <= 3, "cliff at x={x}: {prev} -> {h}");
+            prev = h;
+        }
+        assert!(max - min > 25, "relief too flat: {min}..{max}");
+        let negative: std::collections::BTreeSet<_> =
+            (-512..512).step_by(64).map(|x| g.height(x, -64)).collect();
+        assert!(negative.len() > 4);
+    }
+
+    #[test]
+    fn preview_remains_the_default_terrain_field() {
+        let a = Generator::new(2026);
+        let b = Generator::with_terrain(2026, Terrain::Preview);
+        assert_eq!(a.terrain(), Terrain::Preview);
+        assert_eq!(a.height(999, -1001), b.height(999, -1001));
+        assert_eq!(a.biome(999, -1001), b.biome(999, -1001));
+        assert_eq!(a.generate(3, -4), b.generate(3, -4));
     }
 
     #[test]

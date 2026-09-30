@@ -188,6 +188,7 @@ pub struct Session {
     pub preview: Option<crate::java_preview::Preview>,
     preview_seed: u64,
     preview_radius: u8,
+    preview_terrain: crate::world::Terrain,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -201,6 +202,7 @@ impl Default for Session {
             preview: None,
             preview_seed: 0,
             preview_radius: 2,
+            preview_terrain: crate::world::Terrain::Preview,
         }
     }
 }
@@ -216,9 +218,10 @@ impl Session {
             ..Self::default()
         }
     }
-    pub fn with_world(mut self, seed: u64, radius: u8) -> Self {
+    pub fn with_world(mut self, seed: u64, radius: u8, terrain: crate::world::Terrain) -> Self {
         self.preview_seed = seed;
         self.preview_radius = radius;
+        self.preview_terrain = terrain;
         self
     }
     pub fn state(&self) -> State {
@@ -337,6 +340,7 @@ impl Session {
                     let preview = crate::java_preview::Preview::new(
                         self.preview_seed,
                         self.preview_radius,
+                        self.preview_terrain,
                         manifest,
                     )
                     .ok_or(Error::Malformed)?;
