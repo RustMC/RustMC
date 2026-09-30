@@ -3,6 +3,7 @@
 //! chunk data the owner's own licensed client generated; compares against
 //! RustMC's current generator and reports exact-match percentages.
 
+use rustmc_server::vanilla::generator::VanillaGenerator;
 use rustmc_server::world::Generator;
 
 use crate::nbt::Tag;
@@ -37,21 +38,53 @@ pub struct MatchReport {
     pub mismatches: Vec<ColumnVerdict>,
 }
 
+/// Any source of per-column RustMC answers: the current generator or the
+/// data-driven vanilla density pipeline.
+pub trait ColumnSource {
+    fn column_height(&self, x: i64, z: i64) -> i64;
+    fn column_biome(&self, x: i64, z: i64) -> String;
+}
+
+impl ColumnSource for Generator {
+    fn column_height(&self, x: i64, z: i64) -> i64 {
+        self.height(x, z)
+    }
+    fn column_biome(&self, x: i64, z: i64) -> String {
+        self.biome(x, z).identifier().to_string()
+    }
+}
+
+impl ColumnSource for VanillaGenerator {
+    fn column_height(&self, x: i64, z: i64) -> i64 {
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return i64::MIN;
+        };
+        i64::from(self.surface_height(x, z))
+    }
+    fn column_biome(&self, _x: i64, _z: i64) -> String {
+        // Biome placement is tier T2; report a never-matching placeholder.
+        "<pending-T2>".to_owned()
+    }
+}
+
 pub fn compare_columns(
     columns: impl IntoIterator<Item = VanillaColumn>,
-    generator: &Generator,
+    source: &dyn ColumnSource,
     mismatch_cap: usize,
 ) -> MatchReport {
     let mut report = MatchReport::default();
     for column in columns {
-        let rustmc_height = generator.height(column.x, column.z);
-        let rustmc_biome = generator.biome(column.x, column.z).identifier().to_string();
+        let rustmc_height = source.column_height(column.x, column.z);
+        let rustmc_biome = source.column_biome(column.x, column.z);
         report.columns += 1;
         let height_ok = i64::from(column.surface_y) == rustmc_height;
         let biome_ok = column.biome.as_deref() == Some(rustmc_biome.as_str());
         report.height_matches += usize::from(height_ok);
         report.biome_matches += usize::from(biome_ok);
-        if (!height_ok || !biome_ok) && report.mismatches.len() < mismatch_cap {
+        // The capped detail list tracks height gaps only; biome misses are
+        // tier T2 work and would otherwise drown the diagnostic (the
+        // aggregate biome count above still reports them).
+        if !height_ok && report.mismatches.len() < mismatch_cap {
             report.mismatches.push(ColumnVerdict {
                 x: column.x,
                 z: column.z,

@@ -5,19 +5,24 @@
 //!
 //! ```text
 //! vanilla_oracle inspect <world-dir> [X Z ...]
-//! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental]
-//! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental]
+//! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental|vanilla[:settings-id] [data-root]]
+//! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
 //! ```
 //!
 //! The world directory is a single-player save root (contains region/).
 //! Nothing from the save is copied into the repository; only aggregate
 //! numbers and per-column public facts (height, biome, block name) are
-//! printed.
+//! printed. The `vanilla` terrain mode samples the data-driven density
+//! pipeline from an operator-provisioned worldgen datapack root (second
+//! trailing argument, else `$RUSTMC_VANILLA_DATA`, else
+//! `.rustmc-local/vanilla-data`); those data files are likewise never
+//! committed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use rustmc_server::vanilla::generator::VanillaGenerator;
 use rustmc_server::world::{Generator, Terrain};
-use rustmc_tools::oracle;
+use rustmc_tools::oracle::{self, ColumnSource};
 use rustmc_tools::region::RegionStore;
 
 fn main() {
@@ -63,13 +68,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "worksheet" => {
-            let seed = parse_u64(args.get(2).ok_or("missing <seed>")?)?;
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
             let points = oracle::worksheet_columns();
             println!(
                 "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome"
             );
-            let terrain = parse_terrain(args.get(3))?;
-            let generator = Generator::with_terrain(seed, terrain);
+            let source = build_source(seed, args.get(3), args.get(4))?;
             for (x, z, result) in oracle::read_columns(&mut store, &points)? {
                 let (sy, tb, bi) = match result? {
                     None => return Err(format!("worksheet point ({x}, {z}) is not in the save")),
@@ -81,24 +85,28 @@ fn run(args: &[String]) -> Result<(), String> {
                 };
                 println!(
                     "{x},{z},{sy},{tb},{bi},{},{}",
-                    generator.height(x, z),
-                    generator.biome(x, z).identifier()
+                    source.column_height(x, z),
+                    source.column_biome(x, z)
                 );
             }
         }
         "compare" => {
-            let seed = parse_u64(args.get(2).ok_or("missing <seed>")?)?;
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
             let min = parse_i64(args.get(3).ok_or("missing <min>")?)?;
             let max = parse_i64(args.get(4).ok_or("missing <max>")?)?;
             let stride = parse_i64(args.get(5).ok_or("missing <stride>")?)?;
-            let terrain = parse_terrain(args.get(6))?;
             if min > max {
                 return Err("min must not exceed max".to_string());
             }
             let (columns, missing_chunks) =
                 oracle::sample_columns(&mut store, min, max, min, max, stride)?;
-            let generator = Generator::with_terrain(seed, terrain);
-            let report = oracle::compare_columns(columns.iter().cloned(), &generator, 20);
+            let source = build_source(seed, args.get(6), args.get(7))?;
+            let cap = args
+                .get(8)
+                .map(|v| parse_i64(v).map(|n| n.max(0) as usize))
+                .transpose()?
+                .unwrap_or(20);
+            let report = oracle::compare_columns(columns.iter().cloned(), &*source, cap);
             println!("columns={} missing_chunks={missing_chunks}", report.columns);
             println!(
                 "height_exact={} ({:.2}%) biome={} ({:.2}%)",
@@ -128,12 +136,41 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_terrain(value: Option<&String>) -> Result<Terrain, String> {
-    match value.map(String::as_str) {
-        None | Some("preview") => Ok(Terrain::Preview),
-        Some("experimental") => Ok(Terrain::Experimental),
+/// Builds the RustMC-side column source. `vanilla` mode takes an optional
+/// `:settings-id` suffix (default the overworld) and reads the datapack
+/// root from the trailing argument, `$RUSTMC_VANILLA_DATA`, or the
+/// project-local default.
+fn build_source(
+    seed: i64,
+    terrain: Option<&String>,
+    data_root: Option<&String>,
+) -> Result<Box<dyn ColumnSource>, String> {
+    let value = terrain.map(String::as_str);
+    match value {
+        None | Some("preview") => Ok(Box::new(Generator::with_terrain(
+            seed as u64,
+            Terrain::Preview,
+        ))),
+        Some("experimental") => Ok(Box::new(Generator::with_terrain(
+            seed as u64,
+            Terrain::Experimental,
+        ))),
+        Some(t) if t == "vanilla" || t.starts_with("vanilla:") => {
+            let settings = t
+                .split_once(':')
+                .map_or("minecraft:overworld", |(_, id)| id);
+            let root = match data_root {
+                Some(path) => PathBuf::from(path),
+                None => std::env::var("RUSTMC_VANILLA_DATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data")),
+            };
+            Ok(Box::new(
+                VanillaGenerator::new(&root, seed, settings).map_err(|error| error.to_string())?,
+            ))
+        }
         Some(other) => Err(format!(
-            "unknown terrain {other:?}; use preview or experimental"
+            "unknown terrain {other:?}; use preview, experimental, or vanilla[:settings-id]"
         )),
     }
 }
@@ -142,10 +179,4 @@ fn parse_i64(value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
         .map_err(|_| format!("invalid integer: {value}"))
-}
-
-fn parse_u64(value: &str) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("invalid non-negative integer: {value}"))
 }

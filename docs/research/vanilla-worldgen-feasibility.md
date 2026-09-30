@@ -125,6 +125,49 @@ showing substantially wider relief — confirming that seed-exact parity needs
 the full density-function pipeline, not a tuned noise field. No vanilla
 constants were copied or consulted.
 
+## T1 measurement (1 October 2026, data-driven density pipeline)
+
+With the owner's authorization for the knowledge-consultation route (ADR-0014
+as amended), the Rust `vanilla` modules now implement the full density path:
+the world-seeded noise core, the density-function evaluator (point and
+block-volume, pinned bit-for-bit against 26.3 runtime vectors), a runtime
+loader for operator-provisioned worldgen datapacks (Mojang files are never
+committed), per-dimension `noise_router` wiring, and column-height extraction
+(`final_density > 0` surface scan plus the sea-level water rule).
+
+Measured against the same 2,401-column seed-2026 oracle sample with
+`vanilla_oracle compare ... vanilla`:
+
+- **94.59% exact height match (2,271 / 2,401)**, up from 4.50% (preview) and
+  2.75% (experimental groundwork). All six published worksheet heights
+  reproduce exactly (117 / 64 / 73 / 84 / 71 / 71).
+- Categorizing the 130 remaining columns by the vanilla save's top block:
+  42 tree trunks and 11 village-ruin blocks (feature/structure placement —
+  tiers T2/T3, absent from a density-only surface by definition; every
+  sample tree column mismatches and 3 of 14 ruin columns match), 13 water
+  surfaces where the saved heightmap counts partial water levels (fluid
+  finalization, not density), and 64 terrain-topped columns whose small
+  offsets concentrate near structure footprints and shallow aquifer bands —
+  effects of the runtime blender/beardifier and the aquifer adjustment,
+  which the current pipeline evaluates at their structure-free/aquifer-free
+  defaults.
+- The ≥95% tier gate is therefore not yet passed on the raw sample, and the
+  raw sample structurally cannot be passed by density-only generation:
+  tree and ruin columns above the true surface count as mismatches by
+  construction. Excluding the 56 tree/ruin-top columns, the same scan reads
+  **96.7% exact (2,268 / 2,345)**. Closing the remaining terrain-topped gap
+  requires the runtime-context slice (aquifers, then structure blending
+  with T3); the owner should also decide whether to re-scope the gate to
+  terrain-surface columns.
+
+The oracle's mismatch detail list now tracks height gaps only (biome misses
+are T2 work and would drown the diagnostic); the aggregate biome count is
+unchanged. A grid-refined fast scan is implemented and documented as an
+approximation: it under-scanned 7 of 2,401 columns because the per-block
+cave-carving `min` can dip a y-grid sample below zero while the surface
+block between samples stays positive, so the exhaustive per-block scan is
+the default.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the
