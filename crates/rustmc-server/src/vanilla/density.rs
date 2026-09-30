@@ -58,6 +58,17 @@ impl std::error::Error for DensityError {}
 /// An identifier in the `minecraft` namespace as used by JSON references.
 type Id = String;
 
+/// Ids the registry resolves from code even without a datapack document,
+/// matching the built-ins the vanilla bootstrap registers.
+pub fn builtin_density_ids() -> &'static [&'static str] {
+    &[
+        "minecraft:zero",
+        "minecraft:y",
+        "minecraft:shift_x",
+        "minecraft:shift_z",
+    ]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
     X,
@@ -1413,8 +1424,19 @@ impl<'e> DensityRegistry<'e> {
         Ok(density)
     }
 
+    /// Compiles one child-slot value: an object node, a reference
+    /// string resolved through the registry, or a bare number constant.
+    pub fn compile_slot(&self, value: &Value) -> Result<Density, DensityError> {
+        self.child(value)
+    }
+
     /// Compiles a detached JSON document (not stored in the registry).
     pub fn compile_value(&self, value: &Value) -> Result<Density, DensityError> {
+        // Registry document roots may be bare numbers: the datapack codec
+        // reads them as constant functions (26.3 `zero.json` is `0.0`).
+        if let Value::Number(_) = value {
+            return Ok(Density::constant(noise_value(value)?));
+        }
         let node = self.parse(value)?;
         Ok(Density(Rc::new(node)))
     }
