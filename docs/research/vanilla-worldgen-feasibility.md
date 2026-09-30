@@ -82,6 +82,34 @@ Performance: vanilla generation is CPU-heavy (parallel workers in the client);
 each stage must record release-build chunk-generation timings in
 `docs/BENCHMARKS.md` style before acceptance. No speed claims beforehand.
 
+## T0 outcome (30 September 2026)
+
+`cargo run -p rustmc-tools --bin vanilla_oracle` now provides the oracle:
+`inspect` reads selected columns, `worksheet` re-checks the six comparison
+points, and `compare` samples a strided grid and prints exact-match
+percentages with capped mismatch detail. It reads only saves the owner's
+licensed client generated (26.3 places them under
+`dimensions/minecraft/overworld/region/`, which the tool detects
+automatically); no Mojang file is committed and no generator code changed.
+
+Validated against the owner's seed-2026 world: all six biomes reproduce the
+manual F3 readings, and the six heights reproduce the published worksheet
+(117/64/73/84/71/71; the (-256, 0) cell reads 84 from the save versus the
+hand-noted 83, so the worksheet's sharpest single height carries a ±1
+observation caveat). Reverse-engineered 26.3 save facts, all from the owner's
+own data: heightmaps are packed relative to the world minimum Y; blockstate
+palettes mix string and compound entries (`{"": name}` /
+`{id, properties}`); biome palettes are stored at their exact bit width
+(even one bit), which the old "minimum 3 bits" assumption broke on — the
+decoder now infers the width from the data length and verifies slots against
+the palette.
+
+First aggregate report over every 16th column in the loaded −256..512 square
+(2,401 columns): **4.50% exact height match, 2.87% biome match**. These
+measure one strided sample of one world; they quantify the gap and imply no
+parity claim. T1 and later tiers remain unauthorized pending the ADR-0014
+decision.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the
