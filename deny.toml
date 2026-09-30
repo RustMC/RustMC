@@ -1,0 +1,18 @@
+# cargo-deny configuration for RustMC.
+# License policy is enforced separately and more strictly by the in-repo gate
+# `cargo run -p rustmc-tools --bin check_dependency_licenses` (see
+# crates/rustmc-tools), so this file covers security advisories, dependency
+# graph bans, and crate sources only.
+
+[advisories]
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
