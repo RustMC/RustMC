@@ -1,8 +1,9 @@
 name: foundation
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
