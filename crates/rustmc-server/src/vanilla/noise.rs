@@ -121,7 +121,32 @@ impl PerlinNoise {
         let relative_y = (y - floor_y as f64) as f32;
         let relative_z = (z - floor_z as f64) as f32;
         self.sample_and_lerp(
-            floor_x, floor_y, floor_z, relative_x, relative_y, relative_z,
+            floor_x, floor_y, floor_z, relative_x, relative_y, relative_z, relative_y,
+        )
+    }
+
+    /// Point evaluation of the y-smeared Perlin variant used by the base-3D
+    /// blended noise: the gradient corners use a quantized y fraction while
+    /// the interpolation alpha keeps the original one.
+    pub fn get_smeared(&self, _x: f64, _y: f64, _z: f64, fudge_y_scale: f64) -> f32 {
+        let x = wrap(_x) + self.offset_x;
+        let y = wrap(_y) + self.offset_y;
+        let z = wrap(_z) + self.offset_z;
+        let floor_x = x.floor() as i32;
+        let floor_y = y.floor() as i32;
+        let floor_z = z.floor() as i32;
+        let relative_x = (x - floor_x as f64) as f32;
+        let relative_y = y - floor_y as f64;
+        let relative_z = (z - floor_z as f64) as f32;
+        let fudged = (relative_y - compute_fudge_y(_y, relative_y, fudge_y_scale)) as f32;
+        self.sample_and_lerp(
+            floor_x,
+            floor_y,
+            floor_z,
+            relative_x,
+            fudged,
+            relative_z,
+            relative_y as f32,
         )
     }
 
@@ -138,6 +163,7 @@ impl PerlinNoise {
         relative_x: f32,
         relative_y: f32,
         relative_z: f32,
+        original_relative_y: f32,
     ) -> f32 {
         let x0 = self.permute(x);
         let x1 = self.permute(x.wrapping_add(1));
@@ -195,7 +221,7 @@ impl PerlinNoise {
         );
         lerp3(
             smoothstep(relative_x),
-            smoothstep(relative_y),
+            smoothstep(original_relative_y),
             smoothstep(relative_z),
             d000,
             d100,
@@ -209,11 +235,27 @@ impl PerlinNoise {
     }
 }
 
+/// Y-slice quantization used by the smeared Perlin variant: the largest
+/// multiple of `fudge_y_scale` that fits below the fraction (bounded by the
+/// original absolute y when it lies inside `[0, relative_y)`), with the
+/// `(float)1.0E-7` guard offset.
+fn compute_fudge_y(original_y: f64, relative_y: f64, fudge_y_scale: f64) -> f64 {
+    let fudge_limit = if original_y >= 0.0 && original_y < relative_y {
+        original_y
+    } else {
+        relative_y
+    };
+    f64::from((fudge_limit / fudge_y_scale + f64::from(1.0e-7_f32)).floor() as i32) * fudge_y_scale
+}
+
 #[derive(Clone)]
 struct NoiseLayer {
     noise: PerlinNoise,
     frequency: f64,
     amplitude: f32,
+    /// When set, the layer is a y-smeared Perlin with this fudge scale
+    /// (used by the base-3D blended noise only).
+    smear_y: Option<f64>,
 }
 
 /// A weighted sum of Perlin layers, evaluated with `f32` accumulation.
@@ -226,12 +268,20 @@ impl NoiseStack {
     pub fn get(&self, x: f64, y: f64, z: f64) -> f32 {
         let mut value = 0.0f32;
         for layer in &self.layers {
-            value += layer.amplitude
-                * layer.noise.get(
+            let sample = match layer.smear_y {
+                None => layer.noise.get(
                     x * layer.frequency,
                     y * layer.frequency,
                     z * layer.frequency,
-                );
+                ),
+                Some(fudge) => layer.noise.get_smeared(
+                    x * layer.frequency,
+                    y * layer.frequency,
+                    z * layer.frequency,
+                    fudge,
+                ),
+            };
+            value += layer.amplitude * sample;
         }
         value
     }
@@ -379,16 +429,46 @@ impl NormalNoise {
                 noise: PerlinNoise::new(&mut first_source),
                 frequency: octave.frequency,
                 amplitude: value_factor,
+                smear_y: None,
             });
             let mut second_source = second_random.from_hash_of(&seed);
             layers.push(NoiseLayer {
                 noise: PerlinNoise::new(&mut second_source),
                 frequency: octave.frequency * INPUT_FACTOR,
                 amplitude: value_factor,
+                smear_y: None,
             });
         }
         NoiseStack { layers }
     }
+}
+
+/// Builds one blended-noise FBM: `octave_count = -first_octave + 1` smeared
+/// Perlin layers whose spatial factor halves and value factor doubles per
+/// step, consumed sequentially from `random`. The value factor is normalized
+/// by `2^octave_count − 1` before iteration; all layer coefficients follow
+/// the documented vanilla construction captured in `docs/PROVENANCE.md`.
+pub fn create_blended_fbm(
+    random: &mut RandomSource,
+    first_octave: i32,
+    smear_scale_y: f64,
+    mut value_factor: f64,
+) -> NoiseStack {
+    let octave_count = -first_octave + 1;
+    value_factor /= 2.0f64.powi(octave_count) - 1.0;
+    let mut layers = Vec::with_capacity(octave_count as usize);
+    let mut factor = 1.0f64;
+    for _ in (0..octave_count).rev() {
+        layers.push(NoiseLayer {
+            noise: PerlinNoise::new(random),
+            frequency: factor,
+            amplitude: value_factor as f32,
+            smear_y: Some(smear_scale_y * factor),
+        });
+        factor /= 2.0;
+        value_factor *= 2.0;
+    }
+    NoiseStack { layers }
 }
 
 #[cfg(test)]

@@ -6,5 +6,6 @@
 //! facts in `docs/PROVENANCE.md`. Mojang world-generation data files are
 //! operator-provisioned at runtime and are never committed to this repository.
 
+pub mod density;
 pub mod noise;
 pub mod random;
