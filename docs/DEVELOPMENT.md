@@ -32,6 +32,7 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `preview_registry_manifest` | absent | Path to locally prepared, version-checked 26.3 registry identifier/tag metadata. Required for world entry. |
 | `preview_seed` | `0` | Integer `0..=9223372036854775807`, used only for original preview generation. |
 | `preview_view_distance` | `4` | Integer `2..=32` chunks. Radius 32 permits up to 4,225 loaded chunk coordinates per client; only one batch is in flight, containing at most 16 chunks within a 768 KiB encoding budget. |
+| `preview_terrain` | `"preview"` | `"preview"` or `"experimental"`. Experimental selects the opt-in octave-noise terrain field (T1 groundwork); biome labels, surface blocks, and trees stay on the ADR-0013 preview rules. Neither option is vanilla generation. |
 
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 

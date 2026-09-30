@@ -379,7 +379,11 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         continue;
                     }
                     let mut discovery = discovery_java::Session::new(config.local_java_preview)
-                        .with_world(config.preview_seed, config.preview_view_distance);
+                        .with_world(
+                            config.preview_seed,
+                            config.preview_view_distance,
+                            config.preview_terrain,
+                        );
                     if let Some(manifest) = &registry_manifest {
                         discovery = discovery.with_registry_manifest(Arc::clone(manifest));
                     }

@@ -1,5 +1,5 @@
 //! Anvil region-file reader (`.mca`) for owner-provided world saves.
-//! Format: publicly documented at https://minecraft.wiki/w/Region_file_format.
+//! Format: publicly documented at <https://minecraft.wiki/w/Region_file_format>.
 //! Only chunk streams the user's own client produced are ever read; no Mojang
 //! data ships with RustMC.
 

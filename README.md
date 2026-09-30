@@ -39,7 +39,7 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | Bedrock 1.26.51 discovery | Partial: synthetic UDP socket tests pass; real client not yet checked |
 | Java login and play | Partial opt-in Creative terrain preview: one real 26.3 client joined and rendered chunks; no authentication, authoritative actions, persistence, or shared multiplayer |
 | Bedrock login and play | Planned; no session or playable endpoint exists |
-| Original terrain preview | Seeded coordinate-derived terrain with eight labelled surface regions and trees; real 26.3 client rendered it at a configured 32-chunk view. No vanilla generation parity |
+| Original terrain preview | Seeded coordinate-derived terrain with eight labelled surface regions and trees; real 26.3 client rendered it at a configured 32-chunk view. An optional `preview_terrain = "experimental"` octave-noise height field exists as vanilla-generation groundwork. Neither option is vanilla generation parity |
 | Players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |
