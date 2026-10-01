@@ -167,6 +167,20 @@ impl VanillaGenerator {
         self.surface(x, z).map_or(self.router.min_y, |(y, _)| y)
     }
 
+    /// Raw `final_density` sample before the aquifer adjustment: the
+    /// single-column probe prints it to reason about graph branches.
+    pub fn raw_density(&self, x: i32, y: i32, z: i32) -> f32 {
+        self.router.final_density.sample(x, y, z)
+    }
+
+    /// The filler substance at one absolute block position: the raw
+    /// `final_density` sample through the runtime aquifer. This is what
+    /// the 3D agreement metric compares against the save.
+    pub fn substance(&self, x: i32, y: i32, z: i32) -> Substance {
+        let density = self.raw_density(x, y, z);
+        self.aquifer.substance(x, y, z, density)
+    }
+
     /// The highest non-air position in the column and what fills it.
     pub fn surface(&self, x: i32, z: i32) -> Option<(i32, Substance)> {
         let density = &self.router.final_density;

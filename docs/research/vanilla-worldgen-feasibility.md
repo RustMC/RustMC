@@ -252,6 +252,40 @@ T2's exit gate is met on both halves. The staged plan continues with T3
 (carvers), after which feature placement (T4) closes the remaining
 surface-block residuals listed above.
 
+## T3 baseline measured (1 October 2026, slice H measurement half)
+
+The oracle now reads a per-column 3D substance profile from the save — each
+stored section decoded into the coarse classes air-family, fluid and solid —
+and compares it against the pipeline's own `final_density`-plus-aquifer
+answer at every position from the lowest stored section up to the heightmap
+surface. On the same 2,401-column seed-2026 sample that is 338,217 positions:
+
+- **96.44% exact (326,177)**, split by depth below the surface as 96.76%
+  for the top 8 blocks, 97.15% for 8–63 and 95.89% deeper.
+- The disagreements are dominated by 9,186 positions where the save holds
+  air and the pipeline holds solid, plus 1,771 with the same shape for
+  fluid. Probing the failing columns shows the pipeline's raw density is
+  clearly positive (+0.019 to +0.13) where the save is empty, so this is
+  not a density-graph divergence: it is the registry carver runtime
+  removing blocks that the density graph left solid.
+- Marginal volumes say the cave *amount* is broadly right (the deepest
+  band holds 2.2% vanilla air against 1.5% pipeline air), and a small
+  reverse tail of 842 bonus carves sits at cheese-graph sign boundaries,
+  consistent with the documented `f32` noise approximations.
+- Cave shapes in 26.3 are density-graph work: the overworld `final_density`
+  document resolves through `caves/{entrances,noodle,pillars,spaghetti_2d,`
+  `spaghetti_2d_thickness_modulator,spaghetti_roughness_function}`, and the
+  settings document has no `caves` router section at all. What remains for
+  T3 is therefore the three carvers the biome documents list — `cave`
+  (probability 0.15, y 8–180, biased to the bottom), `cave_extra_underground`
+  (0.07, y 8–47) and `canyon` (0.01, y 10–67) — recorded in
+  `docs/PROVENANCE.md` (session 8).
+
+That measurement is the scoping step for the carver runtime: it says how
+much is missing, where in Y it sits, and that the density pipeline should
+not be re-tuned to chase it. No generator behaviour changed in this slice;
+the release binary samples the full 3D grid in 48 s single-threaded.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

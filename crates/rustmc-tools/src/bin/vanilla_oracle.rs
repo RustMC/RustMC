@@ -7,6 +7,8 @@
 //! vanilla_oracle inspect <world-dir> [X Z ...]
 //! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental|vanilla[:settings-id] [data-root]]
 //! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
+//! vanilla_oracle substance <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [fail-cap]]
+//! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
 //! ```
 //!
 //! The world directory is a single-player save root (contains region/).
@@ -20,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rustmc_server::vanilla::aquifer::Substance;
 use rustmc_server::vanilla::generator::VanillaGenerator;
 use rustmc_server::world::{Generator, Terrain};
 use rustmc_tools::oracle::{self, ColumnSource};
@@ -38,7 +41,10 @@ fn main() {
 
 fn run(args: &[String]) -> Result<(), String> {
     let Some(mode) = args.first().map(String::as_str) else {
-        return Err("usage: vanilla_oracle inspect|worksheet|compare <world-dir> ...".to_string());
+        return Err(
+            "usage: vanilla_oracle inspect|worksheet|compare|substance|column <world-dir> ..."
+                .to_string(),
+        );
     };
     let world = Path::new(args.get(1).ok_or("missing <world-dir>")?);
     let mut store = RegionStore::new(world);
@@ -142,6 +148,127 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("no generated chunks found in the sampled range".to_string());
             }
         }
+        "substance" => {
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
+            let min = parse_i64(args.get(3).ok_or("missing <min>")?)?;
+            let max = parse_i64(args.get(4).ok_or("missing <max>")?)?;
+            let stride = parse_i64(args.get(5).ok_or("missing <stride>")?)?;
+            if min > max {
+                return Err("min must not exceed max".to_string());
+            }
+            let (profiles, missing_chunks) =
+                oracle::sample_profiles(&mut store, min, max, min, max, stride)?;
+            let source = build_source(seed, args.get(6), args.get(7))?;
+            let cap = args
+                .get(8)
+                .map(|v| parse_i64(v).map(|n| n.max(0) as usize))
+                .transpose()?
+                .unwrap_or(20);
+            let report = oracle::compare_substance(profiles, &*source, cap);
+            println!("columns={} missing_chunks={missing_chunks}", report.columns);
+            println!(
+                "substance_positions={} exact={} ({:.2}%)",
+                report.positions,
+                report.matches,
+                oracle::percent(report.matches, report.positions)
+            );
+            for (label, positions, matches) in [
+                (
+                    "near_surface_0_7",
+                    report.near_positions,
+                    report.near_matches,
+                ),
+                (
+                    "middle_8_63",
+                    report.middle_positions,
+                    report.middle_matches,
+                ),
+                ("deep_64_plus", report.deep_positions, report.deep_matches),
+            ] {
+                println!(
+                    "band {label}: positions={positions} exact={matches} ({:.2}%)",
+                    oracle::percent(matches, positions)
+                );
+            }
+            if report.positions == 0 {
+                println!(
+                    "note: the selected source answers no per-position substance (pending T3)."
+                );
+            }
+            let mut pairs: Vec<_> = report.residuals.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for ((vanilla, rustmc), count) in pairs.iter().take(10) {
+                println!(
+                    "substance_residual {count}x vanilla={} rustmc={}",
+                    vanilla.name(),
+                    rustmc.name()
+                );
+            }
+            // Depth profile of the two dominant residual shapes.
+            for (from, to) in pairs.iter().take(2).map(|((from, to), _)| (*from, *to)) {
+                let mut bands: Vec<_> = report
+                    .residual_bands
+                    .iter()
+                    .filter(|((pair, _), _)| *pair == (from, to))
+                    .map(|((_, band), count)| (*band, *count))
+                    .collect();
+                bands.sort_by_key(|(band, _)| *band);
+                let name = format!("{}_to_{}", from.name(), to.name());
+                let rendered: Vec<String> = bands
+                    .iter()
+                    .map(|(band, count)| format!("{band}:{count}"))
+                    .collect();
+                println!("bands {name} {}", rendered.join(" "));
+            }
+            for (band, stats) in &report.marginals {
+                println!(
+                    "marginal y={band}: vanilla air={} fluid={} solid={} | rustmc air={} fluid={} solid={}",
+                    stats.vanilla[0],
+                    stats.vanilla[1],
+                    stats.vanilla[2],
+                    stats.rustmc[0],
+                    stats.rustmc[1],
+                    stats.rustmc[2]
+                );
+            }
+            println!("fail_x,fail_z,fail_y");
+            for (x, z, y) in &report.fail_positions {
+                println!("{x},{z},{y}");
+            }
+            if report.columns == 0 {
+                return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "column" => {
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
+            let x = parse_i64(args.get(3).ok_or("missing <x>")?)?;
+            let z = parse_i64(args.get(4).ok_or("missing <z>")?)?;
+            let terrain = args.get(5).cloned().unwrap_or_else(|| "vanilla".to_owned());
+            if terrain != "vanilla" && !terrain.starts_with("vanilla:") {
+                return Err("column mode requires the vanilla density pipeline".to_string());
+            }
+            let settings = terrain
+                .split_once(':')
+                .map_or("minecraft:overworld", |(_, id)| id);
+            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
+                .map_err(|error| error.to_string())?;
+            let (Ok(x32), Ok(z32)) = (i32::try_from(x), i32::try_from(z)) else {
+                return Err("coordinate too large".to_string());
+            };
+            let profile = oracle::read_profile(&mut store, x, z)?
+                .ok_or_else(|| format!("column ({x}, {z}) is not in the save"))?;
+            println!("y,vanilla,rustmc,rustmc_density");
+            for (offset, vanilla) in profile.categories.iter().copied().enumerate() {
+                let y = profile.min_y + offset as i32;
+                let density = generator.raw_density(x32, y, z32);
+                let rustmc = match generator.substance(x32, y, z32) {
+                    Substance::Air => oracle::Category::Air,
+                    Substance::Fluid(_) => oracle::Category::Fluid,
+                    Substance::Solid => oracle::Category::Solid,
+                };
+                println!("{y},{},{},{density}", vanilla.name(), rustmc.name());
+            }
+        }
         other => return Err(format!("unknown mode {other:?}")),
     }
     Ok(())
@@ -170,19 +297,25 @@ fn build_source(
             let settings = t
                 .split_once(':')
                 .map_or("minecraft:overworld", |(_, id)| id);
-            let root = match data_root {
-                Some(path) => PathBuf::from(path),
-                None => std::env::var("RUSTMC_VANILLA_DATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data")),
-            };
             Ok(Box::new(
-                VanillaGenerator::new(&root, seed, settings).map_err(|error| error.to_string())?,
+                VanillaGenerator::new(&resolve_data_root(data_root), seed, settings)
+                    .map_err(|error| error.to_string())?,
             ))
         }
         Some(other) => Err(format!(
             "unknown terrain {other:?}; use preview, experimental, or vanilla[:settings-id]"
         )),
+    }
+}
+
+/// Datapack root: trailing argument, else `$RUSTMC_VANILLA_DATA`, else the
+/// project-local default.
+fn resolve_data_root(data_root: Option<&String>) -> PathBuf {
+    match data_root {
+        Some(path) => PathBuf::from(path),
+        None => std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data")),
     }
 }
 

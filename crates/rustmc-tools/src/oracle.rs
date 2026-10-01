@@ -3,6 +3,7 @@
 //! chunk data the owner's own licensed client generated; compares against
 //! RustMC's current generator and reports exact-match percentages.
 
+use rustmc_server::vanilla::aquifer::Substance;
 use rustmc_server::vanilla::generator::VanillaGenerator;
 use rustmc_server::world::Generator;
 
@@ -44,6 +45,47 @@ pub struct MatchReport {
     pub mismatches: Vec<ColumnVerdict>,
 }
 
+/// Coarse filler class of a block position, the T3 comparison unit:
+/// caves and terrain agree or not at the substance level, before block
+/// identities (T2 surface rules, T4 features) are considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Category {
+    Air,
+    Fluid,
+    Solid,
+}
+
+impl Category {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Air => "air",
+            Self::Fluid => "fluid",
+            Self::Solid => "solid",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Air => 0,
+            Self::Fluid => 1,
+            Self::Solid => 2,
+        }
+    }
+}
+
+/// Classify a saved block state id. The air family and the two fluids
+/// are named by the public block list; everything else is solid.
+pub fn block_category(name: &str) -> Category {
+    match base_block_name(name) {
+        "minecraft:air"
+        | "minecraft:cave_air"
+        | "minecraft:void_air"
+        | "minecraft:structure_void" => Category::Air,
+        "minecraft:water" | "minecraft:lava" => Category::Fluid,
+        _ => Category::Solid,
+    }
+}
+
 /// Any source of per-column RustMC answers: the current generator or the
 /// data-driven vanilla density pipeline.
 pub trait ColumnSource {
@@ -53,6 +95,11 @@ pub trait ColumnSource {
     /// answer with the pending marker so the metric is never inflated.
     fn column_top_block(&self, _x: i64, _z: i64) -> String {
         "<pending-T2>".to_owned()
+    }
+    /// Filler substance at one absolute position. Sources without a 3D
+    /// answer return `None`, keeping the T3 metric honest.
+    fn column_substance(&self, _x: i64, _z: i64, _y: i32) -> Option<Category> {
+        None
     }
 }
 
@@ -93,6 +140,16 @@ impl ColumnSource for VanillaGenerator {
         };
         self.top_block(x, z)
             .unwrap_or_else(|| "<unknown>".to_owned())
+    }
+    fn column_substance(&self, x: i64, z: i64, y: i32) -> Option<Category> {
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return None;
+        };
+        Some(match self.substance(x, y, z) {
+            Substance::Solid => Category::Solid,
+            Substance::Fluid(_) => Category::Fluid,
+            Substance::Air => Category::Air,
+        })
     }
 }
 
@@ -140,6 +197,85 @@ pub fn compare_columns(
     report
 }
 
+/// Category volumes of one 32-block absolute Y band over the compared
+/// population, in `[air, fluid, solid]` order.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BandStats {
+    pub vanilla: [usize; 3],
+    pub rustmc: [usize; 3],
+}
+
+/// Per-position substance agreement over sampled column profiles (the
+/// T3 measurement). Bands split each column by depth below its vanilla
+/// surface: the near-surface crust, the middle cave belt, and the deep
+/// interior below 64 blocks of cover.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SubstanceReport {
+    pub columns: usize,
+    pub positions: usize,
+    pub matches: usize,
+    pub near_positions: usize,
+    pub near_matches: usize,
+    pub middle_positions: usize,
+    pub middle_matches: usize,
+    pub deep_positions: usize,
+    pub deep_matches: usize,
+    /// Disagreements as `(vanilla, rustmc)` category pair counts.
+    pub residuals: std::collections::BTreeMap<(Category, Category), usize>,
+    /// Disagreements per 32-block absolute Y band, so a residual can be
+    /// attributed to a carver height range without dumping columns.
+    pub residual_bands: std::collections::BTreeMap<((Category, Category), i32), usize>,
+    /// Marginal category volumes per 32-block absolute Y band.
+    pub marginals: std::collections::BTreeMap<i32, BandStats>,
+    /// First capped disagreement positions for follow-up single-column
+    /// probes (`column` mode).
+    pub fail_positions: Vec<(i64, i64, i32)>,
+}
+
+pub fn compare_substance(
+    profiles: impl IntoIterator<Item = ColumnProfile>,
+    source: &dyn ColumnSource,
+    fail_cap: usize,
+) -> SubstanceReport {
+    let mut report = SubstanceReport::default();
+    for profile in profiles {
+        report.columns += 1;
+        for (offset, vanilla) in profile.categories.iter().copied().enumerate() {
+            let y = profile.min_y + offset as i32;
+            let Some(rustmc) = source.column_substance(profile.x, profile.z, y) else {
+                continue;
+            };
+            report.positions += 1;
+            let stats = report.marginals.entry(y.div_euclid(32) * 32).or_default();
+            stats.vanilla[vanilla.index()] += 1;
+            stats.rustmc[rustmc.index()] += 1;
+            let matched = vanilla == rustmc;
+            report.matches += usize::from(matched);
+            if !matched {
+                *report.residuals.entry((vanilla, rustmc)).or_default() += 1;
+                *report
+                    .residual_bands
+                    .entry(((vanilla, rustmc), y.div_euclid(32) * 32))
+                    .or_default() += 1;
+                if report.fail_positions.len() < fail_cap {
+                    report.fail_positions.push((profile.x, profile.z, y));
+                }
+            }
+            let depth = profile.surface_y - y;
+            let (positions, matches) = if depth < 8 {
+                (&mut report.near_positions, &mut report.near_matches)
+            } else if depth < 64 {
+                (&mut report.middle_positions, &mut report.middle_matches)
+            } else {
+                (&mut report.deep_positions, &mut report.deep_matches)
+            };
+            *positions += 1;
+            *matches += usize::from(matched);
+        }
+    }
+    report
+}
+
 pub fn percent(matches: usize, columns: usize) -> f64 {
     if columns == 0 {
         0.0
@@ -148,19 +284,14 @@ pub fn percent(matches: usize, columns: usize) -> f64 {
     }
 }
 
-/// Extract ground truth for one column of one stored chunk.
+/// Absolute Y of the top terrain block from the stored heightmaps, or
+/// `Ok(None)` when the column is not filled yet.
 ///
 /// 26.3 saves (DataVersion 5023, observed 30 September 2026 in the owner's
 /// world) store heightmaps relative to the world minimum Y, so the absolute
 /// top block is `value - 1 + yPos * 16`. `MOTION_BLOCKING_NO_LEAVES` is the
 /// closest stored analogue of a hand-cleared F3 ground reading.
-pub fn column_truth(
-    root: &Tag,
-    chunk_x: i32,
-    chunk_z: i32,
-    lx: u8,
-    lz: u8,
-) -> Result<Option<VanillaColumn>, String> {
+fn surface_top(root: &Tag, lx: u8, lz: u8) -> Result<Option<i32>, String> {
     let heightmaps = root.get("Heightmaps").or_else(|| root.get("heightmaps"));
     let packed = heightmaps
         .and_then(|h| {
@@ -173,9 +304,23 @@ pub fn column_truth(
     let min_y = root.get("yPos").and_then(Tag::as_i32).unwrap_or(-4) * 16;
     let heights = unpack_spanning(packed, 9, 256);
     let index = usize::from(lx) + usize::from(lz) * 16;
-    let surface_top = match heights.get(index).copied() {
-        Some(h) if h > 0 => h as i32 - 1 + min_y,
-        _ => return Ok(None),
+    Ok(match heights.get(index).copied() {
+        Some(h) if h > 0 => Some(h as i32 - 1 + min_y),
+        _ => None,
+    })
+}
+
+/// Extract ground truth for one column of one stored chunk.
+pub fn column_truth(
+    root: &Tag,
+    chunk_x: i32,
+    chunk_z: i32,
+    lx: u8,
+    lz: u8,
+) -> Result<Option<VanillaColumn>, String> {
+    let surface_top = match surface_top(root, lx, lz)? {
+        Some(y) => y,
+        None => return Ok(None),
     };
     let sections = root
         .get("sections")
@@ -201,6 +346,67 @@ pub fn column_truth(
         surface_y: surface_top,
         top_block,
         biome,
+    }))
+}
+
+/// One column's stored substance profile: the air/fluid/solid category
+/// of every absolute Y from the lowest stored section up to the heightmap
+/// surface. Chunks store sections only where content exists, so a Y not
+/// covered by any section is empty: it is recorded as air, matching how
+/// the filler would have written it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnProfile {
+    pub x: i64,
+    pub z: i64,
+    pub surface_y: i32,
+    pub min_y: i32,
+    pub categories: Vec<Category>,
+}
+
+pub fn column_profile(
+    root: &Tag,
+    chunk_x: i32,
+    chunk_z: i32,
+    lx: u8,
+    lz: u8,
+) -> Result<Option<ColumnProfile>, String> {
+    let surface_y = match surface_top(root, lx, lz)? {
+        Some(y) => y,
+        None => return Ok(None),
+    };
+    let sections = root
+        .get("sections")
+        .or_else(|| root.get("Sections"))
+        .and_then(Tag::as_list)
+        .ok_or("chunk has no sections list")?;
+    let stored: Vec<(i32, &Tag)> = sections
+        .iter()
+        .filter_map(|s| s.get("Y").and_then(Tag::as_i32).map(|y| (y * 16, s)))
+        .filter(|(y_min, _)| *y_min <= surface_y)
+        .collect();
+    let min_y = stored
+        .iter()
+        .map(|(y_min, _)| *y_min)
+        .min()
+        .unwrap_or(surface_y);
+    let mut categories = vec![Category::Air; (surface_y - min_y + 1) as usize];
+    for (y_min, section) in &stored {
+        for local_y in 0..16 {
+            let y = y_min + local_y;
+            if y > surface_y {
+                break;
+            }
+            if let Some(name) = block_at(section, lx, lz, local_y)? {
+                categories[(y - min_y) as usize] = block_category(&name);
+            }
+        }
+    }
+    Ok(Some(ColumnProfile {
+        x: i64::from(chunk_x) * 16 + i64::from(lx),
+        z: i64::from(chunk_z) * 16 + i64::from(lz),
+        surface_y,
+        min_y,
+        categories,
     }))
 }
 
@@ -359,6 +565,33 @@ pub fn sample_columns(
     max_z: i64,
     stride: i64,
 ) -> Result<(Vec<VanillaColumn>, usize), String> {
+    sample_grid(store, min_x, max_x, min_z, max_z, stride, column_truth)
+}
+
+/// Like [`sample_columns`], but reading full substance profiles.
+pub fn sample_profiles(
+    store: &mut RegionStore,
+    min_x: i64,
+    max_x: i64,
+    min_z: i64,
+    max_z: i64,
+    stride: i64,
+) -> Result<(Vec<ColumnProfile>, usize), String> {
+    sample_grid(store, min_x, max_x, min_z, max_z, stride, column_profile)
+}
+
+/// One column read from a stored chunk root, shared by the samplers.
+type ColumnReader<T> = fn(&Tag, i32, i32, u8, u8) -> Result<Option<T>, String>;
+
+fn sample_grid<T>(
+    store: &mut RegionStore,
+    min_x: i64,
+    max_x: i64,
+    min_z: i64,
+    max_z: i64,
+    stride: i64,
+    read: ColumnReader<T>,
+) -> Result<(Vec<T>, usize), String> {
     if stride < 1 {
         return Err("stride must be at least 1".to_string());
     }
@@ -378,7 +611,7 @@ pub fn sample_columns(
             match store.chunk_root(chunk_x, chunk_z) {
                 Ok(None) => missing_chunks += 1,
                 Ok(Some(root)) => {
-                    let column = column_truth(&root, chunk_x, chunk_z, lx, lz)
+                    let column = (read)(&root, chunk_x, chunk_z, lx, lz)
                         .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}) at ({x}, {z}): {e}"))?;
                     if let Some(column) = column {
                         columns.push(column);
@@ -395,6 +628,25 @@ pub fn sample_columns(
 
 pub fn worksheet_columns() -> [(i64, i64); 6] {
     [(0, 0), (256, 0), (0, 256), (-256, 0), (0, -256), (512, 512)]
+}
+
+/// Read one absolute column's stored substance profile, or `None` when
+/// the chunk is not generated.
+pub fn read_profile(
+    store: &mut RegionStore,
+    x: i64,
+    z: i64,
+) -> Result<Option<ColumnProfile>, String> {
+    let chunk_x =
+        i32::try_from(x.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
+    let chunk_z =
+        i32::try_from(z.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
+    let lx = u8::try_from(x.rem_euclid(16)).expect("rem_euclid(16) fits u8");
+    let lz = u8::try_from(z.rem_euclid(16)).expect("rem_euclid(16) fits u8");
+    match store.chunk_root(chunk_x, chunk_z)? {
+        None => Ok(None),
+        Some(root) => column_profile(&root, chunk_x, chunk_z, lx, lz),
+    }
 }
 
 /// One requested column read: absolute coordinates plus the extracted
@@ -602,5 +854,133 @@ mod tests {
         assert!(report.mismatches.is_empty());
         assert_eq!(percent(2, 2), 100.0);
         assert_eq!(percent(0, 0), 0.0);
+    }
+
+    #[test]
+    fn categories_classify_air_family_and_fluids() {
+        assert_eq!(block_category("minecraft:cave_air"), Category::Air);
+        assert_eq!(block_category("minecraft:structure_void"), Category::Air);
+        assert_eq!(block_category("minecraft:water[level=3]"), Category::Fluid);
+        assert_eq!(
+            block_category("minecraft:deepslate_gold_ore"),
+            Category::Solid
+        );
+    }
+
+    fn solid_section(y: i32, block: &str) -> Tag {
+        compound(&[
+            ("Y", Tag::Byte(y as i8)),
+            (
+                "block_states",
+                compound(&[("palette", Tag::List(vec![palette_entry(block)]))]),
+            ),
+        ])
+    }
+
+    /// Same packed heightmap as `synthetic_chunk`: top block 75 over the
+    /// implicit -64 world floor.
+    fn heightmap_root(sections: Vec<Tag>) -> Tag {
+        let mut height_data = vec![0i64; 36];
+        let value = 140u64;
+        for i in 0..256 {
+            let bit = i * 9;
+            let long = bit / 64;
+            let off = bit % 64;
+            height_data[long] |= (value << off) as i64;
+            if off + 9 > 64 {
+                height_data[long + 1] |= (value >> (64 - off)) as i64;
+            }
+        }
+        compound(&[
+            (
+                "Heightmaps",
+                compound(&[("WORLD_SURFACE", Tag::LongArray(height_data))]),
+            ),
+            ("sections", Tag::List(sections)),
+        ])
+    }
+
+    #[test]
+    fn profiles_store_categories_with_air_gaps() {
+        let root = heightmap_root(vec![
+            solid_section(0, "minecraft:water"),
+            solid_section(4, "minecraft:stone"),
+        ]);
+        let profile = column_profile(&root, 0, 0, 3, 9).unwrap().expect("profile");
+        assert_eq!((profile.x, profile.z, profile.surface_y), (3, 9, 75));
+        assert_eq!(profile.min_y, 0);
+        assert_eq!(profile.categories.len(), 76);
+        assert_eq!(profile.categories[0], Category::Fluid);
+        assert_eq!(profile.categories[15], Category::Fluid);
+        // The unsaved 16..=63 span is empty: recorded as air.
+        assert_eq!(profile.categories[16], Category::Air);
+        assert_eq!(profile.categories[63], Category::Air);
+        assert_eq!(profile.categories[64], Category::Solid);
+        assert_eq!(profile.categories[75], Category::Solid);
+    }
+
+    #[derive(Clone, Copy)]
+    struct HalfAir;
+
+    impl ColumnSource for HalfAir {
+        fn column_height(&self, _x: i64, _z: i64) -> i64 {
+            0
+        }
+        fn column_biome(&self, _x: i64, _z: i64) -> String {
+            "test".to_owned()
+        }
+        fn column_substance(&self, _x: i64, _z: i64, y: i32) -> Option<Category> {
+            Some(if y < 32 {
+                Category::Solid
+            } else {
+                Category::Air
+            })
+        }
+    }
+
+    #[test]
+    fn substance_report_counts_positions_bands_and_residuals() {
+        let profile = ColumnProfile {
+            x: 0,
+            z: 0,
+            surface_y: 3,
+            min_y: 0,
+            categories: vec![
+                Category::Solid,
+                Category::Air,
+                Category::Air,
+                Category::Solid,
+            ],
+        };
+        // The legacy generator has no 3D answer: nothing is counted.
+        let pending = compare_substance([profile.clone()], &Generator::new(2026), 5);
+        assert_eq!((pending.columns, pending.positions), (1, 0));
+        let report = compare_substance([profile], &HalfAir, 5);
+        assert_eq!((report.positions, report.matches), (4, 2));
+        assert_eq!(report.fail_positions, vec![(0, 0, 1), (0, 0, 2)]);
+        assert_eq!((report.near_positions, report.near_matches), (4, 2));
+        assert_eq!(report.middle_positions, 0);
+        assert_eq!(report.deep_positions, 0);
+        assert_eq!(
+            report
+                .residuals
+                .get(&(Category::Air, Category::Solid))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            report
+                .residual_bands
+                .get(&((Category::Air, Category::Solid), 0))
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            report.marginals.get(&0),
+            Some(&BandStats {
+                vanilla: [2, 0, 2],
+                rustmc: [0, 0, 4],
+            })
+        );
     }
 }

@@ -177,3 +177,50 @@ Under the same policy, the 26.3 surface material system was consulted by decompi
 - Deliberately out of slice G scope (documented residuals): the hardcoded eroded-badlands pillar/roof and frozen-ocean iceberg column extensions inside the material system (their six extra noises were observed in the constructor but not implemented), and feature-driven top blocks (podzol, snow, water plants), which belong to T4.
 
 Post-implementation measurement against the owner's seed-2026 save (same 2,401-column sample; aggregate numbers only): with the data-driven surface-rule tree evaluating the topmost solid row of every height-matched column, top-block identity matched 2,200 of 2,305 columns — **95.44%**, above the ≥95% T2 gate — while exact height (96.00%) and biome (99.92%) were unchanged. Five of the six published worksheet points reproduce their stored top block; the sixth is a podzol column under old-growth pines (a feature cap, not a surface rule). The 105 residuals are dominated by that same class: 65 podzol-topped columns the rule tree correctly leaves as grass/coarse dirt, plus shore and sub-fluid bookkeeping swaps (water↔grass, 9), noise-patch edges (gravel/sand/mossy/coarse, ~25), and a long tail of stone-type flips. The podzol, dirt_path, and mossy_cobblestone classes all sit at feature-decorated positions and are capped until T4. No new dependencies were needed; the slice uses only `std` inside `rustmc-server` and `serde_json` already locked for the density loader.
+
+### Session 8 (1 October 2026): 3D substance baseline and carver data census (T3 slice H, measurement half)
+
+This half-slice consulted no new vanilla runtime code; it adds measurement
+tooling and records what the existing pipeline already reproduces. Facts:
+
+- Cave shapes in 26.3 are composed inside the density graph: the operator's
+  datapack resolves `minecraft:overworld/final_density` through
+  `overworld/caves/{entrances,noodle,pillars,spaghetti_2d,spaghetti_2d_thickness_modulator,spaghetti_roughness_function}`
+  and the `cave_layer`/`cave_cheese`/`base_3d_noise` terms, so the graph
+  compiled for T1 already samples them. There is no `caves` section in the
+  26.3 `noise_settings` document (router slots are exactly
+  `chunk_surface_level`, `continents`, `depth`, `erosion`, `final_density`,
+  `ridges`, `temperature`, `vegetation`).
+- The remaining cave machinery is the registry carver runtime: biome
+  documents list `carvers` `["minecraft:cave", "minecraft:cave_extra_underground", "minecraft:canyon"]`,
+  and the `worldgen/carver` registry documents record (structure facts):
+  the cave type starts at y from `above_bottom 8` to `absolute 180` with a
+  `very_biased_to_bottom` count 0..14, probability 0.15 (0.07 for the
+  extra-underground variant, capped at y 47), thickness trapezoid 0..3
+  plateau 1, floor level uniform −1.0..−0.4, horizontal radius ×0.7..1.4,
+  vertical ×0.8..1.3, room-vertical ×0.1..0.9, with the
+  `weird_thickness_bias` flag; the canyon type runs y 10..67, probability
+  0.01, with shape parameters (thickness trapezoid 0..6 plateau 2,
+  `y_scale` 3.0, `width_smoothness` 3, vertical rotation ±0.125, distance
+  and horizontal-radius factors 0.75..1.0).
+- Baseline (owner's seed-2026 save, same 2,401-column stride-16 grid,
+  categories air-family/fluid/solid, `vanilla_oracle substance`):
+  **96.44% exact over 338,217 sampled positions** (near-surface band
+  96.76%, 8–63 below surface 97.15%, deeper 95.89%). Residuals: 9,186
+  vanilla-air/ours-solid, 1,771 vanilla-fluid/ours-solid, 842
+  ours-air-bonus, plus small fluid bookkeeping tails.
+- Attribution by probing failing columns (e.g. (−256, −256)): vanilla air
+  occurs where our `final_density` sample is clearly positive (+0.019 to
+  +0.13), and the disagreement bands are deepest-heavy where carver counts
+  are biased (`very_biased_to_bottom`), so the gap is the registry carvers
+  carving through solid density, not a density-graph divergence. The
+  bonus-carve tail (842) sits at cheese-graph sign boundaries and is
+  attributed to the documented `f32` noise approximations.
+- The oracle gained a per-column substance profile reader (sections decode
+  palettes per Y; unsaved spans are air), a category classifier for the
+  air family (`air`, `cave_air`, `void_air`, `structure_void`) and the two
+  fluids, `compare_substance` with depth bands, per-band marginals, and a
+  capped fail-position dump, and single-column `column` and `substance`
+  CLI modes. `VanillaGenerator` exposes `raw_density`/`substance`.
+  No new dependencies; no generator behavior changed.
+
