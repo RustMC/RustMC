@@ -57,3 +57,18 @@ The `vanilla_oracle` tool reads Anvil region files from single-player saves the 
 Per the owner's 30 September 2026 direction, ADR-0014 was amended so terrain work may read deobfuscated vanilla or PaperMC generation code **for understanding only**. Nothing consulted enters git: no files, code fragments, or vendor references in tracked content. Each session appends an entry here: what was read, what was learned, and how RustMC implemented it independently.
 
 - 2026-09-30 — Policy amendment recorded; no code consulted yet. The T0 oracle results and the experimental noise field (both pre-amendment, black-box) are documented above and in `docs/research/`.
+
+## TOML 1.1 dependency review (2 October 2026)
+
+The configuration parser upgrade to `toml 1.1.6+spec-1.1.0` changes the
+whole-document entry point: RustMC now uses `toml::from_str` in its two TOML
+document readers. `toml::Value::from_str` in this release parses one value,
+which broke valid configuration and registry manifests until corrected.
+
+The updated lockfile contains `serde_spanned 1.1.1`, `toml_datetime
+1.1.1+spec-1.1.0`, `toml_parser 1.1.3+spec-1.1.0`, `toml_writer
+1.1.2+spec-1.1.0`, and `winnow 1.0.4`. Their declared licenses are `MIT OR
+Apache-2.0` except `winnow`, which declares `MIT`; each has a compatible
+option under RustMC's Apache-2.0 policy. `toml_edit` and `toml_write` leave
+the lockfile. The locked license gate checks these declarations, while a
+binary release still needs the required third-party notice review.
