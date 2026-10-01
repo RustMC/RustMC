@@ -7,6 +7,7 @@
 //! operator-provisioned at runtime and are never committed to this repository.
 
 pub mod aquifer;
+pub mod biome;
 pub mod density;
 pub mod generator;
 pub mod noise;

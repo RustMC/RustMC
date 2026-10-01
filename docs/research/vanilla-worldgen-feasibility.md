@@ -200,6 +200,29 @@ placement and surface rules — the router already exposes the
 continents/erosion/depth/ridges/temperature/vegetation fields it needs) is
 the next workstream.
 
+## T2 biome placement passed (1 October 2026, slice F)
+
+The chunk biome is now resolved the way the game resolves it: the six
+router densities sampled per 4-block quart cell, quantized to fixed-point
+integers, and matched against the preset's parameter table by minimum
+squared-distance fitness (`vanilla::biome`). The table itself is code-side
+in 26.3, so the owner provisions it as a numeric capture beside the local
+data root; the repository keeps only the loader and the format (session 6
+in `docs/PROVENANCE.md`). Measured against the same 2,401-column seed-2026
+sample:
+
+- **99.92% biome match (2,399 / 2,401)** — far above the ≥95% tier gate —
+  with all six published worksheet biomes reproducing exactly. The two
+  residuals sit at blender-affected borders, the known structural
+  exception of a structure-free pipeline.
+- Exact-height match is unchanged at 96.00%; biome lookup rides the same
+  surface scan and did not regress timing materially.
+
+The remaining T2 half is surface rules: 26.3 materializes top blocks from
+`worldgen/material_rule`, `material_condition`, and `block_state_provider`
+datapack graphs evaluated over the column — a data-driven loader and
+evaluator (slice G), the next workstream.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

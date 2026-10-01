@@ -61,9 +61,13 @@ impl ColumnSource for VanillaGenerator {
         };
         i64::from(self.surface_height(x, z))
     }
-    fn column_biome(&self, _x: i64, _z: i64) -> String {
-        // Biome placement is tier T2; report a never-matching placeholder.
-        "<pending-T2>".to_owned()
+    fn column_biome(&self, x: i64, z: i64) -> String {
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return "<unknown>".to_owned();
+        };
+        let surface_y = self.surface_height(x, z);
+        self.biome(x, z, surface_y)
+            .unwrap_or_else(|| "<unknown>".to_owned())
     }
 }
 

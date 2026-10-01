@@ -24,15 +24,19 @@
 use std::path::Path;
 
 use crate::vanilla::aquifer::{Aquifer, GlobalFluid, NoiseBasedAquifer, Substance};
+use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
 use crate::vanilla::worldgen::{NoiseRouter, WorldgenData, WorldgenError};
 
-/// One dimension's column-height source, built from operator-provisioned
-/// data (never committed) and a world seed. The compiled router owns its
-/// graph, so the loaded pack and engine may be dropped once wired.
+/// One dimension's column-height and biome source, built from
+/// operator-provisioned data (never committed) and a world seed. The
+/// compiled router owns its graph, so the loaded pack and engine may be
+/// dropped once wired.
 pub struct VanillaGenerator {
     router: NoiseRouter,
     max_y: i32,
     aquifer: Aquifer,
+    climate: ClimateSampler,
+    placement: Option<BiomePlacement>,
 }
 
 impl VanillaGenerator {
@@ -63,11 +67,31 @@ impl VanillaGenerator {
             }
             None => Aquifer::Disabled(fluids),
         };
+        let climate = ClimateSampler {
+            temperature: router.temperature.clone(),
+            vegetation: router.vegetation.clone(),
+            continents: router.continents.clone(),
+            erosion: router.erosion.clone(),
+            depth: router.depth.clone(),
+            ridges: router.ridges.clone(),
+        };
+        let preset = settings_id.rsplit(':').next().unwrap_or(settings_id);
+        let placement = BiomePlacement::load(data_root, preset);
         Ok(Self {
             router,
             max_y,
             aquifer,
+            climate,
+            placement,
         })
+    }
+
+    /// Biome identifier for the column at `(x, z)`, resolved from the
+    /// climate target at the surface cell. `None` when the operator has
+    /// not provisioned a placement table for this preset.
+    pub fn biome(&self, x: i32, z: i32, surface_y: i32) -> Option<String> {
+        let placement = self.placement.as_ref()?;
+        self.climate.biome(placement, x, surface_y, z)
     }
 
     /// Absolute Y of the top written block: terrain, or the aquifer/sea
@@ -265,5 +289,88 @@ mod tests {
         assert_eq!(y, 127);
         assert_eq!(substance, Substance::Solid);
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The generator resolves biomes through the provisioned placement
+    /// table when one exists beside the data root and reports `None`
+    /// otherwise. Climate slots are constants here so the expected
+    /// nearest entry is fully determined by the self-authored table.
+    #[test]
+    fn biome_requires_a_provisioned_placement_table() {
+        let root = scratch_root("biome");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/solid.json"),
+            r#"{"type": "constant", "value": 1.0}"#,
+        );
+        let settings_path = worldgen.join("noise_settings/biome_dimension.json");
+        let write_settings = |temperature: &str| {
+            write(
+                &settings_path,
+                &format!(
+                    r#"{{
+                "noise": {{"min_y": 0, "height": 128}},
+                "sea_level": 63,
+                "noise_router": {{
+                    "final_density": "testns:solid",
+                    "continents": 0.0,
+                    "erosion": 0.0,
+                    "depth": 0.0,
+                    "ridges": 0.0,
+                    "temperature": {temperature},
+                    "vegetation": 0.0
+                }}
+            }}"#
+                ),
+            );
+        };
+        write_settings("0.5");
+        // Without a placement file the same dimension reports no biome.
+        let bare = VanillaGenerator::new(&root, 2026, "testns:biome_dimension").expect("bare");
+        assert!(bare.placement.is_none());
+        assert_eq!(bare.biome(0, 0, 64), None);
+
+        let psv = root.join("rustmc/biome_placement/biome_dimension.psv");
+        write(
+            &psv,
+            concat!(
+                "0|minecraft:plains|t=[-2000-2000]|h=[-10000-10000]|c=[-10000-10000]|",
+                "e=[-10000-10000]|d=[-10000-10000]|w=[-10000-10000]|off=0\n",
+                "1|minecraft:desert|t=[3000-10000]|h=[-10000-10000]|c=[-10000-10000]|",
+                "e=[-10000-10000]|d=[-10000-10000]|w=[-10000-10000]|off=0\n",
+            ),
+        );
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:biome_dimension").expect("generator");
+        assert_eq!(
+            generator.biome(0, 0, 64).as_deref(),
+            Some("minecraft:desert"),
+            "temperature 0.5 quantizes to 5000, inside the desert interval"
+        );
+        // A colder router selects the other entry instead.
+        write_settings("-1.0");
+        let cold = VanillaGenerator::new(&root, 2026, "testns:biome_dimension").expect("cold");
+        assert_eq!(cold.biome(0, 0, 64).as_deref(), Some("minecraft:plains"));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Requires the operator-provisioned 26.3 worldgen data plus the
+    /// captured overworld placement table (see `docs/PROVENANCE.md`).
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_resolves_overworld_biomes_from_provisioned_table() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let placement = generator.placement.as_ref().expect("provisioned psv table");
+        assert!(placement.len() > 1000, "captured table should be large");
+        let surface_y = generator.surface_height(0, 0);
+        let biome = generator.biome(0, 0, surface_y).expect("biome at origin");
+        assert!(
+            biome.starts_with("minecraft:"),
+            "expected a namespaced biome, got {biome}"
+        );
     }
 }
