@@ -35,6 +35,12 @@ pub struct MatchReport {
     pub columns: usize,
     pub height_matches: usize,
     pub biome_matches: usize,
+    /// Top-block matches restricted to height-matched columns (the
+    /// documented T2 gate population).
+    pub topblock_matches: usize,
+    /// Residual top-block disagreements as `(vanilla, rustmc)` base-id
+    /// pair counts, for attributing the gap without dumping columns.
+    pub topblock_residuals: std::collections::BTreeMap<(String, String), usize>,
     pub mismatches: Vec<ColumnVerdict>,
 }
 
@@ -43,6 +49,18 @@ pub struct MatchReport {
 pub trait ColumnSource {
     fn column_height(&self, x: i64, z: i64) -> i64;
     fn column_biome(&self, x: i64, z: i64) -> String;
+    /// Base block id at the column surface. Sources without surface rules
+    /// answer with the pending marker so the metric is never inflated.
+    fn column_top_block(&self, _x: i64, _z: i64) -> String {
+        "<pending-T2>".to_owned()
+    }
+}
+
+/// The block id without its property suffix (`minecraft:k[v=1]` ->
+/// `minecraft:k`); surface rules and result states are recorded by base
+/// id while saved palettes may carry properties.
+pub fn base_block_name(name: &str) -> &str {
+    name.split_once('[').map_or(name, |(base, _)| base)
 }
 
 impl ColumnSource for Generator {
@@ -69,6 +87,13 @@ impl ColumnSource for VanillaGenerator {
         self.biome(x, z, surface_y)
             .unwrap_or_else(|| "<unknown>".to_owned())
     }
+    fn column_top_block(&self, x: i64, z: i64) -> String {
+        let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) else {
+            return "<unknown>".to_owned();
+        };
+        self.top_block(x, z)
+            .unwrap_or_else(|| "<unknown>".to_owned())
+    }
 }
 
 pub fn compare_columns(
@@ -85,6 +110,19 @@ pub fn compare_columns(
         let biome_ok = column.biome.as_deref() == Some(rustmc_biome.as_str());
         report.height_matches += usize::from(height_ok);
         report.biome_matches += usize::from(biome_ok);
+        if height_ok && let Some(vanilla_top) = column.top_block.as_deref() {
+            let rustmc_top = source.column_top_block(column.x, column.z);
+            let vanilla_base = base_block_name(vanilla_top).to_owned();
+            let rustmc_base = base_block_name(&rustmc_top).to_owned();
+            let matched = vanilla_base == rustmc_base;
+            report.topblock_matches += usize::from(matched);
+            if !matched {
+                *report
+                    .topblock_residuals
+                    .entry((vanilla_base, rustmc_base))
+                    .or_default() += 1;
+            }
+        }
         // The capped detail list tracks height gaps only; biome misses are
         // tier T2 work and would otherwise drown the diagnostic (the
         // aggregate biome count above still reports them).

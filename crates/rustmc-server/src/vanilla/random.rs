@@ -146,6 +146,12 @@ impl RandomSource {
         self.next_bits(53) as f64 * DOUBLE_UNIT
     }
 
+    /// 26.3 `nextBoolean()` is `(nextLong() & 1) != 0`: the low bit of the
+    /// next long, not a one-bit draw.
+    pub fn next_bool(&mut self) -> bool {
+        self.next_long() & 1 != 0
+    }
+
     pub fn next_float(&mut self) -> f32 {
         self.next_bits(24) as f32 * FLOAT_UNIT
     }

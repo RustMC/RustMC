@@ -1376,6 +1376,13 @@ impl NoiseEngine {
         self.positional
     }
 
+    /// Raw noise for a datapack `worldgen/noise` identifier, seeded from
+    /// the world factory exactly as the documented `getOrCreateNoise`
+    /// caching does. Surface rules sample these directly.
+    pub fn noise_stack(&self, id: &str) -> Result<Rc<NoiseStack>, DensityError> {
+        self.stack(&id.to_owned())
+    }
+
     fn stack(&self, id: &Id) -> Result<Rc<NoiseStack>, DensityError> {
         if let Some(stack) = self.stacks.borrow().get(id) {
             return Ok(Rc::clone(stack));

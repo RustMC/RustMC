@@ -71,7 +71,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
             let points = oracle::worksheet_columns();
             println!(
-                "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome"
+                "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome,rustmc_top_block"
             );
             let source = build_source(seed, args.get(3), args.get(4))?;
             for (x, z, result) in oracle::read_columns(&mut store, &points)? {
@@ -84,9 +84,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     ),
                 };
                 println!(
-                    "{x},{z},{sy},{tb},{bi},{},{}",
+                    "{x},{z},{sy},{tb},{bi},{},{},{}",
                     source.column_height(x, z),
-                    source.column_biome(x, z)
+                    source.column_biome(x, z),
+                    source.column_top_block(x, z)
                 );
             }
         }
@@ -115,6 +116,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 report.biome_matches,
                 oracle::percent(report.biome_matches, report.columns)
             );
+            println!(
+                "topblock_on_height_matched={} ({:.2}%)",
+                report.topblock_matches,
+                oracle::percent(report.topblock_matches, report.height_matches)
+            );
+            let mut pairs: Vec<_> = report.topblock_residuals.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for ((vanilla, rustmc), count) in pairs.iter().take(15) {
+                println!("topblock_residual {count}x vanilla={vanilla} rustmc={rustmc}");
+            }
             println!("x,z,vanilla_surface_y,vanilla_biome,rustmc_height,rustmc_biome");
             for m in &report.mismatches {
                 println!(

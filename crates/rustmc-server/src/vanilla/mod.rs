@@ -12,4 +12,5 @@ pub mod density;
 pub mod generator;
 pub mod noise;
 pub mod random;
+pub mod surface;
 pub mod worldgen;

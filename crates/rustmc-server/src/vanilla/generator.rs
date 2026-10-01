@@ -23,20 +23,27 @@
 
 use std::path::Path;
 
-use crate::vanilla::aquifer::{Aquifer, GlobalFluid, NoiseBasedAquifer, Substance};
+use crate::vanilla::aquifer::{Aquifer, Fluid, GlobalFluid, NoiseBasedAquifer, Substance};
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
+use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
 use crate::vanilla::worldgen::{NoiseRouter, WorldgenData, WorldgenError};
 
-/// One dimension's column-height and biome source, built from
+/// `DimensionType.WAY_BELOW_MIN_Y`: the descent ceiling sentinel when the
+/// column is solid all the way to the floor (recorded in `PROVENANCE.md`).
+const WAY_BELOW_MIN_Y: i32 = -32512;
+
+/// One dimension's column-height, biome, and top-block source, built from
 /// operator-provisioned data (never committed) and a world seed. The
-/// compiled router owns its graph, so the loaded pack and engine may be
-/// dropped once wired.
+/// compiled router owns its graph, and the surface program owns every
+/// noise stack and random factory it needs, so the engine is used only
+/// while wiring.
 pub struct VanillaGenerator {
     router: NoiseRouter,
     max_y: i32,
     aquifer: Aquifer,
     climate: ClimateSampler,
     placement: Option<BiomePlacement>,
+    surface: Option<SurfaceRules>,
 }
 
 impl VanillaGenerator {
@@ -77,12 +84,21 @@ impl VanillaGenerator {
         };
         let preset = settings_id.rsplit(':').next().unwrap_or(settings_id);
         let placement = BiomePlacement::load(data_root, preset);
+        // The surface program compiles against the still-borrowed engine
+        // and registry; the result owns everything it needs.
+        let surface = match router.material_rule.clone() {
+            Some(root_id) => Some(SurfaceRules::compile(
+                &data, &engine, &registry, &router, &root_id,
+            )?),
+            None => None,
+        };
         Ok(Self {
             router,
             max_y,
             aquifer,
             climate,
             placement,
+            surface,
         })
     }
 
@@ -92,6 +108,57 @@ impl VanillaGenerator {
     pub fn biome(&self, x: i32, z: i32, surface_y: i32) -> Option<String> {
         let placement = self.placement.as_ref()?;
         self.climate.biome(placement, x, surface_y, z)
+    }
+
+    /// The block id left at the column's highest non-air position by the
+    /// dimension's surface rules. Fluid tops report the dimension fluid;
+    /// a solid top that matches no rule keeps the filler default block
+    /// (the settings `default_block`, stone in the overworld). `None`
+    /// when the dimension has no material rules or the column is empty.
+    pub fn top_block(&self, x: i32, z: i32) -> Option<String> {
+        let rules = self.surface.as_ref()?;
+        let (top_y, substance) = self.surface(x, z)?;
+        match substance {
+            Substance::Air => None,
+            Substance::Fluid(fluid) => Some(
+                match fluid {
+                    Fluid::Lava => "minecraft:lava",
+                    Fluid::Water => "minecraft:water",
+                }
+                .to_owned(),
+            ),
+            Substance::Solid => {
+                // The documented descent reaches the top solid with a
+                // stone depth of one, no water column above, and the
+                // below-depth from the first non-solid position down.
+                let density = &self.router.final_density;
+                let mut ceiling = WAY_BELOW_MIN_Y;
+                for lookahead in (self.router.min_y..top_y).rev() {
+                    let below =
+                        self.aquifer
+                            .substance(x, lookahead, z, density.sample(x, lookahead, z));
+                    if below != Substance::Solid {
+                        ceiling = lookahead + 1;
+                        break;
+                    }
+                }
+                let stone_below = top_y - ceiling + 1;
+                let mut ctx = SurfaceContext::new(
+                    rules,
+                    self.router.chunk_surface_level.as_ref(),
+                    x,
+                    z,
+                    |hx, hz| self.surface_height(hx, hz),
+                    |bx, by, bz| self.biome(bx, bz, by),
+                );
+                ctx.set_y(1, stone_below, None, top_y);
+                Some(
+                    rules
+                        .apply(&mut ctx)
+                        .unwrap_or_else(|| self.router.default_block.clone()),
+                )
+            }
+        }
     }
 
     /// Absolute Y of the top written block: terrain, or the aquifer/sea
@@ -372,5 +439,97 @@ mod tests {
             biome.starts_with("minecraft:"),
             "expected a namespaced biome, got {biome}"
         );
+    }
+
+    /// Requires the operator-provisioned 26.3 worldgen data. The full
+    /// overworld rule tree must compile and produce a namespaced block
+    /// id for every sampled surface column.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_top_blocks_resolve_from_provisioned_surface_rules() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        assert!(generator.surface.is_some(), "overworld has material rules");
+        for (x, z) in [(0, 0), (32, -17), (-128, 96), (1000, 1000)] {
+            let top = generator
+                .top_block(x, z)
+                .unwrap_or_else(|| panic!("column ({x}, {z}) has no top block at all"));
+            assert!(
+                top.starts_with("minecraft:"),
+                "expected a namespaced top block, got {top}"
+            );
+        }
+    }
+
+    /// End-to-end `top_block` on a fabricated pack: a rule that always
+    /// matches replaces the filler block, and a rule gated on a biome
+    /// the column cannot resolve falls back to the settings
+    /// `default_block`.
+    #[test]
+    fn top_block_applies_material_rules_or_keeps_default_block() {
+        let root = scratch_root("topblock");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/solid.json"),
+            r#"{"type": "constant", "value": 1.0}"#,
+        );
+        let zero_noise = r#"{"base_amplitude": 0.0, "base_octave": 4}"#;
+        let mc = root.join("data/minecraft/worldgen/noise");
+        for name in ["surface", "surface_secondary", "clay_bands_offset"] {
+            write(&mc.join(format!("{name}.json")), zero_noise);
+        }
+        write(
+            &worldgen.join("material_rule/always.json"),
+            r#"{"type": "block", "result_state": "minecraft:sandstone"}"#,
+        );
+        write(
+            &worldgen.join("material_rule/never.json"),
+            r#"{"type": "condition",
+                "if_true": {"type": "biome", "biome_is": ["minecraft:badlands"]},
+                "then_run": {"type": "block", "result_state": "minecraft:red_sand"}}"#,
+        );
+        let settings = |id: &str, material_rule: &str| {
+            write(
+                &worldgen.join(format!("noise_settings/{id}.json")),
+                &format!(
+                    r#"{{
+                "noise": {{"min_y": 0, "height": 128}},
+                "sea_level": 63,
+                "default_block": "minecraft:granite",
+                "noise_router": {{
+                    "final_density": "testns:solid",
+                    "continents": 0.0,
+                    "erosion": 0.0,
+                    "depth": 0.0,
+                    "ridges": 0.0,
+                    "temperature": 0.0,
+                    "vegetation": 0.0
+                }},
+                "material_rule": "{material_rule}"
+            }}"#
+                ),
+            );
+        };
+        settings("hit", "testns:always");
+        settings("miss", "testns:never");
+        // A fully solid constant-density column tops out at the ceiling.
+        let hitting = VanillaGenerator::new(&root, 2026, "testns:hit").expect("hit generator");
+        assert_eq!(hitting.surface_height(4, 7), 127);
+        assert_eq!(
+            hitting.top_block(4, 7).as_deref(),
+            Some("minecraft:sandstone"),
+            "an unconditional rule recolors the topmost solid"
+        );
+        // No placement table: the biome-gated rule never holds and the
+        // column keeps the filler default block.
+        let missing = VanillaGenerator::new(&root, 2026, "testns:miss").expect("miss generator");
+        assert_eq!(
+            missing.top_block(4, 7).as_deref(),
+            Some("minecraft:granite")
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 }

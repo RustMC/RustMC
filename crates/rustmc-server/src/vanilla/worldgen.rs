@@ -9,7 +9,9 @@
 //! The layout recognized here is the documented datapack structure:
 //! `data/<namespace>/worldgen/noise/<name>.json`,
 //! `data/<namespace>/worldgen/density_function/<path>.json` (nested
-//! subdirectories are part of the identifier), and
+//! subdirectories are part of the identifier),
+//! `data/<namespace>/worldgen/material_rule/<path>.json`,
+//! `data/<namespace>/worldgen/material_condition/<path>.json`, and
 //! `data/<namespace>/worldgen/noise_settings/<name>.json`. Identifiers
 //! are `<namespace>:<path>`, matching the string references used inside
 //! density JSON and the `noise_router` section.
@@ -51,16 +53,21 @@ impl std::error::Error for WorldgenError {}
 pub struct WorldgenData {
     noise: HashMap<String, NoiseParameters>,
     density_documents: HashMap<String, Value>,
+    material_rules: HashMap<String, Value>,
+    material_conditions: HashMap<String, Value>,
     noise_settings: HashMap<String, Value>,
 }
 
 impl WorldgenData {
-    /// Loads every `worldgen/noise`, `worldgen/density_function`, and
+    /// Loads every `worldgen/noise`, `worldgen/density_function`,
+    /// `worldgen/material_rule`, `worldgen/material_condition`, and
     /// `worldgen/noise_settings` JSON file under `root/data`.
     pub fn load(root: &Path) -> Result<Self, WorldgenError> {
         let mut data = Self {
             noise: HashMap::new(),
             density_documents: HashMap::new(),
+            material_rules: HashMap::new(),
+            material_conditions: HashMap::new(),
             noise_settings: HashMap::new(),
         };
         let data_dir = root.join("data");
@@ -94,6 +101,18 @@ impl WorldgenData {
                 );
                 data.density_documents.insert(id, read_json(&entry)?);
             }
+            for registry in ["material_rule", "material_condition"] {
+                let documents = if registry == "material_rule" {
+                    &mut data.material_rules
+                } else {
+                    &mut data.material_conditions
+                };
+                let base = worldgen.join(registry);
+                for entry in walk_json(&base)? {
+                    let id = format!("{ns}:{}", relative_stem(&entry, &base));
+                    documents.insert(id, read_json(&entry)?);
+                }
+            }
             for entry in walk_json(&worldgen.join("noise_settings"))? {
                 let id = format!("{ns}:{}", stem(&entry));
                 data.noise_settings.insert(id, read_json(&entry)?);
@@ -108,6 +127,14 @@ impl WorldgenData {
 
     pub fn density_documents(&self) -> &HashMap<String, Value> {
         &self.density_documents
+    }
+
+    pub fn material_rule_documents(&self) -> &HashMap<String, Value> {
+        &self.material_rules
+    }
+
+    pub fn material_condition_documents(&self) -> &HashMap<String, Value> {
+        &self.material_conditions
     }
 
     pub fn noise_settings(&self, id: &str) -> Option<&Value> {
@@ -149,6 +176,10 @@ pub struct NoiseRouter {
     pub min_y: i32,
     pub height: i32,
     pub sea_level: i32,
+    /// The settings `default_block` id: what the chunk filler writes at
+    /// solid positions before material rules run (the initial-fill block
+    /// the surface rules replace).
+    pub default_block: String,
     pub default_fluid: Fluid,
     pub final_density: Density,
     pub continents: Density,
@@ -158,6 +189,9 @@ pub struct NoiseRouter {
     pub temperature: Density,
     pub vegetation: Density,
     pub chunk_surface_level: Option<Density>,
+    /// The `material_rule` registry reference of the settings document,
+    /// when present: the root of the surface/underground rule tree.
+    pub material_rule: Option<String>,
     /// The compiled `aquifers` section when the settings provide one.
     pub aquifers: Option<AquiferConfig>,
 }
@@ -202,6 +236,11 @@ impl NoiseRouter {
             )));
         }
         let sea_level = required_int(top, "sea_level", settings_id)?;
+        let default_block = top
+            .get("default_block")
+            .and_then(Value::as_str)
+            .unwrap_or("minecraft:stone")
+            .to_owned();
         let default_fluid = top
             .get("default_fluid")
             .map(|value| {
@@ -258,10 +297,19 @@ impl NoiseRouter {
                 })
             }
         };
+        let material_rule = top
+            .get("material_rule")
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{settings_id}: material_rule not a string"))
+                })
+            })
+            .transpose()?;
         Ok(Self {
             min_y,
             height,
             sea_level,
+            default_block,
             default_fluid,
             final_density: compile("final_density")?,
             continents: compile("continents")?,
@@ -271,6 +319,7 @@ impl NoiseRouter {
             temperature: compile("temperature")?,
             vegetation: compile("vegetation")?,
             chunk_surface_level: compile_optional("chunk_surface_level")?,
+            material_rule,
             aquifers,
         })
     }

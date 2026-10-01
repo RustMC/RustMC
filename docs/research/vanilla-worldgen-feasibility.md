@@ -223,6 +223,35 @@ The remaining T2 half is surface rules: 26.3 materializes top blocks from
 datapack graphs evaluated over the column — a data-driven loader and
 evaluator (slice G), the next workstream.
 
+## T2 top-block gate passed (1 October 2026, slice G)
+
+The surface material rules are now a data-driven loader and evaluator
+(`vanilla::surface`): the `material_rule`/`material_condition` trees from the
+operator-provisioned datapack compile into an owned rule program — sequence,
+condition, block, bandlands (with the deterministic badlands band table),
+and ore-vein rules, plus the ten overworld condition types with the
+documented lazy per-XZ/per-Y context and cache invalidation. The oracle
+evaluates the tree at the topmost solid row of every height-matched column
+(session 7 in `docs/PROVENANCE.md`). Measured against the same
+2,401-column seed-2026 sample:
+
+- **95.44% top-block match (2,200 / 2,305 height-matched columns)** — above
+  the ≥95% tier gate — with exact height unchanged at 96.00% and biome at
+  99.92%. Five of the six published worksheet top blocks reproduce exactly.
+- Residual attribution: 65 columns are podzol-topped under old-growth pines
+  and 3 more carry feature caps of the same family — feature-driven blocks
+  the surface tree correctly leaves as grass/coarse dirt, capped until T4;
+  9 are shore/sub-fluid bookkeeping swaps; the rest are noise-patch edges
+  (gravel/sand/mossy/coarse) and isolated stone-type flips.
+- Documented unimplemented extensions: the hardcoded eroded-badlands
+  pillar/roof and frozen-ocean iceberg special cases inside the material
+  system; `block_state_provider` documents are not referenced by the
+  overworld tree and remain unimplemented until a dimension needs them.
+
+T2's exit gate is met on both halves. The staged plan continues with T3
+(carvers), after which feature placement (T4) closes the remaining
+surface-block residuals listed above.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the
