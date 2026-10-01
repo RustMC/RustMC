@@ -8,6 +8,7 @@
 
 pub mod aquifer;
 pub mod biome;
+pub mod carver;
 pub mod density;
 pub mod generator;
 pub mod noise;

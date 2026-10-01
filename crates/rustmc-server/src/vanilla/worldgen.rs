@@ -471,7 +471,7 @@ fn required_int(
 
 /// Recursively lists `*.json` files under `dir`; a missing directory
 /// simply yields nothing.
-fn walk_json(dir: &Path) -> Result<Vec<PathBuf>, WorldgenError> {
+pub(crate) fn walk_json(dir: &Path) -> Result<Vec<PathBuf>, WorldgenError> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -496,7 +496,7 @@ fn walk_json(dir: &Path) -> Result<Vec<PathBuf>, WorldgenError> {
     Ok(found)
 }
 
-fn read_dir_optional(path: &Path) -> Result<Option<std::fs::ReadDir>, WorldgenError> {
+pub(crate) fn read_dir_optional(path: &Path) -> Result<Option<std::fs::ReadDir>, WorldgenError> {
     match fs::read_dir(path) {
         Ok(entries) => Ok(Some(entries)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -504,13 +504,13 @@ fn read_dir_optional(path: &Path) -> Result<Option<std::fs::ReadDir>, WorldgenEr
     }
 }
 
-fn read_json(path: &Path) -> Result<Value, WorldgenError> {
+pub(crate) fn read_json(path: &Path) -> Result<Value, WorldgenError> {
     let text =
         fs::read_to_string(path).map_err(|error| WorldgenError::Io(path.to_path_buf(), error))?;
     serde_json::from_str(&text).map_err(|error| WorldgenError::Json(path.to_path_buf(), error))
 }
 
-fn stem(path: &Path) -> String {
+pub(crate) fn stem(path: &Path) -> String {
     path.file_stem()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
 }

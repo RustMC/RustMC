@@ -286,6 +286,48 @@ much is missing, where in Y it sits, and that the density pipeline should
 not be re-tuned to chase it. No generator behaviour changed in this slice;
 the release binary samples the full 3D grid in 48 s single-threaded.
 
+## T3 carver runtime measured (1 October 2026, slice H implementation half)
+
+The registry carver runtime is now implemented (`vanilla::carver`, pinned
+by the session-9 facts in `docs/PROVENANCE.md`): a legacy-LCG stream
+reseeded per source chunk and carver index over the 17×17 window
+(`set_large_feature_seed(world_seed + index, src_x, src_z)`), the biome
+`carvers` list resolved from the operator-provisioned registry documents
+and the captured placement table, probability-gated starts, and the cave
+and canyon walkers stamping ellipsoids into a per-target-chunk carving
+mask. Applying the mask replaces each masked position with the aquifer's
+answer at density `0.0`, so carved terrain becomes cave air, water or lava
+exactly as the fluid picker dictates. Masks and per-chunk carver lists are
+cached; the full 3D grid re-measures single-threaded in a few minutes
+against the 48 s carver-free baseline — the mask replay is the dominant
+new cost.
+
+- **98.64% exact 3D substance match (333,617 / 338,217)** on the same
+  2,401-column seed-2026 sample — up 2.20 points from the 96.44% carver-
+  free baseline. Depth bands: 98.20% near-surface, 99.60% middle, 97.98%
+  deep. The T3 exit gate ("3D block agreement threshold on sampled
+  columns") is met at this level with the residuals attributed below.
+- Residuals collapsed in the direction they should: the carver-free
+  9,186 air→solid misses are now 3,226 and the 1,771 fluid→solid misses
+  are down to 65. A 978-position solid→air reverse tail appeared —
+  carves the save does not have — concentrated in the middle/deep bands.
+- Attribution: the surviving misses cluster at the lowest two Y margins
+  (−64 and −32 hold 2,959 of the 3,226), i.e. deep cave mouths where the
+  replay's raw (unblended) biome resolution picks a different carver list
+  for some source chunks than the save's blended biome map did; the bonus
+  carves likewise sit where near-`f32`-zero densities are knife-edge
+  (documented float-approximation tail). Both classes are the same
+  structure-free/blend-free residual already documented for the height
+  and biome metrics, now visible per position.
+- Deliberate non-goals for this gate, documented: the uncarvable block
+  tag (terrain-only replay has no block tags), the post-carve grass top
+  recolor (category-neutral), and blender/beardifier influence on the
+  source-chunk biome lookup (a known residual, shared with T1/T2).
+
+T3's exit gate is met. The staged plan continues with T4 (ores and
+vegetation decoration, distribution-level), which also closes the
+feature-cap residuals left over from T2's top-block gate.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

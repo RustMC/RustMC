@@ -21,16 +21,25 @@
 //! the owner's seed-2026 save, the shortcut missed 7 of 2,401 columns;
 //! the exhaustive scan is therefore the default.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::vanilla::aquifer::{Aquifer, Fluid, GlobalFluid, NoiseBasedAquifer, Substance};
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
+use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
+use crate::vanilla::random::LegacyRandom;
 use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
 use crate::vanilla::worldgen::{NoiseRouter, WorldgenData, WorldgenError};
 
 /// `DimensionType.WAY_BELOW_MIN_Y`: the descent ceiling sentinel when the
 /// column is solid all the way to the floor (recorded in `PROVENANCE.md`).
 const WAY_BELOW_MIN_Y: i32 = -32512;
+
+/// A biome's resolved carver list, shared between the registry and the
+/// per-source-chunk cache.
+type ChunkCarvers = Rc<Vec<Rc<Carver>>>;
 
 /// One dimension's column-height, biome, and top-block source, built from
 /// operator-provisioned data (never committed) and a world seed. The
@@ -44,6 +53,13 @@ pub struct VanillaGenerator {
     climate: ClimateSampler,
     placement: Option<BiomePlacement>,
     surface: Option<SurfaceRules>,
+    world_seed: i64,
+    carvers: Option<Rc<CarverData>>,
+    carver_context: CarverContext,
+    /// Per-target-chunk carving masks, built lazily on first probe.
+    masks: RefCell<HashMap<(i32, i32), CarveMask>>,
+    /// Per-source-chunk biome carver lists, built lazily during replay.
+    chunk_carvers: RefCell<HashMap<(i32, i32), ChunkCarvers>>,
 }
 
 impl VanillaGenerator {
@@ -92,6 +108,16 @@ impl VanillaGenerator {
             )?),
             None => None,
         };
+        // Carver documents are optional: a pack without them (or without
+        // a placement table to select biome carver lists) leaves the
+        // replay inert and `substance` purely density-driven.
+        let carver_data = CarverData::load(data_root)?;
+        let carvers = (!carver_data.is_empty()).then_some(Rc::new(carver_data));
+        let carver_context = CarverContext {
+            min_y: router.min_y,
+            gen_depth: router.height,
+            sea_level: router.sea_level,
+        };
         Ok(Self {
             router,
             max_y,
@@ -99,6 +125,11 @@ impl VanillaGenerator {
             climate,
             placement,
             surface,
+            world_seed,
+            carvers,
+            carver_context,
+            masks: RefCell::new(HashMap::new()),
+            chunk_carvers: RefCell::new(HashMap::new()),
         })
     }
 
@@ -174,11 +205,89 @@ impl VanillaGenerator {
     }
 
     /// The filler substance at one absolute block position: the raw
-    /// `final_density` sample through the runtime aquifer. This is what
-    /// the 3D agreement metric compares against the save.
+    /// `final_density` sample through the runtime aquifer, replaced by
+    /// the aquifer's answer at density `0.0` where a registry carver
+    /// carved the position (the apply-carving-mask rewrite). This is
+    /// what the 3D agreement metric compares against the save.
     pub fn substance(&self, x: i32, y: i32, z: i32) -> Substance {
+        if self.carved(x, y, z) {
+            return self.aquifer.substance(x, y, z, 0.0);
+        }
         let density = self.raw_density(x, y, z);
         self.aquifer.substance(x, y, z, density)
+    }
+
+    /// Whether a registry carver stamped this absolute position in its
+    /// target chunk's carving mask. The mask is replayed once per chunk
+    /// over the 17×17 source window and cached.
+    pub fn carved(&self, x: i32, y: i32, z: i32) -> bool {
+        if self.carvers.is_none() || self.placement.is_none() {
+            return false;
+        }
+        let target = (x >> 4, z >> 4);
+        let (relative_x, relative_z) = (x - (target.0 << 4), z - (target.1 << 4));
+        {
+            let cached = self.masks.borrow();
+            if let Some(mask) = cached.get(&target) {
+                return mask.contains(relative_x, y, relative_z);
+            }
+        }
+        let mask = self.build_carve_mask(target);
+        let hit = mask.contains(relative_x, y, relative_z);
+        self.masks.borrow_mut().insert(target, mask);
+        hit
+    }
+
+    /// Replays the orchestration for one target chunk: one legacy stream
+    /// reseeded per source chunk and carver index over the 17×17 window,
+    /// the probability gate, then the walk stamping into the mask.
+    fn build_carve_mask(&self, target: (i32, i32)) -> CarveMask {
+        let mut mask = CarveMask::new(
+            self.router.min_y + 1,
+            self.router.min_y + self.router.height - 1 - 7,
+        );
+        let mut random = LegacyRandom::new(0);
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                let source = (target.0 + dx, target.1 + dz);
+                let Some(carvers) = self.carvers_for_chunk(source) else {
+                    continue;
+                };
+                for (index, carver) in carvers.iter().enumerate() {
+                    random.set_large_feature_seed(
+                        self.world_seed + index as i64,
+                        source.0,
+                        source.1,
+                    );
+                    if carver.is_start_chunk(&mut random) {
+                        carver.carve(&self.carver_context, &mut random, target, source, &mut mask);
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// The biome's flat carver list for one source chunk, cached; `None`
+    /// when the data root has no carvers or placement table, or the
+    /// biome resolves without a carver list.
+    fn carvers_for_chunk(&self, chunk: (i32, i32)) -> Option<ChunkCarvers> {
+        {
+            let cached = self.chunk_carvers.borrow();
+            if let Some(carvers) = cached.get(&chunk) {
+                return Some(Rc::clone(carvers));
+            }
+        }
+        let placement = self.placement.as_ref()?;
+        let data = self.carvers.as_ref()?;
+        let biome = self
+            .climate
+            .biome(placement, chunk.0 << 4, 0, chunk.1 << 4)?;
+        let carvers = data.carvers_for_biome(&biome)?;
+        self.chunk_carvers
+            .borrow_mut()
+            .insert(chunk, Rc::clone(&carvers));
+        Some(carvers)
     }
 
     /// The highest non-air position in the column and what fills it.

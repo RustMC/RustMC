@@ -224,3 +224,103 @@ tooling and records what the existing pipeline already reproduces. Facts:
   CLI modes. `VanillaGenerator` exposes `raw_density`/`substance`.
   No new dependencies; no generator behavior changed.
 
+
+### Session 9 (1 October 2026): carver runtime consultation (T3 slice H, implementation half)
+
+Deobfuscated 26.3 classes consulted knowledge-only (nothing recorded here
+enters the repository as code): `WorldCarver`, `CaveWorldCarver`,
+`CanyonWorldCarver`, `NoiseBasedChunkGenerator.generateCarvers/
+applyCarvingMask`, `CarvingMask`, `CarverOutput`, `WorldgenRandom`,
+`LegacyRandomSource`, `SingleThreadedRandomSource`, `BitRandomSource`,
+`XoroshiroRandomSource`, `RandomSource`, value providers (`UniformInt`,
+`VeryBiasedToBottomInt`, `UniformFloat`, `TrapezoidFloat`, `ConstantFloat`,
+`IntProviders`, `FloatProviders`), `UniformHeight`, `VerticalAnchor`,
+`WorldGenerationContext`, `BiomeGenerationSettings`, `Aquifer`, `Mth`.
+Numeric/structural facts:
+
+- Orchestration: one `WorldgenRandom` over a legacy source; for each of
+  the 17×17 source-chunk offsets (dx outer, dz inner, both −8..8) the
+  carver list is taken from the biome at the source chunk's corner quart
+  `(4·x, 0, 4·z)`; for carver index i: `setLargeFeatureSeed(worldSeed + i,
+  srcX, srcZ)` then `isStartChunk` (`nextFloat() <= probability`) gates
+  `carve`, which stamps into a per-target-chunk `CarvingMask` spanning
+  `minGenY + 1` to `minGenY + genDepth − 1 − 7` (overworld: −63..312).
+  `setLargeFeatureSeed`: `setSeed(s); a = nextLong(); b = nextLong();
+  setSeed(x·a ^ z·b ^ s)`. Set-bit visits run top-down per column; each
+  masked position not tagged uncarvable is replaced by
+  `aquifer.computeSubstance(x, y, z, 0.0)` (null is impossible at
+  density 0), so carved solids become aquifer air/water/lava; a sticky
+  grass flag can recolor the dirt below via `topMaterial` (category-
+  neutral; not modeled for the substance metric).
+- `RandomSource.createThreadLocalInstance(seed)` returns
+  `SingleThreadedRandomSource`: the 48-bit legacy LCG
+  (`seed = (seed ^ 0x5DEECE66D) & (2^48−1)`, advance
+  `seed·0x5DEECE66D + 0xB`, output `seed >> (48 − bits)`), NOT xoroshiro.
+  All carver randomness is therefore legacy-LCG: the outer per-source-chunk
+  stream and each tunnel's private stream. `nextInt(bound)` uses the
+  power-of-two shortcut `(bound · next(31)) >> 31` else the rejection loop
+  `sample % bound` while `sample − modulo + bound − 1 < 0`; `nextLong =
+  (next(32) << 32) + next(32)`; `nextFloat = next(24) · 5.9604645E-8F`;
+  `nextDouble = ((next(26) << 27) + next(27)) · 1.110223E-16F`.
+- `carveEllipsoid(chunk, x, y, z, hR, vR, mask, skip)`: bail if
+  `|x − cx−8| > 16 + 2·hR` or same for z; x indices
+  `max(floor(x−hR) − minX − 1, 0)..=min(floor(x+hR) − minX, 15)` (same for
+  z); `yLo = max(floor(y−vR) − 1, mask.minY)`, `yHi = min(floor(y+vR) + 1,
+  mask.maxY)`; for each column with `xd² + zd² < 1` where
+  `xd = (wx + 0.5 − x)/hR`, `zd = (wz + 0.5 − z)/hR`, walk `worldY` from
+  `yHi` down while `worldY > yLo` and carve when
+  `!skip(xd, (worldY − 0.5 − y)/vR, zd, worldY)`.
+  `canReach(chunk, x, z, step, total, thickness)`:
+  `xd² + zd² − (total − step)² ≤ (thickness + 2 + 16)²` (float add, then
+  double).
+- Cave carver (`minecraft:cave`) draw order per start source chunk, outer
+  stream: `count` (`very_biased_to_bottom`: `min +
+  nextInt(nextInt(nextInt(span+1)+1)+1)`); then per cave: `x =
+  src·16 + nextInt(16)`, `y = uniform height` (`min>max → min` else
+  `nextInt(max−min+1) + min`; anchors `absolute n`, `above_bottom n →
+  minGenY + n`), `z`, `horizontalRadiusMultiplier`, `verticalRadiusMultiplier`,
+  `startVerticalRadiusMultiplier` (default constant 1.0), `floorLevel`
+  (uniform float `nf·(max−min)+min`); skip test
+  `yd ≤ floorLevel || xd²+yd²+zd² ≥ 1`; `tunnels = 1`; if
+  `nextInt(4) == 0`: room (`yScale = roomVerticalRadiusMultiplier`,
+  `thickness = 1 + nf·6`, ellipsoid at `(x+1, y, z)` with radii
+  `1.5 + sin(π/2)·thickness` and `·yScale`), then `tunnels += nextInt(4)`.
+  Per tunnel: `hRot = nf·2π`, `vRot = (nf − 0.5)/4`,
+  `thickness = provider` then `weird_thickness_bias`: extra
+  `nextInt(10) == 0` → `·(nf·nf·3 + 1)`; `distance = 112 − nextInt(28)`;
+  fork with `seed = nextLong()` into a fresh legacy LCG.
+- Tunnel walk (private stream): `splitPoint = nextInt(dist/2) + dist/4`;
+  `steep = nextInt(6) == 0`; per step `hR = 1.5 + sin(π·step/dist)·thickness`,
+  `vR = hR·yScale`; move `x += cos(hRot)·cos(vRot)`, `y += sin(vRot)`,
+  `z += sin(hRot)·cos(vRot)`; then `vRot = vRot·(0.92 if steep else 0.7)`,
+  `vRot += xRota·0.1`, `hRot += yRota·0.1`, `xRota·=0.9`, `yRota·=0.75`,
+  `xRota += (nf−nf)·nf·2`, `yRota += (nf−nf)·nf·4`; at `splitPoint` with
+  `thickness > 1` two recursive forks (`thickness = nf·0.5 + 0.5` each,
+  `hRot ∓ π/2`, `vRot/3`, yScale 1.0, seeds `nextLong()`) and return;
+  else if `nextInt(4) != 0`: `canReach` else return, carve ellipsoid with
+  radii `hR·horizontalMultiplier`, `vR·verticalMultiplier`.
+- Canyon carver (`minecraft:canyon`): one walk per start chunk; outer
+  draws: `x` (+`nextInt(16)`), `y` int height, `z`, `hRot = nf·2π`,
+  `vRot = verticalRotation provider`, `yScale`, `thickness`,
+  `distanceFactor`, then tunnel seed `nextLong()`. Private stream:
+  width factors (per genDepth entry: index 0 or `nextInt(widthSmoothness)
+  == 0` → `wf = 1 + nf·nf`; store `wf·wf`); per step
+  `hR = 1.5 + sin(step·π/dist)·thickness`, `vR = hR·yScale`,
+  `hR ·= horizontalRadiusFactor` draw, then
+  `vR = (defaultFactor + centerFactor·(1 − |0.5 − step/dist|·2)) · vR ·
+  randomBetween(0.75, 1.0)` (a draw); move as above with 0.05/0.8/0.5
+  rotation damping; skip `nextInt(4) == 0`; `canReach` abort; ellipsoid
+  skip test `(xd²+zd²)·widthFactor[y − minGenY − 1] + yd²/6 ≥ 1`
+  (index is `worldY − minGenY − 1`, floor-divided like Java).
+- `BiomeGenerationSettings` in 26.3 stores a single flat `carvers`
+  `HolderSet` in JSON list order; the plains document lists cave,
+  cave_extra_underground, canyon — carver index for the seed is the list
+  position. Provider registries: int `constant/uniform/biased_to_bottom/
+  very_biased_to_bottom/clamped/weighted_list/clamped_normal/trapezoid`,
+  float `constant/uniform/clamped_normal/trapezoid`; trapezoid float
+  sample `min + nf·plateauEnd + nf·plateauStart` with
+  `plateauStart = (max−min−plateau)/2`. `CarvingMask` storage is a bitset
+  indexed `y − minY + (z + 16·x)·height`; terrain-only replay never
+  encounters the uncarvable tag (barrier-family blocks), and the data
+  root ships no block tags, so the tag check is out of scope for the
+  oracle metric.

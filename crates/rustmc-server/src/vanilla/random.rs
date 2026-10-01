@@ -217,6 +217,86 @@ fn position_seed(x: i32, y: i32, z: i32) -> u64 {
     (seed >> 16) as u64
 }
 
+/// The 48-bit legacy LCG behind Java's `LegacyRandomSource`,
+/// `SingleThreadedRandomSource`, and `WorldgenRandom` — the stream every
+/// registry carver draws from (see `docs/PROVENANCE.md` session 9).
+#[derive(Clone)]
+pub struct LegacyRandom {
+    seed: u64,
+}
+
+const SEED_MASK: u64 = (1 << 48) - 1;
+const SEED_UNA: u64 = 0x0005_DEEC_E66D;
+const SEED_STEP: u64 = 11;
+
+impl LegacyRandom {
+    pub fn new(seed: i64) -> Self {
+        let mut this = Self { seed: 0 };
+        this.set_seed(seed);
+        this
+    }
+
+    /// `setSeed`: mix with the multiplier constant, keep 48 bits.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.seed = (seed as u64 ^ SEED_UNA) & SEED_MASK;
+    }
+
+    /// Advance and return the top `bits` (Java `next(int)`; results for
+    /// `bits < 32` are non-negative, `bits == 32` may be negative).
+    pub fn next_bits(&mut self, bits: u32) -> i32 {
+        self.seed = self.seed.wrapping_mul(SEED_UNA).wrapping_add(SEED_STEP) & SEED_MASK;
+        (self.seed >> (48 - bits)) as i32
+    }
+
+    pub fn next_int(&mut self) -> i32 {
+        self.next_bits(32)
+    }
+
+    /// Java's bounded draw: power-of-two shortcut else the rejection loop
+    /// with `int` wrapping arithmetic.
+    pub fn next_int_bounded(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0, "bound must be positive");
+        if bound & (bound - 1) == 0 {
+            return ((bound as i64 * i64::from(self.next_bits(31))) >> 31) as i32;
+        }
+        loop {
+            let sample = self.next_bits(31);
+            let modulo = sample % bound;
+            if !sample
+                .wrapping_sub(modulo)
+                .wrapping_add(bound - 1)
+                .is_negative()
+            {
+                return modulo;
+            }
+        }
+    }
+
+    /// Java: `(next(32) << 32) + next(32)` with the halves sign-extended.
+    pub fn next_long(&mut self) -> i64 {
+        let upper = i64::from(self.next_bits(32)) << 32;
+        let lower = i64::from(self.next_bits(32));
+        upper.wrapping_add(lower)
+    }
+
+    pub fn next_float(&mut self) -> f32 {
+        self.next_bits(24) as f32 * FLOAT_UNIT
+    }
+
+    /// `WorldgenRandom.setLargeFeatureSeed`: reseed, draw two scale longs,
+    /// reseed from `x·a ^ z·b ^ seed`. Returns nothing; the stream is left
+    /// exactly where Java leaves it.
+    pub fn set_large_feature_seed(&mut self, seed: i64, chunk_x: i32, chunk_z: i32) {
+        self.set_seed(seed);
+        let x_scale = self.next_long();
+        let z_scale = self.next_long();
+        let mixed = (i64::from(chunk_x)).wrapping_mul(x_scale)
+            ^ (i64::from(chunk_z)).wrapping_mul(z_scale)
+            ^ seed;
+        self.set_seed(mixed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +334,59 @@ mod tests {
         for _ in 0..10_000 {
             assert!(source.next_int_bounded(256) < 256);
         }
+    }
+
+    /// Raw-stream parity against the deobfuscated 26.3
+    /// `LegacyRandomSource`/`SingleThreadedRandomSource`, generated with
+    /// `java -cp inner.jar` on 2026-10-01 (facts recorded in
+    /// `docs/PROVENANCE.md` session 9). One continuous draw sequence.
+    #[test]
+    fn legacy_bounded_streams_match_parity_vectors() {
+        let mut r = LegacyRandom::new(2026);
+        let bound_16: Vec<i32> = (0..8).map(|_| r.next_int_bounded(16)).collect();
+        assert_eq!(bound_16, [9, 3, 13, 2, 12, 3, 8, 9]);
+        let bound_237: Vec<i32> = (0..5).map(|_| r.next_int_bounded(237)).collect();
+        assert_eq!(bound_237, [28, 234, 177, 92, 9]);
+        let bound_28: Vec<i32> = (0..5).map(|_| r.next_int_bounded(28)).collect();
+        assert_eq!(bound_28, [10, 10, 6, 6, 0]);
+        // A non-power-of-two bound exercises the rejection loop.
+        let bound_15: Vec<i32> = (0..5).map(|_| r.next_int_bounded(15)).collect();
+        assert_eq!(bound_15, [3, 7, 1, 6, 3]);
+    }
+
+    #[test]
+    fn legacy_float_and_long_streams_match_parity_vectors() {
+        let mut r = LegacyRandom::new(2026);
+        let floats: Vec<u32> = (0..4).map(|_| r.next_float().to_bits()).collect();
+        assert_eq!(floats, [1058954935, 1045075720, 1062823368, 1043807924]);
+        let mut r = LegacyRandom::new(2026);
+        let longs: Vec<u64> = (0..4).map(|_| r.next_long() as u64).collect();
+        assert_eq!(
+            longs,
+            [
+                0x9e5e_b7ef_32a5_c2c5,
+                0xd965_c8bb_2dcf_ad64,
+                0xca56_9a92_32e5_1d6d,
+                0x8794_36e9_9c38_92b9,
+            ]
+        );
+    }
+
+    #[test]
+    fn large_feature_seed_matches_parity_vectors() {
+        for (index, expected) in [
+            (0i64, [0xc137_b17b_u32, 0xee13_e7a9]),
+            (1, [0xa06e_93c3, 0x483c_27c0]),
+            (2, [0x64ec_13e2, 0x29aa_7d22]),
+        ] {
+            let mut r = LegacyRandom::new(1);
+            r.set_large_feature_seed(2026 + index, -16, -13);
+            assert_eq!(r.next_bits(32) as u32, expected[0], "seed {index} word 0");
+            assert_eq!(r.next_bits(32) as u32, expected[1], "seed {index} word 1");
+        }
+        let mut r = LegacyRandom::new(1);
+        r.set_large_feature_seed(2026, 40, -17);
+        assert_eq!(r.next_bits(32) as u32, 0x0c64_b921);
+        assert_eq!(r.next_bits(32) as u32, 0x61ae_4307);
     }
 }
