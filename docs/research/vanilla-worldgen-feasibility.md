@@ -328,6 +328,42 @@ T3's exit gate is met. The staged plan continues with T4 (ores and
 vegetation decoration, distribution-level), which also closes the
 feature-cap residuals left over from T2's top-block gate.
 
+## T4 baseline measured (1 October 2026, slice I measurement half)
+
+The oracle gains a `census` mode: every stored block of the sampled chunk
+rectangle is decoded once and counted into decoration families (ore
+families split by stone/deepslate host, raw-metal and debris families,
+base stone/deepslate denominators, and the vegetation families logs,
+leaves, saplings, grasses, flowers, cactus, sugar cane), with exact
+attribution to 32-block Y bands (sections are 16-aligned, so a section
+never straddles a band). Over the same seed-2026 range — 2,401 chunks,
+none missing — the save contains (totals, with the dominant bands):
+
+- coal 285,066 (peaking at y 32..63), copper 283,434 + 20,065 deepslate,
+  iron 126,103 + 67,284 deepslate, redstone 6,370 + 76,314 deepslate,
+  lapis 24,987 + 31,866, gold 9,251 + 50,078, diamond 1,008 + 54,922
+  (deepslate-dominant as expected), emerald 682 + 27 (mountain-only
+  sparsity), raw metals and no debris in the overworld sample.
+- vegetation: 85,909 log blocks and 605,691 leaf blocks (canopy bands
+  64..95), 54,537 grasses, 1,598 flowers, 120 sugar cane; zero saplings
+  and cactus in the sampled columns.
+- denominators: 28.7M stone and 30.9M deepslate, so e.g. coal reaches
+  about 1.2% of the stone volume in its peak band — the distribution
+  levels the T4 gate must be evaluated against.
+
+Two attributions matter for the implementation slice. First, some ore
+volume is expected to come from the `minecraft:vein`-type material rules
+(large copper/iron blobs) that belong to the surface material system —
+their stream semantics are already captured (surface module ore-vein
+tests) but not applied through full columns; the remaining ores are
+placement-stage features. Second, the census is a raw save count and
+includes structure-placed blocks of the same families (village wood,
+abandoned-farm cane); those are a small fraction at this sample scale
+and get subtracted only if they ever approach the gate margin. The
+pipeline currently places no features at all, so every counted family is
+a quantified T4 target rather than a scored mismatch, keeping the
+measurement honest.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

@@ -653,6 +653,296 @@ pub fn read_profile(
 /// column, or a per-column error.
 pub type ColumnRead = (i64, i64, Result<Option<VanillaColumn>, String>);
 
+/// Block families the T4 decoration baseline counts: ore feature
+/// outputs (stone and deepslate variants kept apart because they are
+/// placed by different distributions), the base stones that ores
+/// replace, and the vegetation families trees and surface patches
+/// produce. Everything outside this list is ignored by the census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CensusFamily {
+    Stone,
+    Deepslate,
+    Coal,
+    DeepslateCoal,
+    Iron,
+    DeepslateIron,
+    Copper,
+    DeepslateCopper,
+    Gold,
+    DeepslateGold,
+    Redstone,
+    DeepslateRedstone,
+    Lapis,
+    DeepslateLapis,
+    Diamond,
+    DeepslateDiamond,
+    Emerald,
+    DeepslateEmerald,
+    RawCopper,
+    RawIron,
+    RawGold,
+    AncientDebris,
+    Logs,
+    Leaves,
+    Saplings,
+    Grasses,
+    Flowers,
+    Cactus,
+    SugarCane,
+}
+
+impl CensusFamily {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stone => "stone",
+            Self::Deepslate => "deepslate",
+            Self::Coal => "coal_ore",
+            Self::DeepslateCoal => "deepslate_coal_ore",
+            Self::Iron => "iron_ore",
+            Self::DeepslateIron => "deepslate_iron_ore",
+            Self::Copper => "copper_ore",
+            Self::DeepslateCopper => "deepslate_copper_ore",
+            Self::Gold => "gold_ore",
+            Self::DeepslateGold => "deepslate_gold_ore",
+            Self::Redstone => "redstone_ore",
+            Self::DeepslateRedstone => "deepslate_redstone_ore",
+            Self::Lapis => "lapis_ore",
+            Self::DeepslateLapis => "deepslate_lapis_ore",
+            Self::Diamond => "diamond_ore",
+            Self::DeepslateDiamond => "deepslate_diamond_ore",
+            Self::Emerald => "emerald_ore",
+            Self::DeepslateEmerald => "deepslate_emerald_ore",
+            Self::RawCopper => "raw_copper_ore",
+            Self::RawIron => "raw_iron_ore",
+            Self::RawGold => "raw_gold_ore",
+            Self::AncientDebris => "ancient_debris",
+            Self::Logs => "logs",
+            Self::Leaves => "leaves",
+            Self::Saplings => "saplings",
+            Self::Grasses => "grasses",
+            Self::Flowers => "flowers",
+            Self::Cactus => "cactus",
+            Self::SugarCane => "sugar_cane",
+        }
+    }
+
+    pub fn all() -> [Self; 29] {
+        [
+            Self::Stone,
+            Self::Deepslate,
+            Self::Coal,
+            Self::DeepslateCoal,
+            Self::Iron,
+            Self::DeepslateIron,
+            Self::Copper,
+            Self::DeepslateCopper,
+            Self::Gold,
+            Self::DeepslateGold,
+            Self::Redstone,
+            Self::DeepslateRedstone,
+            Self::Lapis,
+            Self::DeepslateLapis,
+            Self::Diamond,
+            Self::DeepslateDiamond,
+            Self::Emerald,
+            Self::DeepslateEmerald,
+            Self::RawCopper,
+            Self::RawIron,
+            Self::RawGold,
+            Self::AncientDebris,
+            Self::Logs,
+            Self::Leaves,
+            Self::Saplings,
+            Self::Grasses,
+            Self::Flowers,
+            Self::Cactus,
+            Self::SugarCane,
+        ]
+    }
+}
+
+/// Classify one base block id (no property suffix) into a census family.
+pub fn census_family(base_name: &str) -> Option<CensusFamily> {
+    let name = base_name.strip_prefix("minecraft:")?;
+    let family = match name {
+        "stone" => CensusFamily::Stone,
+        "deepslate" => CensusFamily::Deepslate,
+        "coal_ore" => CensusFamily::Coal,
+        "deepslate_coal_ore" => CensusFamily::DeepslateCoal,
+        "iron_ore" => CensusFamily::Iron,
+        "deepslate_iron_ore" => CensusFamily::DeepslateIron,
+        "copper_ore" => CensusFamily::Copper,
+        "deepslate_copper_ore" => CensusFamily::DeepslateCopper,
+        "gold_ore" => CensusFamily::Gold,
+        "deepslate_gold_ore" => CensusFamily::DeepslateGold,
+        "redstone_ore" => CensusFamily::Redstone,
+        "deepslate_redstone_ore" => CensusFamily::DeepslateRedstone,
+        "lapis_ore" => CensusFamily::Lapis,
+        "deepslate_lapis_ore" => CensusFamily::DeepslateLapis,
+        "diamond_ore" => CensusFamily::Diamond,
+        "deepslate_diamond_ore" => CensusFamily::DeepslateDiamond,
+        "emerald_ore" => CensusFamily::Emerald,
+        "deepslate_emerald_ore" => CensusFamily::DeepslateEmerald,
+        "raw_copper_ore" | "deepslate_raw_copper_ore" => CensusFamily::RawCopper,
+        "raw_iron_ore" | "deepslate_raw_iron_ore" => CensusFamily::RawIron,
+        "raw_gold_ore" | "deepslate_raw_gold_ore" => CensusFamily::RawGold,
+        "ancient_debris" => CensusFamily::AncientDebris,
+        "short_grass" | "tall_grass" | "grass" | "fern" | "large_fern" => CensusFamily::Grasses,
+        "cactus" => CensusFamily::Cactus,
+        "sugar_cane" => CensusFamily::SugarCane,
+        "dandelion" | "poppy" | "blue_orchid" | "allium" | "azure_bluet" | "red_tulip"
+        | "orange_tulip" | "white_tulip" | "pink_tulip" | "oxeye_daisy" | "cornflower"
+        | "lily_of_the_valley" | "with_rose" | "torchflower" | "pitcher_plant" => {
+            CensusFamily::Flowers
+        }
+        other => {
+            if other.ends_with("_log") || other.ends_with("_stem") || other.ends_with("hyphae") {
+                CensusFamily::Logs
+            } else if other.ends_with("_leaves") || other.ends_with("foliage") {
+                CensusFamily::Leaves
+            } else if other.ends_with("_sapling") {
+                CensusFamily::Saplings
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(family)
+}
+
+/// Decode every slot of one section's block palette into name counts.
+/// The width selection mirrors `palette_value`'s candidate ordering but
+/// validates all 4096 slots, which a whole-section decode can afford.
+pub fn section_name_counts(section: &Tag) -> Result<Vec<(String, usize)>, String> {
+    const SLOTS: usize = 16 * 16 * 16;
+    let states = section
+        .get("block_states")
+        .or_else(|| section.get("BlockStates"))
+        .ok_or("section without block_states")?;
+    let palette = states
+        .get("palette")
+        .and_then(Tag::as_list)
+        .ok_or("block_states without palette")?;
+    if palette.len() == 1 {
+        let name = state_name(&palette[0]).ok_or("unusable palette entry")?;
+        return Ok(vec![(name, SLOTS)]);
+    }
+    let packed = states
+        .get("data")
+        .and_then(Tag::as_long_array)
+        .ok_or("multi-value palette without data array")?;
+    let computed = (palette.len() - 1).ilog2() as usize + 1;
+    let mut widths: Vec<usize> = (1..=16)
+        .filter(|&bits| {
+            let per_long = 64 / bits;
+            per_long > 0 && packed.len() == SLOTS.div_ceil(per_long)
+        })
+        .collect();
+    widths.sort_by_key(|bits| (bits != &computed, *bits));
+    if widths.is_empty() {
+        widths.push(computed);
+    }
+    for bits in widths {
+        let slots = unpack_non_spanning(packed, bits, SLOTS);
+        if slots.iter().all(|slot| (*slot as usize) < palette.len()) {
+            let mut counts = vec![0usize; palette.len()];
+            for slot in slots {
+                counts[usize::try_from(slot).expect("slot width <= 16 bits")] += 1;
+            }
+            let mut out = Vec::new();
+            for (entry, count) in palette.iter().zip(counts) {
+                if count == 0 {
+                    continue;
+                }
+                out.push((state_name(entry).ok_or("unusable palette entry")?, count));
+            }
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "no consistent palette width for {} entries",
+        palette.len()
+    ))
+}
+
+/// Aggregate census over a chunk rectangle: family totals and per
+/// 32-block Y-band counts. A sections Y window always sits inside one
+/// band (sections are 16-aligned, bands 32-wide), so band attribution
+/// is exact.
+#[derive(Debug, Default)]
+pub struct Census {
+    pub chunks: usize,
+    pub missing_chunks: usize,
+    pub totals: std::collections::BTreeMap<CensusFamily, usize>,
+    pub bands: std::collections::BTreeMap<(CensusFamily, i32), usize>,
+}
+
+impl Census {
+    fn record_section(&mut self, section: &Tag) -> Result<(), String> {
+        let Some(y_min) = section.get("Y").and_then(Tag::as_i32).map(|y| y * 16) else {
+            return Ok(());
+        };
+        let band = y_min.div_euclid(32) * 32;
+        for (name, count) in section_name_counts(section)? {
+            if let Some(family) = census_family(base_block_name(&name)) {
+                *self.totals.entry(family).or_default() += count;
+                *self.bands.entry((family, band)).or_default() += count;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_chunk(&mut self, root: &Tag) -> Result<(), String> {
+        let sections = root
+            .get("sections")
+            .or_else(|| root.get("Sections"))
+            .and_then(Tag::as_list)
+            .ok_or("chunk has no sections list")?;
+        for section in sections {
+            self.record_section(section)?;
+        }
+        self.chunks += 1;
+        Ok(())
+    }
+}
+
+/// Census every stored chunk with coordinates in the inclusive chunk
+/// rectangle; ungenerated chunks are counted as missing.
+pub fn census_chunks(
+    store: &mut RegionStore,
+    min_cx: i32,
+    max_cx: i32,
+    min_cz: i32,
+    max_cz: i32,
+) -> Result<Census, String> {
+    let mut census = Census::default();
+    for chunk_z in min_cz..=max_cz {
+        for chunk_x in min_cx..=max_cx {
+            match store.chunk_root(chunk_x, chunk_z)? {
+                None => census.missing_chunks += 1,
+                Some(root) => census
+                    .record_chunk(&root)
+                    .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?,
+            }
+        }
+    }
+    Ok(census)
+}
+
+/// Convenience: chunk rectangle covering the inclusive block range.
+pub fn census_blocks(store: &mut RegionStore, min: i64, max: i64) -> Result<Census, String> {
+    let to_chunk = |v: i64| -> Result<i32, String> {
+        i32::try_from(v.div_euclid(16)).map_err(|_| "coordinate too large".to_string())
+    };
+    census_chunks(
+        store,
+        to_chunk(min)?,
+        to_chunk(max)?,
+        to_chunk(min)?,
+        to_chunk(max)?,
+    )
+}
+
 /// Convenience for `inspect`: read specific absolute columns.
 pub fn read_columns(
     store: &mut RegionStore,
@@ -981,6 +1271,114 @@ mod tests {
                 vanilla: [2, 0, 2],
                 rustmc: [0, 0, 4],
             })
+        );
+    }
+
+    #[test]
+    fn census_family_classification_follows_public_block_names() {
+        assert_eq!(
+            census_family("minecraft:coal_ore"),
+            Some(CensusFamily::Coal)
+        );
+        assert_eq!(
+            census_family("minecraft:deepslate_iron_ore"),
+            Some(CensusFamily::DeepslateIron)
+        );
+        assert_eq!(
+            census_family("minecraft:raw_gold_ore"),
+            Some(CensusFamily::RawGold)
+        );
+        assert_eq!(
+            census_family("minecraft:deepslate_raw_copper_ore"),
+            Some(CensusFamily::RawCopper)
+        );
+        assert_eq!(census_family("minecraft:oak_log"), Some(CensusFamily::Logs));
+        assert_eq!(
+            census_family("minecraft:flowering_azalea_leaves"),
+            Some(CensusFamily::Leaves)
+        );
+        assert_eq!(
+            census_family("minecraft:short_grass"),
+            Some(CensusFamily::Grasses)
+        );
+        assert_eq!(
+            census_family("minecraft:poppy"),
+            Some(CensusFamily::Flowers)
+        );
+        assert_eq!(census_family("minecraft:stone"), Some(CensusFamily::Stone));
+        // Terrain and surface materials are not decoration families.
+        assert_eq!(census_family("minecraft:grass_block"), None);
+        assert_eq!(census_family("minecraft:cobblestone"), None);
+        assert_eq!(census_family("minecraft:diorite"), None);
+    }
+
+    #[test]
+    fn section_name_counts_decodes_single_and_multi_entry_palettes() {
+        let single = compound(&[(
+            "block_states",
+            compound(&[("palette", Tag::List(vec![palette_entry("minecraft:stone")]))]),
+        )]);
+        assert_eq!(
+            section_name_counts(&single).unwrap(),
+            vec![("minecraft:stone".to_owned(), 4096)]
+        );
+        // Two-entry palette at the minimal 1-bit width: the first 100
+        // slots are coal, the rest air.
+        let mut data = vec![0i64; 64];
+        for i in 0..100 {
+            data[i / 64] |= 1i64 << (i % 64);
+        }
+        let multi = compound(&[(
+            "block_states",
+            compound(&[
+                (
+                    "palette",
+                    Tag::List(vec![
+                        Tag::String("minecraft:air".into()),
+                        Tag::String("minecraft:coal_ore".into()),
+                    ]),
+                ),
+                ("data", Tag::LongArray(data)),
+            ]),
+        )]);
+        let counts = section_name_counts(&multi).unwrap();
+        assert!(counts.contains(&("minecraft:coal_ore".to_owned(), 100)));
+        assert!(counts.contains(&("minecraft:air".to_owned(), 3996)));
+    }
+
+    #[test]
+    fn census_bands_attribute_sections_to_their_32_block_window() {
+        fn diamond_section(y: i32) -> Tag {
+            compound(&[
+                ("Y", Tag::Byte(y as i8)),
+                (
+                    "block_states",
+                    compound(&[(
+                        "palette",
+                        Tag::List(vec![palette_entry("minecraft:deepslate_diamond_ore")]),
+                    )]),
+                ),
+            ])
+        }
+        let root = compound(&[(
+            "sections",
+            Tag::List(vec![diamond_section(4), diamond_section(6)]),
+        )]);
+        let mut census = Census::default();
+        census.record_chunk(&root).expect("census");
+        assert_eq!(census.chunks, 1);
+        assert_eq!(
+            census.totals.get(&CensusFamily::DeepslateDiamond),
+            Some(&8192)
+        );
+        // Y=4 -> 64..79 in band 64; Y=6 -> 96..111 in band 96.
+        assert_eq!(
+            census.bands.get(&(CensusFamily::DeepslateDiamond, 64)),
+            Some(&4096)
+        );
+        assert_eq!(
+            census.bands.get(&(CensusFamily::DeepslateDiamond, 96)),
+            Some(&4096)
         );
     }
 }

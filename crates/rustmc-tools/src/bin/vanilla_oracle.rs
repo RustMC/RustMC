@@ -8,6 +8,7 @@
 //! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental|vanilla[:settings-id] [data-root]]
 //! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
 //! vanilla_oracle substance <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [fail-cap]]
+//! vanilla_oracle census <world-dir> <min> <max>
 //! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
 //! ```
 //!
@@ -236,6 +237,49 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("{x},{z},{y}");
             }
             if report.columns == 0 {
+                return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "census" => {
+            let min = parse_i64(args.get(2).ok_or("missing <min>")?)?;
+            let max = parse_i64(args.get(3).ok_or("missing <max>")?)?;
+            if min > max {
+                return Err("min must not exceed max".to_string());
+            }
+            // T4 baseline: the save's decoration census (ore features
+            // and vegetation families) over the chunk rectangle covering
+            // the block range. Counts include structure-placed blocks;
+            // the current pipeline places no features, so every counted
+            // family is a quantified T4 target, not a scored mismatch.
+            let census = oracle::census_blocks(&mut store, min, max)?;
+            println!(
+                "chunks={} missing_chunks={}",
+                census.chunks, census.missing_chunks
+            );
+            for family in oracle::CensusFamily::all() {
+                let total = census.totals.get(&family).copied().unwrap_or(0);
+                if total == 0 {
+                    continue;
+                }
+                let mut band_pairs: Vec<_> = census
+                    .bands
+                    .iter()
+                    .filter(|((f, _), _)| *f == family)
+                    .map(|((_, band), count)| (*band, *count))
+                    .collect();
+                band_pairs.sort_by_key(|(band, _)| *band);
+                let rendered: Vec<String> = band_pairs
+                    .iter()
+                    .map(|(band, count)| format!("{band}:{count}"))
+                    .collect();
+                println!(
+                    "census {} total={} bands {}",
+                    family.name(),
+                    total,
+                    rendered.join(" ")
+                );
+            }
+            if census.chunks == 0 {
                 return Err("no generated chunks found in the sampled range".to_string());
             }
         }
