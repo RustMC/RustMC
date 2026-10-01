@@ -232,8 +232,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
 
 /// Parse and validate a configuration document without exposing raw values in errors.
 pub fn parse_config(input: &str) -> Result<Config, String> {
-    let value: toml::Value = input
-        .parse()
+    let value: toml::Value = toml::from_str(input)
         .map_err(|_| "malformed TOML; check syntax and quoting".to_owned())?;
     let table = value
         .as_table()
