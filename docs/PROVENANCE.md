@@ -324,3 +324,116 @@ Numeric/structural facts:
   encounters the uncarvable tag (barrier-family blocks), and the data
   root ships no block tags, so the tag check is out of scope for the
   oracle metric.
+
+### Session 10 (1 October 2026): vein-rate ground truth and census attribution (T4 slice J)
+
+Vein-rate semantics were established two ways under the ADR-0014 knowledge-only
+amendment: (a) by executing the owner's locally fetched/deobfuscated official Java
+26.3 server classes headlessly in `/tmp` via a throwaway Java probe harness (tooling
+only, never committed; all project code remains Rust), and (b) by running that
+official server headless with structures disabled at seed 2026 to generate a 100-chunk
+ground-truth world, censused read-only by RustMC's own Rust oracle. Classes exercised
+for (a): `NormalNoise` (codec, `create`, normalization), `NoiseStack`,
+`Noises.instantiate`, the `NoiseFunction` node, `InterpolatedFunction`,
+`CacheFunction` and `SamplerContext`, the density `getDensitiesInChunk` entry point,
+`OreVeinRule`, and `VeinType`. No vendor code, files, or data entered the repository;
+only numeric/structural facts and this process record are kept. Noise construction
+semantics (26.3):
+
+- NormalNoise codec: `base_amplitude` optional default `1.0`, range `[1e-5, 1e6]`;
+  `base_octave` required int `[-32, 32]`; `octave_count` optional default `1`;
+  `normalize` optional default the `ENABLED` mode; `amplitude_modifiers` optional
+  default empty. LEGACY normalization is reachable only via the `"legacy"` string
+  (the old-parity path) and is NOT used by ore-vein data.
+- Normalize amplitude formula: `base · (0.5^−(n−1) / (0.5^−n − 1))` for `n =
+  base_octave`; target amplitude = sum of `|octave amplitudes|` via `DoubleStream`
+  sum (Kahan, per Session 1); `estimateDeviation = sqrt(sum (0.2702247831245211·
+  |amp|)²)`; `normFactor = (target·(1/3))/(deviation·√2)`. Single-octave σ of output
+  = `base_amplitude/3`, so base `0.955388882960065` gives σ = 0.3185.
+- `NoiseStack.get`: per layer `value += layer.amplitude · layer.noise.get(x·
+  frequency, y·frequency, z·frequency)`; the second layer of a two-layer stack has
+  frequency × input factor `1.0181268882175227`; `NormalNoise.create` forks two
+  positional randoms and seeds octave i by `fromHashOf("octave_i")`.
+- `Noises.instantiate`: each noise instance is created from the registry holder and
+  seeded `positional.fromHashOf(name.identifier()).…` — i.e. by the hash of the
+  registry name (e.g. `minecraft:ore_vein_a`) against the world's single positional
+  factory. RustMC's port matches this exactly.
+- `NoiseFunction` in 26.3: the sampler computes `noise.get(blockX·xzScale,
+  blockY·yScale, blockZ·xzScale)` — multiplicative scales at absolute block
+  coordinates (vein toggles use scale `4.0` with `base_octave −7`; veininess scale
+  `1.5`; `ore_gap` scale `1.0` with `base_octave −5`; all vein noises
+  `base_amplitude 0.955388882960065`).
+- `InterpolatedFunction`: the point path trilinearly lerps (`Mth.lerp3`) over 8
+  absolute `floorMod`-aligned grid corners with `cell_size_xz`/`cell_size_y`; the
+  volume path aligns the corner grid to absolute cell multiples. `CacheFunction` is
+  pure memoization (`SamplerContext.sampleVolumeCached`/`sampleValueCached`) with no
+  value change. Both confirmed value-identical to RustMC's `density.rs`
+  implementations (`Node::Interpolated` uses the same absolute-corner scheme).
+- `getDensitiesInChunk(function, prefill)`: `prefill=true` fills a buffer via the
+  volume path over absolute block coordinates, `prefill=false` uses point sampling;
+  for value comparison these are equivalent to RustMC's per-column descent.
+- `OreVeinRule` draw order (per block): `density ≤ 0` → keep; `randomFactory =
+  getOrCreateRandomFactory("minecraft:ore")` (positional
+  `fromHashOf("minecraft:ore").forkPositional()`); `nextFloat > density` → keep;
+  `richness = richnessGetter`; `nextFloat < richness && fillerGapGetter < 0` →
+  (`nextFloat < 0.02` ? raw : ore) else filler. `VeinType` constants: copper
+  (`copper_ore`, `raw_copper_block`, granite, y `0..50`), iron
+  (`deepslate_iron_ore`, `raw_iron_block`, tuff, y `−60..−8`); thresholds richness
+  `0.4` clamp band `0.4..0.6`, edge roundoff begin `20`, max roundoff `0.2`,
+  solidness `0.7`. RustMC's `surface.rs` ore-vein rule matches this order.
+- Material-rule root binding: noise settings JSONs name the root material rule —
+  overworld/amplified/large_biomes → `minecraft:overworld`; caves →
+  `minecraft:overworld_caves` (a separate root preset, not a second underground
+  pass); floating_islands → `minecraft:overworld_floating_islands`. The field
+  `ore_veins_enabled` does NOT exist anywhere in 26.3 data or classes — veins are
+  purely material-rule + density-function driven. Root `overworld.json` sequence
+  order: [`bedrock_floor`, `overworld/copper_ore_vein`, `overworld/iron_ore_vein`,
+  condition `above_preliminary_surface` → `surface`, `underground`] — veins precede
+  the surface condition, first-match-wins, as implemented.
+- Vein density graphs (operator datapack compared to jar-bundled data: diffed
+  identical), with `t` the toggle: toggle = `cache(interp 4×8 of
+  squeeze(veininess noise, scale 1.5)` clamped to the y window, yielding 0 outside);
+  mask = the y-window gate and `range_choice(toggle, [−0.4, 0.4) → −1 else 0.08 −
+  max(|interp(abs(vein_a))|, |interp(abs(vein_b))|))`; iron gate = `−t − 0.4 +
+  (clamp(min(−8−y, y+60), 0, 20)·0.01) − 0.2 ≥ 0 → 0.7 else −1`; copper gate =
+  `t − 0.4 + (clamp(min(50−y, y), 0, 20)·0.01) − 0.2 ≥ 0`; richness = `clamp(|t|,
+  0.4..0.6)·1.0 − 0.3` (∈ `[0.1, 0.3]`); gap = `−0.3 − noise(ore_gap)`.
+
+Vanilla-class probe marginals (`VeinProbe` harness, seed 2026, vein windows of the
+ground-truth chunks):
+
+- Raw veininess: n=44376 mean −0.0027 sd 0.3059; raw vein_a: n=44376 mean 0.0027 sd
+  0.3120, `P(|a| ≤ 0.08)` = 0.1968; interpolated window samples n=736372 mean 0.0220
+  sd 0.3143.
+- IRON: gate fires 5.368% of window rows; mask ≥ 0 at 0.825%; final density > 0 at
+  0.188%. COPPER: gate 4.095%; density > 0 at 0.130%.
+- These match RustMC's independently written port (mask ≥ 0 ≈ 0.81%; iron ≈ 0.11%,
+  copper ≈ 0.24% at the coarser comparison grid) within grid resolution — i.e. no
+  vein-rate discrepancy exists between vanilla's own classes and RustMC.
+
+Ground-truth census and the attribution correction (the key finding):
+
+- A fresh official-server world (seed 2026, `generate-structures=false`,
+  view-distance 4) was forceloaded over a 10×10 chunk square (blocks −64..95) and
+  censused read-only by the Rust oracle: tuff 114,729 (bands −64: 50,882, −32:
+  62,849, 0: 998; 1,147/chunk ≈ 8.6% of iron-window rows), granite 105,811, diorite
+  107,543, andesite 108,791, deepslate_iron_ore 3,071, iron_ore 5,882,
+  deepslate_copper_ore 734, copper_ore 15,025, raw_iron_block 20, raw_copper_block
+  1, stone 1,661,812, deepslate 1,381,153.
+- Explanation: tuff/granite/diorite/andesite census counts in the vein windows are
+  dominated by placement-stage features — notably the `ore_tuff` feature (type
+  `minecraft:ore`, size 64, target the `base_stone_overworld` tag → tuff) and the
+  stone-blob features — NOT by the vein material rules. Raw-metal block counts (20
+  `raw_iron_block` and 1 `raw_copper_block` across 100 chunks) are consistent with
+  the veins' own low rates (≈0.02 raw chance on ~17.6 vein draws/chunk). The earlier
+  slices' apparent "25–100× vein-rate gap" was therefore a census attribution error,
+  not a generator mismatch; closing the remaining census delta requires the feature
+  runtime (the next slice), and no vein parameter was re-tuned to chase the
+  contaminated numbers.
+- Also recorded: an earlier analytical slip in this investigation (`P(|x| ≤ 0.08) ≈
+  0.599` for a Gaussian with σ 0.3185) was corrected to `2Φ(0.2512) − 1 = 0.198`,
+  which is what the vanilla probe measures (0.1968) and what RustMC's port already
+  produces.
+- No new dependencies were introduced; the `/tmp` harnesses (the Java probe plus the
+  headless server instance) are disposable consultation tooling under the ADR-0014
+  amendment and the project's implementation and tests remain Rust-only.

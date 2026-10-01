@@ -655,9 +655,10 @@ pub type ColumnRead = (i64, i64, Result<Option<VanillaColumn>, String>);
 
 /// Block families the T4 decoration baseline counts: ore feature
 /// outputs (stone and deepslate variants kept apart because they are
-/// placed by different distributions), the base stones that ores
-/// replace, and the vegetation families trees and surface patches
-/// produce. Everything outside this list is ignored by the census.
+/// placed by different distributions), the raw-metal vein outputs,
+/// the vein/blob filler stones, the base stones that ores replace,
+/// and the vegetation families trees and surface patches produce.
+/// Everything outside this list is ignored by the census.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CensusFamily {
     Stone,
@@ -682,6 +683,10 @@ pub enum CensusFamily {
     RawIron,
     RawGold,
     AncientDebris,
+    Granite,
+    Diorite,
+    Andesite,
+    Tuff,
     Logs,
     Leaves,
     Saplings,
@@ -712,10 +717,14 @@ impl CensusFamily {
             Self::DeepslateDiamond => "deepslate_diamond_ore",
             Self::Emerald => "emerald_ore",
             Self::DeepslateEmerald => "deepslate_emerald_ore",
-            Self::RawCopper => "raw_copper_ore",
-            Self::RawIron => "raw_iron_ore",
-            Self::RawGold => "raw_gold_ore",
+            Self::RawCopper => "raw_copper_block",
+            Self::RawIron => "raw_iron_block",
+            Self::RawGold => "raw_gold_block",
             Self::AncientDebris => "ancient_debris",
+            Self::Granite => "granite",
+            Self::Diorite => "diorite",
+            Self::Andesite => "andesite",
+            Self::Tuff => "tuff",
             Self::Logs => "logs",
             Self::Leaves => "leaves",
             Self::Saplings => "saplings",
@@ -726,7 +735,7 @@ impl CensusFamily {
         }
     }
 
-    pub fn all() -> [Self; 29] {
+    pub fn all() -> [Self; 33] {
         [
             Self::Stone,
             Self::Deepslate,
@@ -750,6 +759,10 @@ impl CensusFamily {
             Self::RawIron,
             Self::RawGold,
             Self::AncientDebris,
+            Self::Granite,
+            Self::Diorite,
+            Self::Andesite,
+            Self::Tuff,
             Self::Logs,
             Self::Leaves,
             Self::Saplings,
@@ -783,10 +796,14 @@ pub fn census_family(base_name: &str) -> Option<CensusFamily> {
         "deepslate_diamond_ore" => CensusFamily::DeepslateDiamond,
         "emerald_ore" => CensusFamily::Emerald,
         "deepslate_emerald_ore" => CensusFamily::DeepslateEmerald,
-        "raw_copper_ore" | "deepslate_raw_copper_ore" => CensusFamily::RawCopper,
-        "raw_iron_ore" | "deepslate_raw_iron_ore" => CensusFamily::RawIron,
-        "raw_gold_ore" | "deepslate_raw_gold_ore" => CensusFamily::RawGold,
+        "raw_copper_block" => CensusFamily::RawCopper,
+        "raw_iron_block" => CensusFamily::RawIron,
+        "raw_gold_block" => CensusFamily::RawGold,
         "ancient_debris" => CensusFamily::AncientDebris,
+        "granite" => CensusFamily::Granite,
+        "diorite" => CensusFamily::Diorite,
+        "andesite" => CensusFamily::Andesite,
+        "tuff" => CensusFamily::Tuff,
         "short_grass" | "tall_grass" | "grass" | "fern" | "large_fern" => CensusFamily::Grasses,
         "cactus" => CensusFamily::Cactus,
         "sugar_cane" => CensusFamily::SugarCane,
@@ -893,17 +910,68 @@ impl Census {
     }
 
     fn record_chunk(&mut self, root: &Tag) -> Result<(), String> {
-        let sections = root
-            .get("sections")
-            .or_else(|| root.get("Sections"))
-            .and_then(Tag::as_list)
-            .ok_or("chunk has no sections list")?;
-        for section in sections {
+        for section in chunk_sections(root)? {
             self.record_section(section)?;
         }
         self.chunks += 1;
         Ok(())
     }
+
+    /// Fold one generated column (as produced by
+    /// `VanillaGenerator::column_ids`, indexed from the dimension's
+    /// minimum build Y) into the census with the same band windows as
+    /// the stored decode.
+    pub fn record_column_ids(&mut self, min_y: i32, ids: &[Option<String>]) {
+        for (offset, id) in ids.iter().enumerate() {
+            let Some(name) = id else { continue };
+            let band = (min_y + offset as i32).div_euclid(32) * 32;
+            if let Some(family) = census_family(base_block_name(name)) {
+                *self.totals.entry(family).or_default() += 1;
+                *self.bands.entry((family, band)).or_default() += 1;
+            }
+        }
+    }
+}
+
+/// The stored section list of a chunk root, accepting both NBT spelling
+/// variants used across versions.
+fn chunk_sections(root: &Tag) -> Result<&[Tag], String> {
+    root.get("sections")
+        .or_else(|| root.get("Sections"))
+        .and_then(Tag::as_list)
+        .ok_or_else(|| "chunk has no sections list".to_owned())
+}
+
+/// Histogram of every block-state name stored in the inclusive chunk
+/// rectangle, with the number of census chunks read. This is the
+/// classification audit tool: it lists what the save actually contains
+/// so `census_family` can be checked against real ids rather than
+/// assumed names.
+pub fn census_name_histogram(
+    store: &mut RegionStore,
+    min_cx: i32,
+    max_cx: i32,
+    min_cz: i32,
+    max_cz: i32,
+) -> Result<(usize, std::collections::BTreeMap<String, usize>), String> {
+    let mut chunks = 0usize;
+    let mut names = std::collections::BTreeMap::new();
+    for chunk_z in min_cz..=max_cz {
+        for chunk_x in min_cx..=max_cx {
+            let Some(root) = store.chunk_root(chunk_x, chunk_z)? else {
+                continue;
+            };
+            for section in
+                chunk_sections(&root).map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?
+            {
+                for (name, count) in section_name_counts(section)? {
+                    *names.entry(name).or_default() += count;
+                }
+            }
+            chunks += 1;
+        }
+    }
+    Ok((chunks, names))
 }
 
 /// Census every stored chunk with coordinates in the inclusive chunk
@@ -941,6 +1009,30 @@ pub fn census_blocks(store: &mut RegionStore, min: i64, max: i64) -> Result<Cens
         to_chunk(min)?,
         to_chunk(max)?,
     )
+}
+
+/// Census the generator's full material-rule descent over the inclusive
+/// block square: every column from `min` to `max` in both axes, counted
+/// in the same family/band shape as the save census so the two line up
+/// row by row. `chunks` reports the 16-aligned chunk square covered.
+pub fn census_generated(
+    generator: &VanillaGenerator,
+    min: i64,
+    max: i64,
+) -> Result<Census, String> {
+    let (Ok(min), Ok(max)) = (i32::try_from(min), i32::try_from(max)) else {
+        return Err("coordinate too large".to_string());
+    };
+    let mut census = Census::default();
+    for x in min..=max {
+        for z in min..=max {
+            let ids = generator.column_ids(x, z);
+            census.record_column_ids(generator.min_y(), &ids);
+        }
+    }
+    let side = max - min + 1;
+    census.chunks = (side.div_euclid(16) * side.div_euclid(16)) as usize;
+    Ok(census)
 }
 
 /// Convenience for `inspect`: read specific absolute columns.
@@ -1285,12 +1377,16 @@ mod tests {
             Some(CensusFamily::DeepslateIron)
         );
         assert_eq!(
-            census_family("minecraft:raw_gold_ore"),
+            census_family("minecraft:raw_gold_block"),
             Some(CensusFamily::RawGold)
         );
         assert_eq!(
-            census_family("minecraft:deepslate_raw_copper_ore"),
+            census_family("minecraft:raw_copper_block"),
             Some(CensusFamily::RawCopper)
+        );
+        assert_eq!(
+            census_family("minecraft:raw_iron_block"),
+            Some(CensusFamily::RawIron)
         );
         assert_eq!(census_family("minecraft:oak_log"), Some(CensusFamily::Logs));
         assert_eq!(
@@ -1306,10 +1402,15 @@ mod tests {
             Some(CensusFamily::Flowers)
         );
         assert_eq!(census_family("minecraft:stone"), Some(CensusFamily::Stone));
-        // Terrain and surface materials are not decoration families.
+        assert_eq!(
+            census_family("minecraft:granite"),
+            Some(CensusFamily::Granite)
+        );
+        assert_eq!(census_family("minecraft:tuff"), Some(CensusFamily::Tuff));
+        // Surface and crafted materials are not decoration families.
         assert_eq!(census_family("minecraft:grass_block"), None);
         assert_eq!(census_family("minecraft:cobblestone"), None);
-        assert_eq!(census_family("minecraft:diorite"), None);
+        assert_eq!(census_family("minecraft:tuff_bricks"), None);
     }
 
     #[test]

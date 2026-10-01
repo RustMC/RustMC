@@ -60,6 +60,9 @@ pub struct VanillaGenerator {
     masks: RefCell<HashMap<(i32, i32), CarveMask>>,
     /// Per-source-chunk biome carver lists, built lazily during replay.
     chunk_carvers: RefCell<HashMap<(i32, i32), ChunkCarvers>>,
+    /// Column-top memo: the descent's steep-gradient lookups re-read
+    /// neighbouring columns, whose top scan is otherwise O(height).
+    heights: RefCell<HashMap<(i32, i32), i32>>,
 }
 
 impl VanillaGenerator {
@@ -130,6 +133,7 @@ impl VanillaGenerator {
             carver_context,
             masks: RefCell::new(HashMap::new()),
             chunk_carvers: RefCell::new(HashMap::new()),
+            heights: RefCell::new(HashMap::new()),
         })
     }
 
@@ -151,13 +155,7 @@ impl VanillaGenerator {
         let (top_y, substance) = self.surface(x, z)?;
         match substance {
             Substance::Air => None,
-            Substance::Fluid(fluid) => Some(
-                match fluid {
-                    Fluid::Lava => "minecraft:lava",
-                    Fluid::Water => "minecraft:water",
-                }
-                .to_owned(),
-            ),
+            Substance::Fluid(fluid) => Some(Self::fluid_name(fluid).to_owned()),
             Substance::Solid => {
                 // The documented descent reaches the top solid with a
                 // stone depth of one, no water column above, and the
@@ -192,10 +190,134 @@ impl VanillaGenerator {
         }
     }
 
+    /// The dimension fluid's block id (the settings `default_fluid`
+    /// family: water or lava in the overworld).
+    fn fluid_name(fluid: Fluid) -> &'static str {
+        match fluid {
+            Fluid::Lava => "minecraft:lava",
+            Fluid::Water => "minecraft:water",
+        }
+    }
+
+    /// The full material-rule descent of one column, the documented
+    /// `buildSurface` pass (`PROVENANCE.md` session 7): from the highest
+    /// non-air row walk down, reset the stone-above counter and the water
+    /// latch at air, latch the water height at the first fluid row below
+    /// an air gap, and evaluate the rule program at every solid row with
+    /// the current counters and the below-depth from the contiguous solid
+    /// run. Registry carvers run after this pass in the documented order,
+    /// so carved rows report their post-carve fluid or cave air and are
+    /// never recolored by a rule.
+    ///
+    /// Index 0 of the result is the dimension's minimum build Y. Rows
+    /// above the column top and pre-carve air rows are `None`; solid rows
+    /// with no matching rule keep the filler `default_block`.
+    pub fn column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+        let min_y = self.router.min_y;
+        let mut ids: Vec<Option<String>> = vec![None; self.router.height as usize];
+        let Some(top) = self.surface(x, z).map(|(y, _)| y) else {
+            return ids;
+        };
+        self.heights.borrow_mut().insert((x, z), top);
+        // The column as the surface pass sees it: the registry carvers
+        // have not stamped it yet.
+        let density = &self.router.final_density;
+        let filled: Vec<Substance> = (min_y..=top)
+            .map(|y| self.aquifer.substance(x, y, z, density.sample(x, y, z)))
+            .collect();
+        let rules = self.surface.as_ref();
+        let mut ctx = rules.map(|rules| {
+            SurfaceContext::new(
+                rules,
+                self.router.chunk_surface_level.as_ref(),
+                x,
+                z,
+                |hx, hz| self.surface_height(hx, hz),
+                |bx, by, bz| self.biome(bx, bz, by),
+            )
+        });
+        let mut stone_above = 0i32;
+        let mut water_height: Option<i32> = None;
+        let mut run_bottom = WAY_BELOW_MIN_Y;
+        let mut in_run = false;
+        for offset in (0..filled.len()).rev() {
+            let y = min_y + offset as i32;
+            match filled[offset] {
+                Substance::Air => {
+                    stone_above = 0;
+                    water_height = None;
+                    in_run = false;
+                }
+                Substance::Fluid(fluid) => {
+                    if water_height.is_none() {
+                        water_height = Some(y + 1);
+                    }
+                    in_run = false;
+                    ids[offset] = Some(Self::fluid_name(fluid).to_owned());
+                }
+                Substance::Solid => {
+                    if !in_run {
+                        in_run = true;
+                        // Downward lookahead to the first non-solid row;
+                        // the sentinel floor when the run reaches the
+                        // bottom of the world.
+                        run_bottom = WAY_BELOW_MIN_Y;
+                        let mut lookahead = y - 1;
+                        while lookahead >= min_y {
+                            if filled[(lookahead - min_y) as usize] != Substance::Solid {
+                                run_bottom = lookahead + 1;
+                                break;
+                            }
+                            lookahead -= 1;
+                        }
+                    }
+                    stone_above += 1;
+                    ids[offset] = Some(match &mut ctx {
+                        Some(ctx) => {
+                            ctx.set_y(stone_above, y - run_bottom + 1, water_height, y);
+                            // `rules` is `Some` whenever the context is.
+                            rules
+                                .expect("surface rules")
+                                .apply(ctx)
+                                .unwrap_or_else(|| self.router.default_block.clone())
+                        }
+                        None => self.router.default_block.clone(),
+                    });
+                }
+            }
+        }
+        // The registry carving pass overwrites whatever the surface pass
+        // left at its positions. The density-0 sample is never solid in
+        // the overworld aquifer, so a solid post-carve answer keeps the
+        // surface result untouched.
+        for (offset, id) in ids.iter_mut().enumerate().take(filled.len()) {
+            let y = min_y + offset as i32;
+            if self.carved(x, y, z) {
+                *id = match self.aquifer.substance(x, y, z, 0.0) {
+                    Substance::Air => Some("minecraft:cave_air".to_owned()),
+                    Substance::Fluid(fluid) => Some(Self::fluid_name(fluid).to_owned()),
+                    Substance::Solid => id.take(),
+                };
+            }
+        }
+        ids
+    }
+
     /// Absolute Y of the top written block: terrain, or the aquifer/sea
-    /// fluid surface where terrain does not reach above it.
+    /// fluid surface where terrain does not reach above it. Memoised
+    /// because the descent's steep gradients re-read neighbours.
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {
-        self.surface(x, z).map_or(self.router.min_y, |(y, _)| y)
+        if let Some(&y) = self.heights.borrow().get(&(x, z)) {
+            return y;
+        }
+        let y = self.surface(x, z).map_or(self.router.min_y, |(y, _)| y);
+        self.heights.borrow_mut().insert((x, z), y);
+        y
+    }
+
+    /// The dimension's minimum build height: index 0 of `column_ids`.
+    pub fn min_y(&self) -> i32 {
+        self.router.min_y
     }
 
     /// Raw `final_density` sample before the aquifer adjustment: the
@@ -654,5 +776,290 @@ mod tests {
             Some("minecraft:granite")
         );
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The rule program shared by the descent tests: floor and ceiling
+    /// `stone_depth` gates (a zero-noise pack makes the depth ranges
+    /// deterministic), a vertical-gradient rule coloring the deep rows,
+    /// and an unconditional fallthrough.
+    const DESCENT_ROOT: &str = r#"{"type": "sequence", "sequence": [
+        {"type": "condition",
+            "if_true": {"type": "stone_depth", "surface_type": "floor",
+                "offset": 1, "add_surface_depth": false,
+                "secondary_depth_range": 0},
+            "then_run": {"type": "block", "result_state": "minecraft:dirt"}},
+        {"type": "condition",
+            "if_true": {"type": "stone_depth", "surface_type": "ceiling",
+                "offset": 1, "add_surface_depth": false,
+                "secondary_depth_range": 0},
+            "then_run": {"type": "block", "result_state": "minecraft:moss_block"}},
+        {"type": "condition",
+            "if_true": {"type": "vertical_gradient",
+                "random_name": "minecraft:rustmc_test_deep",
+                "true_at_and_below": {"absolute": 10},
+                "false_at_and_above": {"absolute": 11}},
+            "then_run": {"type": "block", "result_state": "minecraft:deepslate"}},
+        {"type": "block", "result_state": "minecraft:stone"}
+    ]}"#;
+
+    /// Writes the zero-amplitude noise documents and the constant
+    /// noise-router shell the surface program needs for a fabricated
+    /// overworld-like pack.
+    fn descent_pack_noise(root: &Path) {
+        let mc = root.join("data/minecraft/worldgen/noise");
+        let zero_noise = r#"{"base_amplitude": 0.0, "base_octave": 4}"#;
+        for name in ["surface", "surface_secondary", "clay_bands_offset"] {
+            write(&mc.join(format!("{name}.json")), zero_noise);
+        }
+    }
+
+    fn descent_pack_settings(root: &Path, id: &str, density: &str, sea_level: i32, rule: &str) {
+        write(
+            &root.join(format!("data/testns/worldgen/noise_settings/{id}.json")),
+            &format!(
+                r#"{{
+                "noise": {{"min_y": 0, "height": 128}},
+                "sea_level": {sea_level},
+                "default_fluid": "minecraft:water",
+                "default_block": "minecraft:granite",
+                "noise_router": {{
+                    "final_density": "testns:{density}",
+                    "continents": 0.0,
+                    "erosion": 0.0,
+                    "depth": 0.0,
+                    "ridges": 0.0,
+                    "temperature": 0.0,
+                    "vegetation": 0.0
+                }},
+                "material_rule": "testns:{rule}"
+            }}"#
+            ),
+        );
+    }
+
+    /// End-to-end material-rule descent on a fabricated pack whose
+    /// density is the product of two y-gradients: one solid run from
+    /// y=5 to y=23 with nothing solid below or above. Floor rules must
+    /// catch the two topmost rows of the run, ceiling rules its two
+    /// bottommost rows, the gradient rule the rows at or below 10, and
+    /// the sea variant must stamp the fluid rows without disturbing the
+    /// solid results; a biome-gated-only program keeps the filler
+    /// default block on every solid row.
+    #[test]
+    fn column_ids_descends_rules_through_solid_runs() {
+        let root = scratch_root("descent");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/band.json"),
+            r#"{"type": "mul",
+                "left": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": -1.0,
+                    "to_coordinate": 8, "to_value": 1.0},
+                "right": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": 1.0,
+                    "to_coordinate": 48, "to_value": -1.0}}"#,
+        );
+        write(&worldgen.join("material_rule/root.json"), DESCENT_ROOT);
+        write(
+            &worldgen.join("material_rule/never.json"),
+            r#"{"type": "condition",
+                "if_true": {"type": "biome", "biome_is": ["minecraft:badlands"]},
+                "then_run": {"type": "block", "result_state": "minecraft:red_sand"}}"#,
+        );
+        descent_pack_noise(&root);
+        descent_pack_settings(&root, "dry", "band", -1000, "root");
+        descent_pack_settings(&root, "wet", "band", 200, "root");
+        descent_pack_settings(&root, "fallback", "band", -1000, "never");
+
+        // The gradient product is positive exactly on 4 < y < 24, so the
+        // run spans y = 5..=23 with stone_above 1 at y = 23 counting down
+        // and stone_below 1 at y = 5 counting up.
+        let dry = VanillaGenerator::new(&root, 2026, "testns:dry").expect("dry generator");
+        let ids = dry.column_ids(6, -2);
+        assert_eq!(ids.len(), 128);
+        for (y, id) in ids[..5].iter().enumerate() {
+            assert_eq!(*id, None, "row {y} below the run is pre-carve air");
+        }
+        assert_eq!(ids[5].as_deref(), Some("minecraft:moss_block"));
+        assert_eq!(ids[6].as_deref(), Some("minecraft:moss_block"));
+        for id in &ids[7..=10] {
+            assert_eq!(id.as_deref(), Some("minecraft:deepslate"));
+        }
+        for id in &ids[11..=21] {
+            assert_eq!(id.as_deref(), Some("minecraft:stone"));
+        }
+        assert_eq!(ids[22].as_deref(), Some("minecraft:dirt"));
+        assert_eq!(ids[23].as_deref(), Some("minecraft:dirt"));
+        for (i, id) in ids[24..128].iter().enumerate() {
+            assert_eq!(*id, None, "row {} above the column top stays unset", i + 24);
+        }
+        assert_eq!(
+            dry.top_block(6, -2).as_deref(),
+            ids[23].as_deref(),
+            "the descent's top solid row agrees with the top-block pass"
+        );
+
+        // A sea above the volume fills every non-solid row: the descent
+        // still walks from the fluid top and colors the run identically.
+        let wet = VanillaGenerator::new(&root, 2026, "testns:wet").expect("wet generator");
+        let ids = wet.column_ids(6, -2);
+        assert_eq!(ids[127].as_deref(), Some("minecraft:water"));
+        assert_eq!(ids[24].as_deref(), Some("minecraft:water"));
+        assert_eq!(ids[4].as_deref(), Some("minecraft:water"));
+        assert_eq!(ids[0].as_deref(), Some("minecraft:water"));
+        assert_eq!(ids[23].as_deref(), Some("minecraft:dirt"));
+        assert_eq!(ids[8].as_deref(), Some("minecraft:deepslate"));
+        assert_eq!(ids[5].as_deref(), Some("minecraft:moss_block"));
+
+        // No placement table: the only rule never holds and every solid
+        // row keeps the settings default block.
+        let fallback =
+            VanillaGenerator::new(&root, 2026, "testns:fallback").expect("fallback generator");
+        let ids = fallback.column_ids(6, -2);
+        for id in &ids[5..=23] {
+            assert_eq!(id.as_deref(), Some("minecraft:granite"));
+        }
+        assert_eq!(ids[4], None);
+        assert_eq!(ids[24], None);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A solid run that reaches the bottom of the world keeps the
+    /// documented below-depth sentinel, so the ceiling gate (depth <= 2)
+    /// never fires inside the run and the floor row itself falls through
+    /// to the gradient rule.
+    #[test]
+    fn column_ids_floor_run_keeps_below_depth_sentinel() {
+        let root = scratch_root("sentinel");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/ramp.json"),
+            r#"{"type": "mul",
+                "left": {"type": "interpolated", "cell_size_xz": 4, "cell_size_y": 8, "input": {
+                    "type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": 1.0,
+                    "to_coordinate": 48, "to_value": -1.0
+                }},
+                "right": 0.64}"#,
+        );
+        write(&worldgen.join("material_rule/root.json"), DESCENT_ROOT);
+        descent_pack_noise(&root);
+        descent_pack_settings(&root, "floor", "ramp", -1000, "root");
+
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:floor").expect("floor generator");
+        let ids = generator.column_ids(10, -3);
+        // Same ramp top as the ramp scan test: y = 23.
+        assert_eq!(ids[23].as_deref(), Some("minecraft:dirt"));
+        assert_eq!(ids[22].as_deref(), Some("minecraft:dirt"));
+        assert_eq!(ids[21].as_deref(), Some("minecraft:stone"));
+        for id in &ids[11..=20] {
+            assert_eq!(id.as_deref(), Some("minecraft:stone"));
+        }
+        // The run reaches min_y: sentinel below-depths are far above the
+        // ceiling gate's range, and rows at or below 10 color deepslate.
+        for id in &ids[0..=10] {
+            assert_eq!(id.as_deref(), Some("minecraft:deepslate"));
+        }
+        for id in &ids[24..128] {
+            assert_eq!(*id, None);
+        }
+        assert_eq!(
+            generator.top_block(10, -3).as_deref(),
+            ids[23].as_deref(),
+            "the descent's top solid row agrees with the top-block pass"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Requires the operator-provisioned 26.3 worldgen data. The descent
+    /// must reproduce the deepslate split below the transition band and
+    /// fire both ore-vein rules: granite and tuff are vein fillers the
+    /// rest of the program never writes, so any occurrence proves the
+    /// copper and iron veins evaluated, and each must stay inside its
+    /// documented window. The two 16×16 block squares sit on vein
+    /// clusters found by scanning the density graphs at this seed.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_column_ids_splits_deepslate_and_fires_veins() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let min_y = generator.min_y();
+        let mut granite = 0usize;
+        let mut tuff = 0usize;
+        let mut unexpected_deep: Vec<(i32, i32, i32, String)> = Vec::new();
+        for (origin_x, origin_z) in [(-1024, -880), (-824, -149)] {
+            for x in origin_x..origin_x + 16 {
+                for z in origin_z..origin_z + 16 {
+                    let ids = generator.column_ids(x, z);
+                    for (index, id) in ids.iter().enumerate() {
+                        let Some(id) = id else { continue };
+                        let y = min_y + index as i32;
+                        match id.as_str() {
+                            "minecraft:granite" => {
+                                assert!(y < 50, "granite at y={y} outside the copper window");
+                                granite += 1;
+                            }
+                            "minecraft:tuff" => {
+                                assert!(y < -8, "tuff at y={y} outside the iron window");
+                                tuff += 1;
+                            }
+                            _ => {}
+                        }
+                        // Between the iron window and the deepslate/stone
+                        // transition only the underground rule, carving and
+                        // the dimension fluids can have written a row.
+                        if (-8..=-2).contains(&y)
+                            && !matches!(
+                                id.as_str(),
+                                "minecraft:deepslate"
+                                    | "minecraft:cave_air"
+                                    | "minecraft:water"
+                                    | "minecraft:lava"
+                            )
+                        {
+                            unexpected_deep.push((x, z, y, id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(granite > 0, "copper veins must leave granite filler");
+        assert!(tuff > 0, "iron veins must leave tuff filler");
+        assert!(
+            unexpected_deep.is_empty(),
+            "unexpected rows in the deep band: {unexpected_deep:?}"
+        );
+    }
+
+    /// Requires the operator-provisioned 26.3 worldgen data. On columns
+    /// whose top row the carvers left alone, the descent's top solid row
+    /// must equal the single-row top-block pass.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_column_ids_top_row_matches_top_block() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let min_y = generator.min_y();
+        for (x, z) in [(0, 0), (32, -17), (-128, 96)] {
+            let top = generator.surface_height(x, z);
+            if generator.carved(x, top, z) {
+                continue;
+            }
+            let ids = generator.column_ids(x, z);
+            let index = (top - min_y) as usize;
+            let row = ids[index].as_deref().expect("top row is written");
+            assert_eq!(
+                generator.top_block(x, z).as_deref(),
+                Some(row),
+                "column ({x}, {z}) top row at y={top}"
+            );
+        }
     }
 }

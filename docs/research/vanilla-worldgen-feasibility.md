@@ -22,7 +22,7 @@ single column "matches seed 2026".
 | Biomes | Climate-parameter routing (temperature, humidity, altitude, weirdness, continentalness, erosion, penetration) into weighted biome clusters | Nearest jittered site over 8 labels |
 | Caves | Noise caves (spaghetti/noodle/cave pockets), aquifers, carvers | None |
 | Surface | Per-biome rule trees (surface/material rules) choosing top/filler/underwater materials | Fixed per-label blocks |
-| Decoration | Ore veins with per-biome count distributions, trees/flowers via seeded feature passes, structures (villages, strongholds, …) | Fixed-height trees only |
+| Decoration | Ore-vein material rules (applied through full-column descent since slice J) plus trees/flowers/ore-blob feature passes and structures (villages, strongholds, …) | Fixed-height trees only; feature passes deferred to the T4 feature runtime |
 | Seeding | One world seed expanded into many independent sub-seeds (worldgen, carvers, features, structures) | One seed mixed per sample call |
 | Protocol output | Heightmaps, 4×4×4 biome palettes, block-light arrays in 26.3 chunk format | Already implemented for preview chunks |
 
@@ -75,7 +75,7 @@ The worksheet method (manual F3 readings) does not scale. The spike proposes:
 | T1 | Terrain shape: density/noise field → exact heights | ≥95% exact height match on T0 sample |
 | T2 | Biome placement + surface rules | ≥95% biome and top-block match where T1 height matched |
 | T3 | Caves, aquifers, carvers | 3D block agreement threshold on sampled columns |
-| T4 | Ores and vegetation decoration | Distribution-level (not per-block) agreement |
+| T4 | Ores and vegetation decoration (vein material rules applied since slice J; remaining scope is the feature runtime) | Distribution-level (not per-block) agreement |
 | T5 | Structures | Separate spike; explicitly deferred — highest churn, least reusable |
 
 Performance: vanilla generation is CPU-heavy (parallel workers in the client);
@@ -232,7 +232,8 @@ condition, block, bandlands (with the deterministic badlands band table),
 and ore-vein rules, plus the ten overworld condition types with the
 documented lazy per-XZ/per-Y context and cache invalidation. The oracle
 evaluates the tree at the topmost solid row of every height-matched column
-(session 7 in `docs/PROVENANCE.md`). Measured against the same
+(slice J later extended this descent through complete columns;
+session 7 in `docs/PROVENANCE.md`). Measured against the same
 2,401-column seed-2026 sample:
 
 - **95.44% top-block match (2,200 / 2,305 height-matched columns)** — above
@@ -351,18 +352,66 @@ none missing — the save contains (totals, with the dominant bands):
   about 1.2% of the stone volume in its peak band — the distribution
   levels the T4 gate must be evaluated against.
 
-Two attributions matter for the implementation slice. First, some ore
-volume is expected to come from the `minecraft:vein`-type material rules
-(large copper/iron blobs) that belong to the surface material system —
-their stream semantics are already captured (surface module ore-vein
-tests) but not applied through full columns; the remaining ores are
-placement-stage features. Second, the census is a raw save count and
+Two attributions were assumed for the implementation slice. The first —
+that part of the ore volume comes from the `minecraft:vein`-type material
+rules (large copper/iron blobs) whose stream semantics were captured but
+not yet applied through full columns — was tested directly in slice J and
+resolved: applying the vein rules through the full descent reproduces
+vanilla's own rates, and treating their census share as a vein-rate target
+was wrong. Session 10 (`docs/PROVENANCE.md`) measured vanilla's own
+classes at seed 2026: the iron vein density fires on 0.19% of in-window
+rows and copper on 0.13%, which the RustMC port reproduces (mask ≥ 0 at
+0.81% vs 0.825% measured in vanilla). The large tuff and granite counts in
+the vein windows (≈1,147 tuff per chunk, ≈8.6% of in-window rows) are
+dominated by placement-stage *features* — notably `ore_tuff` (size 64,
+targeting the `base_stone_overworld` tag) and the stone-blob features —
+not by vein material rules; the vein-pure census signal (raw metal
+blocks: 20 raw_iron_block and 1 raw_copper_block per 100 chunks in a
+structures-off fresh world) matches the low modeled rates. The second
+attribution stands and widened: the census is a raw save count that also
 includes structure-placed blocks of the same families (village wood,
-abandoned-farm cane); those are a small fraction at this sample scale
-and get subtracted only if they ever approach the gate margin. The
-pipeline currently places no features at all, so every counted family is
-a quantified T4 target rather than a scored mismatch, keeping the
-measurement honest.
+abandoned-farm cane), a small fraction at this sample scale, subtracted
+only if it ever approaches the gate margin. With the vein rules now
+applied, the dominant remaining census delta belongs entirely to the
+feature runtime, and no vein parameter was re-tuned to chase the
+feature-contaminated numbers.
+
+## T4 vein descent measured (1 October 2026, slice J)
+
+The generator now exposes a full-column material-rule descent
+(`VanillaGenerator::column_ids`): every block of a column from the build
+floor up is resolved through the root `material_rule` program —
+bedrock, then the copper/iron `minecraft:vein` rules with their density,
+richness and gap draws on the `minecraft:ore` random factory, then the
+surface/underground conditions — with stone/deepslate host selection,
+aquifer substance and carving preserved. The oracle gained a `census_
+compare` mode that runs this descent over a block square and counts it
+into the same decoration families the save side uses, so the two are
+directly attributable.
+
+- Synthetic descent tests pin the first-match-wins sequencing, the solid
+  run/floor-run boundaries, and the below-floor depth sentinel; an
+  ignored smoke fires both vein rules over two 16×16 squares (granite
+  and tuff fillers observed inside their documented windows) and re-checks
+  the descent's top row against the T2 top-block result.
+- Vein marginals measured by RustMC (dense-window grids over seed 2026)
+  versus vanilla's own classes at the same seed (session 10): mask ≥ 0 at
+  0.81% vs 0.825%; iron density > 0 ≈ 0.11–0.19% vs 0.188%; copper
+  ≈ 0.24% vs 0.130% — agreement within grid resolution, so the port is
+  distribution-faithful and slice J closes with no parameter changes.
+- Census attribution, now measured: in the one-chunk square (0..15) the
+  save holds granite 1,427, diorite 1,171, andesite 984, tuff 815 and
+  every feature-placed ore family (coal/iron/copper/gold/redstone/lapis/
+  diamond incl. deepslate variants) while the vein-only descent counts
+  none of them; the raw-metal and vein-ore families likewise stay at zero
+  in this sparse chunk. The T4 gate therefore reduces to the feature
+  runtime: `ore_tuff`-family ore features and the granite/diorite/andesite
+  stone-blob features first, then coal/diamond/etc. ore features and
+  vegetation.
+
+Slice J's exit condition — veins applied through full columns and shown
+distribution-faithful against vanilla's own marginals — is met. The
+staged plan continues with the feature runtime as T4's next slice.
 
 ## Risks
 

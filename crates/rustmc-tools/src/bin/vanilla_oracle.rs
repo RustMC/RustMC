@@ -9,6 +9,7 @@
 //! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
 //! vanilla_oracle substance <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [fail-cap]]
 //! vanilla_oracle census <world-dir> <min> <max>
+//! vanilla_oracle census_names <world-dir> <min> <max> [cap]
 //! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
 //! ```
 //!
@@ -280,6 +281,101 @@ fn run(args: &[String]) -> Result<(), String> {
                 );
             }
             if census.chunks == 0 {
+                return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "census_compare" => {
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
+            let min = parse_i64(args.get(3).ok_or("missing <min>")?)?;
+            let max = parse_i64(args.get(4).ok_or("missing <max>")?)?;
+            if min > max {
+                return Err("min must not exceed max".to_string());
+            }
+            // T4 comparison: the same census computed from RustMC's full
+            // material-rule descent against the save's stored blocks over
+            // the inclusive block square. Feature-placed families (coal,
+            // diamond, vegetation) still read rustmc=0 until the feature
+            // runtime lands.
+            let terrain = args.get(5).cloned().unwrap_or_else(|| "vanilla".to_owned());
+            if terrain != "vanilla" && !terrain.starts_with("vanilla:") {
+                return Err("census_compare requires the vanilla surface pipeline".to_string());
+            }
+            let settings = terrain
+                .split_once(':')
+                .map_or("minecraft:overworld", |(_, id)| id);
+            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
+                .map_err(|error| error.to_string())?;
+            let save = oracle::census_blocks(&mut store, min, max)?;
+            let ours = oracle::census_generated(&generator, min, max)?;
+            println!(
+                "region={min}..{max} save_chunks={} missing_chunks={} rustmc_columns={}",
+                save.chunks,
+                save.missing_chunks,
+                (max - min + 1) * (max - min + 1)
+            );
+            for family in oracle::CensusFamily::all() {
+                let save_total = save.totals.get(&family).copied().unwrap_or(0);
+                let ours_total = ours.totals.get(&family).copied().unwrap_or(0);
+                if save_total == 0 && ours_total == 0 {
+                    continue;
+                }
+                println!(
+                    "compare {} save={} rustmc={}",
+                    family.name(),
+                    save_total,
+                    ours_total
+                );
+                if save_total > 0 && ours_total > 0 {
+                    for (label, census) in [("save", &save), ("rustmc", &ours)] {
+                        let mut band_pairs: Vec<_> = census
+                            .bands
+                            .iter()
+                            .filter(|((f, _), _)| *f == family)
+                            .map(|((_, band), count)| (*band, *count))
+                            .collect();
+                        band_pairs.sort_by_key(|(band, _)| *band);
+                        let rendered: Vec<String> = band_pairs
+                            .iter()
+                            .map(|(band, count)| format!("{band}:{count}"))
+                            .collect();
+                        println!("bands {label} {} {}", family.name(), rendered.join(" "));
+                    }
+                }
+            }
+            if save.chunks == 0 {
+                return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "census_names" => {
+            let min = parse_i64(args.get(2).ok_or("missing <min>")?)?;
+            let max = parse_i64(args.get(3).ok_or("missing <max>")?)?;
+            if min > max {
+                return Err("min must not exceed max".to_string());
+            }
+            // Classification audit: every stored block-state name in the
+            // rectangle with its count and the census family it maps to
+            // (`none` when the census ignores it).
+            let to_chunk = |v: i64| -> Result<i32, String> {
+                i32::try_from(v.div_euclid(16)).map_err(|_| "coordinate too large".to_string())
+            };
+            let (min_cx, max_cx) = (to_chunk(min)?, to_chunk(max)?);
+            let (chunks, names) =
+                oracle::census_name_histogram(&mut store, min_cx, max_cx, min_cx, max_cx)?;
+            println!("chunks={chunks}");
+            let mut pairs: Vec<_> = names.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            let cap = args
+                .get(4)
+                .map(|v| parse_i64(v).map(|n| n.max(1) as usize))
+                .transpose()?
+                .unwrap_or(pairs.len());
+            for (name, count) in pairs.iter().take(cap) {
+                let family = oracle::census_family(oracle::base_block_name(name))
+                    .map(|f| f.name().to_owned())
+                    .unwrap_or_else(|| "none".to_owned());
+                println!("name {name} count {count} family {family}");
+            }
+            if chunks == 0 {
                 return Err("no generated chunks found in the sampled range".to_string());
             }
         }
