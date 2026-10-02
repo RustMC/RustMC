@@ -16,7 +16,7 @@ These identifiers select discovery responses only. Java's handshake carries a cl
 | Connection and authentication | partial: opt-in loopback Creative terrain preview; configuration and initial play rendered in a real client, no authentication or authoritative gameplay | planned | A real Java 26.3 client accepted the local core-pack registry and tag exchange, entered Creative preview play, and visibly rendered original chunks on 29 September 2026. No account authentication or gameplay state exists. |
 | Rules and update ordering | planned | planned translation; native parity unknown | None |
 | Inventory, commands, recipes, interactions | planned | planned translation | None |
-| Generation and seed behavior | partial: original coordinate-derived preview terrain and eight biome labels transmitted to a real client | unknown | Determinism and border tests plus real Java 26.3 visual evidence; no vanilla world-generation parity |
+| Generation and seed behavior | partial: original preview plus an opt-in, operator-provisioned data-driven Overworld probe | unknown | Determinism, packet parity tests, and local client observation; the probe lacks feature-stage blocks, structures, and exact vanilla world-generation parity. Its disk cache stores immutable preview packets, not world edits. |
 | Save/import/export | planned | unknown | None |
 | Cross-edition translation differences | not applicable | planned | None |
 

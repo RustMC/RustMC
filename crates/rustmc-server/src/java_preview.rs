@@ -39,6 +39,7 @@ struct VanillaWorker {
     results: mpsc::Receiver<BuiltChunk>,
     handles: Vec<thread::JoinHandle<()>>,
     in_flight: BTreeSet<(i32, i32)>,
+    pending: Option<BuiltChunk>,
 }
 
 impl VanillaWorker {
@@ -145,6 +146,7 @@ impl VanillaWorker {
             results,
             handles,
             in_flight: BTreeSet::new(),
+            pending: None,
         }
     }
 }
@@ -417,7 +419,7 @@ impl Preview {
             count += 1;
         }
         let mut count_data = Vec::new();
-        put_varint(count, &mut count_data);
+        put_varint(count as u32, &mut count_data);
         output.extend(frame(BATCH_END, &count_data));
         self.awaiting_batch = true;
         Some((output, generation_us, encoding_us))
@@ -450,36 +452,61 @@ impl Preview {
         if self.awaiting_batch {
             return None;
         }
-        let built = match worker.results.try_recv() {
-            Ok(built) => built,
-            Err(mpsc::TryRecvError::Empty) => return None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.failed = true;
-                return None;
+        let mut count = 0;
+        let mut generation_us = 0;
+        let mut encoding_us = 0;
+        let mut packet_bytes = 0;
+        while count < MAX_CHUNKS_PER_BATCH {
+            let built = match worker.pending.take() {
+                Some(built) => built,
+                None => match worker.results.try_recv() {
+                    Ok(built) => built,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.failed = true;
+                        if count == 0 {
+                            return None;
+                        }
+                        break;
+                    }
+                },
+            };
+            let size = match &built.packet {
+                Ok(packet) if packet.len() < MAX_BATCH_BYTES => packet.len(),
+                _ => {
+                    self.failed = true;
+                    return None;
+                }
+            };
+            if count > 0 && packet_bytes + size > MAX_BATCH_BYTES {
+                worker.pending = Some(built);
+                break;
             }
-        };
-        worker.in_flight.remove(&built.position);
-        let packet = match built.packet {
-            Ok(packet) if packet.len() < MAX_BATCH_BYTES => packet,
-            _ => {
-                self.failed = true;
-                return None;
+            worker.in_flight.remove(&built.position);
+            if (built.position.0 - self.center.0).abs() > self.radius
+                || (built.position.1 - self.center.1).abs() > self.radius
+                || self.sent.contains(&built.position)
+            {
+                continue;
             }
-        };
-        if (built.position.0 - self.center.0).abs() > self.radius
-            || (built.position.1 - self.center.1).abs() > self.radius
-            || self.sent.contains(&built.position)
-        {
+            if count == 0 {
+                output.extend(frame(BATCH_START, &[]));
+            }
+            output.extend(built.packet.expect("checked packet"));
+            self.sent.insert(built.position);
+            generation_us += built.generation_us;
+            encoding_us += built.encoding_us;
+            packet_bytes += size;
+            count += 1;
+        }
+        if count == 0 {
             return None;
         }
-        output.extend(frame(BATCH_START, &[]));
-        output.extend(packet);
         let mut count_data = Vec::new();
-        put_varint(1, &mut count_data);
+        put_varint(count as u32, &mut count_data);
         output.extend(frame(BATCH_END, &count_data));
-        self.sent.insert(built.position);
         self.awaiting_batch = true;
-        Some((output, built.generation_us, built.encoding_us))
+        Some((output, generation_us, encoding_us))
     }
 }
 
@@ -706,6 +733,79 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    #[test]
+    fn vanilla_ready_chunks_share_a_bounded_acknowledged_batch() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(8);
+        let positions = [(0, 0), (1, 0), (0, 1)];
+        for position in positions {
+            tx.send(BuiltChunk {
+                position,
+                packet: Ok(frame(CHUNK, b"test")),
+                generation_us: 4,
+                encoding_us: 2,
+            })
+            .unwrap();
+        }
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: positions.into_iter().collect(),
+            pending: None,
+        });
+        let (stream, generation_us, encoding_us) = preview.next_chunk().unwrap();
+        let ids = packet_ids(&stream);
+        assert_eq!(ids.iter().filter(|id| **id == CHUNK).count(), 3);
+        assert_eq!(ids.iter().filter(|id| **id == BATCH_START).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == BATCH_END).count(), 1);
+        assert_eq!((generation_us, encoding_us), (12, 6));
+        assert!(preview.awaiting_batch);
+        assert_eq!(preview.sent.len(), 3);
+    }
+
+    #[test]
+    fn vanilla_batch_defers_packet_when_byte_budget_is_full() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(8);
+        for position in [(0, 0), (1, 0)] {
+            tx.send(BuiltChunk {
+                position,
+                packet: Ok(frame(CHUNK, &vec![0; 400_000])),
+                generation_us: 0,
+                encoding_us: 0,
+            })
+            .unwrap();
+        }
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: [(0, 0), (1, 0)].into_iter().collect(),
+            pending: None,
+        });
+        let first = preview.next_chunk().unwrap().0;
+        assert_eq!(
+            packet_ids(&first).iter().filter(|id| **id == CHUNK).count(),
+            1
+        );
+        assert!(first.len() < MAX_BATCH_BYTES + 32);
+        assert!(preview.vanilla.as_ref().unwrap().pending.is_some());
+        preview.awaiting_batch = false;
+        let second = preview.next_chunk().unwrap().0;
+        assert_eq!(
+            packet_ids(&second)
+                .iter()
+                .filter(|id| **id == CHUNK)
+                .count(),
+            1
+        );
+        assert!(preview.vanilla.as_ref().unwrap().pending.is_none());
+        assert_eq!(preview.sent.len(), 2);
     }
 
     #[test]

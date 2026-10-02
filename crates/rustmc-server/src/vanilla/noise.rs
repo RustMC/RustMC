@@ -11,23 +11,23 @@ const HALF_ROUND_OFF: f64 = 1.6777215999999996e7;
 /// Java: `GradientNoise.ROUND_OFF == 33554432` (2^25).
 const ROUND_OFF: f64 = 3.3554432e7;
 
-const GRADIENT: [(i32, i32, i32); 16] = [
-    (1, 1, 0),
-    (-1, 1, 0),
-    (1, -1, 0),
-    (-1, -1, 0),
-    (1, 0, 1),
-    (-1, 0, 1),
-    (1, 0, -1),
-    (-1, 0, -1),
-    (0, 1, 1),
-    (0, -1, 1),
-    (0, 1, -1),
-    (0, -1, -1),
-    (1, 1, 0),
-    (0, -1, 1),
-    (-1, 1, 0),
-    (0, -1, -1),
+const GRADIENT: [(f32, f32, f32); 16] = [
+    (1.0, 1.0, 0.0),
+    (-1.0, 1.0, 0.0),
+    (1.0, -1.0, 0.0),
+    (-1.0, -1.0, 0.0),
+    (1.0, 0.0, 1.0),
+    (-1.0, 0.0, 1.0),
+    (1.0, 0.0, -1.0),
+    (-1.0, 0.0, -1.0),
+    (0.0, 1.0, 1.0),
+    (0.0, -1.0, 1.0),
+    (0.0, 1.0, -1.0),
+    (0.0, -1.0, -1.0),
+    (1.0, 1.0, 0.0),
+    (0.0, -1.0, 1.0),
+    (-1.0, 1.0, 0.0),
+    (0.0, -1.0, -1.0),
 ];
 
 /// Keeps coordinates inside the exact-integer band of double arithmetic.
@@ -39,9 +39,18 @@ fn wrap(x: f64) -> f64 {
     }
 }
 
+/// Perlin coordinates are wrapped into the exact integer range before this
+/// conversion. Truncation plus a negative-fraction correction avoids the
+/// platform libm `floor` call on every noise sample.
+#[inline]
+fn lattice_floor(x: f64) -> i32 {
+    let truncated = x as i32;
+    truncated - i32::from(x < f64::from(truncated))
+}
+
 fn grad_dot(hash: i32, x: f32, y: f32, z: f32) -> f32 {
     let g = GRADIENT[(hash & 15) as usize];
-    g.0 as f32 * x + g.1 as f32 * y + g.2 as f32 * z
+    g.0 * x + g.1 * y + g.2 * z
 }
 
 fn smoothstep(x: f32) -> f32 {
@@ -114,9 +123,9 @@ impl PerlinNoise {
         let x = wrap(_x) + self.offset_x;
         let y = wrap(_y) + self.offset_y;
         let z = wrap(_z) + self.offset_z;
-        let floor_x = x.floor() as i32;
-        let floor_y = y.floor() as i32;
-        let floor_z = z.floor() as i32;
+        let floor_x = lattice_floor(x);
+        let floor_y = lattice_floor(y);
+        let floor_z = lattice_floor(z);
         let relative_x = (x - floor_x as f64) as f32;
         let relative_y = (y - floor_y as f64) as f32;
         let relative_z = (z - floor_z as f64) as f32;
@@ -132,9 +141,9 @@ impl PerlinNoise {
         let x = wrap(_x) + self.offset_x;
         let y = wrap(_y) + self.offset_y;
         let z = wrap(_z) + self.offset_z;
-        let floor_x = x.floor() as i32;
-        let floor_y = y.floor() as i32;
-        let floor_z = z.floor() as i32;
+        let floor_x = lattice_floor(x);
+        let floor_y = lattice_floor(y);
+        let floor_z = lattice_floor(z);
         let relative_x = (x - floor_x as f64) as f32;
         let relative_y = y - floor_y as f64;
         let relative_z = (z - floor_z as f64) as f32;
@@ -474,6 +483,18 @@ pub fn create_blended_fbm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lattice_floor_matches_floor_inside_wrapped_coordinate_band() {
+        for integer in [-16_777_216, -4096, -1, 0, 1, 4096, 16_777_216] {
+            for fraction in [0.0, 0.125, 0.5, 0.999_999] {
+                let value = f64::from(integer) + fraction;
+                assert_eq!(lattice_floor(value), value.floor() as i32);
+                let negative = f64::from(integer) - fraction;
+                assert_eq!(lattice_floor(negative), negative.floor() as i32);
+            }
+        }
+    }
 
     const POINTS: [(f64, f64, f64); 4] = [
         (0.5, 0.5, 0.5),

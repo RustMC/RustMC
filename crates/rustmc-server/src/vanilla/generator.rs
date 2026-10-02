@@ -300,16 +300,25 @@ impl VanillaGenerator {
     pub fn column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
         let min_y = self.router.min_y;
         let mut ids: Vec<Option<String>> = vec![None; self.router.height as usize];
-        let Some(top) = self.surface(x, z).map(|(y, _)| y) else {
-            return ids;
-        };
-        self.heights.borrow_mut().insert((x, z), top);
         // The column as the surface pass sees it: the registry carvers
-        // have not stamped it yet.
+        // have not stamped it yet. Keep the first non-air row found by the
+        // top-down scan and retain the rest; this avoids sampling the first
+        // non-air row a second time.
         let density = &self.router.final_density;
-        let filled: Vec<Substance> = (min_y..=top)
-            .map(|y| self.aquifer.substance(x, y, z, density.sample(x, y, z)))
-            .collect();
+        let mut top = None;
+        let mut filled = Vec::with_capacity(self.router.height as usize);
+        for y in (min_y..=self.max_y).rev() {
+            let substance = self.aquifer.substance(x, y, z, density.sample(x, y, z));
+            if top.is_none() && substance != Substance::Air {
+                top = Some(y);
+            }
+            if top.is_some() {
+                filled.push(substance);
+            }
+        }
+        let Some(top) = top else { return ids };
+        filled.reverse();
+        self.heights.borrow_mut().insert((x, z), top);
         let rules = self.surface.as_ref();
         let mut ctx = rules.map(|rules| {
             SurfaceContext::new(

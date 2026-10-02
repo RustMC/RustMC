@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — opt-in Overworld terrain probe
+
+- Added bounded parallel generation of operator-provisioned Java 26.3 Overworld chunks behind an explicit loopback preview setting. The original terrain preview remains the default.
+- Added a local, size-bounded immutable chunk packet cache and a spawn prewarmer; it does not save block edits or player state.
+- Reduced measured cold generation cost on a pinned four-chunk sweep by about 10.6% through equivalent noise arithmetic, and combined completed chunks into bounded acknowledged batches. Exact vanilla parity and full-client loading speed remain unverified.
+
 ## Unreleased — Milestone 2 discovery
 
 - Added bounded Java 26.3 status/ping and Bedrock 1.26.51 UDP discovery paths with independent codec and process tests. Java server-list status was observed in a matching client; Bedrock real-client evidence remains open. Login and world remain absent.

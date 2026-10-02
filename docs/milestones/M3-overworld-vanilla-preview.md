@@ -236,3 +236,35 @@ seconds with 600 new packets and 25 existing hits. These are preparation
 measurements, not client render times or proof of radius-32 instant loading.
 The live server still generates misses and uses acknowledged chunk batches;
 client-side observation is required before treating view delivery as fast.
+
+## Cold generation arithmetic follow-up (3 October 2026)
+
+A local `perf` run on a four-chunk column sweep put about 40% of sampled
+cycles in `PerlinNoise::sample_and_lerp`, 20% in `PerlinNoise::get`, and
+13% in the platform `floor` call. RustMC now converts bounded Perlin
+coordinates to lattice integers with truncation and a negative-fraction
+correction; its gradient table stores the same exactly representable values
+as `f32`. The column scan retains the first non-air row instead of sampling
+that row again. Existing parity-vector tests pass, and all 25 radius-2
+seed-2026 encoded packet payloads compared byte-for-byte with the previous
+build.
+The complete radius-12 preparation also produced byte-identical payloads at
+all 625 coordinates; its updated cold run took 43.1 seconds for 600 new
+packets and 25 hits (the earlier run took 54.6 seconds). This run was not
+CPU-pinned, so the controlled four-chunk figures below are the performance
+comparison.
+
+On one pinned performance core (`taskset -c 4`), four alternating cold 2x2
+column sweeps took 1896.5, 1902.5, 1904.9, and 1933.8 ms before; 1717.3,
+1717.9, 1700.3, and 1698.1 ms after. This is about a 10.6% median reduction
+for this machine and workload, not an instant cold chunk or a full-client
+render measurement. The radius-12 prewarmer remains the main way to make a
+known spawn view ready before join.
+
+The Java preview now combines already completed worker results into one
+acknowledged batch, limited to 16 chunks and 768 KiB of chunk packet bytes.
+When the next packet would exceed the byte budget, it stays pending for the
+following acknowledgement. Tests cover multiple packets in one batch and
+budget deferral. This reduces protocol acknowledgement overhead when workers
+finish near one another; it does not shorten the density computation for a
+cold chunk. Real-client movement still needs operator observation.
