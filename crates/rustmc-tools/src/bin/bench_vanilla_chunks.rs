@@ -225,8 +225,8 @@ fn run(args: &[String]) -> Result<(), String> {
 /// Entries held by every coordinate-keyed cache after one mode's sweep.
 fn report_occupancy(mode: &str, occupancy: &CacheOccupancy) {
     println!(
-        "occupancy,{mode},masks,{},heights,{},chunk_carvers,{}",
-        occupancy.masks, occupancy.heights, occupancy.chunk_carvers
+        "occupancy,{mode},masks,{},heights,{},biomes,{},chunk_carvers,{}",
+        occupancy.masks, occupancy.heights, occupancy.biomes, occupancy.chunk_carvers
     );
     println!(
         "occupancy,{mode},aquifer_centers,{},aquifer_statuses,{},aquifer_surface_levels,{},aquifer_skip_bounds,{},total,{}",
@@ -267,15 +267,17 @@ fn report_budget(mask_bytes: usize) {
     let masks = entries(VanillaGenerator::MASK_CACHE_CAPACITY, mask_bytes);
     let carvers = entries(VanillaGenerator::CHUNK_CARVERS_CACHE_CAPACITY, 8);
     let heights = entries(VanillaGenerator::HEIGHT_CACHE_CAPACITY, 4);
+    let biomes = entries(VanillaGenerator::BIOME_CACHE_CAPACITY, 32);
     let centers = entries(NoiseBasedAquifer::CENTER_CACHE_CAPACITY, 24);
     let statuses = entries(NoiseBasedAquifer::STATUS_CACHE_CAPACITY, 24);
     let surfaces = entries(NoiseBasedAquifer::SURFACE_CACHE_CAPACITY, 12);
     let skips = entries(NoiseBasedAquifer::SKIP_CACHE_CAPACITY, 12);
     println!(
-        "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},aquifer_centers,{}",
+        "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},biomes,{},aquifer_centers,{}",
         masks / 1024,
         carvers / 1024,
         heights / 1024,
+        biomes / 1024,
         centers / 1024
     );
     println!(
@@ -283,7 +285,7 @@ fn report_budget(mask_bytes: usize) {
         statuses / 1024,
         surfaces / 1024,
         skips / 1024,
-        (masks + carvers + heights + centers + statuses + surfaces + skips) / 1024
+        (masks + carvers + heights + biomes + centers + statuses + surfaces + skips) / 1024
     );
 }
 

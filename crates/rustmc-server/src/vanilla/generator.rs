@@ -56,6 +56,8 @@ pub struct CacheOccupancy {
     pub chunk_carvers: usize,
     /// Columns with a memoised surface top.
     pub heights: usize,
+    /// Quart-grid biome choices retained for nearby samples.
+    pub biomes: usize,
     /// Aquifer fluid cells with a memoised center.
     pub aquifer_centers: usize,
     /// Aquifer fluid cells with a memoised status.
@@ -72,6 +74,7 @@ impl CacheOccupancy {
         self.masks
             + self.chunk_carvers
             + self.heights
+            + self.biomes
             + self.aquifer_centers
             + self.aquifer_statuses
             + self.aquifer_surface_levels
@@ -106,6 +109,8 @@ pub struct VanillaGenerator {
     /// Column-top memo: the descent's steep-gradient lookups re-read
     /// neighbouring columns, whose top scan is otherwise O(height).
     heights: RefCell<BoundedCache<(i32, i32), i32>>,
+    /// One immutable biome choice per quantized 4x4x4 world cell.
+    biomes: RefCell<BoundedCache<(i32, i32, i32), Option<String>>>,
 }
 
 impl VanillaGenerator {
@@ -135,6 +140,9 @@ impl VanillaGenerator {
     /// streaming for a full-radius view's worth of 1,081,600 columns,
     /// i.e. tens of KiB instead of ~14 MB.
     pub const HEIGHT_CACHE_CAPACITY: usize = 4_096;
+    /// A full chunk has at most 4×4×96 quart cells; neighboring chunk and
+    /// surface-rule probes reuse them before a streaming sweep evicts them.
+    pub const BIOME_CACHE_CAPACITY: usize = 4_096;
 
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
     /// the noise engine to `world_seed`.
@@ -204,6 +212,7 @@ impl VanillaGenerator {
             masks: RefCell::new(BoundedCache::new(Self::MASK_CACHE_CAPACITY)),
             chunk_carvers: RefCell::new(BoundedCache::new(Self::CHUNK_CARVERS_CACHE_CAPACITY)),
             heights: RefCell::new(BoundedCache::new(Self::HEIGHT_CACHE_CAPACITY)),
+            biomes: RefCell::new(BoundedCache::new(Self::BIOME_CACHE_CAPACITY)),
         })
     }
 
@@ -212,7 +221,13 @@ impl VanillaGenerator {
     /// not provisioned a placement table for this preset.
     pub fn biome(&self, x: i32, z: i32, surface_y: i32) -> Option<String> {
         let placement = self.placement.as_ref()?;
-        self.climate.biome(placement, x, surface_y, z)
+        let key = (x >> 2, surface_y >> 2, z >> 2);
+        if let Some(value) = self.biomes.borrow_mut().get_mut(&key) {
+            return value.clone();
+        }
+        let value = self.climate.biome(placement, x, surface_y, z);
+        self.biomes.borrow_mut().insert(key, value.clone());
+        value
     }
 
     /// The block id left at the column's highest non-air position by the
@@ -481,11 +496,8 @@ impl VanillaGenerator {
                 return Some(Rc::clone(carvers));
             }
         }
-        let placement = self.placement.as_ref()?;
         let data = self.carvers.as_ref()?;
-        let biome = self
-            .climate
-            .biome(placement, chunk.0 << 4, 0, chunk.1 << 4)?;
+        let biome = self.biome(chunk.0 << 4, chunk.1 << 4, 0)?;
         let carvers = data.carvers_for_biome(&biome)?;
         self.chunk_carvers
             .borrow_mut()
@@ -542,6 +554,7 @@ impl VanillaGenerator {
             masks: self.masks.borrow().entries(),
             chunk_carvers: self.chunk_carvers.borrow().entries(),
             heights: self.heights.borrow().entries(),
+            biomes: self.biomes.borrow().entries(),
             aquifer_centers: aquifer.centers,
             aquifer_statuses: aquifer.statuses,
             aquifer_surface_levels: aquifer.surface_levels,
@@ -1262,6 +1275,22 @@ mod tests {
         (root, generator)
     }
 
+    #[test]
+    fn quart_biome_cache_is_bounded_and_matches_uncached_sampler() {
+        let (root, generator) = bounded_generator("cache-biomes");
+        let placement = generator.placement.as_ref().expect("fixture placement");
+        for quart in 0..9_000i32 {
+            let x = quart * 4;
+            let expected = generator.climate.biome(placement, x, 8, -4);
+            assert_eq!(generator.biome(x, -4, 8), expected);
+            assert_eq!(generator.biome(x + 3, -1, 11), expected);
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(occupancy.biomes <= 2 * VanillaGenerator::BIOME_CACHE_CAPACITY);
+        assert!(occupancy.biomes < 9_000);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// The carving caches must stop growing long before the world volume
     /// queried: 300 chunk targets along the x = z diagonal touch 300
     /// distinct mask keys and (each replaying its 17x17 window) more than
@@ -1405,6 +1434,7 @@ mod tests {
         let before_height = generator.surface_height(x, z);
         let before_ids = generator.column_ids(x, z);
         let before_top = generator.top_block(x, z);
+        let before_biome = generator.biome(x, z, 8);
         let before_carved = generator.carved(x, 8, z);
         assert!(
             before_height > 0 && before_ids.iter().any(Option::is_some) && before_top.is_some(),
@@ -1432,6 +1462,7 @@ mod tests {
         assert!(
             occupancy.masks <= 2 * VanillaGenerator::MASK_CACHE_CAPACITY
                 && occupancy.heights <= 2 * VanillaGenerator::HEIGHT_CACHE_CAPACITY
+                && occupancy.biomes <= 2 * VanillaGenerator::BIOME_CACHE_CAPACITY
                 && occupancy.aquifer_centers <= 2 * NoiseBasedAquifer::CENTER_CACHE_CAPACITY,
             "the sweeps above must have rotated the caches while keeping them bounded: \
              {occupancy:?}"
@@ -1440,6 +1471,7 @@ mod tests {
         assert_eq!(generator.surface_height(x, z), before_height);
         assert_eq!(generator.column_ids(x, z), before_ids);
         assert_eq!(generator.top_block(x, z), before_top);
+        assert_eq!(generator.biome(x, z, 8), before_biome);
         assert_eq!(generator.carved(x, 8, z), before_carved);
         fs::remove_dir_all(&root).expect("cleanup");
     }
