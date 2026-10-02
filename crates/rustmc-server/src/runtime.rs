@@ -290,6 +290,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             registry_table: registry_table.clone(),
             seed,
             spawn_y: generator.surface_height(0, 0),
+            workers: config.vanilla_generation_workers,
             cache: config
                 .vanilla_cache_root
                 .as_ref()

@@ -14,8 +14,6 @@ use std::{
     time::Instant,
 };
 
-const VANILLA_WORKERS: usize = 8;
-
 /// Validated operator-local input. Runtime preflight checks the files before binding.
 #[derive(Debug, Clone)]
 pub struct VanillaSource {
@@ -24,6 +22,7 @@ pub struct VanillaSource {
     pub seed: i64,
     pub spawn_y: i32,
     pub cache: Option<crate::preview_cache::PreviewCache>,
+    pub workers: usize,
 }
 
 struct BuiltChunk {
@@ -40,14 +39,16 @@ struct VanillaWorker {
     handles: Vec<thread::JoinHandle<()>>,
     in_flight: BTreeSet<(i32, i32)>,
     pending: Option<BuiltChunk>,
+    capacity: usize,
 }
 
 impl VanillaWorker {
     fn new(source: VanillaSource) -> Self {
+        let capacity = source.workers;
         let (requests, rx) = mpsc::sync_channel::<(i32, i32)>(0);
-        let (tx, results) = mpsc::sync_channel(VANILLA_WORKERS);
+        let (tx, results) = mpsc::sync_channel(capacity);
         let rx = Arc::new(Mutex::new(rx));
-        let handles = (0..VANILLA_WORKERS)
+        let handles = (0..capacity)
             .map(|_| {
                 let rx = Arc::clone(&rx);
                 let tx = tx.clone();
@@ -147,6 +148,7 @@ impl VanillaWorker {
             handles,
             in_flight: BTreeSet::new(),
             pending: None,
+            capacity,
         }
     }
 }
@@ -249,6 +251,9 @@ impl Preview {
         manifest: &RegistryManifest,
         source: VanillaSource,
     ) -> Option<Self> {
+        if !(1..=20).contains(&source.workers) {
+            return None;
+        }
         let mut preview = Self::new(
             source.seed as u64,
             radius,
@@ -368,7 +373,7 @@ impl Preview {
             && self
                 .vanilla
                 .as_ref()
-                .is_some_and(|worker| worker.in_flight.len() >= VANILLA_WORKERS)
+                .is_some_and(|worker| worker.in_flight.len() >= worker.capacity)
         {
             return None;
         }
@@ -428,7 +433,7 @@ impl Preview {
     fn next_vanilla_chunk(&mut self, mut output: Vec<u8>) -> Option<(Vec<u8>, u128, u128)> {
         let worker = self.vanilla.as_mut()?;
         for position in self.view_order.iter().copied() {
-            if worker.in_flight.len() >= VANILLA_WORKERS {
+            if worker.in_flight.len() >= worker.capacity {
                 break;
             }
             if self.sent.contains(&position) || worker.in_flight.contains(&position) {
@@ -756,6 +761,7 @@ mod tests {
             handles: Vec::new(),
             in_flight: positions.into_iter().collect(),
             pending: None,
+            capacity: 8,
         });
         let (stream, generation_us, encoding_us) = preview.next_chunk().unwrap();
         let ids = packet_ids(&stream);
@@ -787,6 +793,7 @@ mod tests {
             handles: Vec::new(),
             in_flight: [(0, 0), (1, 0)].into_iter().collect(),
             pending: None,
+            capacity: 8,
         });
         let first = preview.next_chunk().unwrap().0;
         assert_eq!(
@@ -883,6 +890,7 @@ mod tests {
             seed: 2026,
             spawn_y: 117,
             cache: None,
+            workers: 8,
         };
         let mut preview = Preview::new_vanilla(2, &manifest(), source).expect("preview");
         preview.teleport_acknowledged = true;
