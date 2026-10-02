@@ -437,3 +437,17 @@ Ground-truth census and the attribution correction (the key finding):
 - No new dependencies were introduced; the `/tmp` harnesses (the Java probe plus the
   headless server instance) are disposable consultation tooling under the ADR-0014
   amendment and the project's implementation and tests remain Rust-only.
+## Vanilla research review hardening (2 October 2026)
+
+No new external generator source or game data was consulted for this change.
+Review of the RustMC research implementation found that cyclic density
+references and out-of-range gradient coordinates could crash a local oracle
+run. Compilation now rejects reference cycles, deep reference chains, and
+gradient ranges outside the supported 32-bit span; evaluation widens the
+coordinate arithmetic before tiling. Biome interval documentation now matches
+the inclusive implementation. Unsupported carver types retain their position
+in a biome's carver list, preserving later seed indices, while malformed or
+missing references fail with an error. Tests cover these cases with synthetic
+data. The provisioned Overworld graph was checked locally; no private data is
+committed. Volume wrappers, cache bounds, feature placement, and live chunk
+integration remain open before any client-visible parity claim.

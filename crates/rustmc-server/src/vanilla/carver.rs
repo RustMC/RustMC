@@ -5,8 +5,9 @@
 //! consultation under ADR-0014 (as amended) and are recorded as
 //! numeric/structural facts in `docs/PROVENANCE.md` (session 9). Nothing
 //! from that consultation is present in this repository as code; the
-//! module is written independently from the recorded facts and pinned by
-//! parity vectors.
+//! module is written independently from the recorded facts. Full geometry
+//! parity vectors remain to be captured; current tests cover components and
+//! aggregate save comparisons cover the assembled output.
 //!
 //! Shape of the runtime: one legacy-LCG stream is reseeded per source
 //! chunk and carver index over the 17×17 chunk window around the target
@@ -26,7 +27,7 @@
 //! `SingleThreadedRandomSource` built on the same bit generator
 //! (PROVENANCE session 9).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -670,14 +671,48 @@ impl CanyonCarver {
 #[derive(Debug, Default)]
 pub struct CarverData {
     carvers: HashMap<String, Rc<Carver>>,
-    biomes: HashMap<String, Rc<Vec<Rc<Carver>>>>,
+    biomes: HashMap<String, Rc<Vec<Option<Rc<Carver>>>>>,
+}
+
+fn resolve_biome_carvers(
+    biome_id: &str,
+    document: &Value,
+    known_ids: &HashSet<String>,
+    supported: &HashMap<String, Rc<Carver>>,
+) -> Result<Vec<Option<Rc<Carver>>>, WorldgenError> {
+    let Some(entries) = document.get("carvers") else {
+        return Ok(Vec::new());
+    };
+    // The configured-carver holder accepts a single identifier as well as
+    // an array. Preserve source positions in either representation.
+    let one = std::slice::from_ref(entries);
+    let entries = entries.as_array().map(Vec::as_slice).unwrap_or(one);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let name = entry.as_str().ok_or_else(|| {
+                WorldgenError::Invalid(format!(
+                    "{biome_id}: carvers[{index}] must be an identifier"
+                ))
+            })?;
+            if !known_ids.contains(name) {
+                return Err(WorldgenError::Invalid(format!(
+                    "{biome_id}: carvers[{index}] references unknown {name}"
+                )));
+            }
+            // Unsupported dimension-specific carvers keep their original
+            // index, so later supported carvers retain their random seed.
+            Ok(supported.get(name).map(Rc::clone))
+        })
+        .collect()
 }
 
 impl CarverData {
     /// Loads `data/<ns>/worldgen/carver/*.json` and
     /// `data/<ns>/worldgen/biome/*.json` under the data root. Carver
     /// types without a runtime implementation here (the nether family)
-    /// are skipped; biomes referencing them simply omit those entries.
+    /// retain empty positions in biome lists to preserve subsequent indices.
     pub fn load(root: &Path) -> Result<Self, WorldgenError> {
         let mut data = Self::default();
         let data_dir = root.join("data");
@@ -708,6 +743,7 @@ impl CarverData {
                 biome_docs.push((format!("{ns}:{}", stem(&entry)), read_json(&entry)?));
             }
         }
+        let known_ids: HashSet<String> = carver_docs.iter().map(|(id, _)| id.clone()).collect();
         for (id, document) in carver_docs {
             let Some(carver) = parse_carver(&id, &document)? else {
                 continue; // unsupported carver type
@@ -715,15 +751,7 @@ impl CarverData {
             data.carvers.insert(id, Rc::new(carver));
         }
         for (id, document) in biome_docs {
-            let mut list = Vec::new();
-            if let Some(entries) = document.get("carvers").and_then(Value::as_array) {
-                for entry in entries {
-                    let name = entry.as_str().unwrap_or_default();
-                    if let Some(carver) = data.carvers.get(name) {
-                        list.push(Rc::clone(carver));
-                    }
-                }
-            }
+            let list = resolve_biome_carvers(&id, &document, &known_ids, &data.carvers)?;
             data.biomes.insert(id, Rc::new(list));
         }
         Ok(data)
@@ -733,7 +761,7 @@ impl CarverData {
         self.biomes.is_empty() && self.carvers.is_empty()
     }
 
-    pub fn carvers_for_biome(&self, biome_id: &str) -> Option<Rc<Vec<Rc<Carver>>>> {
+    pub fn carvers_for_biome(&self, biome_id: &str) -> Option<Rc<Vec<Option<Rc<Carver>>>>> {
         self.biomes.get(biome_id).map(Rc::clone)
     }
 }
@@ -1000,6 +1028,31 @@ mod tests {
                 max: -0.4,
             },
         })
+    }
+
+    #[test]
+    fn biome_carvers_preserve_source_indices_and_reject_bad_entries() {
+        let known = HashSet::from(["test:unsupported".to_owned(), "test:cave".to_owned()]);
+        let cave = Rc::new(simple_cave());
+        let supported = HashMap::from([("test:cave".to_owned(), Rc::clone(&cave))]);
+        let biome = serde_json::json!({"carvers": ["test:unsupported", "test:cave"]});
+        let slots = resolve_biome_carvers("test:biome", &biome, &known, &supported).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert!(slots[0].is_none());
+        assert!(Rc::ptr_eq(slots[1].as_ref().unwrap(), &cave));
+        let single = serde_json::json!({"carvers": "test:cave"});
+        assert_eq!(
+            resolve_biome_carvers("test:biome", &single, &known, &supported)
+                .unwrap()
+                .len(),
+            1
+        );
+        for invalid in [
+            serde_json::json!({"carvers": [17]}),
+            serde_json::json!({"carvers": ["test:missing"]}),
+        ] {
+            assert!(resolve_biome_carvers("test:biome", &invalid, &known, &supported).is_err());
+        }
     }
 
     #[test]
