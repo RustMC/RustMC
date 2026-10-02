@@ -126,6 +126,21 @@ interval. This removes idle generation time between batches; it does not
 change the measured cost of generating an individual chunk or establish a
 client-visible speed result.
 
+For the radius-32 probe, RustMC now sorts the player's 4,225 chunk positions
+only when the player crosses a chunk boundary, rather than on every 10 ms
+network poll. When all workers are occupied and a client batch is awaiting
+acknowledgement, the poll returns without scanning the view. A release-build
+CPU profile before this change assigned about 9% of samples to view-set search
+and sorting, alongside roughly half to Perlin sampling. This change leaves
+terrain values untouched.
+
+On this 20-thread machine, a separate-process release benchmark of 16 cold
+one-chunk tasks took 3.36 s at four-way concurrency and 1.96 s at eight-way
+concurrency while the local server was also active. This is a throughput
+probe, not a same-client latency measurement; it motivated increasing the
+opt-in worker pool to eight. An individual chunk still takes hundreds of
+milliseconds, so a radius-32 view will continue to fill over time.
+
 ## Independent seed check (2 October 2026)
 
 `inspect_vanilla_save` verified an additional owner-local Java 26.3

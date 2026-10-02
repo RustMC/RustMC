@@ -37,7 +37,7 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `vanilla_registry_table` | absent | Operator-local Java 26.3 block-state and biome ID table produced by `prepare_chunk_registry`; never commit the table or game data. |
 
 When both `vanilla_*` paths are set, RustMC validates them before binding and
-starts a fixed pool of four workers. Each worker owns a generator; at most four
+starts a fixed pool of eight workers. Each worker owns a generator; at most eight
 chunks are under construction for the one permitted local client. The initial
 recommended first test radius is 2; the operator can set up to 32 for a
 long-running load test. This is a slow, incomplete terrain probe: no structures,

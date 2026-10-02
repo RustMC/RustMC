@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 
-const VANILLA_WORKERS: usize = 4;
+const VANILLA_WORKERS: usize = 8;
 
 /// Validated operator-local input. Runtime preflight checks the files before binding.
 #[derive(Debug, Clone)]
@@ -152,6 +152,7 @@ pub struct Preview {
     generator: Generator,
     radius: i32,
     center: (i32, i32),
+    view_order: Vec<(i32, i32)>,
     sent: BTreeSet<(i32, i32)>,
     biomes: [u32; 8],
     pub teleport_acknowledged: bool,
@@ -184,6 +185,7 @@ impl Preview {
             generator: Generator::with_terrain(seed, terrain),
             radius: radius.into(),
             center: (0, 0),
+            view_order: ordered_view((0, 0), radius.into()),
             sent: BTreeSet::new(),
             biomes,
             teleport_acknowledged: false,
@@ -287,10 +289,14 @@ impl Preview {
         if !self.teleport_acknowledged {
             return Err("position before teleport acknowledgement");
         }
-        self.center = (
+        let center = (
             (x.floor() as i32).div_euclid(16),
             (z.floor() as i32).div_euclid(16),
         );
+        if center != self.center {
+            self.center = center;
+            self.view_order = ordered_view(center, self.radius);
+        }
         Ok(())
     }
 
@@ -314,6 +320,14 @@ impl Preview {
         if self.awaiting_batch && self.vanilla.is_none() {
             return None;
         }
+        if self.awaiting_batch
+            && self
+                .vanilla
+                .as_ref()
+                .is_some_and(|worker| worker.in_flight.len() >= VANILLA_WORKERS)
+        {
+            return None;
+        }
         let mut output = cache_center(self.center);
         let (cx, cz) = self.center;
         let radius = self.radius;
@@ -330,16 +344,17 @@ impl Preview {
                 self.sent.remove(&(x, z));
             }
         }
-        let mut candidates: Vec<_> = (-radius..=radius)
-            .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
+        if self.vanilla.is_some() {
+            return self.next_vanilla_chunk(output);
+        }
+        let candidates: Vec<_> = self
+            .view_order
+            .iter()
+            .copied()
             .filter(|pos| !self.sent.contains(pos))
             .collect();
         if candidates.is_empty() {
             return None;
-        }
-        candidates.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
-        if self.vanilla.is_some() {
-            return self.next_vanilla_chunk(output, candidates);
         }
         output.extend(frame(BATCH_START, &[]));
         let mut generation_us = 0;
@@ -366,17 +381,13 @@ impl Preview {
         Some((output, generation_us, encoding_us))
     }
 
-    fn next_vanilla_chunk(
-        &mut self,
-        mut output: Vec<u8>,
-        candidates: Vec<(i32, i32)>,
-    ) -> Option<(Vec<u8>, u128, u128)> {
+    fn next_vanilla_chunk(&mut self, mut output: Vec<u8>) -> Option<(Vec<u8>, u128, u128)> {
         let worker = self.vanilla.as_mut()?;
-        for position in candidates.iter().copied() {
+        for position in self.view_order.iter().copied() {
             if worker.in_flight.len() >= VANILLA_WORKERS {
                 break;
             }
-            if worker.in_flight.contains(&position) {
+            if self.sent.contains(&position) || worker.in_flight.contains(&position) {
                 continue;
             }
             if let Some(requests) = &worker.requests {
@@ -413,7 +424,10 @@ impl Preview {
                 return None;
             }
         };
-        if !candidates.contains(&built.position) {
+        if (built.position.0 - self.center.0).abs() > self.radius
+            || (built.position.1 - self.center.1).abs() > self.radius
+            || self.sent.contains(&built.position)
+        {
             return None;
         }
         output.extend(frame(BATCH_START, &[]));
@@ -432,6 +446,15 @@ fn cache_center((x, z): (i32, i32)) -> Vec<u8> {
     put_varint(x as u32, &mut body);
     put_varint(z as u32, &mut body);
     frame(CACHE_CENTER, &body)
+}
+
+/// Near chunks first; rebuild only when the player enters another chunk.
+fn ordered_view((cx, cz): (i32, i32), radius: i32) -> Vec<(i32, i32)> {
+    let mut positions: Vec<_> = (-radius..=radius)
+        .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
+        .collect();
+    positions.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
+    positions
 }
 
 fn block(chunk: &Chunk, x: usize, y: i32, z: usize) -> Block {
