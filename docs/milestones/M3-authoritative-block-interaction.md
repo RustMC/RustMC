@@ -1,6 +1,10 @@
 # M3 follow-on slice — authoritative block interaction (design)
 
-Status: **design only, not authorized, not implemented.** This is the design
+Status: **design only, not implemented.** The owner requested a vanilla-matching
+Overworld with standing, breaking, and placement on 2 October 2026. Live
+Overworld chunk delivery, an authoritative Y-coordinate model, and durable
+world state remain prerequisites; this document does not claim those are met.
+This is the design
 gate for the first gameplay slice *after* the [local Java 26.3 preview
 slice](M3-java-local-preview.md). That preview is a read-only,
 single-observer Creative inspection of RustMC-generated chunks whose surface
