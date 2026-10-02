@@ -590,3 +590,14 @@ default state, and writes a versioned JSON table outside Git. The table and
 game report are local data, not redistributed RustMC source. A smoke test
 encoded two generated columns with the derived IDs. No competing server code
 or architecture was consulted for this tool.
+
+## Second-seed save observation (2 October 2026)
+
+The read-only `inspect_vanilla_save` tool parses the owner's local Java 26.3
+`level.dat` and `data/minecraft/world_gen_settings.dat` as compressed NBT.
+Their observed metadata supplies version, seed, Overworld generator/settings,
+modded flag, enabled packs, and spawn coordinates without printing player
+records. The source is an owner-generated save; it remains untracked. A second
+default-preset seed was compared through the existing oracle, and its
+denominators and residuals are recorded in the M3 Overworld milestone note.
+No competing server source was used for this observation.

@@ -85,6 +85,27 @@ frames. This verifies ID lookup and encoding on those two columns only. No
 client has received them; state-kind tags, lighting, and live delivery still
 need validation.
 
+## Independent seed check (2 October 2026)
+
+`inspect_vanilla_save` verified an additional owner-local Java 26.3
+single-player save with a different seed (kept in private progress notes),
+Overworld generator `minecraft:noise`, and settings `minecraft:overworld`.
+Its metadata reports
+`WasModded=true` and enabled packs `vanilla,fabric-convention-tags-v2`; this
+is a default-preset observation from a modded client, not a clean vanilla
+fixture. The world remains local and untracked.
+
+On a stride-16 square from `-640..640` on each axis, 6,561 grid points were
+requested: 1,662 generated columns, 4,052 missing chunks, and 847 stored but
+ungenerated columns. Among the 1,662 scored columns, exact surface height was
+1,636 (98.44%), biome identity 1,662 (100%), and top block 1,621 of the 1,636
+height-matched columns (99.08%). The full-column base-block comparison scored
+213,871 positions: 178,414 exact (83.42%) and 181,341 exact after collapsing
+the air family (84.79%). Dominant remaining substitutions were tuff, andesite,
+diorite, and granite in the save versus plain deepslate or stone in RustMC.
+Only loaded/generated save columns enter the numerator. This is a second-seed
+measurement, not proof across arbitrary seeds or vanilla client rendering.
+
 ## Ground truth: first block-identity measurement (2 October 2026)
 
 This records automated evidence for the first acceptance item. The item stays

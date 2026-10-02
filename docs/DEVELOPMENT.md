@@ -101,6 +101,17 @@ the report's default block states and retains explicit property-bearing states.
 It is an input to adapter tests and future opt-in integration; the command
 above does not make the current preview serve vanilla chunks.
 
+Before comparing an owner-generated 26.3 save, inspect its seed and preset:
+
+```sh
+cargo run -p rustmc-tools --bin inspect_vanilla_save --locked -- /path/to/world
+```
+
+The tool reads `level.dat` and `data/minecraft/world_gen_settings.dat` locally
+and prints only comparison metadata. A world with a nondefault preset or
+generation-changing packs needs its own reference data and cannot be scored as
+the default preset merely because its client version matches.
+
 Join `127.0.0.1:25565`. The server announces a maximum 32-chunk view; set the
 client's render distance separately if desired. The client enters Creative for
 terrain inspection, with a fly-speed value ten times the first preview value.
