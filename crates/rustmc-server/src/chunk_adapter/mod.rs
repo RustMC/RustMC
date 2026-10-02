@@ -6,11 +6,11 @@
 //! field order, bit widths, and palette rules as the synthetic preview path
 //! (`crate::java_preview`), whose packet-ID and field-order provenance is
 //! logged in `docs/PROVENANCE.md`. The container, heightmap, and light facts
-//! this module adds on top are stated at each write site and carried in the
-//! commit message that introduced them; a `docs/PROVENANCE.md` session entry
-//! for this slice is still owed to the lead. Nothing was copied: only shapes
-//! were consulted, and every consulted number is re-derived here from the
-//! operator-provisioned tables.
+//! this module adds on top are stated at each write site and are logged as
+//! `docs/PROVENANCE.md` Session 11, which also records the registry-count fact
+//! that was removed from a tracked comment rather than left in the code. Nothing
+//! was copied: only shapes were consulted, and every consulted number is
+//! re-derived here from the operator-provisioned tables.
 //!
 //! Pipeline:
 //!

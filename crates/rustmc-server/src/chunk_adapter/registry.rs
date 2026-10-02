@@ -5,7 +5,7 @@
 //! registry and the `minecraft:worldgen/biome` dynamic registry). Those numbers
 //! are Mojang-derived, so RustMC never commits them: an operator provisions a
 //! versioned table at runtime (the same policy as the local preview manifest,
-//! see `docs/PROVENANCE.md` and [ADR-0014](docs/decisions/ADR-0014.md)) and this
+//! see `docs/PROVENANCE.md` and ADR-0014 as amended) and this
 //! module turns it into the lookup the adapter needs.
 //!
 //! Two guarantees this module owns:
