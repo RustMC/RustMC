@@ -7,6 +7,158 @@ use crate::{
     world::{Biome, Block, Chunk, Generator},
 };
 use std::collections::BTreeSet;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Instant,
+};
+
+const VANILLA_WORKERS: usize = 8;
+
+/// Validated operator-local input. Runtime preflight checks the files before binding.
+#[derive(Debug, Clone)]
+pub struct VanillaSource {
+    pub data_root: PathBuf,
+    pub registry_table: PathBuf,
+    pub seed: i64,
+    pub spawn_y: i32,
+    pub cache: Option<crate::preview_cache::PreviewCache>,
+}
+
+struct BuiltChunk {
+    position: (i32, i32),
+    packet: Result<Vec<u8>, String>,
+    generation_us: u128,
+    encoding_us: u128,
+}
+
+/// A fixed pool with one chunk per worker. Each generator stays on its owning thread.
+struct VanillaWorker {
+    requests: Option<mpsc::SyncSender<(i32, i32)>>,
+    results: mpsc::Receiver<BuiltChunk>,
+    handles: Vec<thread::JoinHandle<()>>,
+    in_flight: BTreeSet<(i32, i32)>,
+    pending: Option<BuiltChunk>,
+}
+
+impl VanillaWorker {
+    fn new(source: VanillaSource) -> Self {
+        let (requests, rx) = mpsc::sync_channel::<(i32, i32)>(0);
+        let (tx, results) = mpsc::sync_channel(VANILLA_WORKERS);
+        let rx = Arc::new(Mutex::new(rx));
+        let handles = (0..VANILLA_WORKERS)
+            .map(|_| {
+                let rx = Arc::clone(&rx);
+                let tx = tx.clone();
+                let source = source.clone();
+                thread::spawn(move || {
+                    let Ok(generator) = crate::vanilla::generator::VanillaGenerator::new(
+                        &source.data_root,
+                        source.seed,
+                        "minecraft:overworld",
+                    ) else {
+                        return;
+                    };
+                    let Ok(text) = std::fs::read_to_string(&source.registry_table) else {
+                        return;
+                    };
+                    let Ok(tables) =
+                        crate::chunk_adapter::registry::RegistryTables::from_provisioned(&text)
+                    else {
+                        return;
+                    };
+                    loop {
+                        let position = match rx.lock().expect("worker request lock poisoned").recv()
+                        {
+                            Ok(position) => position,
+                            Err(_) => break,
+                        };
+                        if let Some(cache) = &source.cache {
+                            match cache.read(position.0, position.1) {
+                                Ok(Some(packet)) => {
+                                    if tx
+                                        .send(BuiltChunk {
+                                            position,
+                                            packet: Ok(packet),
+                                            generation_us: 0,
+                                            encoding_us: 0,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    if tx
+                                        .send(BuiltChunk {
+                                            position,
+                                            packet: Err(error.to_string()),
+                                            generation_us: 0,
+                                            encoding_us: 0,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        let started = Instant::now();
+                        let chunk = crate::chunk_adapter::chunk_from_generator(
+                            &generator, position.0, position.1, &tables,
+                        );
+                        let generation_us = started.elapsed().as_micros();
+                        let started = Instant::now();
+                        let packet = chunk
+                            .and_then(|chunk| crate::chunk_adapter::encode_chunk(&chunk, &tables))
+                            .map_err(|error| error.to_string());
+                        let packet = packet.and_then(|packet| {
+                            if let Some(cache) = &source.cache {
+                                cache
+                                    .write(position.0, position.1, &packet)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            Ok(packet)
+                        });
+                        let encoding_us = started.elapsed().as_micros();
+                        if tx
+                            .send(BuiltChunk {
+                                position,
+                                packet,
+                                generation_us,
+                                encoding_us,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        Self {
+            requests: Some(requests),
+            results,
+            handles,
+            in_flight: BTreeSet::new(),
+            pending: None,
+        }
+    }
+}
+
+impl Drop for VanillaWorker {
+    fn drop(&mut self) {
+        self.requests.take();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
 
 const LOGIN: u32 = 50;
 const POSITION: u32 = 73;
@@ -44,6 +196,7 @@ pub struct Preview {
     generator: Generator,
     radius: i32,
     center: (i32, i32),
+    view_order: Vec<(i32, i32)>,
     sent: BTreeSet<(i32, i32)>,
     biomes: [u32; 8],
     pub teleport_acknowledged: bool,
@@ -52,6 +205,9 @@ pub struct Preview {
     keepalive_at: std::time::Instant,
     keepalive_id: u64,
     pub pending_keepalive: Option<u64>,
+    vanilla: Option<VanillaWorker>,
+    vanilla_spawn_y: Option<i32>,
+    pub failed: bool,
 }
 
 impl Preview {
@@ -73,6 +229,7 @@ impl Preview {
             generator: Generator::with_terrain(seed, terrain),
             radius: radius.into(),
             center: (0, 0),
+            view_order: ordered_view((0, 0), radius.into()),
             sent: BTreeSet::new(),
             biomes,
             teleport_acknowledged: false,
@@ -81,7 +238,26 @@ impl Preview {
             keepalive_at: std::time::Instant::now(),
             keepalive_id: 0,
             pending_keepalive: None,
+            vanilla: None,
+            vanilla_spawn_y: None,
+            failed: false,
         })
+    }
+
+    pub fn new_vanilla(
+        radius: u8,
+        manifest: &RegistryManifest,
+        source: VanillaSource,
+    ) -> Option<Self> {
+        let mut preview = Self::new(
+            source.seed as u64,
+            radius,
+            crate::world::Terrain::Preview,
+            manifest,
+        )?;
+        preview.vanilla_spawn_y = Some(source.spawn_y);
+        preview.vanilla = Some(VanillaWorker::new(source));
+        Some(preview)
     }
 
     pub fn initial(&self, manifest: &RegistryManifest) -> Option<Vec<Vec<u8>>> {
@@ -111,7 +287,9 @@ impl Preview {
         let mut position = vec![1]; // Teleport ID.
         for value in [
             0.5,
-            self.generator.height(0, 0) as f64 + 10.0,
+            self.vanilla_spawn_y
+                .map_or_else(|| self.generator.height(0, 0), i64::from) as f64
+                + 10.0,
             0.5,
             0.0,
             0.0,
@@ -155,10 +333,14 @@ impl Preview {
         if !self.teleport_acknowledged {
             return Err("position before teleport acknowledgement");
         }
-        self.center = (
+        let center = (
             (x.floor() as i32).div_euclid(16),
             (z.floor() as i32).div_euclid(16),
         );
+        if center != self.center {
+            self.center = center;
+            self.view_order = ordered_view(center, self.radius);
+        }
         Ok(())
     }
 
@@ -176,31 +358,48 @@ impl Preview {
     }
 
     pub fn next_chunk(&mut self) -> Option<(Vec<u8>, u128, u128)> {
-        if !self.teleport_acknowledged || self.awaiting_batch {
+        if !self.teleport_acknowledged {
+            return None;
+        }
+        if self.awaiting_batch && self.vanilla.is_none() {
+            return None;
+        }
+        if self.awaiting_batch
+            && self
+                .vanilla
+                .as_ref()
+                .is_some_and(|worker| worker.in_flight.len() >= VANILLA_WORKERS)
+        {
             return None;
         }
         let mut output = cache_center(self.center);
         let (cx, cz) = self.center;
         let radius = self.radius;
-        let expired: Vec<_> = self
-            .sent
+        if !self.awaiting_batch {
+            let expired: Vec<_> = self
+                .sent
+                .iter()
+                .copied()
+                .filter(|(x, z)| (x - cx).abs() > radius || (z - cz).abs() > radius)
+                .collect();
+            for (x, z) in expired {
+                let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
+                output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
+                self.sent.remove(&(x, z));
+            }
+        }
+        if self.vanilla.is_some() {
+            return self.next_vanilla_chunk(output);
+        }
+        let candidates: Vec<_> = self
+            .view_order
             .iter()
             .copied()
-            .filter(|(x, z)| (x - cx).abs() > radius || (z - cz).abs() > radius)
-            .collect();
-        for (x, z) in expired {
-            let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
-            output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
-            self.sent.remove(&(x, z));
-        }
-        let mut candidates: Vec<_> = (-radius..=radius)
-            .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
             .filter(|pos| !self.sent.contains(pos))
             .collect();
         if candidates.is_empty() {
             return None;
         }
-        candidates.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
         output.extend(frame(BATCH_START, &[]));
         let mut generation_us = 0;
         let mut encoding_us = 0;
@@ -220,7 +419,91 @@ impl Preview {
             count += 1;
         }
         let mut count_data = Vec::new();
-        put_varint(count, &mut count_data);
+        put_varint(count as u32, &mut count_data);
+        output.extend(frame(BATCH_END, &count_data));
+        self.awaiting_batch = true;
+        Some((output, generation_us, encoding_us))
+    }
+
+    fn next_vanilla_chunk(&mut self, mut output: Vec<u8>) -> Option<(Vec<u8>, u128, u128)> {
+        let worker = self.vanilla.as_mut()?;
+        for position in self.view_order.iter().copied() {
+            if worker.in_flight.len() >= VANILLA_WORKERS {
+                break;
+            }
+            if self.sent.contains(&position) || worker.in_flight.contains(&position) {
+                continue;
+            }
+            if let Some(requests) = &worker.requests {
+                match requests.try_send(position) {
+                    Ok(()) => {
+                        worker.in_flight.insert(position);
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        self.failed = true;
+                        return None;
+                    }
+                }
+            }
+        }
+        // Keep generation busy while the client processes the previous batch.
+        // Results stay in the bounded channel until its acknowledgement arrives.
+        if self.awaiting_batch {
+            return None;
+        }
+        let mut count = 0;
+        let mut generation_us = 0;
+        let mut encoding_us = 0;
+        let mut packet_bytes = 0;
+        while count < MAX_CHUNKS_PER_BATCH {
+            let built = match worker.pending.take() {
+                Some(built) => built,
+                None => match worker.results.try_recv() {
+                    Ok(built) => built,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.failed = true;
+                        if count == 0 {
+                            return None;
+                        }
+                        break;
+                    }
+                },
+            };
+            let size = match &built.packet {
+                Ok(packet) if packet.len() < MAX_BATCH_BYTES => packet.len(),
+                _ => {
+                    self.failed = true;
+                    return None;
+                }
+            };
+            if count > 0 && packet_bytes + size > MAX_BATCH_BYTES {
+                worker.pending = Some(built);
+                break;
+            }
+            worker.in_flight.remove(&built.position);
+            if (built.position.0 - self.center.0).abs() > self.radius
+                || (built.position.1 - self.center.1).abs() > self.radius
+                || self.sent.contains(&built.position)
+            {
+                continue;
+            }
+            if count == 0 {
+                output.extend(frame(BATCH_START, &[]));
+            }
+            output.extend(built.packet.expect("checked packet"));
+            self.sent.insert(built.position);
+            generation_us += built.generation_us;
+            encoding_us += built.encoding_us;
+            packet_bytes += size;
+            count += 1;
+        }
+        if count == 0 {
+            return None;
+        }
+        let mut count_data = Vec::new();
+        put_varint(count as u32, &mut count_data);
         output.extend(frame(BATCH_END, &count_data));
         self.awaiting_batch = true;
         Some((output, generation_us, encoding_us))
@@ -232,6 +515,15 @@ fn cache_center((x, z): (i32, i32)) -> Vec<u8> {
     put_varint(x as u32, &mut body);
     put_varint(z as u32, &mut body);
     frame(CACHE_CENTER, &body)
+}
+
+/// Near chunks first; rebuild only when the player enters another chunk.
+fn ordered_view((cx, cz): (i32, i32), radius: i32) -> Vec<(i32, i32)> {
+    let mut positions: Vec<_> = (-radius..=radius)
+        .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
+        .collect();
+    positions.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
+    positions
 }
 
 fn block(chunk: &Chunk, x: usize, y: i32, z: usize) -> Block {
@@ -444,6 +736,79 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_ready_chunks_share_a_bounded_acknowledged_batch() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(8);
+        let positions = [(0, 0), (1, 0), (0, 1)];
+        for position in positions {
+            tx.send(BuiltChunk {
+                position,
+                packet: Ok(frame(CHUNK, b"test")),
+                generation_us: 4,
+                encoding_us: 2,
+            })
+            .unwrap();
+        }
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: positions.into_iter().collect(),
+            pending: None,
+        });
+        let (stream, generation_us, encoding_us) = preview.next_chunk().unwrap();
+        let ids = packet_ids(&stream);
+        assert_eq!(ids.iter().filter(|id| **id == CHUNK).count(), 3);
+        assert_eq!(ids.iter().filter(|id| **id == BATCH_START).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == BATCH_END).count(), 1);
+        assert_eq!((generation_us, encoding_us), (12, 6));
+        assert!(preview.awaiting_batch);
+        assert_eq!(preview.sent.len(), 3);
+    }
+
+    #[test]
+    fn vanilla_batch_defers_packet_when_byte_budget_is_full() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(8);
+        for position in [(0, 0), (1, 0)] {
+            tx.send(BuiltChunk {
+                position,
+                packet: Ok(frame(CHUNK, &vec![0; 400_000])),
+                generation_us: 0,
+                encoding_us: 0,
+            })
+            .unwrap();
+        }
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: [(0, 0), (1, 0)].into_iter().collect(),
+            pending: None,
+        });
+        let first = preview.next_chunk().unwrap().0;
+        assert_eq!(
+            packet_ids(&first).iter().filter(|id| **id == CHUNK).count(),
+            1
+        );
+        assert!(first.len() < MAX_BATCH_BYTES + 32);
+        assert!(preview.vanilla.as_ref().unwrap().pending.is_some());
+        preview.awaiting_batch = false;
+        let second = preview.next_chunk().unwrap().0;
+        assert_eq!(
+            packet_ids(&second)
+                .iter()
+                .filter(|id| **id == CHUNK)
+                .count(),
+            1
+        );
+        assert!(preview.vanilla.as_ref().unwrap().pending.is_none());
+        assert_eq!(preview.sent.len(), 2);
+    }
+
+    #[test]
     fn maximum_view_uses_bounded_acknowledged_batches_and_unloads_old_view() {
         assert!(Preview::new(2026, 33, Terrain::Preview, &manifest()).is_none());
         let mut preview = Preview::new(2026, 32, Terrain::Preview, &manifest()).unwrap();
@@ -502,6 +867,46 @@ mod tests {
         assert_ne!(
             first,
             encode_chunk(&generator.generate(0, 2), generator, &biomes)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned 26.3 worldgen data and registry IDs"]
+    fn local_vanilla_worker_delivers_a_framed_chunk_without_blocking_network_poll() {
+        let source = VanillaSource {
+            data_root: std::env::var_os("RUSTMC_VANILLA_DATA")
+                .map(PathBuf::from)
+                .expect("set RUSTMC_VANILLA_DATA"),
+            registry_table: std::env::var_os("RUSTMC_CHUNK_REGISTRY")
+                .map(PathBuf::from)
+                .expect("set RUSTMC_CHUNK_REGISTRY"),
+            seed: 2026,
+            spawn_y: 117,
+            cache: None,
+        };
+        let mut preview = Preview::new_vanilla(2, &manifest(), source).expect("preview");
+        preview.teleport_acknowledged = true;
+        let started = Instant::now();
+        assert!(preview.next_chunk().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        let delivered = loop {
+            if let Some((stream, _, _)) = preview.next_chunk() {
+                break stream;
+            }
+            assert!(!preview.failed, "worker failed before returning a chunk");
+            assert!(started.elapsed() < std::time::Duration::from_secs(20));
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(packet_ids(&delivered).contains(&CHUNK));
+        assert_eq!(preview.sent.len(), 1);
+        preview.move_to(16.5, 80.0, 0.5).unwrap();
+        assert!(
+            preview.next_chunk().is_none(),
+            "the first batch still awaits acknowledgement"
+        );
+        assert!(
+            !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
+            "generation should continue while awaiting the client"
         );
     }
 }

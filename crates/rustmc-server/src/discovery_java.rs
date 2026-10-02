@@ -189,6 +189,7 @@ pub struct Session {
     preview_seed: u64,
     preview_radius: u8,
     preview_terrain: crate::world::Terrain,
+    vanilla_source: Option<crate::java_preview::VanillaSource>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -203,6 +204,7 @@ impl Default for Session {
             preview_seed: 0,
             preview_radius: 2,
             preview_terrain: crate::world::Terrain::Preview,
+            vanilla_source: None,
         }
     }
 }
@@ -222,6 +224,10 @@ impl Session {
         self.preview_seed = seed;
         self.preview_radius = radius;
         self.preview_terrain = terrain;
+        self
+    }
+    pub fn with_vanilla_source(mut self, source: crate::java_preview::VanillaSource) -> Self {
+        self.vanilla_source = Some(source);
         self
     }
     pub fn state(&self) -> State {
@@ -337,12 +343,20 @@ impl Session {
                 }
                 (State::ConfigurationData, 3) if body.is_empty() => {
                     let manifest = self.registry_manifest.as_ref().ok_or(Error::WrongState)?;
-                    let preview = crate::java_preview::Preview::new(
-                        self.preview_seed,
-                        self.preview_radius,
-                        self.preview_terrain,
-                        manifest,
-                    )
+                    let preview = if let Some(source) = &self.vanilla_source {
+                        crate::java_preview::Preview::new_vanilla(
+                            self.preview_radius,
+                            manifest,
+                            source.clone(),
+                        )
+                    } else {
+                        crate::java_preview::Preview::new(
+                            self.preview_seed,
+                            self.preview_radius,
+                            self.preview_terrain,
+                            manifest,
+                        )
+                    }
                     .ok_or(Error::Malformed)?;
                     responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
                     self.preview = Some(preview);

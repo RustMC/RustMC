@@ -27,12 +27,29 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `max_connections` | `8` | `1..=64` simultaneous accepted sockets |
 | `max_bytes_per_connection` | `4096` | `1..=65536` bytes read before closure |
 | `idle_timeout_ms` | `1000` | `10..=60000` ms without received data |
-| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms total; must be at least idle timeout |
+| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms for discovery, or up to `3600000` ms for the opt-in local Java preview; must be at least idle timeout |
 | `local_java_preview` | `false` | Boolean; enables the unauthenticated local Java 26.3 Creative terrain preview when a matching manifest is supplied. |
 | `preview_registry_manifest` | absent | Path to locally prepared, version-checked 26.3 registry identifier/tag metadata. Required for world entry. |
 | `preview_seed` | `0` | Integer `0..=9223372036854775807`, used only for original preview generation. |
 | `preview_view_distance` | `4` | Integer `2..=32` chunks. Radius 32 permits up to 4,225 loaded chunk coordinates per client; only one batch is in flight, containing at most 16 chunks within a 768 KiB encoding budget. |
 | `preview_terrain` | `"preview"` | `"preview"` or `"experimental"`. Experimental selects the opt-in octave-noise terrain field (T1 groundwork); biome labels, surface blocks, and trees stay on the ADR-0013 preview rules. Neither option is vanilla generation. |
+| `vanilla_data_root` | absent | Operator-local Java 26.3 worldgen data root for a data-driven Overworld probe; requires the registry table, local preview, manifest, and `max_connections = 1`. |
+| `vanilla_registry_table` | absent | Operator-local Java 26.3 block-state and biome ID table produced by `prepare_chunk_registry`; never commit the table or game data. |
+| `vanilla_cache_root` | absent | Optional disk directory for immutable preview chunk packets. Improves repeat visits only; contains no authoritative world edits. Cache is capped at 8,192 packets or 1 GiB for the current seed/data identity. |
+
+When both `vanilla_*` paths are set, RustMC validates them before binding and
+starts a fixed pool of eight workers. Each worker owns a generator; at most eight
+chunks are under construction for the one permitted local client. The initial
+recommended first test radius is 2; the operator can set up to 32 for a
+long-running load test. For a repeat visit, set `vanilla_cache_root` and run
+`cargo run --release -p rustmc-tools --bin prepare_preview_cache --locked -- DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED 12`
+before joining. This prepares a radius-12 disk view around chunk (0,0); cold
+generation still takes time. The cache identity includes the seed, input files,
+registry, protocol, and format version. Delete the cache if generator semantics
+change without a format bump. This is a slow, incomplete terrain probe: no structures,
+feature-stage ores or trees, authoritative edits, lateral cave lighting, or
+radius-32 throughput claim. Remove both paths to return to the original
+synthetic preview.
 
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 
@@ -85,6 +102,32 @@ preview_view_distance = 32
 EOF
 cargo run -p rustmc-server --locked -- --run "$rustmc_preview_dir/preview.toml"
 ```
+
+For the separate, **not yet live** vanilla chunk adapter, prepare its local
+state/biome ID table from the same official reports and manifest:
+
+```sh
+cargo run -p rustmc-tools --bin prepare_chunk_registry --locked -- \
+  "$rustmc_preview_dir/reports/generated/reports/blocks.json" \
+  "$rustmc_preview_dir/preview-registries.toml" \
+  "$rustmc_preview_dir/chunk-registry-26.3.json"
+```
+
+Keep this generated JSON outside Git. It maps material-rule block names to
+the report's default block states and retains explicit property-bearing states.
+It is an input to adapter tests and future opt-in integration; the command
+above does not make the current preview serve vanilla chunks.
+
+Before comparing an owner-generated 26.3 save, inspect its seed and preset:
+
+```sh
+cargo run -p rustmc-tools --bin inspect_vanilla_save --locked -- /path/to/world
+```
+
+The tool reads `level.dat` and `data/minecraft/world_gen_settings.dat` locally
+and prints only comparison metadata. A world with a nondefault preset or
+generation-changing packs needs its own reference data and cannot be scored as
+the default preset merely because its client version matches.
 
 Join `127.0.0.1:25565`. The server announces a maximum 32-chunk view; set the
 client's render distance separately if desired. The client enters Creative for
