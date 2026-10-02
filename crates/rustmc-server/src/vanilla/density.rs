@@ -15,16 +15,17 @@
 //! `-0.0`), and the interpolated volume path lerps per axis and fills
 //! the vertical direction by repeated addition of a value step. Vanilla
 //! world generation fills density caches through the volume path, so
-//! both are implemented and pinned bit-for-bit by the parity vector
-//! tests over the golden captures recorded in `docs/PROVENANCE.md`
-//! (session 3).
+//! the tested node shapes are pinned bit-for-bit by the parity vectors in
+//! `docs/PROVENANCE.md` (session 3). Nested volume wrappers around an
+//! `interpolated` node still need independent vectors; the fallback point
+//! path must not be used to claim complete volume parity.
 //! Context nodes (`blend_alpha`, `blend_offset`, `beardifier`,
 //! `blend_density`) currently evaluate to their context-free defaults
 //! (1, 0, 0, and pass-through); slice C will attach real blender and
 //! structure providers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -486,26 +487,24 @@ impl Density {
                 from_value,
                 coordinate_factor,
             } => {
-                let coordinate = axis.choose(x, y, z);
+                let coordinate = i64::from(axis.choose(x, y, z));
+                let from_coordinate = i64::from(*from_coordinate);
+                let coordinate_range = i64::from(*coordinate_range);
                 let relative = match tiling {
                     Tiling::ClampToEdge => {
-                        let min =
-                            (*from_coordinate).min(from_coordinate.wrapping_add(*coordinate_range));
-                        let max =
-                            (*from_coordinate).max(from_coordinate.wrapping_add(*coordinate_range));
+                        let min = from_coordinate.min(from_coordinate + coordinate_range);
+                        let max = from_coordinate.max(from_coordinate + coordinate_range);
                         coordinate.clamp(min, max) - from_coordinate
                     }
-                    Tiling::Repeat => {
-                        relative_floor_mod(coordinate - from_coordinate, *coordinate_range)
-                    }
+                    Tiling::Repeat => (coordinate - from_coordinate).rem_euclid(coordinate_range),
                     Tiling::MirroredRepeat => {
                         let shifted = coordinate - from_coordinate;
-                        let tile = shifted.div_euclid(*coordinate_range);
-                        let local = shifted - tile * *coordinate_range;
+                        let tile = shifted.div_euclid(coordinate_range);
+                        let local = shifted - tile * coordinate_range;
                         if tile & 1 == 0 {
                             local
                         } else {
-                            *coordinate_range - local
+                            coordinate_range - local
                         }
                     }
                 };
@@ -1266,10 +1265,6 @@ fn floor_mod(value: i32, divisor: i32) -> i32 {
 }
 
 /// `a - floorDiv(a, b) * b` for the mirrored-repeat tiling (Java int ops).
-fn relative_floor_mod(value: i32, divisor: i32) -> i32 {
-    value - value.div_euclid(divisor) * divisor
-}
-
 /// Index selection of `interval_select`: first threshold strictly above the
 /// input, else the last function.
 fn select_index(thresholds: &[f32], input: f32) -> usize {
@@ -1410,7 +1405,12 @@ pub struct DensityRegistry<'e> {
     engine: &'e NoiseEngine,
     documents: HashMap<Id, Value>,
     compiled: RefCell<HashMap<Id, Density>>,
+    compiling: RefCell<HashSet<Id>>,
 }
+
+// A reference chain also nests Rust parser frames. Keep the limit below the
+// default test-thread stack while accepting the provisioned 26.3 graph.
+const MAX_REFERENCE_DEPTH: usize = 32;
 
 impl<'e> DensityRegistry<'e> {
     pub fn new(engine: &'e NoiseEngine, documents: HashMap<Id, Value>) -> Self {
@@ -1418,6 +1418,7 @@ impl<'e> DensityRegistry<'e> {
             engine,
             documents,
             compiled: RefCell::new(HashMap::new()),
+            compiling: RefCell::new(HashSet::new()),
         }
     }
 
@@ -1427,11 +1428,23 @@ impl<'e> DensityRegistry<'e> {
         if let Some(existing) = self.compiled.borrow().get(id) {
             return Ok(existing.clone());
         }
-        let density = if let Some(document) = self.documents.get(id) {
-            self.compile_value(document)?
+        if self.compiling.borrow().len() >= MAX_REFERENCE_DEPTH {
+            return Err(DensityError::Parse(format!(
+                "density reference depth exceeds {MAX_REFERENCE_DEPTH} at {id}"
+            )));
+        }
+        if !self.compiling.borrow_mut().insert(id.clone()) {
+            return Err(DensityError::Parse(format!(
+                "cyclic density reference: {id}"
+            )));
+        }
+        let result = if let Some(document) = self.documents.get(id) {
+            self.compile_value(document)
         } else {
-            self.compile_builtin(id)?
+            self.compile_builtin(id)
         };
+        self.compiling.borrow_mut().remove(id);
+        let density = result?;
         self.compiled
             .borrow_mut()
             .insert(id.clone(), density.clone());
@@ -1547,21 +1560,29 @@ impl<'e> DensityRegistry<'e> {
                     Ok(Value::Null) | Err(_) => Tiling::ClampToEdge,
                     Ok(other) => return Err(DensityError::Parse(format!("bad tiling {other}"))),
                 };
-                let from_coordinate = get("from_coordinate")?.as_i64().ok_or_else(|| {
-                    DensityError::Parse("from_coordinate must be an int".to_owned())
-                })? as i32;
+                let from_coordinate = get("from_coordinate")?
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DensityError::Parse("from_coordinate must be a 32-bit int".to_owned())
+                    })?;
                 let to_coordinate = get("to_coordinate")?
                     .as_i64()
-                    .ok_or_else(|| DensityError::Parse("to_coordinate must be an int".to_owned()))?
-                    as i32;
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        DensityError::Parse("to_coordinate must be a 32-bit int".to_owned())
+                    })?;
                 let from_value = noise_value(get("from_value")?)?;
                 let to_value = noise_value(get("to_value")?)?;
-                if from_coordinate == to_coordinate {
-                    return Err(DensityError::Parse(
-                        "from_coordinate cannot equal to_coordinate".to_owned(),
-                    ));
-                }
-                let coordinate_range = to_coordinate - from_coordinate;
+                let coordinate_range = to_coordinate
+                    .checked_sub(from_coordinate)
+                    .filter(|value| *value != 0)
+                    .ok_or_else(|| {
+                        DensityError::Parse(
+                            "gradient coordinate range must be nonzero and fit a 32-bit int"
+                                .to_owned(),
+                        )
+                    })?;
                 Node::Axial {
                     axis,
                     tiling,
@@ -2185,6 +2206,68 @@ mod tests {
         // The referenced document resolves to the same compiled subtree.
         let direct = reg.compile(&"minecraft:half".to_owned()).unwrap();
         assert_eq!(direct.sample(0, 0, 0), 0.5);
+    }
+
+    #[test]
+    fn cyclic_and_excessively_deep_density_references_are_rejected() {
+        let engine = engine();
+        let mut documents = HashMap::from([
+            (
+                "test:a".to_owned(),
+                json!({"type": "minecraft:add", "left": "test:b", "right": 1}),
+            ),
+            (
+                "test:b".to_owned(),
+                json!({"type": "minecraft:add", "left": "test:a", "right": 1}),
+            ),
+            ("test:good".to_owned(), json!(3)),
+        ]);
+        for index in 0..=MAX_REFERENCE_DEPTH {
+            documents.insert(
+                format!("test:depth_{index}"),
+                json!({"type": "minecraft:add", "left": format!("test:depth_{}", index + 1), "right": 0}),
+            );
+        }
+        let registry = DensityRegistry::new(&engine, documents);
+        assert!(matches!(
+            registry.compile(&"test:a".to_owned()),
+            Err(DensityError::Parse(message)) if message.contains("cyclic")
+        ));
+        assert!(matches!(
+            registry.compile(&"test:depth_0".to_owned()),
+            Err(DensityError::Parse(message)) if message.contains("depth")
+        ));
+        assert_eq!(
+            registry
+                .compile(&"test:good".to_owned())
+                .unwrap()
+                .sample(0, 0, 0),
+            3.0
+        );
+    }
+
+    #[test]
+    fn gradient_coordinates_reject_truncation_and_extreme_samples_do_not_overflow() {
+        let engine = engine();
+        let registry = registry(&engine);
+        let gradient = |from: i64, to: i64| {
+            json!({"type": "minecraft:gradient", "axis": "x",
+                   "from_coordinate": from, "to_coordinate": to,
+                   "from_value": 0.0, "to_value": 4.0})
+        };
+        for invalid in [
+            gradient(0, 4_294_967_296),
+            gradient(i64::from(i32::MIN), i64::from(i32::MAX)),
+            gradient(0, 0),
+        ] {
+            assert!(matches!(
+                registry.compile_value(&invalid),
+                Err(DensityError::Parse(_))
+            ));
+        }
+        let valid = registry.compile_value(&gradient(-2, 2)).unwrap();
+        assert_eq!(valid.sample(i32::MIN, 0, 0), 0.0);
+        assert_eq!(valid.sample(i32::MAX, 0, 0), 4.0);
     }
 
     #[test]

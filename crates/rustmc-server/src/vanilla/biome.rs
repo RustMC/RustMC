@@ -4,7 +4,7 @@
 //! densities on a 4-block grid, quantizing each `f32` coordinate to a
 //! fixed-point integer (`value × 10 000` truncated toward zero), and
 //! picking the parameter entry with the smallest squared-distance
-//! "fitness" across the six half-open ranges plus a constant offset term.
+//! "fitness" across the six inclusive ranges plus a constant offset term.
 //! The parameter table itself lives in the game's code, not its datapack
 //! JSON; under ADR-0014 the owner provisions it as a numeric capture
 //! (`rustmc/biome_placement/<preset>.psv` beside the worldgen data root,

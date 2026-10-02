@@ -39,7 +39,7 @@ const WAY_BELOW_MIN_Y: i32 = -32512;
 
 /// A biome's resolved carver list, shared between the registry and the
 /// per-source-chunk cache.
-type ChunkCarvers = Rc<Vec<Rc<Carver>>>;
+type ChunkCarvers = Rc<Vec<Option<Rc<Carver>>>>;
 
 /// One dimension's column-height, biome, and top-block source, built from
 /// operator-provisioned data (never committed) and a world seed. The
@@ -376,6 +376,9 @@ impl VanillaGenerator {
                     continue;
                 };
                 for (index, carver) in carvers.iter().enumerate() {
+                    let Some(carver) = carver else {
+                        continue;
+                    };
                     random.set_large_feature_seed(
                         self.world_seed + index as i64,
                         source.0,
