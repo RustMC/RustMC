@@ -7,6 +7,7 @@ pub mod chunk_adapter;
 pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod java_preview;
+pub mod preview_cache;
 pub mod preview_data;
 pub mod runtime;
 pub mod vanilla;
@@ -59,6 +60,8 @@ pub struct ListenerConfig {
     /// Operator-local 26.3 worldgen data and protocol IDs; both required together.
     pub vanilla_data_root: Option<std::path::PathBuf>,
     pub vanilla_registry_table: Option<std::path::PathBuf>,
+    /// Optional operator-local immutable packet cache; not a saved world.
+    pub vanilla_cache_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ListenerConfig {
@@ -74,6 +77,7 @@ impl Default for ListenerConfig {
             preview_registry_manifest: None,
             vanilla_data_root: None,
             vanilla_registry_table: None,
+            vanilla_cache_root: None,
             preview_seed: 0,
             preview_view_distance: 4,
             preview_terrain: world::Terrain::Preview,
@@ -126,6 +130,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "preview_terrain"
                 | "vanilla_data_root"
                 | "vanilla_registry_table"
+                | "vanilla_cache_root"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -196,8 +201,12 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     };
     let vanilla_data_root = local_path("vanilla_data_root")?;
     let vanilla_registry_table = local_path("vanilla_registry_table")?;
+    let vanilla_cache_root = local_path("vanilla_cache_root")?;
     if vanilla_data_root.is_some() != vanilla_registry_table.is_some() {
         return Err("`listener.vanilla_data_root` and `listener.vanilla_registry_table` must be set together".to_owned());
+    }
+    if vanilla_cache_root.is_some() && vanilla_data_root.is_none() {
+        return Err("`listener.vanilla_cache_root` requires vanilla data paths".to_owned());
     }
     if (preview_registry_manifest.is_some()
         || table.contains_key("preview_seed")
@@ -262,6 +271,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         preview_registry_manifest,
         vanilla_data_root,
         vanilla_registry_table,
+        vanilla_cache_root,
         preview_seed: integer_field(
             table,
             "preview_seed",
@@ -468,6 +478,13 @@ mod tests {
         let complete =
             format!("{base}vanilla_data_root = 'data'\nvanilla_registry_table = 'ids.json'\n");
         let config = parse_config(&complete).unwrap();
+        assert!(config.listener.vanilla_cache_root.is_none());
+        let cached = parse_config(&format!("{complete}vanilla_cache_root = 'cache'\n")).unwrap();
+        assert_eq!(
+            cached.listener.vanilla_cache_root.as_deref(),
+            Some(Path::new("cache"))
+        );
+        assert!(parse_config(&format!("{base}vanilla_cache_root = 'cache'\n")).is_err());
         assert_eq!(
             config.listener.vanilla_data_root.as_deref(),
             Some(Path::new("data"))

@@ -217,3 +217,22 @@ generation states are uneven across the sample; feature- and
 structure-placed blocks count as mismatches by design; block-state properties
 are stripped from both sides; and no client rendering is involved in these
 numbers.
+
+## Operator-local packet reuse (3 October 2026)
+
+The opt-in Java 26.3 terrain path can now read and write immutable encoded
+chunk packets in a bounded operator-local disk cache. A cache key hashes the
+seed, worldgen input files, registry table, protocol, and format version; each
+packet also has a coordinate and checksum. This is a rendering accelerator,
+not authoritative world persistence: block edits, inventories, entities, and
+light changes are not saved. The cache currently permits 8,192 packets or
+1 GiB per input identity and needs manual format-version invalidation when the
+generator implementation changes without an input change.
+
+A separate `prepare_preview_cache` command fills a square spawn view before
+join. On this machine, seed 2026 radius 2 (25 chunks) took 3.57 seconds cold
+and 0.10 seconds for a fully cached repeat. Radius 12 (625 chunks) took 54.6
+seconds with 600 new packets and 25 existing hits. These are preparation
+measurements, not client render times or proof of radius-32 instant loading.
+The live server still generates misses and uses acknowledged chunk batches;
+client-side observation is required before treating view delivery as fast.

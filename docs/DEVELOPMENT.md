@@ -35,12 +35,18 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `preview_terrain` | `"preview"` | `"preview"` or `"experimental"`. Experimental selects the opt-in octave-noise terrain field (T1 groundwork); biome labels, surface blocks, and trees stay on the ADR-0013 preview rules. Neither option is vanilla generation. |
 | `vanilla_data_root` | absent | Operator-local Java 26.3 worldgen data root for a data-driven Overworld probe; requires the registry table, local preview, manifest, and `max_connections = 1`. |
 | `vanilla_registry_table` | absent | Operator-local Java 26.3 block-state and biome ID table produced by `prepare_chunk_registry`; never commit the table or game data. |
+| `vanilla_cache_root` | absent | Optional disk directory for immutable preview chunk packets. Improves repeat visits only; contains no authoritative world edits. Cache is capped at 8,192 packets or 1 GiB for the current seed/data identity. |
 
 When both `vanilla_*` paths are set, RustMC validates them before binding and
 starts a fixed pool of eight workers. Each worker owns a generator; at most eight
 chunks are under construction for the one permitted local client. The initial
 recommended first test radius is 2; the operator can set up to 32 for a
-long-running load test. This is a slow, incomplete terrain probe: no structures,
+long-running load test. For a repeat visit, set `vanilla_cache_root` and run
+`cargo run --release -p rustmc-tools --bin prepare_preview_cache --locked -- DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED 12`
+before joining. This prepares a radius-12 disk view around chunk (0,0); cold
+generation still takes time. The cache identity includes the seed, input files,
+registry, protocol, and format version. Delete the cache if generator semantics
+change without a format bump. This is a slow, incomplete terrain probe: no structures,
 feature-stage ores or trees, authoritative edits, lateral cave lighting, or
 radius-32 throughput claim. Remove both paths to return to the original
 synthetic preview.

@@ -23,6 +23,7 @@ pub struct VanillaSource {
     pub registry_table: PathBuf,
     pub seed: i64,
     pub spawn_y: i32,
+    pub cache: Option<crate::preview_cache::PreviewCache>,
 }
 
 struct BuiltChunk {
@@ -72,6 +73,39 @@ impl VanillaWorker {
                             Ok(position) => position,
                             Err(_) => break,
                         };
+                        if let Some(cache) = &source.cache {
+                            match cache.read(position.0, position.1) {
+                                Ok(Some(packet)) => {
+                                    if tx
+                                        .send(BuiltChunk {
+                                            position,
+                                            packet: Ok(packet),
+                                            generation_us: 0,
+                                            encoding_us: 0,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    if tx
+                                        .send(BuiltChunk {
+                                            position,
+                                            packet: Err(error.to_string()),
+                                            generation_us: 0,
+                                            encoding_us: 0,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let started = Instant::now();
                         let chunk = crate::chunk_adapter::chunk_from_generator(
                             &generator, position.0, position.1, &tables,
@@ -81,6 +115,14 @@ impl VanillaWorker {
                         let packet = chunk
                             .and_then(|chunk| crate::chunk_adapter::encode_chunk(&chunk, &tables))
                             .map_err(|error| error.to_string());
+                        let packet = packet.and_then(|packet| {
+                            if let Some(cache) = &source.cache {
+                                cache
+                                    .write(position.0, position.1, &packet)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            Ok(packet)
+                        });
                         let encoding_us = started.elapsed().as_micros();
                         if tx
                             .send(BuiltChunk {
@@ -740,6 +782,7 @@ mod tests {
                 .expect("set RUSTMC_CHUNK_REGISTRY"),
             seed: 2026,
             spawn_y: 117,
+            cache: None,
         };
         let mut preview = Preview::new_vanilla(2, &manifest(), source).expect("preview");
         preview.teleport_acknowledged = true;

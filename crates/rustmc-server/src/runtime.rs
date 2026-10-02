@@ -290,6 +290,14 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             registry_table: registry_table.clone(),
             seed,
             spawn_y: generator.surface_height(0, 0),
+            cache: config
+                .vanilla_cache_root
+                .as_ref()
+                .map(|root| {
+                    crate::preview_cache::PreviewCache::open(root, data_root, registry_table, seed)
+                })
+                .transpose()
+                .map_err(RuntimeError::Bind)?,
         })
     } else {
         None

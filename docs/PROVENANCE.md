@@ -601,3 +601,11 @@ records. The source is an owner-generated save; it remains untracked. A second
 default-preset seed was compared through the existing oracle, and its
 denominators and residuals are recorded in the M3 Overworld milestone note.
 No competing server source was used for this observation.
+# Operator-local preview packet cache (2 October 2026)
+
+`sha2 0.10.9` (RustCrypto, `MIT OR Apache-2.0`) hashes the preview cache's
+operator-provisioned inputs and packet bytes for invalidation and corruption
+detection. Its new locked transitive `cpufeatures 0.2.17` has the same license
+declaration. This is a local integrity check, not authentication or custom
+cryptography. The cache is an immutable rendering artifact and does not save
+player edits. Both packages are recorded in the dependency license policy.
