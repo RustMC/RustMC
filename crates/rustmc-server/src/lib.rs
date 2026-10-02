@@ -157,7 +157,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         "max_connection_lifetime_ms",
         defaults.max_connection_lifetime_ms,
         10,
-        60000,
+        3_600_000,
     )?;
     if idle_timeout_ms > max_connection_lifetime_ms {
         return Err(
@@ -171,6 +171,11 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             .as_bool()
             .ok_or_else(|| "`listener.local_java_preview` must be true or false".to_owned())?,
     };
+    if !local_java_preview && max_connection_lifetime_ms > 60_000 {
+        return Err(
+            "`listener.max_connection_lifetime_ms` exceeds the discovery-only limit".to_owned(),
+        );
+    }
     let preview_registry_manifest = match table.get("preview_registry_manifest") {
         None => None,
         Some(value) => Some(std::path::PathBuf::from(value.as_str().ok_or_else(
@@ -387,6 +392,14 @@ mod tests {
                 format!("schema_version = 1\nlog_level = 'info'\n[listener]\n{field} = {value}\n");
             assert!(parse_config(&input).unwrap_err().contains(field));
         }
+    }
+
+    #[test]
+    fn local_preview_allows_a_bounded_longer_session_for_large_views() {
+        let config = parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\nmax_connection_lifetime_ms = 3600000\npreview_view_distance = 32\n").unwrap();
+        assert_eq!(config.listener.max_connection_lifetime_ms, 3_600_000);
+        assert_eq!(config.listener.preview_view_distance, 32);
+        assert!(parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nmax_connection_lifetime_ms = 3600000\n").is_err());
     }
 
     #[test]

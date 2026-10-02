@@ -27,7 +27,7 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `max_connections` | `8` | `1..=64` simultaneous accepted sockets |
 | `max_bytes_per_connection` | `4096` | `1..=65536` bytes read before closure |
 | `idle_timeout_ms` | `1000` | `10..=60000` ms without received data |
-| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms total; must be at least idle timeout |
+| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms for discovery, or up to `3600000` ms for the opt-in local Java preview; must be at least idle timeout |
 | `local_java_preview` | `false` | Boolean; enables the unauthenticated local Java 26.3 Creative terrain preview when a matching manifest is supplied. |
 | `preview_registry_manifest` | absent | Path to locally prepared, version-checked 26.3 registry identifier/tag metadata. Required for world entry. |
 | `preview_seed` | `0` | Integer `0..=9223372036854775807`, used only for original preview generation. |
@@ -39,7 +39,8 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 When both `vanilla_*` paths are set, RustMC validates them before binding and
 starts a fixed pool of four workers. Each worker owns a generator; at most four
 chunks are under construction for the one permitted local client. The initial
-test radius is 2. This is a slow, incomplete terrain probe: no structures,
+recommended first test radius is 2; the operator can set up to 32 for a
+long-running load test. This is a slow, incomplete terrain probe: no structures,
 feature-stage ores or trees, authoritative edits, lateral cave lighting, or
 radius-32 throughput claim. Remove both paths to return to the original
 synthetic preview.

@@ -193,7 +193,12 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         || config.max_bytes_per_connection == 0
         || config.max_bytes_per_connection > 65536
         || !(10..=60000).contains(&config.idle_timeout_ms)
-        || !(10..=60000).contains(&config.max_connection_lifetime_ms)
+        || !(10..=if config.local_java_preview {
+            3_600_000
+        } else {
+            60_000
+        })
+            .contains(&config.max_connection_lifetime_ms)
         || config.idle_timeout_ms > config.max_connection_lifetime_ms
     {
         observe(event(
