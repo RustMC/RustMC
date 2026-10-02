@@ -270,8 +270,8 @@ Ordering rules:
 
 ## 9. Provenance discipline (continues ADR-0014)
 
-- No mechanic, table, or code is copied or translated from Pumpkin, Paper,
-  Folia, or any other server, and no Mojang code or asset enters git. Knowledge
+- No mechanic, table, or code is copied or translated from another server,
+  and no Mojang code or asset enters git. Knowledge
   consultation, if used, is logged in [PROVENANCE](../PROVENANCE.md) with what
   was read, what was learned, and how the result was independently written.
 - Compatibility facts enter the repository in three forms only: a citation to
