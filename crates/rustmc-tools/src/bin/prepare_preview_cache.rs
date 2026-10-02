@@ -1,5 +1,5 @@
 //! Prepare immutable preview packets around spawn before a player joins.
-//! Usage: prepare_preview_cache DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED RADIUS
+//! Usage: `prepare_preview_cache DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED RADIUS [WORKERS]`
 
 use rustmc_server::chunk_adapter::{chunk_from_generator, encode_chunk, registry::RegistryTables};
 use rustmc_server::preview_cache::PreviewCache;
@@ -20,9 +20,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 5 {
+    if !(5..=6).contains(&args.len()) {
         return Err(
-            "usage: prepare_preview_cache DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED RADIUS".into(),
+            "usage: prepare_preview_cache DATA_ROOT REGISTRY_TABLE CACHE_ROOT SEED RADIUS [WORKERS]".into(),
         );
     }
     let data_root = PathBuf::from(&args[0]);
@@ -38,6 +38,15 @@ fn run() -> Result<(), String> {
         .map_err(|_| "invalid radius")?;
     if !(1..=32).contains(&radius) {
         return Err("radius must be 1..=32".into());
+    }
+    let workers: usize = args.get(5).map_or(Ok(8), |value| {
+        value
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| "invalid workers")
+    })?;
+    if !(1..=20).contains(&workers) {
+        return Err("workers must be 1..=20".into());
     }
     let text = std::fs::read_to_string(&registry_path).map_err(|error| error.to_string())?;
     RegistryTables::from_provisioned(&text).map_err(|error| error.to_string())?;
@@ -56,7 +65,7 @@ fn run() -> Result<(), String> {
     let hits = AtomicUsize::new(0);
     let started = Instant::now();
     std::thread::scope(|scope| -> Result<(), String> {
-        let handles: Vec<_> = (0..8)
+        let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let work = Arc::clone(&work);
                 let cache = cache.clone();
@@ -104,7 +113,7 @@ fn run() -> Result<(), String> {
         Ok(())
     })?;
     println!(
-        "preview cache: total={total} built={} hits={} elapsed_ms={}",
+        "preview cache: workers={workers} total={total} built={} hits={} elapsed_ms={}",
         built.load(Ordering::Relaxed),
         hits.load(Ordering::Relaxed),
         started.elapsed().as_millis()

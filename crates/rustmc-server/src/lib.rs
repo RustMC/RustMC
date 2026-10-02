@@ -62,6 +62,8 @@ pub struct ListenerConfig {
     pub vanilla_registry_table: Option<std::path::PathBuf>,
     /// Optional operator-local immutable packet cache; not a saved world.
     pub vanilla_cache_root: Option<std::path::PathBuf>,
+    /// Parallel chunk builders for the opt-in vanilla preview.
+    pub vanilla_generation_workers: usize,
 }
 
 impl Default for ListenerConfig {
@@ -78,6 +80,7 @@ impl Default for ListenerConfig {
             vanilla_data_root: None,
             vanilla_registry_table: None,
             vanilla_cache_root: None,
+            vanilla_generation_workers: 8,
             preview_seed: 0,
             preview_view_distance: 4,
             preview_terrain: world::Terrain::Preview,
@@ -131,6 +134,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "vanilla_data_root"
                 | "vanilla_registry_table"
                 | "vanilla_cache_root"
+                | "vanilla_generation_workers"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -208,6 +212,9 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     if vanilla_cache_root.is_some() && vanilla_data_root.is_none() {
         return Err("`listener.vanilla_cache_root` requires vanilla data paths".to_owned());
     }
+    if table.contains_key("vanilla_generation_workers") && vanilla_data_root.is_none() {
+        return Err("`listener.vanilla_generation_workers` requires vanilla data paths".to_owned());
+    }
     if (preview_registry_manifest.is_some()
         || table.contains_key("preview_seed")
         || table.contains_key("preview_view_distance")
@@ -272,6 +279,13 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         vanilla_data_root,
         vanilla_registry_table,
         vanilla_cache_root,
+        vanilla_generation_workers: integer_field(
+            table,
+            "vanilla_generation_workers",
+            defaults.vanilla_generation_workers as u64,
+            1,
+            20,
+        )? as usize,
         preview_seed: integer_field(
             table,
             "preview_seed",
@@ -478,6 +492,23 @@ mod tests {
             format!("{base}vanilla_data_root = 'data'\nvanilla_registry_table = 'ids.json'\n");
         let config = parse_config(&complete).unwrap();
         assert!(config.listener.vanilla_cache_root.is_none());
+        assert_eq!(config.listener.vanilla_generation_workers, 8);
+        assert_eq!(
+            parse_config(&format!("{complete}vanilla_generation_workers = 16\n"))
+                .unwrap()
+                .listener
+                .vanilla_generation_workers,
+            16
+        );
+        for workers in [0, 21] {
+            assert!(
+                parse_config(&format!(
+                    "{complete}vanilla_generation_workers = {workers}\n"
+                ))
+                .is_err()
+            );
+        }
+        assert!(parse_config(&format!("{base}vanilla_generation_workers = 16\n")).is_err());
         let cached = parse_config(&format!("{complete}vanilla_cache_root = 'cache'\n")).unwrap();
         assert_eq!(
             cached.listener.vanilla_cache_root.as_deref(),

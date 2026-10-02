@@ -36,9 +36,10 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `vanilla_data_root` | absent | Operator-local Java 26.3 worldgen data root for a data-driven Overworld probe; requires the registry table, local preview, manifest, and `max_connections = 1`. |
 | `vanilla_registry_table` | absent | Operator-local Java 26.3 block-state and biome ID table produced by `prepare_chunk_registry`; never commit the table or game data. |
 | `vanilla_cache_root` | absent | Optional disk directory for immutable preview chunk packets. Improves repeat visits only; contains no authoritative world edits. Cache is capped at 8,192 packets or 1 GiB for the current seed/data identity. |
+| `vanilla_generation_workers` | `8` | Integer `1..=20`; number of independent cold chunk generators for the local vanilla preview. More workers use more CPU and memory. |
 
 When both `vanilla_*` paths are set, RustMC validates them before binding and
-starts a fixed pool of eight workers. Each worker owns a generator; at most eight
+starts the configured worker pool. Each worker owns a generator; at most that many
 chunks are under construction for the one permitted local client. The initial
 recommended first test radius is 2; the operator can set up to 32 for a
 long-running load test. For a repeat visit, set `vanilla_cache_root` and run
@@ -50,6 +51,14 @@ change without a format bump. This is a slow, incomplete terrain probe: no struc
 feature-stage ores or trees, authoritative edits, lateral cave lighting, or
 radius-32 throughput claim. Remove both paths to return to the original
 synthetic preview.
+
+A local release-build cold-cache comparison on a 20-thread Intel i7-13650HX
+generated the same 49 chunks at seed 2026 (radius 3, no cache hits). Eight workers
+took 3,911 and 4,332 ms with 156–157 MiB peak resident memory; 16 workers took
+2,705 and 2,771 ms with 291–292 MiB peak. The preview server was stopped during
+these four runs. This measures preparation throughput, not client-visible latency;
+the default remains eight workers. The optional last argument to
+`prepare_preview_cache` selects `WORKERS` in `1..=20` for the same local test.
 
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 
