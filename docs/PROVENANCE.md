@@ -569,3 +569,14 @@ now include them. No game code, class file, or asset was added to the repository
 The adapter still uses a coarse state classification for the block tags and
 needs per-state validation against versioned data before claiming exact
 heightmap parity.
+
+## Interpolated density cache (2 October 2026)
+
+This optimization consulted no new game source or third-party implementation.
+Linux `perf` on RustMC's own release binary attributed the largest CPU share
+to repeated Perlin sampling while evaluating interpolated density nodes. The
+node now memoizes its eight corner values by aligned world cell in a bounded
+cache. It retains the existing volume evaluation and interpolation arithmetic;
+eviction recomputes the same immutable values. The published seed-2026 save
+comparison counts remained identical after the change. Timing and limits are
+recorded in the M3 Overworld milestone note.

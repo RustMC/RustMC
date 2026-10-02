@@ -31,6 +31,7 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
+use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::noise::{NoiseParameters, NoiseStack, NormalNoise, create_blended_fbm};
 use crate::vanilla::random::{PositionalRandomFactory, RandomSource};
 
@@ -390,6 +391,10 @@ enum Node {
         input: Density,
         cell_size_xz: i32,
         cell_size_y: i32,
+        // Each corner volume is a pure function of its aligned origin and
+        // this immutable node. Adjacent block samples share it. Two 64-entry
+        // generations cap retained values at 128 cells per node.
+        corners: RefCell<BoundedCache<[i32; 3], [f32; 8]>>,
     },
     Slice {
         axis: Axis,
@@ -602,6 +607,7 @@ impl Density {
                 input,
                 cell_size_xz,
                 cell_size_y,
+                corners,
             } => {
                 let x_in_cell = floor_mod(x, *cell_size_xz);
                 let y_in_cell = floor_mod(y, *cell_size_y);
@@ -620,8 +626,14 @@ impl Density {
                     min: [origin_x, origin_y, origin_z],
                     step: [*cell_size_xz, *cell_size_y, *cell_size_xz],
                 };
-                let mut corner = vec![0.0f32; 8];
-                input.sample_volume(&corner_volume, &mut corner);
+                let key = [origin_x, origin_y, origin_z];
+                let cached = corners.borrow_mut().get_mut(&key).copied();
+                let corner = cached.unwrap_or_else(|| {
+                    let mut values = [0.0f32; 8];
+                    input.sample_volume(&corner_volume, &mut values);
+                    corners.borrow_mut().insert(key, values);
+                    values
+                });
                 let at = |cx: usize, cy: usize, cz: usize| corner[corner_volume.index(cx, cy, cz)];
                 lerp3(
                     x_in_cell as f32 / *cell_size_xz as f32,
@@ -724,6 +736,7 @@ impl Density {
                 input,
                 cell_size_xz,
                 cell_size_y,
+                ..
             } => sample_interpolated_volume(input, *cell_size_xz, *cell_size_y, volume, out),
             _ => {
                 for z in 0..volume.size[2] {
@@ -1615,6 +1628,7 @@ impl<'e> DensityRegistry<'e> {
                     input: self.child(get("input")?)?,
                     cell_size_xz,
                     cell_size_y,
+                    corners: RefCell::new(BoundedCache::new(64)),
                 }
             }
             "slice" => Node::Slice {
@@ -2179,6 +2193,7 @@ mod tests {
             input: inner,
             cell_size_xz: 2,
             cell_size_y: 2,
+            corners: RefCell::new(BoundedCache::new(64)),
         }));
         // Cell corners pass through the direct sample.
         assert_eq!(interpolated.sample(0, 0, 0), 0.0);
@@ -2187,6 +2202,30 @@ mod tests {
         assert_eq!(interpolated.sample(1, 1, 1), 1.0);
         // Negative coordinates use floor-modulated cell offsets.
         assert_eq!(interpolated.sample(-1, -1, -1), -1.0);
+    }
+
+    #[test]
+    fn interpolated_corner_cache_is_bounded_and_eviction_is_value_neutral() {
+        let input = Density(Rc::new(Node::Binary(
+            BinaryKind::Add,
+            identity(Axis::X),
+            identity(Axis::Y),
+        )));
+        let node = Density(Rc::new(Node::Interpolated {
+            input,
+            cell_size_xz: 4,
+            cell_size_y: 8,
+            corners: RefCell::new(BoundedCache::new(64)),
+        }));
+        let first = node.sample(-3, 5, -2).to_bits();
+        for x in -120..120 {
+            let _ = node.sample(x * 4 + 1, 5, 1);
+        }
+        let Node::Interpolated { corners, .. } = &*node.0 else {
+            unreachable!()
+        };
+        assert!(corners.borrow().entries() <= 128);
+        assert_eq!(node.sample(-3, 5, -2).to_bits(), first);
     }
 
     #[test]

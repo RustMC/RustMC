@@ -58,6 +58,26 @@ model. Settling one authoritative world-Y mapping (decision **D1** / requirement
 the block-interaction milestone) is a prerequisite for both live wiring and gameplay, and
 no mapping has been chosen or implemented.
 
+## Interpolated-corner cache follow-up (2 October 2026)
+
+Profiling a release-build, one-chunk column descent showed repeated Perlin
+evaluation in the point path of the `interpolated` density node. Neighboring
+block positions recomputed the same eight aligned cell corners. A per-node,
+two-generation cache now retains at most 128 corner sets; keys are absolute
+aligned cell origins and eviction only recomputes immutable input. The volume
+path and density formulas are unchanged. A cache-eviction test and the existing
+bit-exact density vectors pass. Re-running the seed-2026, 2,401-column save
+comparison gave the same 273,498 / 338,217 exact base-block positions (80.86%)
+and the same per-band counts as the pre-cache worksheet below.
+
+On this machine, a fresh release-build one-chunk run of `bench_vanilla_chunks
+--side 1 --repeat 1 --mode columns` took 14,549 ms before and 1,547 ms after
+the cache. A separate 2×2 cold sweep after the change took 6,030.5 ms total,
+or 1,507.6 ms/chunk. These are local measurements with a warm filesystem and
+one seed, not a throughput or client-visible latency guarantee. At that rate,
+4,225 chunks still project to about 1.77 hours of single-threaded work. The
+finite-generation and live-client acceptance items remain unchecked.
+
 ## Ground truth: first block-identity measurement (2 October 2026)
 
 This records automated evidence for the first acceptance item. The item stays
