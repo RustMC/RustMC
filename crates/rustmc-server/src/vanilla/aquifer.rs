@@ -14,15 +14,16 @@
 //! ADR-0014 (as amended) and are recorded as facts in `docs/PROVENANCE.md`;
 //! this implementation is written independently for RustMC's column query.
 //! Where the reference used per-chunk arrays and a fluid-tick scheduling
-//! flag, this module uses seed-pure grid lookups behind caches (a cell's
-//! center and fluid status are functions of its grid coordinates and the
-//! world seed alone) and omits the scheduling flag, which affects tick
+//! flag, this module uses seed-pure grid lookups behind fixed-capacity
+//! caches (a cell's center and fluid status are functions of its grid
+//! coordinates and the world seed alone, so an evicted entry is just
+//! recomputed) and omits the scheduling flag, which affects tick
 //! post-processing but not the generated block substance a column query
 //! observes.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
+use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::density::Density;
 use crate::vanilla::random::PositionalRandomFactory;
 
@@ -98,6 +99,19 @@ pub enum Substance {
     Air,
 }
 
+/// Occupancy of the aquifer's coordinate-keyed grid caches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AquiferOccupancy {
+    /// Fluid cells with a memoised hashed center.
+    pub centers: usize,
+    /// Fluid cells with a memoised fluid status.
+    pub statuses: usize,
+    /// Quart-grid points with a memoised preliminary surface level.
+    pub surface_levels: usize,
+    /// Chunks with a memoised above-this-Y global-fluid shortcut.
+    pub skip_bounds: usize,
+}
+
 fn substance_of(fluid: Option<Fluid>) -> Substance {
     match fluid {
         Some(f) => Substance::Fluid(f),
@@ -141,13 +155,38 @@ pub struct NoiseBasedAquifer {
     /// Positional random factory fork for the aquifer cell grid, derived
     /// from the world seed before any cell is touched.
     factory: PositionalRandomFactory,
-    centers: RefCell<HashMap<[i32; 3], [i32; 3]>>,
-    statuses: RefCell<HashMap<[i32; 3], FluidStatus>>,
-    surface_cache: RefCell<HashMap<[i32; 2], i32>>,
-    skip_cache: RefCell<HashMap<[i32; 2], i32>>,
+    centers: RefCell<BoundedCache<[i32; 3], [i32; 3]>>,
+    statuses: RefCell<BoundedCache<[i32; 3], FluidStatus>>,
+    surface_cache: RefCell<BoundedCache<[i32; 2], i32>>,
+    skip_cache: RefCell<BoundedCache<[i32; 2], i32>>,
 }
 
 impl NoiseBasedAquifer {
+    /// Fluid cells with a memoised hashed center. One chunk column spans
+    /// 2x2 grid cells in x/z and one 12-block y cell per 12 rows, so the
+    /// overworld's 384-row column touches 2x2x32 = 128 centers plus the
+    /// 12-cell interpolation halo: about 140 per chunk. 1,024 keeps seven
+    /// chunks of streaming resident (2,048 entries at 24 bytes plus
+    /// control bytes is roughly 60 KiB) instead of one entry per cell of
+    /// every chunk ever visited.
+    pub const CENTER_CACHE_CAPACITY: usize = 1_024;
+    /// Fluid cells with a memoised status. Same working set as the centers
+    /// and the more expensive recompute (13 surface samples plus three
+    /// density samples), so the same capacity.
+    pub const STATUS_CACHE_CAPACITY: usize = 1_024;
+    /// Quart-grid points with a memoised preliminary surface level. A
+    /// chunk's `skip_sampling_above_y` scan covers a padded cell span of
+    /// about 11x11 quart points, and one row of a radius-32 view is 65
+    /// chunks wide, i.e. 65x16/4 + 16 = 276 quart columns by ~15 rows:
+    /// 4,096 entries covers that row plus the 13-point ring of the cells
+    /// inside it.
+    pub const SURFACE_CACHE_CAPACITY: usize = 4_096;
+    /// Chunks with a memoised aquifer sampling bound. Exactly one key per
+    /// chunk and only ever read for positions inside that chunk, so two
+    /// rows of a view is the real working set; 256 (2,048 entries, ~30 KiB
+    /// including the hash table's control bytes) leaves plenty of slack.
+    pub const SKIP_CACHE_CAPACITY: usize = 256;
+
     /// Cell spacing is 16 blocks in x/z (power of two) and 12 in y.
     const X_SPACING: i32 = 16;
     const Y_SPACING: i32 = 12;
@@ -158,6 +197,7 @@ impl NoiseBasedAquifer {
     const Z_RANGE: u32 = 10;
     /// Blocks sampled above the adjusted surface take the global fluid.
     const SURFACE_ADJUST: i32 = 8;
+
     /// The chunk ring (in 16-block units) whose preliminary surfaces a
     /// cell consults; the center sample is first and special-cased.
     const SURFACE_SAMPLING_OFFSETS: [[i32; 2]; 13] = [
@@ -185,10 +225,23 @@ impl NoiseBasedAquifer {
             config,
             fluids,
             factory,
-            centers: RefCell::new(HashMap::new()),
-            statuses: RefCell::new(HashMap::new()),
-            surface_cache: RefCell::new(HashMap::new()),
-            skip_cache: RefCell::new(HashMap::new()),
+            centers: RefCell::new(BoundedCache::new(Self::CENTER_CACHE_CAPACITY)),
+            statuses: RefCell::new(BoundedCache::new(Self::STATUS_CACHE_CAPACITY)),
+            surface_cache: RefCell::new(BoundedCache::new(Self::SURFACE_CACHE_CAPACITY)),
+            skip_cache: RefCell::new(BoundedCache::new(Self::SKIP_CACHE_CAPACITY)),
+        }
+    }
+
+    /// Entry counts of the four grid caches. Every key is a world grid
+    /// coordinate, so each cache would grow with the volume of world
+    /// queried; the capacities above bound them and this view lets the
+    /// generator tests and the bench binary check the bound holds.
+    pub fn cache_occupancy(&self) -> AquiferOccupancy {
+        AquiferOccupancy {
+            centers: self.centers.borrow().entries(),
+            statuses: self.statuses.borrow().entries(),
+            surface_levels: self.surface_cache.borrow().entries(),
+            skip_bounds: self.skip_cache.borrow().entries(),
         }
     }
 
@@ -208,7 +261,7 @@ impl NoiseBasedAquifer {
     /// The hashed fluid-cell center of a grid cell (seed-pure function of
     /// its coordinates), cached.
     fn cell_center(&self, cell: [i32; 3]) -> [i32; 3] {
-        if let Some(center) = self.centers.borrow().get(&cell) {
+        if let Some(center) = self.centers.borrow_mut().get_mut(&cell) {
             return *center;
         }
         let mut random = self.factory.at(cell[0], cell[1], cell[2]);
@@ -223,7 +276,7 @@ impl NoiseBasedAquifer {
 
     /// The fluid status of a grid cell, computed from its center once.
     fn cell_status(&self, cell: [i32; 3]) -> FluidStatus {
-        if let Some(status) = self.statuses.borrow().get(&cell) {
+        if let Some(status) = self.statuses.borrow_mut().get_mut(&cell) {
             return *status;
         }
         let center = self.cell_center(cell);
@@ -234,7 +287,7 @@ impl NoiseBasedAquifer {
 
     fn surface_level(&self, block_x: i32, block_z: i32) -> i32 {
         let key = [quantize_quart(block_x), quantize_quart(block_z)];
-        if let Some(value) = self.surface_cache.borrow().get(&key) {
+        if let Some(value) = self.surface_cache.borrow_mut().get_mut(&key) {
             return *value;
         }
         let value = self.config.surface_level.sample(key[0], 0, key[1]).floor() as i32;
@@ -248,7 +301,7 @@ impl NoiseBasedAquifer {
     /// bound of the reference implementation.
     fn skip_sampling_above_y(&self, block_x: i32, block_z: i32) -> i32 {
         let chunk = [block_x >> 4, block_z >> 4];
-        if let Some(value) = self.skip_cache.borrow().get(&chunk) {
+        if let Some(value) = self.skip_cache.borrow_mut().get_mut(&chunk) {
             return *value;
         }
         let min_block_x = chunk[0] * 16;

@@ -86,6 +86,13 @@ impl CarveMask {
         }
     }
 
+    /// Heap bytes of the bitset for one chunk's Y window: the price of
+    /// caching a target chunk's mask, used to size the mask cache.
+    pub const fn heap_bytes(min_y: i32, max_y: i32) -> usize {
+        let height = (max_y - min_y + 1) as usize;
+        (256 * height).div_ceil(64) * size_of::<u64>()
+    }
+
     pub fn min_y(&self) -> i32 {
         self.min_y
     }

@@ -22,12 +22,14 @@
 //! the exhaustive scan is therefore the default.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::vanilla::aquifer::{Aquifer, Fluid, GlobalFluid, NoiseBasedAquifer, Substance};
+use crate::vanilla::aquifer::{
+    Aquifer, AquiferOccupancy, Fluid, GlobalFluid, NoiseBasedAquifer, Substance,
+};
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
+use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
 use crate::vanilla::random::LegacyRandom;
 use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
@@ -41,11 +43,52 @@ const WAY_BELOW_MIN_Y: i32 = -32512;
 /// per-source-chunk cache.
 type ChunkCarvers = Rc<Vec<Option<Rc<Carver>>>>;
 
+/// Entry counts of the generator's coordinate-keyed caches. Every one of
+/// them is keyed by world coordinates, so the count grows with the volume
+/// of world the generator has been asked about; `VanillaGenerator` bounds
+/// each with a fixed-capacity cache and this view lets tests and the bench
+/// binary check the bound holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheOccupancy {
+    /// Target chunks with a replayed carve mask.
+    pub masks: usize,
+    /// Source chunks with a resolved biome carver list.
+    pub chunk_carvers: usize,
+    /// Columns with a memoised surface top.
+    pub heights: usize,
+    /// Aquifer fluid cells with a memoised center.
+    pub aquifer_centers: usize,
+    /// Aquifer fluid cells with a memoised status.
+    pub aquifer_statuses: usize,
+    /// Quart-grid points with a memoised preliminary surface level.
+    pub aquifer_surface_levels: usize,
+    /// Chunks with a memoised aquifer sampling bound.
+    pub aquifer_skip_bounds: usize,
+}
+
+impl CacheOccupancy {
+    /// Sum of all entries held.
+    pub fn total(&self) -> usize {
+        self.masks
+            + self.chunk_carvers
+            + self.heights
+            + self.aquifer_centers
+            + self.aquifer_statuses
+            + self.aquifer_surface_levels
+            + self.aquifer_skip_bounds
+    }
+}
+
 /// One dimension's column-height, biome, and top-block source, built from
 /// operator-provisioned data (never committed) and a world seed. The
 /// compiled router owns its graph, and the surface program owns every
 /// noise stack and random factory it needs, so the engine is used only
 /// while wiring.
+///
+/// The three coordinate-keyed memos below are fixed-capacity caches, not
+/// growing maps: every value they hold is a pure function of world
+/// coordinates and the seed, so eviction only costs a recomputation. See
+/// `vanilla::cache` and the capacity comments for the sizing reasoning.
 pub struct VanillaGenerator {
     router: NoiseRouter,
     max_y: i32,
@@ -57,15 +100,42 @@ pub struct VanillaGenerator {
     carvers: Option<Rc<CarverData>>,
     carver_context: CarverContext,
     /// Per-target-chunk carving masks, built lazily on first probe.
-    masks: RefCell<HashMap<(i32, i32), CarveMask>>,
+    masks: RefCell<BoundedCache<(i32, i32), CarveMask>>,
     /// Per-source-chunk biome carver lists, built lazily during replay.
-    chunk_carvers: RefCell<HashMap<(i32, i32), ChunkCarvers>>,
+    chunk_carvers: RefCell<BoundedCache<(i32, i32), ChunkCarvers>>,
     /// Column-top memo: the descent's steep-gradient lookups re-read
     /// neighbouring columns, whose top scan is otherwise O(height).
-    heights: RefCell<HashMap<(i32, i32), i32>>,
+    heights: RefCell<BoundedCache<(i32, i32), i32>>,
 }
 
 impl VanillaGenerator {
+    /// Target chunks with a replayed carve mask. A mask is only ever read
+    /// for positions inside its own chunk (`carved` derives the target
+    /// from the block coordinates), and building one replays the 17x17
+    /// source window, so contiguous generation touches one mask at a time.
+    /// 32 keeps a 4x4 chunk batch and the row it is streaming warm at
+    /// 64 masks; the overworld mask is 12,032 bytes of bitset, so that is
+    /// about 750 KiB instead of the 48 MiB a radius-32 view (4,225 chunks)
+    /// would otherwise pin forever.
+    pub const MASK_CACHE_CAPACITY: usize = 32;
+    /// Source chunks with a resolved biome carver list. One mask replay
+    /// resolves the 17x17 window (289 chunks) and consecutive targets
+    /// overlap by 16 of 17 rows, so a row-major sweep of a view of radius
+    /// R needs 17x(2R+17) entries: 1,377 at R=32. The values are shared
+    /// references into the carver registry, so an entry is 16 bytes and
+    /// 2,048 costs under 100 KiB. The recompute is not cheap (a climate
+    /// sample plus a linear search of the placement table), which is why
+    /// this cache is sized for a whole 32-chunk row rather than a few
+    /// chunks.
+    pub const CHUNK_CARVERS_CACHE_CAPACITY: usize = 2_048;
+    /// Columns with a memoised surface top. The surface program's steep
+    /// test reads the columns one block either side in x and z (clamped to
+    /// the chunk), so a column's top is reused within its own chunk: 256
+    /// entries per chunk plus the halo. 4,096 covers 16 chunks of
+    /// streaming for a full-radius view's worth of 1,081,600 columns,
+    /// i.e. tens of KiB instead of ~14 MB.
+    pub const HEIGHT_CACHE_CAPACITY: usize = 4_096;
+
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
     /// the noise engine to `world_seed`.
     pub fn new(
@@ -131,9 +201,9 @@ impl VanillaGenerator {
             world_seed,
             carvers,
             carver_context,
-            masks: RefCell::new(HashMap::new()),
-            chunk_carvers: RefCell::new(HashMap::new()),
-            heights: RefCell::new(HashMap::new()),
+            masks: RefCell::new(BoundedCache::new(Self::MASK_CACHE_CAPACITY)),
+            chunk_carvers: RefCell::new(BoundedCache::new(Self::CHUNK_CARVERS_CACHE_CAPACITY)),
+            heights: RefCell::new(BoundedCache::new(Self::HEIGHT_CACHE_CAPACITY)),
         })
     }
 
@@ -307,7 +377,7 @@ impl VanillaGenerator {
     /// fluid surface where terrain does not reach above it. Memoised
     /// because the descent's steep gradients re-read neighbours.
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {
-        if let Some(&y) = self.heights.borrow().get(&(x, z)) {
+        if let Some(&y) = self.heights.borrow_mut().get_mut(&(x, z)) {
             return y;
         }
         let y = self.surface(x, z).map_or(self.router.min_y, |(y, _)| y);
@@ -349,8 +419,8 @@ impl VanillaGenerator {
         let target = (x >> 4, z >> 4);
         let (relative_x, relative_z) = (x - (target.0 << 4), z - (target.1 << 4));
         {
-            let cached = self.masks.borrow();
-            if let Some(mask) = cached.get(&target) {
+            let mut cached = self.masks.borrow_mut();
+            if let Some(mask) = cached.get_mut(&target) {
                 return mask.contains(relative_x, y, relative_z);
             }
         }
@@ -360,14 +430,22 @@ impl VanillaGenerator {
         hit
     }
 
+    /// The Y window a target chunk's mask covers, as block rows
+    /// `(min_y, max_y)`. Single source of truth because `carve_mask_bytes`
+    /// has to price exactly the bitset `build_carve_mask` allocates.
+    fn mask_window(&self) -> (i32, i32) {
+        (
+            self.router.min_y + 1,
+            self.router.min_y + self.router.height - 1 - 7,
+        )
+    }
+
     /// Replays the orchestration for one target chunk: one legacy stream
     /// reseeded per source chunk and carver index over the 17×17 window,
     /// the probability gate, then the walk stamping into the mask.
     fn build_carve_mask(&self, target: (i32, i32)) -> CarveMask {
-        let mut mask = CarveMask::new(
-            self.router.min_y + 1,
-            self.router.min_y + self.router.height - 1 - 7,
-        );
+        let (mask_min_y, mask_max_y) = self.mask_window();
+        let mut mask = CarveMask::new(mask_min_y, mask_max_y);
         let mut random = LegacyRandom::new(0);
         for dx in -8..=8 {
             for dz in -8..=8 {
@@ -398,8 +476,8 @@ impl VanillaGenerator {
     /// biome resolves without a carver list.
     fn carvers_for_chunk(&self, chunk: (i32, i32)) -> Option<ChunkCarvers> {
         {
-            let cached = self.chunk_carvers.borrow();
-            if let Some(carvers) = cached.get(&chunk) {
+            let mut cached = self.chunk_carvers.borrow_mut();
+            if let Some(carvers) = cached.get_mut(&chunk) {
                 return Some(Rc::clone(carvers));
             }
         }
@@ -437,6 +515,38 @@ impl VanillaGenerator {
             }
         }
         self.router.min_y
+    }
+
+    /// The dimension's build height: the `noise.height` setting, the
+    /// number of rows `column_ids` indexes.
+    pub fn height(&self) -> i32 {
+        self.router.height
+    }
+
+    /// Heap bytes of one chunk's carve mask bitset: the per-target-chunk
+    /// value the mask cache stores, used to price the cache bound.
+    pub fn carve_mask_bytes(&self) -> usize {
+        let (mask_min_y, mask_max_y) = self.mask_window();
+        CarveMask::heap_bytes(mask_min_y, mask_max_y)
+    }
+
+    /// Current occupancy of every coordinate-keyed cache of this generator.
+    /// Diagnostic and test surface: the bounded caches must stay inside the
+    /// capacities documented on each field.
+    pub fn cache_occupancy(&self) -> CacheOccupancy {
+        let aquifer = match &self.aquifer {
+            Aquifer::NoiseBased(aquifer) => aquifer.cache_occupancy(),
+            Aquifer::Disabled(_) => AquiferOccupancy::default(),
+        };
+        CacheOccupancy {
+            masks: self.masks.borrow().entries(),
+            chunk_carvers: self.chunk_carvers.borrow().entries(),
+            heights: self.heights.borrow().entries(),
+            aquifer_centers: aquifer.centers,
+            aquifer_statuses: aquifer.statuses,
+            aquifer_surface_levels: aquifer.surface_levels,
+            aquifer_skip_bounds: aquifer.skip_bounds,
+        }
     }
 
     /// Grid-refined alternative scan (see module docs: an approximation
@@ -1064,5 +1174,273 @@ mod tests {
                 "column ({x}, {z}) top row at y={top}"
             );
         }
+    }
+
+    /// A fabricated pack that drives every coordinate-keyed cache of the
+    /// generator and the aquifer without touching the operator's data: a
+    /// y-only density band (solid on y = 5..=23, identical in all
+    /// columns), the shared descent rule program, an all-constant aquifer
+    /// section, a one-entry placement table selecting a biome whose only
+    /// carver has probability 0. That carver never stamps a mask, yet
+    /// `build_carve_mask` still resolves the 17x17 window of source chunk
+    /// carver lists, so the replay path and both carving caches run.
+    fn bounded_pack(root: &Path) {
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/band.json"),
+            r#"{"type": "mul",
+                "left": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": -1.0,
+                    "to_coordinate": 8, "to_value": 1.0},
+                "right": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": 1.0,
+                    "to_coordinate": 48, "to_value": -1.0}}"#,
+        );
+        write(&worldgen.join("material_rule/root.json"), DESCENT_ROOT);
+        write(
+            &worldgen.join("carver/scarce.json"),
+            r#"{"type": "minecraft:cave", "probability": 0.0,
+                "y": {"type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": -20},
+                    "max_inclusive": {"absolute": 60}},
+                "count": 1, "thickness": 1.5,
+                "room_vertical_radius_multiplier": 1.0,
+                "horizontal_radius_multiplier": 1.0,
+                "vertical_radius_multiplier": 1.0,
+                "floor_level": -0.7}"#,
+        );
+        write(
+            &worldgen.join("biome/flat.json"),
+            r#"{"carvers": ["testns:scarce"]}"#,
+        );
+        descent_pack_noise(root);
+        write(
+            &worldgen.join("noise_settings/bounded.json"),
+            r#"{
+                "noise": {"min_y": 0, "height": 128},
+                "sea_level": -1000,
+                "default_fluid": "minecraft:water",
+                "default_block": "minecraft:granite",
+                "noise_router": {
+                    "final_density": "testns:band",
+                    "continents": 0.0,
+                    "erosion": 0.0,
+                    "depth": 0.0,
+                    "ridges": 0.0,
+                    "temperature": 0.0,
+                    "vegetation": 0.0
+                },
+                "aquifers": {
+                    "barrier": 0.0,
+                    "fluid_level_floodedness": 0.0,
+                    "fluid_level_spread": 0.0,
+                    "lava": 0.0,
+                    "exclusion": 0.0,
+                    "surface_level": 0.0
+                },
+                "material_rule": "testns:root"
+            }"#,
+        );
+        // The preset of `testns:bounded` is `bounded`, so the placement
+        // table beside the data root must be named accordingly. A single
+        // entry covering the whole climate volume keeps every chunk on
+        // the `testns:flat` carver list.
+        write(
+            &root.join("rustmc/biome_placement/bounded.psv"),
+            concat!(
+                "0|testns:flat|t=[-2000-2000]|h=[-10000-10000]|c=[-10000-10000]|",
+                "e=[-10000-10000]|d=[-10000-10000]|w=[-10000-10000]|off=0\n"
+            ),
+        );
+    }
+
+    fn bounded_generator(label: &str) -> (PathBuf, VanillaGenerator) {
+        let root = scratch_root(label);
+        bounded_pack(&root);
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("bounded pack generator");
+        (root, generator)
+    }
+
+    /// The carving caches must stop growing long before the world volume
+    /// queried: 300 chunk targets along the x = z diagonal touch 300
+    /// distinct mask keys and (each replaying its 17x17 window) more than
+    /// 10,000 distinct source chunk keys, while the capacities allow 64
+    /// and 4,096 entries at most.
+    #[test]
+    fn carve_caches_stay_bounded_across_target_chunks() {
+        let (root, generator) = bounded_generator("cache-carve");
+        let mut distinct_sources = std::collections::HashSet::new();
+        for target in 0..300i32 {
+            // One column per target chunk: the descent's carve pass is
+            // what builds and reads the mask.
+            let _ = generator.column_ids(target * 16 + 8, target * 16 + 8);
+            for dx in -8..=8 {
+                for dz in -8..=8 {
+                    distinct_sources.insert((target + dx, target + dz));
+                }
+            }
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            distinct_sources.len() > 10_000,
+            "the fixture must probe a source-window union far past the cache bound, \
+             got {}",
+            distinct_sources.len()
+        );
+        assert!(
+            occupancy.masks <= 2 * VanillaGenerator::MASK_CACHE_CAPACITY,
+            "mask cache grew past its bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.masks < 300,
+            "every one of the 300 target masks is still pinned: {occupancy:?}"
+        );
+        assert!(
+            occupancy.chunk_carvers <= 2 * VanillaGenerator::CHUNK_CARVERS_CACHE_CAPACITY,
+            "carver cache grew past its bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.chunk_carvers < distinct_sources.len(),
+            "every source chunk of the sweep is still pinned: {occupancy:?}"
+        );
+        assert!(
+            occupancy.heights <= 2 * VanillaGenerator::HEIGHT_CACHE_CAPACITY,
+            "height cache grew past its bound: {occupancy:?}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The column-top memo is the largest of the seven caches by entry
+    /// count: a sweep of 36 whole chunks queries 9,216 distinct columns,
+    /// and the memo must hold at most 8,192 of them.
+    #[test]
+    fn height_cache_stays_bounded_across_column_sweeps() {
+        let (root, generator) = bounded_generator("cache-heights");
+        // 96x96 blocks is 36 chunks, i.e. 9,216 distinct columns; the
+        // neighbour reads of the surface program land on columns inside
+        // the same sweep.
+        let mut columns = 0usize;
+        for x in 0..96i32 {
+            for z in 0..96i32 {
+                let _ = generator.surface_height(x, z);
+                columns += 1;
+            }
+        }
+        assert_eq!(columns, 9_216);
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.heights <= 2 * VanillaGenerator::HEIGHT_CACHE_CAPACITY,
+            "height cache grew past its bound after {columns} columns: {occupancy:?}"
+        );
+        assert!(
+            occupancy.heights < columns,
+            "the memo still holds one entry per column queried: {occupancy:?}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The aquifer's four grid caches are keyed by fluid cell, quart
+    /// point, and chunk, so they grow with the area queried even when the
+    /// columns themselves are not cached. Probing one low block per chunk
+    /// of a 60x60 chunk sweep touches 3,600 distinct chunk keys (bound:
+    /// 512) and, because each sampling consults the 2x3x2 cell
+    /// neighbourhood of its anchor, the full 61x3x61 = 11,163 cell grid
+    /// (bound: 2,048), plus tens of thousands of quart surface points
+    /// (bound: 8,192).
+    #[test]
+    fn aquifer_caches_stay_bounded_across_chunk_sweeps() {
+        let (root, generator) = bounded_generator("cache-aquifer");
+        for chunk_x in 0..60i32 {
+            for chunk_z in 0..60i32 {
+                // y = 4 is density-empty below the aquifer sampling bound
+                // of this pack, which is the branch that consults cells.
+                let _ = generator.substance(chunk_x * 16 + 3, 4, chunk_z * 16 + 7);
+            }
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.aquifer_skip_bounds <= 2 * NoiseBasedAquifer::SKIP_CACHE_CAPACITY,
+            "chunk sampling bounds grew past their bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_skip_bounds < 3_600,
+            "one key per chunk and the sweep spans 3,600 chunks, so a growing map would pin \
+             all of them: {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_centers <= 2 * NoiseBasedAquifer::CENTER_CACHE_CAPACITY,
+            "fluid cell centers grew past their bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_centers < 11_163,
+            "the sweep consults 61x3x61 fluid cells, so a growing map would pin all of them: \
+             {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_statuses <= 2 * NoiseBasedAquifer::STATUS_CACHE_CAPACITY,
+            "fluid cell statuses grew past their bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_surface_levels <= 2 * NoiseBasedAquifer::SURFACE_CACHE_CAPACITY,
+            "preliminary surface levels grew past their bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.aquifer_centers > 0 && occupancy.aquifer_surface_levels > 0,
+            "the sweep did not populate the aquifer caches, so the bounds above are vacuous: \
+             {occupancy:?}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Eviction is a recomputation, not a change of result: after the
+    /// caches have rotated through a wide sweep, the same column must
+    /// still report the same top, the same rule descent, and the same
+    /// carve state, which is what makes the bounds safe to apply to
+    /// coordinate-keyed memos at all.
+    #[test]
+    fn evicted_entries_recompute_identically() {
+        let (root, generator) = bounded_generator("cache-invariance");
+        let (x, z) = (6i32, -2i32);
+        let before_height = generator.surface_height(x, z);
+        let before_ids = generator.column_ids(x, z);
+        let before_top = generator.top_block(x, z);
+        let before_carved = generator.carved(x, 8, z);
+        assert!(
+            before_height > 0 && before_ids.iter().any(Option::is_some) && before_top.is_some(),
+            "the fixture column must actually have terrain and rule results to compare"
+        );
+
+        // Enough distinct keys to rotate every generation of every cache,
+        // none of which re-reads the column captured above: 300 new mask
+        // targets (capacity 32), 9,216 new columns (capacity 4,096), and
+        // some 19,000 new fluid cells (capacity 1,024).
+        for target in 0..300i32 {
+            let _ = generator.column_ids(target * 16 + 8, target * 16 + 8);
+        }
+        for x in 0..96i32 {
+            for z in 0..96i32 {
+                let _ = generator.surface_height(x, z);
+            }
+        }
+        for chunk_x in 0..40i32 {
+            for chunk_z in 0..40i32 {
+                let _ = generator.substance(chunk_x * 16 + 3, 4, chunk_z * 16 + 7);
+            }
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.masks <= 2 * VanillaGenerator::MASK_CACHE_CAPACITY
+                && occupancy.heights <= 2 * VanillaGenerator::HEIGHT_CACHE_CAPACITY
+                && occupancy.aquifer_centers <= 2 * NoiseBasedAquifer::CENTER_CACHE_CAPACITY,
+            "the sweeps above must have rotated the caches while keeping them bounded: \
+             {occupancy:?}"
+        );
+
+        assert_eq!(generator.surface_height(x, z), before_height);
+        assert_eq!(generator.column_ids(x, z), before_ids);
+        assert_eq!(generator.top_block(x, z), before_top);
+        assert_eq!(generator.carved(x, 8, z), before_carved);
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 }
