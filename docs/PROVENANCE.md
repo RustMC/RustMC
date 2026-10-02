@@ -601,7 +601,7 @@ records. The source is an owner-generated save; it remains untracked. A second
 default-preset seed was compared through the existing oracle, and its
 denominators and residuals are recorded in the M3 Overworld milestone note.
 No competing server source was used for this observation.
-# Operator-local preview packet cache (2 October 2026)
+## Operator-local preview packet cache (2 October 2026)
 
 `sha2 0.10.9` (RustCrypto, `MIT OR Apache-2.0`) hashes the preview cache's
 operator-provisioned inputs and packet bytes for invalidation and corruption
@@ -609,3 +609,17 @@ detection. Its new locked transitive `cpufeatures 0.2.17` has the same license
 declaration. This is a local integrity check, not authentication or custom
 cryptography. The cache is an immutable rendering artifact and does not save
 player edits. Both packages are recorded in the dependency license policy.
+## TOML 1.1 dependency review (2 October 2026)
+
+The configuration parser upgrade to `toml 1.1.6+spec-1.1.0` changes the
+whole-document entry point: RustMC now uses `toml::from_str` in its two TOML
+document readers. `toml::Value::from_str` in this release parses one value,
+which broke valid configuration and registry manifests until corrected.
+
+The updated lockfile contains `serde_spanned 1.1.1`, `toml_datetime
+1.1.1+spec-1.1.0`, `toml_parser 1.1.3+spec-1.1.0`, `toml_writer
+1.1.2+spec-1.1.0`, and `winnow 1.0.4`. Their declared licenses are `MIT OR
+Apache-2.0` except `winnow`, which declares `MIT`; each has a compatible
+option under RustMC's Apache-2.0 policy. `toml_edit` and `toml_write` leave
+the lockfile. The locked license gate checks these declarations, while a
+binary release still needs the required third-party notice review.

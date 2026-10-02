@@ -29,8 +29,7 @@ pub fn parse(input: &str) -> Result<RegistryManifest, String> {
     if input.len() > MAX_MANIFEST_BYTES {
         return Err("preview registry manifest exceeds 1 MiB".to_owned());
     }
-    let value: toml::Value = input
-        .parse()
+    let value: toml::Value = toml::from_str(input)
         .map_err(|_| "preview registry manifest is not valid TOML".to_owned())?;
     let table = value
         .as_table()
