@@ -8,6 +8,7 @@
 //! vanilla_oracle worksheet <world-dir> <seed> [preview|experimental|vanilla[:settings-id] [data-root]]
 //! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
 //! vanilla_oracle substance <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [fail-cap]]
+//! vanilla_oracle block_compare <world-dir> <seed> <min> <max> <stride> [data-root [fail-cap]]
 //! vanilla_oracle census <world-dir> <min> <max>
 //! vanilla_oracle census_names <world-dir> <min> <max> [cap]
 //! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
@@ -107,8 +108,7 @@ fn run(args: &[String]) -> Result<(), String> {
             if min > max {
                 return Err("min must not exceed max".to_string());
             }
-            let (columns, missing_chunks) =
-                oracle::sample_columns(&mut store, min, max, min, max, stride)?;
+            let (columns, gaps) = oracle::sample_columns(&mut store, min, max, min, max, stride)?;
             let source = build_source(seed, args.get(6), args.get(7))?;
             let cap = args
                 .get(8)
@@ -116,7 +116,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 .transpose()?
                 .unwrap_or(20);
             let report = oracle::compare_columns(columns.iter().cloned(), &*source, cap);
-            println!("columns={} missing_chunks={missing_chunks}", report.columns);
+            println!(
+                "columns={} missing_chunks={} ungenerated_columns={}",
+                report.columns, gaps.missing_chunks, gaps.ungenerated_columns
+            );
             println!(
                 "height_exact={} ({:.2}%) biome={} ({:.2}%)",
                 report.height_matches,
@@ -158,8 +161,7 @@ fn run(args: &[String]) -> Result<(), String> {
             if min > max {
                 return Err("min must not exceed max".to_string());
             }
-            let (profiles, missing_chunks) =
-                oracle::sample_profiles(&mut store, min, max, min, max, stride)?;
+            let (profiles, gaps) = oracle::sample_profiles(&mut store, min, max, min, max, stride)?;
             let source = build_source(seed, args.get(6), args.get(7))?;
             let cap = args
                 .get(8)
@@ -167,7 +169,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 .transpose()?
                 .unwrap_or(20);
             let report = oracle::compare_substance(profiles, &*source, cap);
-            println!("columns={} missing_chunks={missing_chunks}", report.columns);
+            println!(
+                "columns={} missing_chunks={} ungenerated_columns={}",
+                report.columns, gaps.missing_chunks, gaps.ungenerated_columns
+            );
             println!(
                 "substance_positions={} exact={} ({:.2}%)",
                 report.positions,
@@ -232,6 +237,119 @@ fn run(args: &[String]) -> Result<(), String> {
                     stats.rustmc[1],
                     stats.rustmc[2]
                 );
+            }
+            println!("fail_x,fail_z,fail_y");
+            for (x, z, y) in &report.fail_positions {
+                println!("{x},{z},{y}");
+            }
+            if report.columns == 0 {
+                return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "block_compare" => {
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
+            let min = parse_i64(args.get(3).ok_or("missing <min>")?)?;
+            let max = parse_i64(args.get(4).ok_or("missing <max>")?)?;
+            let stride = parse_i64(args.get(5).ok_or("missing <stride>")?)?;
+            if min > max {
+                return Err("min must not exceed max".to_string());
+            }
+            let (profiles, gaps) = oracle::sample_profiles(&mut store, min, max, min, max, stride)?;
+            let generator =
+                VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, "minecraft:overworld")
+                    .map_err(|error| error.to_string())?;
+            let cap = args
+                .get(7)
+                .map(|v| parse_i64(v).map(|n| n.max(0) as usize))
+                .transpose()?
+                .unwrap_or(20);
+            let report = oracle::compare_block_ids(profiles, &generator, cap);
+            // M3 ground truth: the requested sample size and every grid
+            // point that could not be scored are printed before any
+            // percentage, so the denominator is never implied.
+            let per_axis = (max - min)
+                .checked_div(stride)
+                .and_then(|n| n.checked_add(1))
+                .ok_or("invalid sample grid")?;
+            let grid_points = usize::try_from(
+                per_axis
+                    .checked_mul(per_axis)
+                    .ok_or("invalid sample grid")?,
+            )
+            .map_err(|_| "sample grid too large".to_string())?;
+            let unaccounted = grid_points
+                .saturating_sub(report.columns)
+                .saturating_sub(gaps.total())
+                .saturating_sub(report.out_of_domain_columns)
+                .saturating_sub(report.declined_columns);
+            println!("requested={min}..{max} stride={stride} grid_points={grid_points}");
+            println!(
+                "columns={} missing_chunks={} ungenerated_columns={} declined_columns={} out_of_domain_columns={} unaccounted_grid_points={} out_of_range_rows={}",
+                report.columns,
+                gaps.missing_chunks,
+                gaps.ungenerated_columns,
+                report.declined_columns,
+                report.out_of_domain_columns,
+                unaccounted,
+                report.out_of_range_rows
+            );
+            println!(
+                "base_block_positions={} exact={} ({:.2}%) air_family_normalised_exact={} ({:.2}%)",
+                report.positions,
+                report.exact_base,
+                oracle::percent(report.exact_base, report.positions),
+                report.exact_base_air_family,
+                oracle::percent(report.exact_base_air_family, report.positions)
+            );
+            for (band, agreement) in &report.bands {
+                println!(
+                    "band y={band}: positions={} exact={} ({:.2}%) air_family_exact={} ({:.2}%)",
+                    agreement.positions,
+                    agreement.matches,
+                    oracle::percent(agreement.matches, agreement.positions),
+                    agreement.matches_air_family,
+                    oracle::percent(agreement.matches_air_family, agreement.positions)
+                );
+            }
+            for (context, agreement) in &report.cave {
+                println!(
+                    "cave {}: positions={} exact={} ({:.2}%) air_family_exact={} ({:.2}%)",
+                    context.name(),
+                    agreement.positions,
+                    agreement.matches,
+                    oracle::percent(agreement.matches, agreement.positions),
+                    agreement.matches_air_family,
+                    oracle::percent(agreement.matches_air_family, agreement.positions)
+                );
+            }
+            println!(
+                "save_void_ours_block={} save_block_ours_air={} of which near_saved_void={}",
+                report.missed_carves, report.extra_carves, report.extra_carves_near_void
+            );
+            for (label, bands) in [
+                ("missed", &report.missed_carves_bands),
+                ("extra", &report.extra_carves_bands),
+            ] {
+                let rendered: Vec<String> = bands
+                    .iter()
+                    .map(|(band, count)| format!("{band}:{count}"))
+                    .collect();
+                println!("carve_bands {label} {}", rendered.join(" "));
+            }
+            let mut pairs: Vec<_> = report.residuals.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for ((saved, generated), count) in pairs.into_iter().take(20) {
+                println!("residual {count}x vanilla={saved} rustmc={generated}");
+            }
+            let mut pairs: Vec<_> = report.residuals_air_family.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for ((saved, generated), count) in pairs.into_iter().take(20) {
+                println!("residual_air_norm {count}x vanilla={saved} rustmc={generated}");
+            }
+            let mut pairs: Vec<_> = report.residuals_cave.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for ((saved, generated), count) in pairs.into_iter().take(10) {
+                println!("residual_cave {count}x vanilla={saved} rustmc={generated}");
             }
             println!("fail_x,fail_z,fail_y");
             for (x, z, y) in &report.fail_positions {

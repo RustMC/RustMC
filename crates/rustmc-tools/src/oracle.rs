@@ -276,6 +276,273 @@ pub fn compare_substance(
     report
 }
 
+/// Numerator and denominator for one subgroup of a sampled population.
+/// `matches` counts strict base ids, `matches_air_family` the same rows
+/// with the air family collapsed to one name, so a subgroup dominated by
+/// air bookkeeping is visible instead of depressing the headline score.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Agreement {
+    pub positions: usize,
+    pub matches: usize,
+    pub matches_air_family: usize,
+}
+
+impl Agreement {
+    fn add(&mut self, matched: bool, matched_air_family: bool) {
+        self.positions += 1;
+        self.matches += usize::from(matched);
+        self.matches_air_family += usize::from(matched_air_family);
+    }
+}
+
+/// Vertical distance in stored rows at which a block is still considered
+/// cave wall rather than intact rock.
+pub const CAVE_WALL_ROWS: u32 = 4;
+
+/// Where a sampled row sits relative to the cave voids the save itself
+/// stores, used to attribute solid-vs-air disagreement to the carving
+/// pass instead of the density graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CaveContext {
+    /// The save stores an air-family block below its heightmap surface:
+    /// a vanilla cave void (or a span the chunk never wrote).
+    Void,
+    /// The save stores a block within [`CAVE_WALL_ROWS`] rows of a void:
+    /// cave floor, ceiling, or wall.
+    CaveWall,
+    /// The save stores a block further from any void in the column.
+    IntactRock,
+}
+
+impl CaveContext {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Void => "void",
+            Self::CaveWall => "cave_wall",
+            Self::IntactRock => "intact_rock",
+        }
+    }
+}
+
+/// Any source of a full per-column block descent: index 0 of the answer
+/// is the dimension's minimum build Y, `None` entries are air. Sources
+/// without a material-rule descent answer `None` for every row, which the
+/// report counts as a declined column instead of scoring as air.
+pub trait ColumnDescent {
+    fn column_block_ids(&self, x: i32, z: i32) -> Vec<Option<String>>;
+    fn column_min_y(&self) -> i32;
+}
+
+impl ColumnDescent for VanillaGenerator {
+    fn column_block_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+        self.column_ids(x, z)
+    }
+    fn column_min_y(&self) -> i32 {
+        self.min_y()
+    }
+}
+
+/// Exact base-block agreement for a sampled generated column volume, the
+/// M3 ground-truth measurement. This deliberately scores feature and
+/// structure blocks too: a high substance score alone cannot establish a
+/// vanilla-looking or editable world. Two scores are reported: strict base
+/// ids, and ids with the air family (`air`, `cave_air`, `void_air`,
+/// `structure_void`) collapsed to one name, which separates identity gaps
+/// from air bookkeeping.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlockReport {
+    /// Columns contributing at least one scored position.
+    pub columns: usize,
+    /// Sampled columns whose absolute coordinates leave the generator's
+    /// `i32` domain: reported, never silently dropped.
+    pub out_of_domain_columns: usize,
+    /// Sampled columns where the generator answered no block at all.
+    pub declined_columns: usize,
+    /// Stored rows outside the generator's build range: not scored.
+    pub out_of_range_rows: usize,
+    pub positions: usize,
+    pub exact_base: usize,
+    pub exact_base_air_family: usize,
+    /// Agreement per 32-block absolute Y band, the generator-side
+    /// counterpart of the save census banding.
+    pub bands: std::collections::BTreeMap<i32, Agreement>,
+    /// Agreement per cave context of the saved column.
+    pub cave: std::collections::BTreeMap<CaveContext, Agreement>,
+    /// Rows the save leaves air where we keep a block: carving the density
+    /// graph does not open the cave.
+    pub missed_carves: usize,
+    /// `missed_carves` per 32-block absolute Y band: where the carvers are
+    /// still missing.
+    pub missed_carves_bands: std::collections::BTreeMap<i32, usize>,
+    /// Rows the save fills with a block where we answer air.
+    pub extra_carves: usize,
+    /// `extra_carves` per 32-block absolute Y band: where we carve too much.
+    pub extra_carves_bands: std::collections::BTreeMap<i32, usize>,
+    /// `extra_carves` within [`CAVE_WALL_ROWS`] of a saved void: over-wide
+    /// carving of an existing cave. The remainder are invented caves in
+    /// rock the save leaves solid.
+    pub extra_carves_near_void: usize,
+    /// Confusion pairs as `(save, rustmc)` base-id counts.
+    pub residuals: std::collections::BTreeMap<(String, String), usize>,
+    /// The same pairs after collapsing the air family, dropping the pairs
+    /// that only differ by which air block was written.
+    pub residuals_air_family: std::collections::BTreeMap<(String, String), usize>,
+    /// The same pairs restricted to saved voids and cave walls: how the
+    /// carving neighbourhood disagrees, block by block.
+    pub residuals_cave: std::collections::BTreeMap<(String, String), usize>,
+    /// First capped disagreement positions for follow-up single-column
+    /// probes (`column` mode).
+    pub fail_positions: Vec<(i64, i64, i32)>,
+}
+
+/// Collapse the air family to one name so residual reporting can separate
+/// real identity differences from air bookkeeping. Expects a base id.
+pub fn air_family_name(name: &str) -> &str {
+    if block_category(name) == Category::Air {
+        "minecraft:air"
+    } else {
+        name
+    }
+}
+
+/// Distance in rows from each position to the nearest `true` entry,
+/// `u32::MAX` when the column has none.
+fn void_distances(flags: &[bool]) -> Vec<u32> {
+    let mut distances = vec![u32::MAX; flags.len()];
+    let mut previous: Option<usize> = None;
+    for (index, flag) in flags.iter().enumerate() {
+        if *flag {
+            previous = Some(index);
+        }
+        let Some(nearest) = previous else { continue };
+        let Ok(distance) = u32::try_from(index - nearest) else {
+            continue;
+        };
+        distances[index] = distance;
+    }
+    let mut next: Option<usize> = None;
+    for index in (0..flags.len()).rev() {
+        if flags[index] {
+            next = Some(index);
+        }
+        let Some(nearest) = next else { continue };
+        let Ok(distance) = u32::try_from(nearest - index) else {
+            continue;
+        };
+        if distance < distances[index] {
+            distances[index] = distance;
+        }
+    }
+    distances
+}
+
+/// Score one generator's full-column descent against sampled saved
+/// columns. Rows are matched by absolute Y; a saved row outside the
+/// generator's build range is counted in `out_of_range_rows` and never
+/// scored, and `fail_cap` bounds the follow-up position dump.
+pub fn compare_block_ids(
+    profiles: impl IntoIterator<Item = ColumnProfile>,
+    source: &dyn ColumnDescent,
+    fail_cap: usize,
+) -> BlockReport {
+    let mut report = BlockReport::default();
+    let generated_min_y = source.column_min_y();
+    for profile in profiles {
+        let (Ok(x), Ok(z)) = (i32::try_from(profile.x), i32::try_from(profile.z)) else {
+            report.out_of_domain_columns += 1;
+            continue;
+        };
+        let generated = source.column_block_ids(x, z);
+        if generated.iter().all(Option::is_none) {
+            report.declined_columns += 1;
+            continue;
+        }
+        report.columns += 1;
+        let voids: Vec<bool> = profile
+            .block_ids
+            .iter()
+            .map(|name| block_category(name) == Category::Air)
+            .collect();
+        let nearest_void = void_distances(&voids);
+        for (offset, (saved, is_void)) in profile.block_ids.iter().zip(&voids).enumerate() {
+            let y = profile.min_y + offset as i32;
+            let Some(index) = usize::try_from(y - generated_min_y).ok() else {
+                report.out_of_range_rows += 1;
+                continue;
+            };
+            let ours: Option<&str> = match generated.get(index) {
+                None => {
+                    report.out_of_range_rows += 1;
+                    continue;
+                }
+                Some(None) => None,
+                Some(Some(name)) => Some(name.as_str()),
+            };
+            let saved = base_block_name(saved);
+            let ours = ours.map_or("minecraft:air", base_block_name);
+            let saved_family = air_family_name(saved);
+            let ours_family = air_family_name(ours);
+            let distance = nearest_void[offset];
+            let matched = saved == ours;
+            let matched_family = saved_family == ours_family;
+            report.positions += 1;
+            report.exact_base += usize::from(matched);
+            report.exact_base_air_family += usize::from(matched_family);
+            let band = y.div_euclid(32) * 32;
+            report
+                .bands
+                .entry(band)
+                .or_default()
+                .add(matched, matched_family);
+            let context = if *is_void {
+                CaveContext::Void
+            } else if distance <= CAVE_WALL_ROWS {
+                CaveContext::CaveWall
+            } else {
+                CaveContext::IntactRock
+            };
+            report
+                .cave
+                .entry(context)
+                .or_default()
+                .add(matched, matched_family);
+            let ours_is_air = block_category(ours) == Category::Air;
+            if *is_void && !ours_is_air {
+                report.missed_carves += 1;
+                *report.missed_carves_bands.entry(band).or_default() += 1;
+            } else if !*is_void && ours_is_air {
+                report.extra_carves += 1;
+                *report.extra_carves_bands.entry(band).or_default() += 1;
+                if distance <= CAVE_WALL_ROWS {
+                    report.extra_carves_near_void += 1;
+                }
+            }
+            if !matched {
+                *report
+                    .residuals
+                    .entry((saved.to_owned(), ours.to_owned()))
+                    .or_default() += 1;
+                if context != CaveContext::IntactRock {
+                    *report
+                        .residuals_cave
+                        .entry((saved.to_owned(), ours.to_owned()))
+                        .or_default() += 1;
+                }
+                if !matched_family {
+                    *report
+                        .residuals_air_family
+                        .entry((saved_family.to_owned(), ours_family.to_owned()))
+                        .or_default() += 1;
+                }
+                if report.fail_positions.len() < fail_cap {
+                    report.fail_positions.push((profile.x, profile.z, y));
+                }
+            }
+        }
+    }
+    report
+}
+
 pub fn percent(matches: usize, columns: usize) -> f64 {
     if columns == 0 {
         0.0
@@ -291,16 +558,22 @@ pub fn percent(matches: usize, columns: usize) -> f64 {
 /// world) store heightmaps relative to the world minimum Y, so the absolute
 /// top block is `value - 1 + yPos * 16`. `MOTION_BLOCKING_NO_LEAVES` is the
 /// closest stored analogue of a hand-cleared F3 ground reading.
+///
+/// A stored chunk with no heightmaps at all is a chunk the client wrote
+/// before the height pass, not a decode failure: it answers `Ok(None)` so
+/// samplers can report it as ungenerated instead of losing the run.
 fn surface_top(root: &Tag, lx: u8, lz: u8) -> Result<Option<i32>, String> {
     let heightmaps = root.get("Heightmaps").or_else(|| root.get("heightmaps"));
-    let packed = heightmaps
+    let Some(packed) = heightmaps
         .and_then(|h| {
             h.get("MOTION_BLOCKING_NO_LEAVES")
                 .or_else(|| h.get("WORLD_SURFACE"))
                 .or_else(|| h.get("MOTION_BLOCKING"))
         })
         .and_then(Tag::as_long_array)
-        .ok_or("chunk has no usable heightmap")?;
+    else {
+        return Ok(None);
+    };
     let min_y = root.get("yPos").and_then(Tag::as_i32).unwrap_or(-4) * 16;
     let heights = unpack_spanning(packed, 9, 256);
     let index = usize::from(lx) + usize::from(lz) * 16;
@@ -361,6 +634,8 @@ pub struct ColumnProfile {
     pub surface_y: i32,
     pub min_y: i32,
     pub categories: Vec<Category>,
+    /// Saved block-state names at each absolute Y. Missing sections are air.
+    pub block_ids: Vec<String>,
 }
 
 pub fn column_profile(
@@ -390,6 +665,7 @@ pub fn column_profile(
         .min()
         .unwrap_or(surface_y);
     let mut categories = vec![Category::Air; (surface_y - min_y + 1) as usize];
+    let mut block_ids = vec!["minecraft:air".to_owned(); categories.len()];
     for (y_min, section) in &stored {
         for local_y in 0..16 {
             let y = y_min + local_y;
@@ -398,6 +674,7 @@ pub fn column_profile(
             }
             if let Some(name) = block_at(section, lx, lz, local_y)? {
                 categories[(y - min_y) as usize] = block_category(&name);
+                block_ids[(y - min_y) as usize] = name;
             }
         }
     }
@@ -407,6 +684,7 @@ pub fn column_profile(
         surface_y,
         min_y,
         categories,
+        block_ids,
     }))
 }
 
@@ -555,6 +833,24 @@ fn unpack_non_spanning(data: &[i64], bits: usize, count: usize) -> Vec<u32> {
         .collect()
 }
 
+/// Grid points a sampler could not score, split by cause so a report can
+/// state its denominator completely.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SampleGaps {
+    /// No chunk is stored in the region file at the grid point.
+    pub missing_chunks: usize,
+    /// A chunk is stored but holds no filled surface column yet: the
+    /// client wrote it before the height pass, or it is a not-generated
+    /// placeholder.
+    pub ungenerated_columns: usize,
+}
+
+impl SampleGaps {
+    pub fn total(self) -> usize {
+        self.missing_chunks + self.ungenerated_columns
+    }
+}
+
 /// Sample every `stride`-th column in the inclusive block range, skipping
 /// chunks the world has not generated. Deterministic order (z then x).
 pub fn sample_columns(
@@ -564,7 +860,7 @@ pub fn sample_columns(
     min_z: i64,
     max_z: i64,
     stride: i64,
-) -> Result<(Vec<VanillaColumn>, usize), String> {
+) -> Result<(Vec<VanillaColumn>, SampleGaps), String> {
     sample_grid(store, min_x, max_x, min_z, max_z, stride, column_truth)
 }
 
@@ -576,7 +872,7 @@ pub fn sample_profiles(
     min_z: i64,
     max_z: i64,
     stride: i64,
-) -> Result<(Vec<ColumnProfile>, usize), String> {
+) -> Result<(Vec<ColumnProfile>, SampleGaps), String> {
     sample_grid(store, min_x, max_x, min_z, max_z, stride, column_profile)
 }
 
@@ -591,12 +887,12 @@ fn sample_grid<T>(
     max_z: i64,
     stride: i64,
     read: ColumnReader<T>,
-) -> Result<(Vec<T>, usize), String> {
+) -> Result<(Vec<T>, SampleGaps), String> {
     if stride < 1 {
         return Err("stride must be at least 1".to_string());
     }
     let mut columns = Vec::new();
-    let mut missing_chunks = 0usize;
+    let mut gaps = SampleGaps::default();
     let stride = u8::try_from(stride).map_err(|_| "stride above 255 unsupported".to_string())?;
     let mut z = min_z;
     while z <= max_z {
@@ -609,12 +905,13 @@ fn sample_grid<T>(
             let lx = u8::try_from(x.rem_euclid(16)).expect("rem_euclid(16) fits u8");
             let lz = u8::try_from(z.rem_euclid(16)).expect("rem_euclid(16) fits u8");
             match store.chunk_root(chunk_x, chunk_z) {
-                Ok(None) => missing_chunks += 1,
+                Ok(None) => gaps.missing_chunks += 1,
                 Ok(Some(root)) => {
                     let column = (read)(&root, chunk_x, chunk_z, lx, lz)
                         .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}) at ({x}, {z}): {e}"))?;
-                    if let Some(column) = column {
-                        columns.push(column);
+                    match column {
+                        Some(column) => columns.push(column),
+                        None => gaps.ungenerated_columns += 1,
                     }
                 }
                 Err(e) => return Err(format!("chunk ({chunk_x}, {chunk_z}): {e}")),
@@ -623,7 +920,7 @@ fn sample_grid<T>(
         }
         z += i64::from(stride);
     }
-    Ok((columns, missing_chunks))
+    Ok((columns, gaps))
 }
 
 pub fn worksheet_columns() -> [(i64, i64); 6] {
@@ -1299,6 +1596,21 @@ mod tests {
         assert_eq!(profile.categories[63], Category::Air);
         assert_eq!(profile.categories[64], Category::Solid);
         assert_eq!(profile.categories[75], Category::Solid);
+        assert_eq!(profile.block_ids[16], "minecraft:air");
+        assert_eq!(profile.block_ids[64], "minecraft:stone");
+    }
+
+    #[test]
+    fn stored_chunks_without_heightmaps_are_ungenerated() {
+        // A chunk the client wrote before the height pass: no Heightmaps
+        // compound at all. That is an ungenerated column, not a decode
+        // failure that would abort a sample.
+        let root = compound(&[(
+            "sections",
+            Tag::List(vec![solid_section(0, "minecraft:stone")]),
+        )]);
+        assert_eq!(column_truth(&root, 0, 0, 3, 9).unwrap(), None);
+        assert_eq!(column_profile(&root, 0, 0, 3, 9).unwrap(), None);
     }
 
     #[derive(Clone, Copy)]
@@ -1333,6 +1645,12 @@ mod tests {
                 Category::Air,
                 Category::Solid,
             ],
+            block_ids: vec![
+                "minecraft:stone".to_owned(),
+                "minecraft:air".to_owned(),
+                "minecraft:air".to_owned(),
+                "minecraft:stone".to_owned(),
+            ],
         };
         // The legacy generator has no 3D answer: nothing is counted.
         let pending = compare_substance([profile.clone()], &Generator::new(2026), 5);
@@ -1364,6 +1682,292 @@ mod tests {
                 rustmc: [0, 0, 4],
             })
         );
+    }
+
+    /// Descent stub with an explicit `min_y` and per-row answers, so the
+    /// block report is testable without operator worldgen data.
+    struct StubDescent {
+        min_y: i32,
+        ids: Vec<Option<String>>,
+    }
+
+    impl ColumnDescent for StubDescent {
+        fn column_block_ids(&self, _x: i32, _z: i32) -> Vec<Option<String>> {
+            self.ids.clone()
+        }
+        fn column_min_y(&self) -> i32 {
+            self.min_y
+        }
+    }
+
+    /// Saved column from Y 30 to Y 40 with two void rows (36 and 38) and
+    /// one property-carrying state, the fixture for the block report.
+    fn block_profile(x: i64) -> ColumnProfile {
+        let saved: [&str; 11] = [
+            "minecraft:stone",
+            "minecraft:stone",
+            "minecraft:stone",
+            "minecraft:stone",
+            "minecraft:stone",
+            "minecraft:grass_block[snowy=false]",
+            "minecraft:cave_air",
+            "minecraft:stone",
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:stone",
+        ];
+        ColumnProfile {
+            x,
+            z: 0,
+            surface_y: 40,
+            min_y: 30,
+            categories: saved
+                .iter()
+                .map(|name| block_category(name))
+                .collect::<Vec<_>>(),
+            block_ids: saved.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn stub_descent() -> StubDescent {
+        let ids: [&str; 10] = [
+            "minecraft:cave_air",
+            "minecraft:cave_air",
+            "minecraft:stone",
+            "minecraft:granite",
+            "minecraft:grass_block[snowy=true]",
+            "minecraft:stone",
+            "minecraft:stone",
+            "minecraft:cave_air",
+            "minecraft:air",
+            "minecraft:stone",
+        ];
+        StubDescent {
+            // Index 0 is Y 31: the saved Y 30 row is out of the generator
+            // build range for this sample.
+            min_y: 31,
+            ids: ids.iter().map(|name| Some((*name).to_owned())).collect(),
+        }
+    }
+
+    #[test]
+    fn block_report_scores_bands_air_family_and_cave_context() {
+        let report = compare_block_ids([block_profile(0)], &stub_descent(), 20);
+        // One stored row below the generator's build range is reported,
+        // not silently scored.
+        assert_eq!((report.columns, report.positions), (1, 10));
+        assert_eq!(report.out_of_range_rows, 1);
+        assert_eq!(report.out_of_domain_columns, 0);
+        assert_eq!(report.declined_columns, 0);
+        // Y 31 and 32 (we opened rock the save fills), 34 (granite vs
+        // stone), 36 (stone in a saved void), 38 (cave_air vs air), and
+        // 39 (air vs stone) disagree on base ids; only the 38 pair survives
+        // air-family normalisation.
+        assert_eq!((report.exact_base, report.exact_base_air_family), (4, 5));
+        assert_eq!(
+            report.bands.get(&0),
+            Some(&Agreement {
+                positions: 1,
+                matches: 0,
+                matches_air_family: 0
+            })
+        );
+        assert_eq!(
+            report.bands.get(&32),
+            Some(&Agreement {
+                positions: 9,
+                matches: 4,
+                matches_air_family: 5
+            })
+        );
+        // Void rows are 36 and 38; Y 31 is five rows from the nearest one,
+        // everything else in the sample is cave wall.
+        assert_eq!(
+            report.cave,
+            [
+                (
+                    CaveContext::Void,
+                    Agreement {
+                        positions: 2,
+                        matches: 0,
+                        matches_air_family: 1
+                    }
+                ),
+                (
+                    CaveContext::CaveWall,
+                    Agreement {
+                        positions: 7,
+                        matches: 4,
+                        matches_air_family: 4
+                    }
+                ),
+                (
+                    CaveContext::IntactRock,
+                    Agreement {
+                        positions: 1,
+                        matches: 0,
+                        matches_air_family: 0
+                    }
+                ),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        // Three rows we opened that the save fills (Y 31 far from any void,
+        // Y 32 and Y 39 against a cave wall) and one row the save leaves
+        // air that we filled.
+        assert_eq!(
+            (
+                report.extra_carves,
+                report.extra_carves_near_void,
+                report.missed_carves
+            ),
+            (3, 2, 1)
+        );
+        assert_eq!(
+            report
+                .missed_carves_bands
+                .iter()
+                .map(|(band, count)| (*band, *count))
+                .collect::<Vec<_>>(),
+            vec![(32, 1)]
+        );
+        assert_eq!(
+            report
+                .extra_carves_bands
+                .iter()
+                .map(|(band, count)| (*band, *count))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (32, 2)]
+        );
+        assert_eq!(
+            report.residuals.get(&(
+                "minecraft:stone".to_owned(),
+                "minecraft:cave_air".to_owned()
+            )),
+            Some(&2)
+        );
+        assert_eq!(
+            report
+                .residuals
+                .get(&("minecraft:air".to_owned(), "minecraft:cave_air".to_owned())),
+            Some(&1)
+        );
+        assert_eq!(
+            report.residuals.get(&(
+                "minecraft:cave_air".to_owned(),
+                "minecraft:stone".to_owned()
+            )),
+            Some(&1)
+        );
+        assert_eq!(report.residuals.values().sum::<usize>(), 6);
+        // Air-name bookkeeping collapses to one air key: the 38 pair
+        // disappears and the 36 pair is keyed as air, not cave_air. The
+        // property-carrying grass_block pair is never a residual at all.
+        assert_eq!(report.residuals_air_family.values().sum::<usize>(), 5);
+        // The cave view is the same population minus the intact-rock row:
+        // what goes wrong next to a saved void.
+        assert_eq!(
+            report
+                .residuals_cave
+                .iter()
+                .map(|(pair, count)| (pair.clone(), *count))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ("minecraft:air".to_owned(), "minecraft:cave_air".to_owned()),
+                    1
+                ),
+                (
+                    (
+                        "minecraft:cave_air".to_owned(),
+                        "minecraft:stone".to_owned()
+                    ),
+                    1
+                ),
+                (
+                    ("minecraft:stone".to_owned(), "minecraft:air".to_owned()),
+                    1
+                ),
+                (
+                    (
+                        "minecraft:stone".to_owned(),
+                        "minecraft:cave_air".to_owned()
+                    ),
+                    1
+                ),
+                (
+                    ("minecraft:stone".to_owned(), "minecraft:granite".to_owned()),
+                    1
+                ),
+            ]
+        );
+        assert_eq!(
+            report
+                .residuals_air_family
+                .get(&("minecraft:stone".to_owned(), "minecraft:air".to_owned())),
+            Some(&3)
+        );
+        assert_eq!(
+            report
+                .residuals_air_family
+                .get(&("minecraft:air".to_owned(), "minecraft:stone".to_owned())),
+            Some(&1)
+        );
+        assert_eq!(
+            report.residuals_air_family.get(&(
+                "minecraft:cave_air".to_owned(),
+                "minecraft:stone".to_owned()
+            )),
+            None
+        );
+        assert_eq!(
+            report.fail_positions,
+            vec![
+                (0, 0, 31),
+                (0, 0, 32),
+                (0, 0, 34),
+                (0, 0, 36),
+                (0, 0, 38),
+                (0, 0, 39)
+            ]
+        );
+    }
+
+    #[test]
+    fn block_report_caps_fails_and_reports_unscorable_columns() {
+        let report = compare_block_ids([block_profile(0)], &stub_descent(), 2);
+        assert_eq!(report.fail_positions.len(), 2);
+        // A descent with no answer anywhere is a declined column, not a
+        // column of air disagreements.
+        let empty = StubDescent {
+            min_y: 31,
+            ids: vec![None; 10],
+        };
+        let report = compare_block_ids([block_profile(0)], &empty, 5);
+        assert_eq!(
+            (report.columns, report.positions, report.declined_columns),
+            (0, 0, 1)
+        );
+        // Coordinates outside the generator's domain are counted, not dropped.
+        let report =
+            compare_block_ids([block_profile(i64::from(i32::MAX) + 1)], &stub_descent(), 5);
+        assert_eq!(
+            (
+                report.columns,
+                report.positions,
+                report.out_of_domain_columns
+            ),
+            (0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn air_family_name_collapses_only_the_air_family() {
+        assert_eq!(air_family_name("minecraft:cave_air"), "minecraft:air");
+        assert_eq!(air_family_name("minecraft:void_air"), "minecraft:air");
+        assert_eq!(air_family_name("minecraft:stone"), "minecraft:stone");
+        assert_eq!(air_family_name("minecraft:water"), "minecraft:water");
     }
 
     #[test]

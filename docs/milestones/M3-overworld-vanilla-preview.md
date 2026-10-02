@@ -1,0 +1,74 @@
+# Java 26.3 Overworld validation and live preview
+
+Status: planned. This Java-only work does not close the M3 dual-edition join gate or establish vanilla parity. The existing opt-in synthetic preview remains the default under [ADR-0014](../decisions/ADR-0014.md).
+
+## Goal and boundaries
+
+Render RustMC's independently implemented, data-driven Overworld in a real Java 26.3 client, then compare its saved and displayed results with an owner-generated vanilla 26.3 world at the same seed. Operator-provisioned game data stays local. The first live slice is a read-only Creative inspection world on loopback; it does not provide secure authentication, multiplayer, saves, block interaction, or a release.
+
+## Acceptance sequence
+
+- [ ] **Ground truth:** Record the save's exact client version, seed, preset, datapacks, and mod effects. Sample loaded chunks across positive and negative coordinates. Compare height, biome, top block, and full 3D block categories; add exact block-state comparisons where the RustMC generator represents them. Report numerator, denominator, missing chunks, and differences. Keep the save and any extracted game data out of Git.
+- [ ] **Finite generation:** Bound the research generator's caches and per-client chunk work. Reject unsupported or missing operator data at startup with actionable errors. Measure cold and warm generation per chunk and the memory/work retained at the configured view radius; do not promise 32-chunk real-time delivery from one sample.
+- [ ] **Versioned chunk adapter:** Map every emitted block state and biome to an operator-provisioned Java 26.3 protocol ID. Fail on unknown states rather than substituting a plausible block. Encode all 24 vertical sections, heightmaps, fluids, light, and chunk boundaries correctly, with packet-size tests and negative-coordinate fixtures.
+- [ ] **Opt-in client view:** Send the data-driven chunks through the existing bounded Java preview session. Confirm a real 26.3 client renders terrain above and below sea level, cave openings and interiors, biomes, and movement-driven chunk loading. Capture coordinates and known mismatches. Leave the synthetic preview as the default until the owner accepts a change.
+- [ ] **Terrain completion:** Implement and independently verify remaining Overworld feature placement (ores, vegetation, trees) and structures in separate slices. Measure exact blocks and distribution against vanilla saves; do not label a partial generator vanilla-equivalent.
+- [ ] **Authoritative editing:** Introduce ordered block intents and a bounded mutable world state before enabling placement or breaking. Verify state changes with at least two clients, chunk-edge updates, drops/inventory rules, save/reload, and crash recovery before claiming gameplay support. Creative inspection alone does not satisfy this item.
+
+Every checked item needs focused tests, `cargo fmt`, `check`, Clippy with warnings denied, tests, build, rustdoc, the dependency license gate, diff review, and passing CI. Record client observations separately from automated evidence and keep edition/version scope explicit in the [compatibility matrix](../COMPATIBILITY.md).
+
+## Ground truth: first block-identity measurement (2 October 2026)
+
+This records automated evidence for the first acceptance item. The item stays
+unchecked: the comparison is by base block id, so the exact block-state
+comparison it asks for has not been made, and no vanilla-parity or
+client-visible claim follows from these numbers.
+
+`vanilla_oracle block_compare` (`crates/rustmc-tools`) scores RustMC's
+full-column `vanilla::VanillaGenerator` descent — density, aquifer, material
+rules including vein rules, and the registry carvers — against the block names
+the owner's Java 26.3 save stores at the same absolute `(x, y, z)` positions,
+Overworld only, read-only. Saved rows above the chunk
+`MOTION_BLOCKING_NO_LEAVES` height are outside the compared volume.
+
+Sample A is the published seed-2026 grid (stride 16 over `-256..512` on both
+axes): 2,401 requested grid points, 2,401 columns read, 0 missing chunks,
+0 ungenerated or unscorable columns, 338,217 scored positions — the same
+denominator as the T3 substance baseline in `docs/PROVENANCE.md`.
+
+- Exact base-block agreement: 273,498 / 338,217 = **80.86%**. Collapsing the
+  air family (`air`, `cave_air`, `void_air`, `structure_void`) to one name:
+  279,991 = 82.78%. Substance (air/fluid/solid) agreement on this grid is
+  98.64%, so the gap is block identity rather than terrain shape.
+- Per 32-block absolute Y band (exact): `-64` 86.61%, `-32` 84.66%, `0` 72.52%,
+  `32` 75.61%, `64` 90.35%, `96` 91.55%, `128` 75.93% (54 positions). The
+  sea-level bands are the weakest.
+- Dominant confusion pairs (save → RustMC): tuff→deepslate 9,804;
+  diorite→stone 8,757; andesite→stone 8,393; granite→stone 8,269;
+  air→cave_air 6,456; dirt→stone 2,763; air→deepslate 2,493; gravel→stone
+  2,291; gravel→deepslate 2,194. The four vein/blob stones alone are 35,223
+  positions (10.4% of the sample), which is the placement-stage blob and ore
+  runtime already isolated as the T4 target.
+- Cave context, keyed on the air rows the save itself stores: saved voids
+  28,723 positions (66.16% exact, 88.76% with the air family collapsed), cave
+  wall within four rows of a void 28,251 (76.73%), intact rock 281,243 (82.78%).
+  Two-thirds of the raw void disagreement is only which air block was written.
+  Solid-versus-air: 3,228 void rows the save leaves air that we fill (2,063 in
+  the `-64` band and 896 in the `-32` band, matching the deep-carver residual
+  attribution of the T3 baseline), and 1,167 rows we open that the save fills —
+  652 beside an existing void (over-wide carving) and 515 in intact rock
+  (invented caves).
+
+Sample B, a sparser negative-coordinate grid (stride 32 over `-1024..-512`):
+289 requested grid points, 61 scored columns, 120 missing chunks, and 108
+stored-but-ungenerated columns. The sampler now reports that last case as a
+denominator bucket instead of aborting the run, which is what previously made
+wide-area measurement impossible. Agreement 85.14% over 12,221 positions, with
+the same residual shape: 430 void rows left filled (325 at `-64`) and 20 rows
+over-carved.
+
+Caveats: one seed, one default preset, and one hand-travelled world, so chunk
+generation states are uneven across the sample; feature- and
+structure-placed blocks count as mismatches by design; block-state properties
+are stripped from both sides; and no client rendering is involved in these
+numbers.
