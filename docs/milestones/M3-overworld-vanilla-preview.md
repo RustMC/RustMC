@@ -78,6 +78,13 @@ one seed, not a throughput or client-visible latency guarantee. At that rate,
 4,225 chunks still project to about 1.77 hours of single-threaded work. The
 finite-generation and live-client acceptance items remain unchecked.
 
+The local `prepare_chunk_registry` tool now derives a versioned ID table from
+operator-generated official 26.3 reports. Using that table, an ignored adapter
+smoke encoded generated chunks `(0,0)` and `(-1,2)` to 74,943 and 77,001 byte
+frames. This verifies ID lookup and encoding on those two columns only. No
+client has received them; state-kind tags, lighting, and live delivery still
+need validation.
+
 ## Ground truth: first block-identity measurement (2 October 2026)
 
 This records automated evidence for the first acceptance item. The item stays

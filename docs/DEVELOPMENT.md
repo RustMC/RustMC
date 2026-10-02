@@ -86,6 +86,21 @@ EOF
 cargo run -p rustmc-server --locked -- --run "$rustmc_preview_dir/preview.toml"
 ```
 
+For the separate, **not yet live** vanilla chunk adapter, prepare its local
+state/biome ID table from the same official reports and manifest:
+
+```sh
+cargo run -p rustmc-tools --bin prepare_chunk_registry --locked -- \
+  "$rustmc_preview_dir/reports/generated/reports/blocks.json" \
+  "$rustmc_preview_dir/preview-registries.toml" \
+  "$rustmc_preview_dir/chunk-registry-26.3.json"
+```
+
+Keep this generated JSON outside Git. It maps material-rule block names to
+the report's default block states and retains explicit property-bearing states.
+It is an input to adapter tests and future opt-in integration; the command
+above does not make the current preview serve vanilla chunks.
+
 Join `127.0.0.1:25565`. The server announces a maximum 32-chunk view; set the
 client's render distance separately if desired. The client enters Creative for
 terrain inspection, with a fly-speed value ten times the first preview value.

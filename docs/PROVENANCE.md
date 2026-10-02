@@ -580,3 +580,13 @@ cache. It retains the existing volume evaluation and interpolation arithmetic;
 eviction recomputes the same immutable values. The published seed-2026 save
 comparison counts remained identical after the change. Timing and limits are
 recorded in the M3 Overworld milestone note.
+
+## Local Java 26.3 chunk ID table preparation (2 October 2026)
+
+`prepare_chunk_registry` reads the owner-generated official `blocks.json`
+report and RustMC's existing local biome manifest. It derives protocol state
+IDs from the report, aliases bare material-rule block names to each reported
+default state, and writes a versioned JSON table outside Git. The table and
+game report are local data, not redistributed RustMC source. A smoke test
+encoded two generated columns with the derived IDs. No competing server code
+or architecture was consulted for this tool.
