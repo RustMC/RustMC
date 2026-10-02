@@ -56,6 +56,9 @@ pub struct ListenerConfig {
     /// Terrain field for the local preview; defaults to the accepted preview.
     pub preview_terrain: world::Terrain,
     pub preview_registry_manifest: Option<std::path::PathBuf>,
+    /// Operator-local 26.3 worldgen data and protocol IDs; both required together.
+    pub vanilla_data_root: Option<std::path::PathBuf>,
+    pub vanilla_registry_table: Option<std::path::PathBuf>,
 }
 
 impl Default for ListenerConfig {
@@ -69,6 +72,8 @@ impl Default for ListenerConfig {
             max_connection_lifetime_ms: 10000,
             local_java_preview: false,
             preview_registry_manifest: None,
+            vanilla_data_root: None,
+            vanilla_registry_table: None,
             preview_seed: 0,
             preview_view_distance: 4,
             preview_terrain: world::Terrain::Preview,
@@ -119,6 +124,8 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "preview_seed"
                 | "preview_view_distance"
                 | "preview_terrain"
+                | "vanilla_data_root"
+                | "vanilla_registry_table"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -170,16 +177,47 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             || "`listener.preview_registry_manifest` must be a file path string".to_owned(),
         )?)),
     };
+    let local_path = |key: &str| -> Result<Option<std::path::PathBuf>, String> {
+        table
+            .get(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| format!("`listener.{key}` must be a nonempty path string"))
+            })
+            .transpose()
+    };
+    let vanilla_data_root = local_path("vanilla_data_root")?;
+    let vanilla_registry_table = local_path("vanilla_registry_table")?;
+    if vanilla_data_root.is_some() != vanilla_registry_table.is_some() {
+        return Err("`listener.vanilla_data_root` and `listener.vanilla_registry_table` must be set together".to_owned());
+    }
     if (preview_registry_manifest.is_some()
         || table.contains_key("preview_seed")
         || table.contains_key("preview_view_distance")
-        || table.contains_key("preview_terrain"))
+        || table.contains_key("preview_terrain")
+        || vanilla_data_root.is_some()
+        || vanilla_registry_table.is_some())
         && !local_java_preview
     {
         return Err(
             "`listener.preview_registry_manifest` requires `listener.local_java_preview = true`"
                 .to_owned(),
         );
+    }
+    if vanilla_data_root.is_some() && preview_registry_manifest.is_none() {
+        return Err("vanilla preview requires `listener.preview_registry_manifest`".to_owned());
+    }
+    if vanilla_data_root.is_some()
+        && table
+            .get("max_connections")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(8)
+            != 1
+    {
+        return Err("vanilla preview requires `listener.max_connections = 1`".to_owned());
     }
     let preview_terrain = match table.get("preview_terrain") {
         None => defaults.preview_terrain,
@@ -193,6 +231,9 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             }
         },
     };
+    if vanilla_data_root.is_some() && preview_terrain != world::Terrain::Preview {
+        return Err("vanilla preview cannot be combined with experimental terrain".to_owned());
+    }
     Ok(ListenerConfig {
         bind_address,
         port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
@@ -214,6 +255,8 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         max_connection_lifetime_ms,
         local_java_preview,
         preview_registry_manifest,
+        vanilla_data_root,
+        vanilla_registry_table,
         preview_seed: integer_field(
             table,
             "preview_seed",
@@ -403,5 +446,22 @@ mod tests {
         )
         .unwrap_err()
         .contains("local_java_preview"));
+    }
+
+    #[test]
+    fn vanilla_preview_requires_complete_local_input_and_one_connection() {
+        let base = "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\nmax_connections = 1\npreview_registry_manifest = 'manifest.toml'\n";
+        assert!(parse_config(&format!("{base}vanilla_data_root = 'data'\n")).is_err());
+        let complete =
+            format!("{base}vanilla_data_root = 'data'\nvanilla_registry_table = 'ids.json'\n");
+        let config = parse_config(&complete).unwrap();
+        assert_eq!(
+            config.listener.vanilla_data_root.as_deref(),
+            Some(Path::new("data"))
+        );
+        assert!(
+            parse_config(&complete.replace("max_connections = 1", "max_connections = 2")).is_err()
+        );
+        assert!(parse_config(&format!("{complete}preview_terrain = 'experimental'\n")).is_err());
     }
 }

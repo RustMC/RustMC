@@ -33,6 +33,16 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `preview_seed` | `0` | Integer `0..=9223372036854775807`, used only for original preview generation. |
 | `preview_view_distance` | `4` | Integer `2..=32` chunks. Radius 32 permits up to 4,225 loaded chunk coordinates per client; only one batch is in flight, containing at most 16 chunks within a 768 KiB encoding budget. |
 | `preview_terrain` | `"preview"` | `"preview"` or `"experimental"`. Experimental selects the opt-in octave-noise terrain field (T1 groundwork); biome labels, surface blocks, and trees stay on the ADR-0013 preview rules. Neither option is vanilla generation. |
+| `vanilla_data_root` | absent | Operator-local Java 26.3 worldgen data root for a data-driven Overworld probe; requires the registry table, local preview, manifest, and `max_connections = 1`. |
+| `vanilla_registry_table` | absent | Operator-local Java 26.3 block-state and biome ID table produced by `prepare_chunk_registry`; never commit the table or game data. |
+
+When both `vanilla_*` paths are set, RustMC validates them before binding and
+starts a fixed pool of four workers. Each worker owns a generator; at most four
+chunks are under construction for the one permitted local client. The initial
+test radius is 2. This is a slow, incomplete terrain probe: no structures,
+feature-stage ores or trees, authoritative edits, lateral cave lighting, or
+radius-32 throughput claim. Remove both paths to return to the original
+synthetic preview.
 
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 

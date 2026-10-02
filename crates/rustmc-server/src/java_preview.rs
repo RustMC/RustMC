@@ -7,6 +7,114 @@ use crate::{
     world::{Biome, Block, Chunk, Generator},
 };
 use std::collections::BTreeSet;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Instant,
+};
+
+const VANILLA_WORKERS: usize = 4;
+
+/// Validated operator-local input. Runtime preflight checks the files before binding.
+#[derive(Debug, Clone)]
+pub struct VanillaSource {
+    pub data_root: PathBuf,
+    pub registry_table: PathBuf,
+    pub seed: i64,
+    pub spawn_y: i32,
+}
+
+struct BuiltChunk {
+    position: (i32, i32),
+    packet: Result<Vec<u8>, String>,
+    generation_us: u128,
+    encoding_us: u128,
+}
+
+/// A fixed pool with one chunk per worker. Each generator stays on its owning thread.
+struct VanillaWorker {
+    requests: Option<mpsc::SyncSender<(i32, i32)>>,
+    results: mpsc::Receiver<BuiltChunk>,
+    handles: Vec<thread::JoinHandle<()>>,
+    in_flight: BTreeSet<(i32, i32)>,
+}
+
+impl VanillaWorker {
+    fn new(source: VanillaSource) -> Self {
+        let (requests, rx) = mpsc::sync_channel::<(i32, i32)>(0);
+        let (tx, results) = mpsc::sync_channel(VANILLA_WORKERS);
+        let rx = Arc::new(Mutex::new(rx));
+        let handles = (0..VANILLA_WORKERS)
+            .map(|_| {
+                let rx = Arc::clone(&rx);
+                let tx = tx.clone();
+                let source = source.clone();
+                thread::spawn(move || {
+                    let Ok(generator) = crate::vanilla::generator::VanillaGenerator::new(
+                        &source.data_root,
+                        source.seed,
+                        "minecraft:overworld",
+                    ) else {
+                        return;
+                    };
+                    let Ok(text) = std::fs::read_to_string(&source.registry_table) else {
+                        return;
+                    };
+                    let Ok(tables) =
+                        crate::chunk_adapter::registry::RegistryTables::from_provisioned(&text)
+                    else {
+                        return;
+                    };
+                    loop {
+                        let position = match rx.lock().expect("worker request lock poisoned").recv()
+                        {
+                            Ok(position) => position,
+                            Err(_) => break,
+                        };
+                        let started = Instant::now();
+                        let chunk = crate::chunk_adapter::chunk_from_generator(
+                            &generator, position.0, position.1, &tables,
+                        );
+                        let generation_us = started.elapsed().as_micros();
+                        let started = Instant::now();
+                        let packet = chunk
+                            .and_then(|chunk| crate::chunk_adapter::encode_chunk(&chunk, &tables))
+                            .map_err(|error| error.to_string());
+                        let encoding_us = started.elapsed().as_micros();
+                        if tx
+                            .send(BuiltChunk {
+                                position,
+                                packet,
+                                generation_us,
+                                encoding_us,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        Self {
+            requests: Some(requests),
+            results,
+            handles,
+            in_flight: BTreeSet::new(),
+        }
+    }
+}
+
+impl Drop for VanillaWorker {
+    fn drop(&mut self) {
+        self.requests.take();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
 
 const LOGIN: u32 = 50;
 const POSITION: u32 = 73;
@@ -52,6 +160,9 @@ pub struct Preview {
     keepalive_at: std::time::Instant,
     keepalive_id: u64,
     pub pending_keepalive: Option<u64>,
+    vanilla: Option<VanillaWorker>,
+    vanilla_spawn_y: Option<i32>,
+    pub failed: bool,
 }
 
 impl Preview {
@@ -81,7 +192,26 @@ impl Preview {
             keepalive_at: std::time::Instant::now(),
             keepalive_id: 0,
             pending_keepalive: None,
+            vanilla: None,
+            vanilla_spawn_y: None,
+            failed: false,
         })
+    }
+
+    pub fn new_vanilla(
+        radius: u8,
+        manifest: &RegistryManifest,
+        source: VanillaSource,
+    ) -> Option<Self> {
+        let mut preview = Self::new(
+            source.seed as u64,
+            radius,
+            crate::world::Terrain::Preview,
+            manifest,
+        )?;
+        preview.vanilla_spawn_y = Some(source.spawn_y);
+        preview.vanilla = Some(VanillaWorker::new(source));
+        Some(preview)
     }
 
     pub fn initial(&self, manifest: &RegistryManifest) -> Option<Vec<Vec<u8>>> {
@@ -111,7 +241,9 @@ impl Preview {
         let mut position = vec![1]; // Teleport ID.
         for value in [
             0.5,
-            self.generator.height(0, 0) as f64 + 10.0,
+            self.vanilla_spawn_y
+                .map_or_else(|| self.generator.height(0, 0), i64::from) as f64
+                + 10.0,
             0.5,
             0.0,
             0.0,
@@ -176,22 +308,27 @@ impl Preview {
     }
 
     pub fn next_chunk(&mut self) -> Option<(Vec<u8>, u128, u128)> {
-        if !self.teleport_acknowledged || self.awaiting_batch {
+        if !self.teleport_acknowledged {
+            return None;
+        }
+        if self.awaiting_batch && self.vanilla.is_none() {
             return None;
         }
         let mut output = cache_center(self.center);
         let (cx, cz) = self.center;
         let radius = self.radius;
-        let expired: Vec<_> = self
-            .sent
-            .iter()
-            .copied()
-            .filter(|(x, z)| (x - cx).abs() > radius || (z - cz).abs() > radius)
-            .collect();
-        for (x, z) in expired {
-            let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
-            output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
-            self.sent.remove(&(x, z));
+        if !self.awaiting_batch {
+            let expired: Vec<_> = self
+                .sent
+                .iter()
+                .copied()
+                .filter(|(x, z)| (x - cx).abs() > radius || (z - cz).abs() > radius)
+                .collect();
+            for (x, z) in expired {
+                let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
+                output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
+                self.sent.remove(&(x, z));
+            }
         }
         let mut candidates: Vec<_> = (-radius..=radius)
             .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
@@ -201,6 +338,9 @@ impl Preview {
             return None;
         }
         candidates.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
+        if self.vanilla.is_some() {
+            return self.next_vanilla_chunk(output, candidates);
+        }
         output.extend(frame(BATCH_START, &[]));
         let mut generation_us = 0;
         let mut encoding_us = 0;
@@ -224,6 +364,66 @@ impl Preview {
         output.extend(frame(BATCH_END, &count_data));
         self.awaiting_batch = true;
         Some((output, generation_us, encoding_us))
+    }
+
+    fn next_vanilla_chunk(
+        &mut self,
+        mut output: Vec<u8>,
+        candidates: Vec<(i32, i32)>,
+    ) -> Option<(Vec<u8>, u128, u128)> {
+        let worker = self.vanilla.as_mut()?;
+        for position in candidates.iter().copied() {
+            if worker.in_flight.len() >= VANILLA_WORKERS {
+                break;
+            }
+            if worker.in_flight.contains(&position) {
+                continue;
+            }
+            if let Some(requests) = &worker.requests {
+                match requests.try_send(position) {
+                    Ok(()) => {
+                        worker.in_flight.insert(position);
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        self.failed = true;
+                        return None;
+                    }
+                }
+            }
+        }
+        // Keep generation busy while the client processes the previous batch.
+        // Results stay in the bounded channel until its acknowledgement arrives.
+        if self.awaiting_batch {
+            return None;
+        }
+        let built = match worker.results.try_recv() {
+            Ok(built) => built,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.failed = true;
+                return None;
+            }
+        };
+        worker.in_flight.remove(&built.position);
+        let packet = match built.packet {
+            Ok(packet) if packet.len() < MAX_BATCH_BYTES => packet,
+            _ => {
+                self.failed = true;
+                return None;
+            }
+        };
+        if !candidates.contains(&built.position) {
+            return None;
+        }
+        output.extend(frame(BATCH_START, &[]));
+        output.extend(packet);
+        let mut count_data = Vec::new();
+        put_varint(1, &mut count_data);
+        output.extend(frame(BATCH_END, &count_data));
+        self.sent.insert(built.position);
+        self.awaiting_batch = true;
+        Some((output, built.generation_us, built.encoding_us))
     }
 }
 
@@ -502,6 +702,45 @@ mod tests {
         assert_ne!(
             first,
             encode_chunk(&generator.generate(0, 2), generator, &biomes)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned 26.3 worldgen data and registry IDs"]
+    fn local_vanilla_worker_delivers_a_framed_chunk_without_blocking_network_poll() {
+        let source = VanillaSource {
+            data_root: std::env::var_os("RUSTMC_VANILLA_DATA")
+                .map(PathBuf::from)
+                .expect("set RUSTMC_VANILLA_DATA"),
+            registry_table: std::env::var_os("RUSTMC_CHUNK_REGISTRY")
+                .map(PathBuf::from)
+                .expect("set RUSTMC_CHUNK_REGISTRY"),
+            seed: 2026,
+            spawn_y: 117,
+        };
+        let mut preview = Preview::new_vanilla(2, &manifest(), source).expect("preview");
+        preview.teleport_acknowledged = true;
+        let started = Instant::now();
+        assert!(preview.next_chunk().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        let delivered = loop {
+            if let Some((stream, _, _)) = preview.next_chunk() {
+                break stream;
+            }
+            assert!(!preview.failed, "worker failed before returning a chunk");
+            assert!(started.elapsed() < std::time::Duration::from_secs(20));
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(packet_ids(&delivered).contains(&CHUNK));
+        assert_eq!(preview.sent.len(), 1);
+        preview.move_to(16.5, 80.0, 0.5).unwrap();
+        assert!(
+            preview.next_chunk().is_none(),
+            "the first batch still awaits acknowledgement"
+        );
+        assert!(
+            !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
+            "generation should continue while awaiting the client"
         );
     }
 }

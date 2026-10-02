@@ -6,6 +6,20 @@ Status: planned. This Java-only work does not close the M3 dual-edition join gat
 
 Render RustMC's independently implemented, data-driven Overworld in a real Java 26.3 client, then compare its saved and displayed results with an owner-generated vanilla 26.3 world at the same seed. Operator-provisioned game data stays local. The first live slice is a read-only Creative inspection world on loopback; it does not provide secure authentication, multiplayer, saves, block interaction, or a release.
 
+## Live adapter probe plan (2 October 2026)
+
+The current Java client still receives the original synthetic preview. Wire the
+data-driven column adapter behind a separate, explicit local configuration flag.
+Keep the synthetic path as the default. Before binding, validate the local
+versioned ID table and generated data root. Generate one chunk at a time on a
+bounded worker so that network polling and keepalives continue during slow
+generation. A disconnected client must close its worker after its current
+bounded chunk finishes. Start with a small view radius, inspect the actual
+Java 26.3 display and F3 coordinates, then compare visible terrain and cave
+blocks with the same-seed save. Record generation, encoding, and delivery
+separately. This probe does not claim feature-stage ores, trees, structures,
+block interaction, radius-32 delivery, or vanilla parity.
+
 ## Acceptance sequence
 
 - [ ] **Ground truth:** Record the save's exact client version, seed, preset, datapacks, and mod effects. Sample loaded chunks across positive and negative coordinates. Compare height, biome, top block, and full 3D block categories; add exact block-state comparisons where the RustMC generator represents them. Report numerator, denominator, missing chunks, and differences. Keep the save and any extracted game data out of Git.
@@ -84,6 +98,33 @@ smoke encoded generated chunks `(0,0)` and `(-1,2)` to 74,943 and 77,001 byte
 frames. This verifies ID lookup and encoding on those two columns only. No
 client has received them; state-kind tags, lighting, and live delivery still
 need validation.
+
+## Biome lookup profiling and bounded cache (2 October 2026)
+
+A release-build `perf` run on four seed-2026 chunks found repeated linear
+biome-placement searches as the largest sampled cost before this change.
+RustMC now reuses a biome result within its quantized 4×4×4 coordinate cell,
+with at most 8,192 cells retained per generator (two generations of 4,096).
+The cache stores only results of the same climate sampler; a test compares
+cached and uncached answers over 9,000 cells and checks eviction. No biome
+placement values or sampling rules changed.
+
+On this machine, the same release-build 2×2 cold column sweep measured
+6,259.6 ms before and 2,088.6 ms after this cache, including a concurrently
+running local preview in the latter measurement. The corresponding per-chunk
+means were 1,564.9 and 522.2 ms. These are generator timings, not client
+render latency. A four-worker local client probe is still visibly slow at a
+radius-2 view, and a radius-32 view remains unverified. A second `perf`
+sample after the cache attributes about half of sampled CPU time to RustMC's
+Perlin gradient/interpolation code; this is the next measured hotspot.
+
+The local client delivery path now keeps its bounded vanilla workers generating
+while the client acknowledges the previous one-chunk batch. Chunk unloading
+waits until an acknowledged batch can carry the forget packets. An
+operator-data smoke confirms that a worker remains in flight during this
+interval. This removes idle generation time between batches; it does not
+change the measured cost of generating an individual chunk or establish a
+client-visible speed result.
 
 ## Independent seed check (2 October 2026)
 

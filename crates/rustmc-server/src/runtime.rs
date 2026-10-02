@@ -1,6 +1,6 @@
 //! Bounded loopback discovery supervisor with an opt-in local Java terrain preview.
 
-use crate::{ListenerConfig, discovery_bedrock, discovery_java, preview_data};
+use crate::{ListenerConfig, discovery_bedrock, discovery_java, java_preview, preview_data};
 use std::{
     fmt,
     io::{self, Read, Write},
@@ -223,6 +223,15 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             "M1 requires a loopback bind address",
         )));
     }
+    if config.vanilla_data_root.is_some() != config.vanilla_registry_table.is_some()
+        || (config.vanilla_data_root.is_some()
+            && (!config.local_java_preview || config.max_connections != 1))
+    {
+        return Err(RuntimeError::Bind(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local vanilla preview requires both data paths and max_connections = 1",
+        )));
+    }
     let registry_manifest = match &config.preview_registry_manifest {
         Some(path) => match preview_data::load(path) {
             Ok(manifest) => Some(Arc::new(manifest)),
@@ -242,6 +251,43 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             }
         },
         None => None,
+    };
+    let vanilla_source = if let (Some(data_root), Some(registry_table)) =
+        (&config.vanilla_data_root, &config.vanilla_registry_table)
+    {
+        let seed = i64::try_from(config.preview_seed).map_err(|_| {
+            RuntimeError::Bind(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "preview seed exceeds i64",
+            ))
+        })?;
+        let generator = crate::vanilla::generator::VanillaGenerator::new(
+            data_root,
+            seed,
+            "minecraft:overworld",
+        )
+        .map_err(|error| {
+            RuntimeError::Bind(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid operator-local worldgen data: {error}"),
+            ))
+        })?;
+        let table_text = std::fs::read_to_string(registry_table).map_err(RuntimeError::Bind)?;
+        let _tables = crate::chunk_adapter::registry::RegistryTables::from_provisioned(&table_text)
+            .map_err(|error| {
+                RuntimeError::Bind(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid local 26.3 registry table: {error}"),
+                ))
+            })?;
+        Some(java_preview::VanillaSource {
+            data_root: data_root.clone(),
+            registry_table: registry_table.clone(),
+            seed,
+            spawn_y: generator.surface_height(0, 0),
+        })
+    } else {
+        None
     };
     let bind_address = SocketAddr::new(config.bind_address, config.port);
     let listener = match TcpListener::bind(bind_address) {
@@ -384,6 +430,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                             config.preview_view_distance,
                             config.preview_terrain,
                         );
+                    if let Some(source) = &vanilla_source {
+                        discovery = discovery.with_vanilla_source(source.clone());
+                    }
                     if let Some(manifest) = &registry_manifest {
                         discovery = discovery.with_registry_manifest(Arc::clone(manifest));
                     }
@@ -526,6 +575,13 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     connection.pending.extend(packet);
                 }
             }
+            let reason = reason.or_else(|| {
+                connection
+                    .discovery
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.failed.then_some("vanilla_chunk_failure"))
+            });
             let reason = if reason.is_none() && !connection.pending.is_empty() {
                 match connection.stream.write(&connection.pending) {
                     Ok(0) => Some("write_closed"),
