@@ -478,10 +478,10 @@ fn negative_chunk_coordinates_keep_their_fixed_width_header() {
 }
 
 #[test]
-fn cave_profile_keeps_air_pockets_and_separates_the_three_heightmaps() {
+fn cave_profile_keeps_air_pockets_and_fluid_in_motion_heightmaps() {
     let tables = tables();
-    // A solid run with carved air inside, an uncollected water layer on top of
-    // leaves, so each heightmap type sees a different row.
+    // A solid run with carved air inside and fluid above leaves. The fluid
+    // surface is included in both motion heightmaps.
     let top = 106i32;
     let chunk = column_chunk(
         0,
@@ -524,13 +524,13 @@ fn cave_profile_keeps_air_pockets_and_separates_the_three_heightmaps() {
     );
     assert_eq!(
         decoded.heightmap(HeightmapKind::MotionBlocking)[255],
-        captured(100),
-        "water does not block motion"
+        captured(top),
+        "a non-empty fluid state is captured by the motion heightmap"
     );
     assert_eq!(
         decoded.heightmap(HeightmapKind::MotionBlockingNoLeaves)[255],
-        captured(99),
-        "leaves are excluded from MOTION_BLOCKING_NO_LEAVES"
+        captured(top),
+        "fluid is captured even where leaves below are excluded"
     );
     assert!(
         decoded
@@ -586,7 +586,7 @@ fn cave_profile_keeps_air_pockets_and_separates_the_three_heightmaps() {
 }
 
 #[test]
-fn fluid_levels_are_counted_per_section_and_stay_out_of_the_motion_heightmaps() {
+fn fluid_levels_are_counted_per_section_and_captured_by_motion_heightmaps() {
     // Water and lava reach the wire as one registry id per level, all from the
     // same base family, so the section counters, heightmaps, and skylight must
     // treat every level alike.
@@ -698,12 +698,12 @@ fn fluid_levels_are_counted_per_section_and_stay_out_of_the_motion_heightmaps() 
     );
     assert_eq!(
         decoded.heightmap(HeightmapKind::MotionBlocking)[0],
-        captured(47),
-        "no level of water or lava blocks motion"
+        captured(67),
+        "the fluid surface is included in MOTION_BLOCKING"
     );
     assert_eq!(
         decoded.heightmap(HeightmapKind::MotionBlockingNoLeaves)[0],
-        captured(47)
+        captured(67)
     );
     assert!(
         decoded

@@ -557,3 +557,15 @@ missing references fail with an error. Tests cover these cases with synthetic
 data. The provisioned Overworld graph was checked locally; no private data is
 committed. Volume wrappers, cache bounds, feature placement, and live chunk
 integration remain open before any client-visible parity claim.
+
+## Java 26.3 motion heightmap review (2 October 2026)
+
+The owner-local Java 26.3 server jar was inspected with `javap` in `/tmp` to
+check the predicates for `MOTION_BLOCKING` and `MOTION_BLOCKING_NO_LEAVES`.
+Both capture a block when its matching heightmap tag applies **or** its fluid
+state is nonempty. RustMC's independent chunk adapter had omitted fluid states
+from both motion heightmaps; the classification and synthetic round-trip tests
+now include them. No game code, class file, or asset was added to the repository.
+The adapter still uses a coarse state classification for the block tags and
+needs per-state validation against versioned data before claiming exact
+heightmap parity.

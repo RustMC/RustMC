@@ -52,8 +52,8 @@
 //! (world-gen air, the dimension's `default_fluid` family, leaf blocks, and
 //! everything else), and the table may override any single state. Facts this
 //! classification encodes: `Heightmap.Types.WORLD_SURFACE` captures every
-//! non-air state, `MOTION_BLOCKING` only states that block motion (fluids do
-//! not), `MOTION_BLOCKING_NO_LEAVES` drops leaves as well, and the section
+//! non-air state, both motion heightmaps capture non-empty fluid states,
+//! `MOTION_BLOCKING_NO_LEAVES` drops leaves, and the section
 //! `fluidCount` field counts states with a non-empty fluid
 //! (`LevelChunkSection$1BlockCounter#accept`, consulted 2 October 2026 under
 //! the ADR-0014 knowledge-consultation policy; nothing was copied).
@@ -73,8 +73,9 @@ pub enum StateKind {
     /// `air`, `cave_air`, `void_air`: invisible to every heightmap, no
     /// attenuation of skylight.
     Air,
-    /// The dimension fluid (`water`, `lava`): counted in `WORLD_SURFACE` and in
-    /// the section fluid count, but does not block motion.
+    /// The dimension fluid (`water`, `lava`): counted in all three heightmaps
+    /// and in the section fluid count. Heightmap inclusion does not imply
+    /// that fluid blocks player movement.
     Fluid,
     /// Leaves: block motion, excluded from `MOTION_BLOCKING_NO_LEAVES`,
     /// attenuate skylight by one level.
@@ -100,8 +101,8 @@ impl StateKind {
     pub fn captured_by(self, kind: HeightmapKind) -> bool {
         match kind {
             HeightmapKind::WorldSurface => self != Self::Air,
-            HeightmapKind::MotionBlocking => matches!(self, Self::Leaves | Self::Solid),
-            HeightmapKind::MotionBlockingNoLeaves => self == Self::Solid,
+            HeightmapKind::MotionBlocking => self != Self::Air,
+            HeightmapKind::MotionBlockingNoLeaves => matches!(self, Self::Fluid | Self::Solid),
         }
     }
 
@@ -775,7 +776,7 @@ mod tests {
                 ),
                 match kind {
                     StateKind::Air => (false, false, false),
-                    StateKind::Fluid => (true, false, false),
+                    StateKind::Fluid => (true, true, true),
                     StateKind::Leaves => (true, true, false),
                     StateKind::Solid => (true, true, true),
                 }
