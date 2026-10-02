@@ -17,6 +17,47 @@ Render RustMC's independently implemented, data-driven Overworld in a real Java 
 
 Every checked item needs focused tests, `cargo fmt`, `check`, Clippy with warnings denied, tests, build, rustdoc, the dependency license gate, diff review, and passing CI. Record client observations separately from automated evidence and keep edition/version scope explicit in the [compatibility matrix](../COMPATIBILITY.md).
 
+## Integration status of the first slices (2 October 2026)
+
+Four parallel slices landed on this branch together. None of the acceptance items
+above is checked by them, and the sequence below says exactly where each one stops.
+
+- **Ground truth** — evidence landed (this document's measurement section, plus the
+  oracle's `block_compare` mode). Item stays unchecked: base-block ids only, one seed,
+  one preset, no block-state properties, no client involved.
+- **Finite generation** — partially landed. The seven coordinate-keyed generator memos
+  are now fixed-capacity (`vanilla::cache`, 1,407 KiB total per generator, verified by
+  occupancy tests that sweep far past each bound and by an eviction-recomputes-identically
+  test). Cold full-descent cost is *not* satisfied: measured 13,954 ms per chunk on a 2×2
+  cold sweep and 12,682 ms on a 4×4 sweep, which projects to roughly 15–16 hours
+  single-threaded for one 4,225-chunk radius-32 view, with peak RSS ~10 MiB. A 32-chunk
+  live view cannot be sustained from this yet, and nothing here promises it.
+- **Versioned chunk adapter** — landed as an encoding seam, not a live path.
+  `chunk_adapter::registry` validates an operator-provisioned 26.3/777 id table and makes
+  any unclassified id a typed error; `chunk_adapter` encodes all 24 sections, three
+  heightmaps, per-section fluid counts, and 26 skylight layers, with the tests decoding
+  the bytes back off the wire. Deferred and stated in the module docs: block entities,
+  neighbour-chunk border blocks, per-layer vertical biome selection, and block light. A
+  real 26.3 client has **not** been shown an adapter-built column, and the worst-case
+  251,457-byte column against the preview's own 786,432-byte batch budget means the
+  budget binds at batch level.
+- **Opt-in client view** — not started: no session code sends adapter output, and the
+  synthetic preview remains the default.
+- **Terrain completion** — not started. The measurement below attributes 10.4% of the
+  scored positions (35,223) to the four vein/blob stones the save stores where we still
+  write plain stone or deepslate — the placement-stage blob and ore runtime, which is the
+  next generator lever.
+- **Authoritative editing** — design landed
+  (`docs/milestones/M3-authoritative-block-interaction.md`) with its numeric mechanics
+  deferred to BIND/OBSERVE tasks; no gameplay code.
+
+One cross-cutting blocker recorded by the design slice and unresolved here: the preview
+`world::Chunk` index space is `0..WORLD_HEIGHT` while the adapter emits absolute Overworld
+rows `-64..319`, so the two chunk representations in this tree are not the same coordinate
+model. Settling one authoritative world-Y mapping (decision **D1** / requirement **V6** in
+the block-interaction milestone) is a prerequisite for both live wiring and gameplay, and
+no mapping has been chosen or implemented.
+
 ## Ground truth: first block-identity measurement (2 October 2026)
 
 This records automated evidence for the first acceptance item. The item stays

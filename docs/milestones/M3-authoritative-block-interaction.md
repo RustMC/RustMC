@@ -288,6 +288,13 @@ Bind/derive tasks (no code claim until done):
   global block-state palette id) from the operator's locally generated 26.3
   reports; record the report path and generation command in PROVENANCE; keep the
   data untracked.
+  Landed so far: `chunk_adapter::registry::RegistryTables` is the provisioning seam
+  for this shape (version-validated `26.3`/`777` name→id maps, canonical state-key
+  normalization, unknown identity as a typed error, direct-mode widths derived from the
+  declared registry sizes). It covers the states the terrain generator emits, is fed by
+  an operator-provisioned file that stays untracked, and its provenance is Session 11.
+  It does **not** yet carry the interactive cell states this slice needs, and no entry in
+  it has been confirmed by a client, so BIND-1 is extended rather than closed.
 - BIND-2 Bind the 26.3 ids and field orders for the clientbound block-change and
   batched block-update packets, the serverbound block-action packets, and the
   block-placement interaction packet from the same report; confirm each with a

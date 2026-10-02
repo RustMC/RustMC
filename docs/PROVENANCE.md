@@ -516,8 +516,10 @@ claim:
 - Block identity vs the seed-2026 save (the oracle's `block_compare`, 2,401-column
   grid, 338,217 scored positions): 80.86% exact base block, 82.78% with the air family
   collapsed, against the 98.64% substance figure from Session 9. The `3,228` uncarved
-  deep rows reproduce the recorded 3,226 carver residual. The 10.4% identity delta is the
-  known T4 decoration gap, not a consulted difference.
+  deep rows reproduce the recorded 3,226 carver residual. Four vein/blob stone pairs
+  (tuff→deepslate, diorite/andesite/granite→stone) cover 35,223 positions, 10.4% of the
+  sample — the placement-stage decoration runtime already isolated as the T4 target, not a
+  consulted difference.
 - Generator cache bounds: the overworld carve mask is `12,032` bytes
   (`ceil(256 x 376 / 64) x 8`), and the seven coordinate-keyed memos are capped at a
   fixed 1,407 KiB per generator (753 masks, 96 chunk carvers, 160 column tops,
