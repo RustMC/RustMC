@@ -437,6 +437,110 @@ Ground-truth census and the attribution correction (the key finding):
 - No new dependencies were introduced; the `/tmp` harnesses (the Java probe plus the
   headless server instance) are disposable consultation tooling under the ADR-0014
   amendment and the project's implementation and tests remain Rust-only.
+
+### Session 11 (2 October 2026): chunk-adapter registry tables, protocol-777 wire shapes, and the four-slice integration record
+
+Method. This entry closes the provenance record that the four integrated slices owed
+(bounded generator caches, the protocol-777 chunk adapter, the M3 block-interaction
+design, and the full-column block-identity oracle). No terrain generation code was
+consulted for it: the generator-side facts are those of Sessions 1–10, re-used
+unchanged. The adapter needed one thing no earlier slice had — numeric registry
+identities — and it takes them **only at runtime from an operator-provisioned versioned
+table** (`chunk_adapter::registry::RegistryTables`, validated for 26.3/777); no id list,
+data file, or registry size from any Mojang source is in this repository, and the unit
+fixtures use locally invented ids inside invented registry sizes. What *was* consulted
+for the adapter is shape only: the field order and palette rules of the section
+containers, the heightmap and light encodings, and the block-state classification each
+one depends on, read from the 26.3 classes under the ADR-0014 knowledge-only amendment.
+Nothing was copied or translated; every consulted number is restated below and
+re-derived in Rust from the provisioned table rather than hardcoded.
+
+A deletion made traceable: a predecessor of the adapter slice left the real 26.3
+registry sizes — **35,723 block states and 67 biomes** — in a tracked test comment.
+Those counts are Mojang-derived numeric facts, so they were removed from the code before
+the commit and are logged here instead, with the two derived figures that depend on them:
+`ceillog2(35723) = 16` bits for a direct-mode block palette and `ceillog2(67) = 7` bits
+for a direct-mode biome palette. The committed fixtures reach the same two widths from
+invented sizes (65,536 states and 128 biomes), which is why the tests stay meaningful
+without carrying the counts. Any future change to a provisioned table recomputes both
+widths from the table's declared sizes; no width is a constant in the code.
+
+Wire facts the adapter depends on, recorded here because the log did not carry them
+before (protocol 777, Java 26.3; the chunk packet id `46` is the one the accepted
+synthetic preview already uses and a real client has rendered with):
+
+- Heightmaps are sent as a VarInt entry count, then per entry a VarInt type id followed
+  by a VarInt-prefixed big-endian long array. The type ids in use are WORLD_SURFACE `1`,
+  MOTION_BLOCKING `4`, MOTION_BLOCKING_NO_LEAVES `5`. Entries are
+  `ceillog2(dimension height)` bits wide, so the Overworld's 384-row columns pack at 9
+  bits, 256 columns per chunk; stored values are relative to the dimension `min_y` (the
+  T0 save-format fact) as `absolute_y + 1 − min_y`, so the Overworld's lowest buildable
+  row (absolute `−64`) reports `1` and a column with nothing captured reports `0`.
+- Section field order is `block_count` (short), `fluid_count` (short), block container,
+  biome container. Both counts are `u16` big-endian and are keyed on `isAir()` and on a
+  non-empty fluid state, which is why carved rows (whose saved air is `cave_air`) count
+  as air and only the dimension fluid feeds the fluid count.
+- Paletted containers: block palettes are indirect from 4 through 8 bits per entry,
+  biome palettes from 1 through 3 bits; beyond those limits the container switches to
+  global/direct mode whose width is `ceillog2(declared registry size)` and no palette
+  entries are written. A single-distinct-value section writes width byte `0` plus one
+  bare id and no long array.
+- Light: a full column sends `sections + 2 = 26` skylight layers (the two boundary
+  sections included), then four `BIT_SET` masks in the order skyYMask / blockYMask /
+  emptySkyYMask / emptyBlockYMask, then the sky-light layer list and an empty block-light
+  list. For a complete column skyYMask and emptyBlockYMask are all-set over the 26 layers
+  and the other two are clear. A `BIT_SET` here is a VarInt byte count over little-endian
+  bytes truncated at the highest set bit, not a long array. Skylight itself is a purely
+  vertical model — level `15` above the top, attenuated per state downward with air `0`,
+  fluid and leaves `1`, solid closing the column to `0` — nibble-packed two cells per
+  byte, low nibble first. This is the same vertical model the accepted preview path uses;
+  it is **not** a lit world: no block light, no sky-edge propagation from neighbours, and
+  no border transfer is modelled (stated in the module docs).
+- Block-state classification into air / fluid / leaves / solid is derived from the
+  documented behaviour of the block families the generator can emit; the provisioned
+  table's optional `state_kinds` section overrides any single state. An id the table does
+  not classify is a typed error, never a fallback, because substituting an id moves a
+  heightmap entry.
+
+The M3 block-interaction design and its test-only probes cite one external figure: the
+0.6 x 1.8-block player envelope, from the public wiki page for the player (checked
+2 October 2026). It is recorded as RustMC's *proposed* whole-cube approximation, not as
+a verified 26.3 mechanic; per-block collision, reach, and correction values remain
+OBSERVE/BIND tasks in that document, and no gameplay number from Mojang data was
+consulted or committed.
+
+Measurements. Every number below is RustMC's own run against RustMC code and the owner's
+own save — none of it is consulted or vendor-supplied data, and none of it is a parity
+claim:
+
+- Block identity vs the seed-2026 save (the oracle's `block_compare`, 2,401-column
+  grid, 338,217 scored positions): 80.86% exact base block, 82.78% with the air family
+  collapsed, against the 98.64% substance figure from Session 9. The `3,228` uncarved
+  deep rows reproduce the recorded 3,226 carver residual. The 10.4% identity delta is the
+  known T4 decoration gap, not a consulted difference.
+- Generator cache bounds: the overworld carve mask is `12,032` bytes
+  (`ceil(256 x 376 / 64) x 8`), and the seven coordinate-keyed memos are capped at a
+  fixed 1,407 KiB per generator (753 masks, 96 chunk carvers, 160 column tops,
+  80 + 80 aquifer centers/statuses, 224 aquifer surfaces, 14 skip bounds), replacing
+  48.5 MiB of masks plus 12.4 MiB of tops that a radius-32 view would otherwise pin.
+- Full-descent cost, release build, seed 2026, re-measured by the lead on the integrated
+  tree (2x2 chunk cold sweep): 13,954 ms per chunk, 54.5 ms per column, projected
+  16.38 hours single-threaded for one 4,225-chunk radius-32 view; peak RSS 9,924 KiB.
+  The slice's own 4x4 measurement gave 12,682 ms per chunk and a 14.88-hour projection.
+  Either figure is the live-preview blocker; the cache bound is not what makes a view
+  fast.
+- Carve-path cost of the bound: 1.39 -> 2.27 ms per chunk on the adversarial 64x64
+  full-volume scan, with peak RSS 54,528 -> 9,792 KiB (5.6x) and identical carved-block
+  counts, which is the eviction-is-recomputation evidence.
+- Adapter payload worst case: a fully direct-mode Overworld column encodes to 251,457
+  bytes against the preview path's own 786,432-byte (768 KiB) batch budget, so 16 such
+  chunks overflow it and the budget binds at batch level.
+
+No new Cargo dependency, no save file, region file, or game data entered the repository
+in any of the four slices; the operator-provisioned data roots stay untracked and are
+reached only through `RUSTMC_VANILLA_DATA` / `RUSTMC_VANILLA_SAVE` in `#[ignore]`d
+smokes.
+
 ## Vanilla research review hardening (2 October 2026)
 
 No new external generator source or game data was consulted for this change.
