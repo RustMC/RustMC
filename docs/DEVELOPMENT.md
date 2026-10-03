@@ -60,6 +60,17 @@ these four runs. This measures preparation throughput, not client-visible latenc
 the default remains eight workers. The optional last argument to
 `prepare_preview_cache` selects `WORKERS` in `1..=20` for the same local test.
 
+During movement across chunk coordinates, the vanilla preview gives cold work
+within three chunks of the player priority for 750 ms after each change.
+Generation of farther uncached chunks resumes when movement pauses, with at
+most two workers on that background work. A far chunk already under construction
+is discarded at a column boundary if it falls outside the new near area.
+Previously delivered chunks remain visible until they leave the view; cached
+farther chunks can still stream during movement. This
+keeps CPU and memory bounded and reduces wasted work during fast flight, but a player
+moving continuously can still outrun cold generation; the advertised view
+distance is not a guarantee that every outer chunk is ready at once.
+
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 
 The preview flag is for local protocol testing only. It accepts an unverified name and client UUID, then sends a separate random session UUID. It does not authenticate a Microsoft account, grant permissions, or establish player identity. Keep it disabled when not testing. Its successful response does not imply configuration, play, chunk delivery, or gameplay support.

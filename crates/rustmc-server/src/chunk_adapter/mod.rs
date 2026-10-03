@@ -344,6 +344,18 @@ pub fn chunk_from_generator(
     chunk_z: i32,
     tables: &RegistryTables,
 ) -> Result<VanillaChunk, EncodeError> {
+    chunk_from_generator_cancellable(generator, chunk_x, chunk_z, tables, || false)
+        .map(|chunk| chunk.expect("unconditional generation cannot cancel"))
+}
+
+/// Discards a partly built chunk when it is no longer useful to the caller.
+pub fn chunk_from_generator_cancellable(
+    generator: &VanillaGenerator,
+    chunk_x: i32,
+    chunk_z: i32,
+    tables: &RegistryTables,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<Option<VanillaChunk>, EncodeError> {
     if generator.min_y() != OVERWORLD_MIN_Y {
         return Err(EncodeError::UnsupportedMinY {
             min_y: generator.min_y(),
@@ -353,6 +365,9 @@ pub fn chunk_from_generator(
     let mut states = vec![air; CHUNK_CELLS];
     for z in 0..CHUNK_SIDE {
         for x in 0..CHUNK_SIDE {
+            if should_cancel() {
+                return Ok(None);
+            }
             let wx = chunk_x * CHUNK_SIDE as i32 + x as i32;
             let wz = chunk_z * CHUNK_SIDE as i32 + z as i32;
             let column = generator.column_ids(wx, wz);
@@ -395,12 +410,12 @@ pub fn chunk_from_generator(
             }
         }
     }
-    Ok(VanillaChunk {
+    Ok(Some(VanillaChunk {
         chunk_x,
         chunk_z,
         states,
         biomes,
-    })
+    }))
 }
 
 /// Encodes one complete column as a framed 26.3 chunk packet.

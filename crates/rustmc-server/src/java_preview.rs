@@ -9,10 +9,26 @@ use crate::{
 use std::collections::BTreeSet;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+const MOVING_NEAR_RADIUS: i32 = 3;
+const MOVING_PRIORITY_WINDOW: Duration = Duration::from_millis(750);
+const BACKGROUND_FAR_WORKERS: usize = 2;
+
+fn packed_center((x, z): (i32, i32)) -> u64 {
+    (u64::from(z as u32) << 32) | u64::from(x as u32)
+}
+
+fn unpacked_center(value: u64) -> (i32, i32) {
+    (value as u32 as i32, (value >> 32) as u32 as i32)
+}
 
 /// Validated operator-local input. Runtime preflight checks the files before binding.
 #[derive(Debug, Clone)]
@@ -27,32 +43,41 @@ pub struct VanillaSource {
 
 struct BuiltChunk {
     position: (i32, i32),
-    packet: Result<Vec<u8>, String>,
+    packet: Result<Option<Vec<u8>>, String>,
     generation_us: u128,
     encoding_us: u128,
 }
 
+struct ChunkRequest {
+    position: (i32, i32),
+    center: (i32, i32),
+}
+
 /// A fixed pool with one chunk per worker. Each generator stays on its owning thread.
 struct VanillaWorker {
-    requests: Option<mpsc::SyncSender<(i32, i32)>>,
+    requests: Option<mpsc::SyncSender<ChunkRequest>>,
     results: mpsc::Receiver<BuiltChunk>,
     handles: Vec<thread::JoinHandle<()>>,
     in_flight: BTreeSet<(i32, i32)>,
     pending: Option<BuiltChunk>,
     capacity: usize,
+    current_center: Arc<AtomicU64>,
+    cache: Option<crate::preview_cache::PreviewCache>,
 }
 
 impl VanillaWorker {
     fn new(source: VanillaSource) -> Self {
         let capacity = source.workers;
-        let (requests, rx) = mpsc::sync_channel::<(i32, i32)>(0);
+        let (requests, rx) = mpsc::sync_channel::<ChunkRequest>(0);
         let (tx, results) = mpsc::sync_channel(capacity);
         let rx = Arc::new(Mutex::new(rx));
+        let current_center = Arc::new(AtomicU64::new(packed_center((0, 0))));
         let handles = (0..capacity)
             .map(|_| {
                 let rx = Arc::clone(&rx);
                 let tx = tx.clone();
                 let source = source.clone();
+                let current_center = Arc::clone(&current_center);
                 thread::spawn(move || {
                     let Ok(generator) = crate::vanilla::generator::VanillaGenerator::new(
                         &source.data_root,
@@ -70,9 +95,11 @@ impl VanillaWorker {
                         return;
                     };
                     loop {
-                        let position = match rx.lock().expect("worker request lock poisoned").recv()
-                        {
-                            Ok(position) => position,
+                        let ChunkRequest {
+                            position,
+                            center: requested_center,
+                        } = match rx.lock().expect("worker request lock poisoned").recv() {
+                            Ok(request) => request,
                             Err(_) => break,
                         };
                         if let Some(cache) = &source.cache {
@@ -81,7 +108,7 @@ impl VanillaWorker {
                                     if tx
                                         .send(BuiltChunk {
                                             position,
-                                            packet: Ok(packet),
+                                            packet: Ok(Some(packet)),
                                             generation_us: 0,
                                             encoding_us: 0,
                                         })
@@ -109,18 +136,36 @@ impl VanillaWorker {
                             }
                         }
                         let started = Instant::now();
-                        let chunk = crate::chunk_adapter::chunk_from_generator(
-                            &generator, position.0, position.1, &tables,
+                        let chunk = crate::chunk_adapter::chunk_from_generator_cancellable(
+                            &generator,
+                            position.0,
+                            position.1,
+                            &tables,
+                            || {
+                                let center =
+                                    unpacked_center(current_center.load(Ordering::Relaxed));
+                                center != requested_center
+                                    && (position.0 - center.0)
+                                        .abs()
+                                        .max((position.1 - center.1).abs())
+                                        > MOVING_NEAR_RADIUS
+                            },
                         );
                         let generation_us = started.elapsed().as_micros();
                         let started = Instant::now();
                         let packet = chunk
-                            .and_then(|chunk| crate::chunk_adapter::encode_chunk(&chunk, &tables))
+                            .and_then(|chunk| {
+                                chunk
+                                    .map(|chunk| {
+                                        crate::chunk_adapter::encode_chunk(&chunk, &tables)
+                                    })
+                                    .transpose()
+                            })
                             .map_err(|error| error.to_string());
                         let packet = packet.and_then(|packet| {
-                            if let Some(cache) = &source.cache {
+                            if let (Some(cache), Some(packet)) = (&source.cache, &packet) {
                                 cache
-                                    .write(position.0, position.1, &packet)
+                                    .write(position.0, position.1, packet)
                                     .map_err(|error| error.to_string())?;
                             }
                             Ok(packet)
@@ -149,6 +194,8 @@ impl VanillaWorker {
             in_flight: BTreeSet::new(),
             pending: None,
             capacity,
+            current_center,
+            cache: source.cache,
         }
     }
 }
@@ -199,6 +246,10 @@ pub struct Preview {
     radius: i32,
     center: (i32, i32),
     view_order: Vec<(i32, i32)>,
+    next_view_position: usize,
+    next_cached_position: usize,
+    forget_dirty: bool,
+    last_center_change: Instant,
     sent: BTreeSet<(i32, i32)>,
     biomes: [u32; 8],
     pub teleport_acknowledged: bool,
@@ -232,6 +283,10 @@ impl Preview {
             radius: radius.into(),
             center: (0, 0),
             view_order: ordered_view((0, 0), radius.into()),
+            next_view_position: 0,
+            next_cached_position: 0,
+            forget_dirty: false,
+            last_center_change: Instant::now() - MOVING_PRIORITY_WINDOW,
             sent: BTreeSet::new(),
             biomes,
             teleport_acknowledged: false,
@@ -345,6 +400,15 @@ impl Preview {
         if center != self.center {
             self.center = center;
             self.view_order = ordered_view(center, self.radius);
+            self.next_view_position = 0;
+            self.next_cached_position = 0;
+            self.forget_dirty = true;
+            self.last_center_change = Instant::now();
+            if let Some(worker) = &self.vanilla {
+                worker
+                    .current_center
+                    .store(packed_center(center), Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -378,23 +442,26 @@ impl Preview {
             return None;
         }
         let mut output = cache_center(self.center);
+        let mut had_forgets = false;
         let (cx, cz) = self.center;
         let radius = self.radius;
-        if !self.awaiting_batch {
+        if !self.awaiting_batch && self.forget_dirty {
             let expired: Vec<_> = self
                 .sent
                 .iter()
                 .copied()
                 .filter(|(x, z)| (x - cx).abs() > radius || (z - cz).abs() > radius)
                 .collect();
+            had_forgets = !expired.is_empty();
             for (x, z) in expired {
                 let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
                 output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
                 self.sent.remove(&(x, z));
             }
+            self.forget_dirty = false;
         }
         if self.vanilla.is_some() {
-            return self.next_vanilla_chunk(output);
+            return self.next_vanilla_chunk(output, had_forgets);
         }
         let candidates: Vec<_> = self
             .view_order
@@ -403,7 +470,7 @@ impl Preview {
             .filter(|pos| !self.sent.contains(pos))
             .collect();
         if candidates.is_empty() {
-            return None;
+            return had_forgets.then_some((output, 0, 0));
         }
         output.extend(frame(BATCH_START, &[]));
         let mut generation_us = 0;
@@ -430,19 +497,75 @@ impl Preview {
         Some((output, generation_us, encoding_us))
     }
 
-    fn next_vanilla_chunk(&mut self, mut output: Vec<u8>) -> Option<(Vec<u8>, u128, u128)> {
+    fn next_vanilla_chunk(
+        &mut self,
+        mut output: Vec<u8>,
+        had_forgets: bool,
+    ) -> Option<(Vec<u8>, u128, u128)> {
         let worker = self.vanilla.as_mut()?;
-        for position in self.view_order.iter().copied() {
-            if worker.in_flight.len() >= worker.capacity {
+        let moving = self.last_center_change.elapsed() < MOVING_PRIORITY_WINDOW;
+        while let Some(&position) = self.view_order.get(self.next_view_position) {
+            let distance = (position.0 - self.center.0)
+                .abs()
+                .max((position.1 - self.center.1).abs());
+            if moving && distance > MOVING_NEAR_RADIUS {
+                break;
+            }
+            let limit = if distance > MOVING_NEAR_RADIUS {
+                worker.capacity.min(BACKGROUND_FAR_WORKERS)
+            } else {
+                worker.capacity
+            };
+            if worker.in_flight.len() >= limit {
                 break;
             }
             if self.sent.contains(&position) || worker.in_flight.contains(&position) {
+                self.next_view_position += 1;
                 continue;
             }
-            if let Some(requests) = &worker.requests {
-                match requests.try_send(position) {
+            let Some(requests) = &worker.requests else {
+                break;
+            };
+            match requests.try_send(ChunkRequest {
+                position,
+                center: self.center,
+            }) {
+                Ok(()) => {
+                    worker.in_flight.insert(position);
+                    self.next_view_position += 1;
+                }
+                Err(mpsc::TrySendError::Full(_)) => break,
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.failed = true;
+                    return None;
+                }
+            }
+        }
+        if moving && let Some(cache) = &worker.cache {
+            while worker.in_flight.len() < worker.capacity
+                && let Some(&position) = self.view_order.get(self.next_cached_position)
+            {
+                if (position.0 - self.center.0)
+                    .abs()
+                    .max((position.1 - self.center.1).abs())
+                    <= MOVING_NEAR_RADIUS
+                    || self.sent.contains(&position)
+                    || worker.in_flight.contains(&position)
+                    || !cache.contains(position.0, position.1)
+                {
+                    self.next_cached_position += 1;
+                    continue;
+                }
+                let Some(requests) = &worker.requests else {
+                    break;
+                };
+                match requests.try_send(ChunkRequest {
+                    position,
+                    center: self.center,
+                }) {
                     Ok(()) => {
                         worker.in_flight.insert(position);
+                        self.next_cached_position += 1;
                     }
                     Err(mpsc::TrySendError::Full(_)) => break,
                     Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -476,8 +599,13 @@ impl Preview {
                     }
                 },
             };
+            if matches!(built.packet, Ok(None)) {
+                worker.in_flight.remove(&built.position);
+                self.next_view_position = 0;
+                continue;
+            }
             let size = match &built.packet {
-                Ok(packet) if packet.len() < MAX_BATCH_BYTES => packet.len(),
+                Ok(Some(packet)) if packet.len() < MAX_BATCH_BYTES => packet.len(),
                 _ => {
                     self.failed = true;
                     return None;
@@ -497,7 +625,12 @@ impl Preview {
             if count == 0 {
                 output.extend(frame(BATCH_START, &[]));
             }
-            output.extend(built.packet.expect("checked packet"));
+            output.extend(
+                built
+                    .packet
+                    .expect("checked packet")
+                    .expect("checked non-cancelled"),
+            );
             self.sent.insert(built.position);
             generation_us += built.generation_us;
             encoding_us += built.encoding_us;
@@ -505,7 +638,7 @@ impl Preview {
             count += 1;
         }
         if count == 0 {
-            return None;
+            return had_forgets.then_some((output, 0, 0));
         }
         let mut count_data = Vec::new();
         put_varint(count as u32, &mut count_data);
@@ -749,7 +882,7 @@ mod tests {
         for position in positions {
             tx.send(BuiltChunk {
                 position,
-                packet: Ok(frame(CHUNK, b"test")),
+                packet: Ok(Some(frame(CHUNK, b"test"))),
                 generation_us: 4,
                 encoding_us: 2,
             })
@@ -762,6 +895,8 @@ mod tests {
             in_flight: positions.into_iter().collect(),
             pending: None,
             capacity: 8,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
         });
         let (stream, generation_us, encoding_us) = preview.next_chunk().unwrap();
         let ids = packet_ids(&stream);
@@ -781,7 +916,7 @@ mod tests {
         for position in [(0, 0), (1, 0)] {
             tx.send(BuiltChunk {
                 position,
-                packet: Ok(frame(CHUNK, &vec![0; 400_000])),
+                packet: Ok(Some(frame(CHUNK, &vec![0; 400_000]))),
                 generation_us: 0,
                 encoding_us: 0,
             })
@@ -794,6 +929,8 @@ mod tests {
             in_flight: [(0, 0), (1, 0)].into_iter().collect(),
             pending: None,
             capacity: 8,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
         });
         let first = preview.next_chunk().unwrap().0;
         assert_eq!(
@@ -813,6 +950,84 @@ mod tests {
         );
         assert!(preview.vanilla.as_ref().unwrap().pending.is_none());
         assert_eq!(preview.sent.len(), 2);
+    }
+
+    #[test]
+    fn vanilla_move_sends_unload_without_waiting_for_generated_chunk() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        preview.sent.insert((0, 0));
+        let (_tx, results) = mpsc::sync_channel(1);
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results,
+            handles: Vec::new(),
+            in_flight: BTreeSet::new(),
+            pending: None,
+            capacity: 1,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+        preview.move_to(48.5, 80.0, 0.5).unwrap();
+        let (stream, _, _) = preview.next_chunk().expect("unload-only stream");
+        assert_eq!(packet_ids(&stream), vec![CACHE_CENTER, FORGET_CHUNK]);
+        assert!(!preview.sent.contains(&(0, 0)));
+        assert!(!preview.awaiting_batch);
+    }
+
+    #[test]
+    fn cancelled_far_chunk_releases_slot_without_failing_preview() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        let (tx, results) = mpsc::sync_channel(1);
+        tx.send(BuiltChunk {
+            position: (2, 2),
+            packet: Ok(None),
+            generation_us: 1,
+            encoding_us: 0,
+        })
+        .unwrap();
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results,
+            handles: Vec::new(),
+            in_flight: [(2, 2)].into_iter().collect(),
+            pending: None,
+            capacity: 1,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+        assert!(preview.next_chunk().is_none());
+        assert!(!preview.failed);
+        assert!(preview.vanilla.as_ref().unwrap().in_flight.is_empty());
+        assert_eq!(preview.next_view_position, 0);
+    }
+
+    #[test]
+    fn completed_view_is_not_rescanned_until_center_changes() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        preview.sent.extend(preview.view_order.iter().copied());
+        let (_tx, results) = mpsc::sync_channel(1);
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results,
+            handles: Vec::new(),
+            in_flight: BTreeSet::new(),
+            pending: None,
+            capacity: 1,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+        assert!(preview.next_chunk().is_none());
+        assert_eq!(preview.next_view_position, preview.view_order.len());
+        assert!(preview.next_chunk().is_none());
+        assert_eq!(preview.next_view_position, preview.view_order.len());
+        preview.move_to(16.5, 80.0, 0.5).unwrap();
+        assert_eq!(preview.next_view_position, 0);
+        let stream = preview.next_chunk().expect("old edge unload").0;
+        assert!(packet_ids(&stream).contains(&FORGET_CHUNK));
+        assert!(preview.next_view_position < preview.view_order.len());
     }
 
     #[test]
