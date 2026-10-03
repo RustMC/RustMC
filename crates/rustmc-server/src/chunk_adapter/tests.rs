@@ -1133,6 +1133,14 @@ fn smoke_encodes_a_provisioned_overworld_column() {
             .expect("positional table from the emitted vocabulary")
         }
     };
+    let mut visited_columns = 0;
+    let cancelled = chunk_from_generator_cancellable(&generator, 0, 0, &tables, || {
+        visited_columns += 1;
+        visited_columns > 8
+    })
+    .expect("cancel after a few complete columns");
+    assert!(cancelled.is_none());
+    assert_eq!(visited_columns, 9);
     for (chunk_x, chunk_z) in [(0, 0), (-1, 2)] {
         let chunk =
             chunk_from_generator(&generator, chunk_x, chunk_z, &tables).expect("resolve a column");

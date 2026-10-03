@@ -5,7 +5,7 @@
 //! worldgen file, the registry table, seed, protocol, and cache format version.
 
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,13 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 struct Budget {
     files: VecDeque<(PathBuf, u64)>,
+    positions: BTreeSet<(i32, i32)>,
     bytes: u64,
+}
+
+fn packet_position(path: &Path) -> Option<(i32, i32)> {
+    let (x, z) = path.file_stem()?.to_str()?.split_once('.')?;
+    Some((x.parse().ok()?, z.parse().ok()?))
 }
 
 /// Shared, bounded packet store; clones share the same write/eviction lock.
@@ -63,6 +69,9 @@ impl PreviewCache {
         let mut budget = Budget::default();
         for (path, size, _) in entries {
             budget.bytes += size;
+            if let Some(position) = packet_position(&path) {
+                budget.positions.insert(position);
+            }
             budget.files.push_back((path, size));
         }
         prune(&mut budget)?;
@@ -109,6 +118,15 @@ impl PreviewCache {
         Ok(Some(packet.to_vec()))
     }
 
+    /// A cheap hint for scheduling cached packets; `read` still validates them.
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        self.budget
+            .lock()
+            .expect("preview cache lock poisoned")
+            .positions
+            .contains(&(x, z))
+    }
+
     pub fn write(&self, x: i32, z: i32, packet: &[u8]) -> io::Result<()> {
         if packet.is_empty() || packet.len() > MAX_PACKET_BYTES {
             return Err(io::Error::new(
@@ -147,6 +165,7 @@ impl PreviewCache {
         }
         let size = (HEADER_BYTES + packet.len()) as u64;
         budget.files.push_back((path, size));
+        budget.positions.insert((x, z));
         budget.bytes += size;
         prune(&mut budget)
     }
@@ -163,12 +182,15 @@ impl PreviewCache {
 fn prune(budget: &mut Budget) -> io::Result<()> {
     while budget.files.len() > MAX_FILES || budget.bytes > MAX_BYTES {
         let (path, size) = budget.files.pop_front().expect("over budget has files");
-        match fs::remove_file(path) {
+        match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         budget.bytes -= size;
+        if let Some(position) = packet_position(&path) {
+            budget.positions.remove(&position);
+        }
     }
     Ok(())
 }
@@ -264,10 +286,14 @@ mod tests {
         fs::write(&registry, b"registry-a").unwrap();
         let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
         assert_eq!(cache.read(-2, 3).unwrap(), None);
+        assert!(!cache.contains(-2, 3));
         cache.write(-2, 3, b"framed-packet").unwrap();
+        assert!(cache.contains(-2, 3));
         assert_eq!(cache.read(-2, 3).unwrap(), Some(b"framed-packet".to_vec()));
         let reopened = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
         assert_eq!(reopened.cached_count(), 1);
+        assert!(reopened.contains(-2, 3));
+        assert!(!reopened.contains(3, -2));
         assert_eq!(
             reopened.read(-2, 3).unwrap(),
             Some(b"framed-packet".to_vec())
