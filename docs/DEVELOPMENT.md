@@ -60,6 +60,14 @@ these four runs. This measures preparation throughput, not client-visible latenc
 the default remains eight workers. The optional last argument to
 `prepare_preview_cache` selects `WORKERS` in `1..=20` for the same local test.
 
+In a separate single-worker, cold 4×4-chunk sweep at chunk origin (32,32),
+memoizing the two horizontal shift-noise signals by X/Z reduced the measured
+column-descent time from 6,585 ms to 4,925–5,273 ms across three candidate
+runs. The memo retains at most 1,024 coordinate entries per shift node.
+Nine seed-2026 encoded packets matched the preceding build byte-for-byte.
+These are local generation timings, not a client render or all-seeds parity
+result; future feature placement will add work to cold chunks.
+
 During movement across chunk coordinates, the vanilla preview gives cold work
 within three chunks of the player priority for 750 ms after each change.
 Generation of farther uncached chunks resumes when movement pauses, with at

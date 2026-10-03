@@ -336,6 +336,7 @@ enum Node {
     ShiftNoise {
         kind: ShiftKind,
         stack: Rc<NoiseStack>,
+        horizontal: RefCell<BoundedCache<[i32; 2], f32>>,
     },
     Axial {
         axis: Axis,
@@ -470,7 +471,16 @@ impl Density {
                 let noise_z = f64::from(z) * xz_scale + f64::from(shift_z.sample(x, y, z));
                 stack.get(noise_x, noise_y, noise_z)
             }
-            Node::ShiftNoise { kind, stack } => {
+            Node::ShiftNoise {
+                kind,
+                stack,
+                horizontal,
+            } => {
+                if *kind != ShiftKind::X
+                    && let Some(&cached) = horizontal.borrow_mut().get_mut(&[x, z])
+                {
+                    return cached;
+                }
                 let fx = f64::from(x) * 0.25;
                 let fy = f64::from(y) * 0.25;
                 let fz = f64::from(z) * 0.25;
@@ -482,7 +492,11 @@ impl Density {
                     // plain shift: full 3D.
                     ShiftKind::X => stack.get(fx, fy, fz),
                 };
-                raw * 4.0
+                let result = raw * 4.0;
+                if *kind != ShiftKind::X {
+                    horizontal.borrow_mut().insert([x, z], result);
+                }
+                result
             }
             Node::Axial {
                 axis,
@@ -1500,10 +1514,12 @@ impl<'e> DensityRegistry<'e> {
             "minecraft:shift_x" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Xy,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
+                horizontal: RefCell::new(BoundedCache::new(512)),
             }))),
             "minecraft:shift_z" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Z,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
+                horizontal: RefCell::new(BoundedCache::new(512)),
             }))),
             _ => return Err(DensityError::Unresolved(id.clone())),
         };
@@ -1561,6 +1577,7 @@ impl<'e> DensityRegistry<'e> {
                     _ => ShiftKind::Z,
                 },
                 stack: self.engine.stack(&referenced_id(get("noise")?)?)?,
+                horizontal: RefCell::new(BoundedCache::new(512)),
             },
             "gradient" => {
                 let axis = Axis::parse(
@@ -2000,6 +2017,36 @@ mod tests {
 
     fn registry(engine: &NoiseEngine) -> DensityRegistry<'_> {
         DensityRegistry::new(engine, HashMap::new())
+    }
+
+    #[test]
+    fn horizontal_shift_memo_matches_direct_noise_across_heights_and_eviction() {
+        let engine = engine_with_noise();
+        let stack = engine.stack(&"minecraft:shift".to_owned()).unwrap();
+        for kind in [ShiftKind::Xy, ShiftKind::Z] {
+            let node = Density(Rc::new(Node::ShiftNoise {
+                kind,
+                stack: Rc::clone(&stack),
+                horizontal: RefCell::new(BoundedCache::new(512)),
+            }));
+            for x in -750..750 {
+                let z = x * 3 - 17;
+                let fx = f64::from(x) * 0.25;
+                let fz = f64::from(z) * 0.25;
+                let expected = match kind {
+                    ShiftKind::Xy => stack.get(fx, 0.0, fz),
+                    ShiftKind::Z => stack.get(fz, fx, 0.0),
+                    ShiftKind::X => unreachable!(),
+                } * 4.0;
+                for y in [-64, 0, 127, 319] {
+                    assert_eq!(node.sample(x, y, z).to_bits(), expected.to_bits());
+                }
+            }
+            let Node::ShiftNoise { horizontal, .. } = &*node.0 else {
+                unreachable!()
+            };
+            assert!(horizontal.borrow().entries() <= 1024);
+        }
     }
 
     /// Exact coordinate passthrough for small coordinates: the Chebyshev
