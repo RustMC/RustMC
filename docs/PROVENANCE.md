@@ -544,6 +544,157 @@ in any of the four slices; the operator-provisioned data roots stay untracked an
 reached only through `RUSTMC_VANILLA_DATA` / `RUSTMC_VANILLA_SAVE` in `#[ignore]`d
 smokes.
 
+### Session 12 (4–5 October 2026): placement-stage feature runtime (T4 slice K)
+
+The ore/blob stone slice consulted the owner's locally fetched, deobfuscated
+official Java 26.3 server classes, read in `/tmp` under the ADR-0014 amendment:
+`OreFeature`/`AbstractOreFeature`, the `FeaturePlacer` placement chain and the
+placement-modifier type registry, the `IntProvider`/`HeightProvider` family,
+`VerticalAnchor` and `WorldGenerationContext`, `WorldgenRandom`,
+`LegacyRandomSource`, `BitRandomSource` and `XoroshiroRandomSource`, `Mth`,
+`WorldGenRegion` and `BulkSectionAccess`, `GenerationStep.Decoration`,
+`FeatureSorter`, `ChunkGenerator.applyBiomeDecoration`, the `Heightmap` types
+and the rule-test/target classes. Nothing consulted entered the repository: no
+dump, decompiled text, translation or derived file is tracked, and the design,
+implementation and tests are RustMC's own. The operator datapack documents and
+the owner's saves were read only through `RUSTMC_VANILLA_DATA` /
+`RUSTMC_VANILLA_SAVE` paths and were never copied.
+
+Behaviour facts established (26.3):
+
+- `OreFeature.place` draws exactly three times before any block work: `ang =
+  nextFloat() * π`, then two independent `nextInt(3) − 2` for the two endpoint
+  Y values. The axis endpoints use `java.lang.Math.sin`/`Math.cos` on the
+  widened float — a 26.3 divergence from the table-based `Mth.sin` the in-vein
+  wobble uses. With `f = size/8` the box is `2·(ceil(f) + extent)` wide and
+  `2·(extent + 2)` tall, `extent = ceil((size/16·2 + 1)/2)`.
+- The anchor gate scans the box footprint x-outer/z-inner, inclusive of
+  `base + size`, accepts the first column with `baseY ≤ getHeight(
+  OCEAN_FLOOR_WG, x, z)` (that getter returns the column height plus one) and
+  calls `doPlace` at most once. With no passing column it returns `false`
+  having drawn nothing further. The type is the world-gen heightmap, not
+  motion blocking.
+- `doPlace` takes one `nextDouble` per `size` axis point for that point's
+  ellipsoid radius, prunes a point whose radius difference exceeds its squared
+  distance by writing `−1.0`, then walks the inclusive box with a `BitSet`
+  sized `sizeX·sizeY·sizeX` so each candidate index is painted at most once,
+  and the strict `dx² + dy² + dz² < 1` test decides inclusion. For each
+  accepted position the target list is evaluated in order and the first passing
+  replacement wins; the air-exposure discard roll happens only when `0 <
+  discard < 1`, and the adjacency test reads six neighbours with a missing
+  section counting as air.
+- `WorldgenRandom`, the decoration stream, forwards every `next(bits)` to its
+  xoroshiro delegate, so one request costs exactly one delegate long while
+  `nextLong` and `nextDouble` cost two — a different contract from the derived
+  draws on `RandomSource` itself, and the decoration order depends on it.
+  `setDecorationSeed(worldSeed, x, z)` reseeds, takes two `nextLong | 1`
+  scales, mixes `(x·a + z·b) ^ worldSeed` and reseeds, ignoring Y;
+  `setFeatureSeed` is `seed + ordinal + step·10000` with no draws at all.
+  Observed output: running the 26.3 server classes on 5 October 2026 produced
+  the decoration seeds and draw sequences now pinned as golden vectors by
+  `vanilla::random::tests::decoration_seed_matches_parity_vectors`,
+  `decoration_draw_sequence_matches_parity_vectors` and
+  `decoration_composite_draws_match_parity_vectors` — the numbers are black-box
+  observations, no reference source was transcribed.
+- Placement modifiers run in list order with these per-attempt costs: `count`
+  is one provider sample (constant 0 draws, uniform 1, trapezoid 1–2) that
+  reuses the *same* position for each copy; `rarity_filter` is one `nextFloat`
+  kept iff `< 1/chance`; `in_square` is two `nextInt(16)`; `height_range` is
+  one draw for a uniform provider (even when min equals max) and two for a
+  trapezoid unless the span is 0, while an inverted bound resolves to the
+  minimum without drawing; `biome` draws nothing and is a flat membership
+  test. 26.3's `TrapezoidInt` has no `base`/`fold` terms.
+- `FeatureSorter.buildFeaturesPerStep` numbers features with one global
+  sequential counter, uses that only to topologically order the graph built
+  from each biome's per-step lists, and hands the index inside the step's
+  sorted list to `setFeatureSeed` as the ordinal.
+  `GenerationStep.Decoration` has 11 constants with `UNDERGROUND_ORES` at 6.
+- Chunk-border behaviour: `WorldGenRegion.isWithinWriteZone` compares only the
+  section x/z of a position against `ChunkStep.blockStateWriteRadius()` (Y is
+  not considered), an out-of-zone write is silently skipped (log plus IDE
+  pause, no exception) while reads stay unrestricted. A border vein therefore
+  loses its overhang in one chunk's pass and the neighbour's own pass paints
+  the rest from its own per-feature seed. `ChunkSteps` was absent from the
+  dumps, so the concrete integer radius for the terrain and feature steps is
+  unverified.
+- `applyBiomeDecoration` builds one nondeterministically seeded stream per
+  chunk and immediately reseeds it, collects the biome holders appearing in
+  the 3×3 chunk range intersected with the generator's possible biomes, and
+  iterates the decoration steps in order.
+
+Shape facts measured from the owner's seed-2026 save (read-only generated
+output; the counting probe was throwaway tooling in a disposable worktree and
+is not committed):
+
+- `size` is a scale, not a voxel budget: across the twelve single-`size` ore
+  features the mean component follows `blocks ≈ 0.045 · size^2.09` (R² = 0.949,
+  n = 12), so a `size = 64` stone placement is worth roughly ten times its
+  nominal size in blocks (granite 265 blocks at 6-connectivity, 585 at
+  26-connectivity).
+- Stone blobs are oblate and sparse: at `size = 64` the median `dx`/`dz` is
+  13–15 and `dy` is 8, horizontal reach median 8.5–9.0 (`size/7`) with p90
+  13–14, fill fraction 0.32–0.35. Ore clumps are small and near-solid (2.3–18.3
+  blocks, fill 0.54–1.00, reach ≤ 2.1).
+- Veins straddle chunk borders constantly: 26-connected stone components cross
+  a border in either axis 0.761–0.858 of the time and occupy 2.86–3.07 chunks;
+  the widest merged components span `dx = 95` (granite) and `dx = 181` (tuff)
+  blocks. Those wide components are several adjacent anchors merging, so
+  per-anchor reach stays inside one neighbouring chunk ring: a feature placed
+  at one anchor can only affect the 3×3 ring around it, and a target chunk sees
+  the union of its own and its eight neighbours' anchors.
+- 6-connectivity fragments real veins (granite median component 4 blocks at
+  6-connectivity against 510 at 26-connectivity), and the 26-connected
+  component count per chunk is 0.72–0.84 of the datapack's attempts per chunk —
+  the paint step advances diagonally and adjacent placements merge, which a
+  face-only walk would not reproduce.
+- Air contact is low and filtered: 3.8–4.4% of stone blob blocks touch air, and
+  the families carrying a discard chance sit at the bottom of that range
+  (diamond 0.74%, lapis 1.20%, coal 1.73–1.98%, gold 2.17%) against copper
+  3.94–5.27% and iron 4.39–5.21% with discard 0.
+- The Y bands match the datapack windows, with the leak between bands
+  attributable to vertical reach rather than to the height providers (tuff
+  10,343 of 1,231,339 blocks, 0.84%, in the band above its window).
+
+Documented deviations in RustMC's implementation of this stage:
+
+- **Write zone.** RustMC clips a decorated chunk's writes to its own 16×16
+  column area and replays the 3×3 ring of anchor chunks, which the measured
+  per-anchor reach bounds exactly. Vanilla's own `blockStateWriteRadius`
+  integer could not be verified from the dumps, so the ring rests on the
+  geometry and the save measurement rather than on a consulted constant.
+  Overlapping writes from two anchors resolve in RustMC's deterministic
+  row-major replay order whereas vanilla lets each chunk's own pass write last;
+  the difference is confined to positions two veins both claim, and tests pin
+  that the assembled grid is independent of the order chunks are built in and
+  of cache eviction.
+- **Ordinals.** RustMC numbers one global per-step schedule sorted by feature
+  identifier instead of reproducing the reference runtime's dependency-graph
+  ordering, so a feature's reseed ordinal can differ from vanilla's whenever
+  that graph reorders a step. Features RustMC does not model still consume
+  their slot, so their neighbours keep stable ordinals. The measured
+  consequence, recorded in
+  `docs/research/vanilla-worldgen-feasibility.md` under slice K: because the
+  ordinal is part of the feature's seed, an ordinal that differs moves every
+  anchor that feature draws, so family counts land close to the save while the
+  sampled per-coordinate block identity falls from 81.28% to 70.83% on the
+  seed-2026 `-384..384` grid.
+- **Anchor gate.** The `OCEAN_FLOOR_WG` footprint gate is not reproduced. It is
+  a fast path rather than a placement rule — a box with no terrain in it can
+  only hold air and fluid, which every stone-family target test rejects — but
+  skipping it lets a floating vein draw its `size` radii here, which shifts the
+  stream for the attempts that follow it in the same chain.
+- **Heightmap.** Because the gate is absent, the world-gen heightmap is not
+  captured for decoration. That is a prerequisite for the vegetation families,
+  which do depend on surface heights, and is tracked in
+  `docs/research/vanilla-worldgen-feasibility.md`.
+
+No parity claim rests on this slice. The measured census and base-block deltas
+are in `docs/research/vanilla-worldgen-feasibility.md`, the vegetation families
+and structures remain absent, and the ore/blob placement is verified against
+aggregate save counts plus self-consistency invariants — not against a
+block-for-block vanilla reproduction. No new Cargo dependency was introduced,
+and no game data or consulted source entered the repository.
+
 ## Vanilla research review hardening (2 October 2026)
 
 No new external generator source or game data was consulted for this change.

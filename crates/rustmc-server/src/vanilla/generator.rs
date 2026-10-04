@@ -22,6 +22,7 @@
 //! the exhaustive scan is therefore the default.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -31,6 +32,7 @@ use crate::vanilla::aquifer::{
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
 use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
+use crate::vanilla::feature::{DecorationTarget, FeatureData};
 use crate::vanilla::random::LegacyRandom;
 use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
 use crate::vanilla::worldgen::{NoiseRouter, WorldgenData, WorldgenError};
@@ -42,6 +44,82 @@ const WAY_BELOW_MIN_Y: i32 = -32512;
 /// A biome's resolved carver list, shared between the registry and the
 /// per-source-chunk cache.
 type ChunkCarvers = Rc<Vec<Option<Rc<Carver>>>>;
+
+/// One chunk after the decoration pass: the material-rule columns with
+/// every vein that landed in them painted over.
+///
+/// The grid is a flat palette index per position rather than a `String`
+/// per position: a chunk column is 256 x `height` positions, and holding a
+/// name for each would cost more than the terrain it describes. The palette
+/// stays small because one chunk holds a couple of dozen stone and surface
+/// families plus the ores that decorated it.
+struct DecoratedChunk {
+    /// Interned block names; index 0 is the air slot a `None` column entry
+    /// maps to.
+    palette: Vec<Option<String>>,
+    /// Which palette entry each position holds, laid out y-outer so that one
+    /// absolute Y row of the chunk is 256 contiguous entries: `row * 256 +
+    /// local_x * 16 + local_z`, with `row` relative to `min_y`.
+    blocks: Vec<u16>,
+    /// Name to palette index, kept so interning is O(1) per write.
+    ids: HashMap<String, u16>,
+}
+
+impl DecoratedChunk {
+    fn new(height: usize) -> Self {
+        Self {
+            palette: vec![None],
+            blocks: vec![0; height * 256],
+            ids: HashMap::new(),
+        }
+    }
+
+    fn index(&self, local_x: i32, row: usize, local_z: i32) -> usize {
+        row * 256 + (local_x as usize) * 16 + local_z as usize
+    }
+
+    /// The palette slot for a name, adding it when first seen.
+    fn intern(&mut self, name: Option<String>) -> u16 {
+        let Some(name) = name else { return 0 };
+        if let Some(&slot) = self.ids.get(name.as_str()) {
+            return slot;
+        }
+        let slot = self.palette.len() as u16;
+        self.palette.push(Some(name.clone()));
+        self.ids.insert(name, slot);
+        slot
+    }
+
+    fn name(&self, slot: u16) -> Option<&str> {
+        self.palette.get(slot as usize).and_then(Option::as_deref)
+    }
+
+    fn set(&mut self, local_x: i32, row: usize, local_z: i32, name: &str) {
+        let at = self.index(local_x, row, local_z);
+        let slot = self.intern(Some(name.to_owned()));
+        self.blocks[at] = slot;
+    }
+
+    /// One absolute column of the chunk, dimension-relative from index 0.
+    fn column(&self, local_x: i32, local_z: i32) -> Vec<Option<String>> {
+        (0..self.blocks.len() / 256)
+            .map(|row| {
+                self.name(self.blocks[self.index(local_x, row, local_z)])
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+}
+
+/// The chunk grid as the decoration pass sees it: reads and writes inside
+/// the chunk being decorated, with the six-neighbour air test falling back
+/// to the underlying terrain for positions in a neighbouring chunk.
+struct ChunkView<'a> {
+    generator: &'a VanillaGenerator,
+    chunk_x: i32,
+    chunk_z: i32,
+    chunk: &'a mut DecoratedChunk,
+}
 
 /// Entry counts of the generator's coordinate-keyed caches. Every one of
 /// them is keyed by world coordinates, so the count grows with the volume
@@ -66,6 +144,8 @@ pub struct CacheOccupancy {
     pub aquifer_surface_levels: usize,
     /// Chunks with a memoised aquifer sampling bound.
     pub aquifer_skip_bounds: usize,
+    /// Chunks with a decorated grid.
+    pub decorated_chunks: usize,
 }
 
 impl CacheOccupancy {
@@ -79,6 +159,7 @@ impl CacheOccupancy {
             + self.aquifer_statuses
             + self.aquifer_surface_levels
             + self.aquifer_skip_bounds
+            + self.decorated_chunks
     }
 }
 
@@ -102,6 +183,9 @@ pub struct VanillaGenerator {
     world_seed: i64,
     carvers: Option<Rc<CarverData>>,
     carver_context: CarverContext,
+    /// The pack's placement stage: `None` when the operator's data has no
+    /// biome or placed-feature documents to decorate with.
+    features: Option<FeatureData>,
     /// Per-target-chunk carving masks, built lazily on first probe.
     masks: RefCell<BoundedCache<(i32, i32), CarveMask>>,
     /// Per-source-chunk biome carver lists, built lazily during replay.
@@ -111,6 +195,10 @@ pub struct VanillaGenerator {
     heights: RefCell<BoundedCache<(i32, i32), i32>>,
     /// One immutable biome choice per quantized 4x4x4 world cell.
     biomes: RefCell<BoundedCache<(i32, i32, i32), Option<String>>>,
+    /// Chunks whose columns have been decorated. The value is a pure
+    /// function of the chunk position and the seed, so an eviction only
+    /// costs a replay of the nine anchor chunks' placement passes.
+    chunks: RefCell<BoundedCache<(i32, i32), Rc<DecoratedChunk>>>,
 }
 
 impl VanillaGenerator {
@@ -143,6 +231,15 @@ impl VanillaGenerator {
     /// A full chunk has at most 4×4×96 quart cells; neighboring chunk and
     /// surface-rule probes reuse them before a streaming sweep evicts them.
     pub const BIOME_CACHE_CAPACITY: usize = 4_096;
+    /// Chunks with a decorated grid. A column sweep visits a chunk 16 times
+    /// before moving on and returns to it only after a whole row of 512
+    /// columns, so the cache has to hold one row's worth of chunk keys — 32
+    /// for a 512-block square — or every column rebuilds its chunk, which
+    /// costs 256 columns plus nine placement replays each time. The grid is
+    /// two bytes per position, so an overworld entry is 196 KiB and the
+    /// bound costs 6.3 MiB; a smaller square or a chunk-at-a-time consumer
+    /// simply never fills it.
+    pub const DECORATED_CHUNK_CACHE_CAPACITY: usize = 32;
 
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
     /// the noise engine to `world_seed`.
@@ -199,6 +296,11 @@ impl VanillaGenerator {
             gen_depth: router.height,
             sea_level: router.sea_level,
         };
+        // Placement documents are optional in the same sense the carver
+        // documents are: a pack without them leaves the generator with the
+        // terrain, carving, and surface passes only.
+        let feature_data = FeatureData::load(data_root)?;
+        let features = (!feature_data.is_empty()).then_some(feature_data);
         Ok(Self {
             router,
             max_y,
@@ -209,10 +311,12 @@ impl VanillaGenerator {
             world_seed,
             carvers,
             carver_context,
+            features,
             masks: RefCell::new(BoundedCache::new(Self::MASK_CACHE_CAPACITY)),
             chunk_carvers: RefCell::new(BoundedCache::new(Self::CHUNK_CARVERS_CACHE_CAPACITY)),
             heights: RefCell::new(BoundedCache::new(Self::HEIGHT_CACHE_CAPACITY)),
             biomes: RefCell::new(BoundedCache::new(Self::BIOME_CACHE_CAPACITY)),
+            chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
         })
     }
 
@@ -284,6 +388,88 @@ impl VanillaGenerator {
         }
     }
 
+    /// The full material-rule descent of one column plus everything the
+    /// placement stage painted over it: the generator's block-id answer, and
+    /// index 0 of the result is the dimension's minimum build Y.
+    ///
+    /// Terrain, carving, and surface stay as the earlier passes left them
+    /// (`substance`, `carved`, and `top_block` all answer pre-feature by
+    /// design, so the 3D substance metric keeps comparing the same thing);
+    /// only the ids a chunk is shipped with carry veins.
+    pub fn column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+        let chunk = self.decorated_chunk(x >> 4, z >> 4);
+        chunk.column(x & 15, z & 15)
+    }
+
+    /// The decorated grid of one chunk, built once and cached: 256 base
+    /// columns, then every placement pass that can reach into it.
+    fn decorated_chunk(&self, chunk_x: i32, chunk_z: i32) -> Rc<DecoratedChunk> {
+        let key = (chunk_x, chunk_z);
+        if let Some(existing) = self.chunks.borrow_mut().get_mut(&key) {
+            return Rc::clone(existing);
+        }
+        let built = Rc::new(self.build_decorated_chunk(chunk_x, chunk_z));
+        self.chunks.borrow_mut().insert(key, Rc::clone(&built));
+        built
+    }
+
+    /// Builds one chunk's grid.
+    ///
+    /// A vein's own blocks can lie up to twelve or thirteen blocks from the
+    /// chunk it was seeded in — measured from the owner's save, three quarters
+    /// of stone blobs cross a chunk border and a blob covers about three
+    /// chunks — so a chunk is decorated by replaying the placement passes of
+    /// its own chunk *and* the eight around it, keeping only the writes that
+    /// land inside. Every one of those replays is a pure function of the
+    /// anchor chunk's coordinates, the seed, and the step and ordinal numbers
+    /// the pack gives it, so the answer does not depend on which chunk was
+    /// asked for first: two neighbouring chunks agree about the border because
+    /// each replays the same anchor with the same seed and clips to itself.
+    ///
+    /// Within one replay the order is ours: anchor chunks row-major from the
+    /// northwest of the 3×3, then the pack's generation steps, then the step's
+    /// feature ordinals. The reference runtime mutates a shared region and
+    /// leaves the cross-chunk order to whatever the worker queue did, so where
+    /// two veins compete for one position the winner can differ; `docs/
+    /// PROVENANCE.md` records that as a deviation rather than a parity claim.
+    fn build_decorated_chunk(&self, chunk_x: i32, chunk_z: i32) -> DecoratedChunk {
+        let height = self.router.height as usize;
+        let mut chunk = DecoratedChunk::new(height);
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                let x = chunk_x * 16 + local_x;
+                let z = chunk_z * 16 + local_z;
+                let ids = self.base_column_ids(x, z);
+                for (row, name) in ids.into_iter().enumerate() {
+                    let at = chunk.index(local_x, row, local_z);
+                    let slot = chunk.intern(name);
+                    chunk.blocks[at] = slot;
+                }
+            }
+        }
+        let Some(features) = self.features.as_ref() else {
+            return chunk;
+        };
+        let steps = features.decorated_steps();
+        if steps.is_empty() {
+            return chunk;
+        }
+        for anchor_z in chunk_z - 1..=chunk_z + 1 {
+            for anchor_x in chunk_x - 1..=chunk_x + 1 {
+                let mut view = ChunkView {
+                    generator: self,
+                    chunk_x,
+                    chunk_z,
+                    chunk: &mut chunk,
+                };
+                for &step in &steps {
+                    features.decorate_step(&mut view, step, anchor_x, anchor_z, self.world_seed);
+                }
+            }
+        }
+        chunk
+    }
+
     /// The full material-rule descent of one column, the documented
     /// `buildSurface` pass (`PROVENANCE.md` session 7): from the highest
     /// non-air row walk down, reset the stone-above counter and the water
@@ -297,7 +483,7 @@ impl VanillaGenerator {
     /// Index 0 of the result is the dimension's minimum build Y. Rows
     /// above the column top and pre-carve air rows are `None`; solid rows
     /// with no matching rule keep the filler `default_block`.
-    pub fn column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+    fn base_column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
         let min_y = self.router.min_y;
         let mut ids: Vec<Option<String>> = vec![None; self.router.height as usize];
         // The column as the surface pass sees it: the registry carvers
@@ -568,6 +754,7 @@ impl VanillaGenerator {
             aquifer_statuses: aquifer.statuses,
             aquifer_surface_levels: aquifer.surface_levels,
             aquifer_skip_bounds: aquifer.skip_bounds,
+            decorated_chunks: self.chunks.borrow().entries(),
         }
     }
 
@@ -594,6 +781,60 @@ impl VanillaGenerator {
         }
         // No solid grid sample: the floor is the only guaranteed block.
         self.router.min_y
+    }
+}
+
+/// The air families a decoration pass's neighbour test treats as air: the
+/// filler writes the named cave air at carved rows, and the pre-carve `None`
+/// entry stands for the air above the terrain.
+const AIR_IDS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
+
+impl DecorationTarget for ChunkView<'_> {
+    fn min_y(&self) -> i32 {
+        self.generator.router.min_y
+    }
+
+    fn height(&self) -> i32 {
+        self.generator.router.height
+    }
+
+    fn writable(&self, x: i32, y: i32, z: i32) -> bool {
+        (x >> 4, z >> 4) == (self.chunk_x, self.chunk_z)
+            && y >= self.generator.router.min_y
+            && y <= self.generator.max_y
+    }
+
+    fn block_at(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+        if !self.writable(x, y, z) {
+            // Never asked: the pass tests `writable` before it reads.
+            return None;
+        }
+        let row = (y - self.generator.router.min_y) as usize;
+        let at = self.chunk.index(x & 15, row, z & 15);
+        self.chunk.name(self.chunk.blocks[at])
+    }
+
+    fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
+        if self.writable(x, y, z) {
+            return match self.block_at(x, y, z) {
+                None => true,
+                Some(name) => AIR_IDS.contains(&name),
+            };
+        }
+        // A border block's neighbour lies in the next chunk, whose veins this
+        // pass has not replayed. The underlying terrain answers instead: the
+        // air test only ever rejects a placement, and a cave that a neighbour
+        // vein opened is not a stone target either way.
+        self.generator.substance(x, y, z) == Substance::Air
+    }
+
+    fn set_block(&mut self, x: i32, y: i32, z: i32, name: &str) {
+        let row = (y - self.generator.router.min_y) as usize;
+        self.chunk.set(x & 15, row, z & 15, name);
+    }
+
+    fn biome_at(&self, _x: i32, y: i32, z: i32) -> Option<String> {
+        self.generator.biome(_x, z, y)
     }
 }
 
@@ -1108,12 +1349,21 @@ mod tests {
     }
 
     /// Requires the operator-provisioned 26.3 worldgen data. The descent
-    /// must reproduce the deepslate split below the transition band and
-    /// fire both ore-vein rules: granite and tuff are vein fillers the
-    /// rest of the program never writes, so any occurrence proves the
-    /// copper and iron veins evaluated, and each must stay inside its
-    /// documented window. The two 16×16 block squares sit on vein
-    /// clusters found by scanning the density graphs at this seed.
+    /// must reproduce the deepslate split below the transition band and fire
+    /// both ore-vein rules: granite and tuff are vein states the rest of the
+    /// program never writes, so any occurrence proves the copper and iron
+    /// veins evaluated. A vein may only replace a block its target test
+    /// accepts, and every replaceable tag in the pack (`stone_ore_replaceables`,
+    /// `deepslate_ore_replaceables`, `height_specific_ore_replaceables`) is a
+    /// subset of `base_stone_overworld`, so that one tag answers for the whole
+    /// placement stage: a row the pass changed must have held one of its
+    /// members before, and no row may appear or disappear.
+    ///
+    /// The four 16×16 squares sit at fixed origins on a power-of-two grid,
+    /// with one off-grid pair so at least one square straddles chunk borders
+    /// and exercises the neighbour replay. Veins are dense enough that the
+    /// families appear at any underground position: the coordinates are a
+    /// sample, not a tuned pick.
     #[test]
     #[ignore = "requires operator-provisioned local data"]
     fn smoke_column_ids_splits_deepslate_and_fires_veins() {
@@ -1123,50 +1373,78 @@ mod tests {
         let generator =
             VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
         let min_y = generator.min_y();
+        let tags = generator
+            .features
+            .as_ref()
+            .expect("the provisioned pack decorates")
+            .tags();
         let mut granite = 0usize;
         let mut tuff = 0usize;
+        let mut ores = 0usize;
         let mut unexpected_deep: Vec<(i32, i32, i32, String)> = Vec::new();
-        for (origin_x, origin_z) in [(-1024, -880), (-824, -149)] {
+        for (origin_x, origin_z) in [(0, 0), (512, -512), (-1024, 1024), (255, -97)] {
             for x in origin_x..origin_x + 16 {
                 for z in origin_z..origin_z + 16 {
+                    let base = generator.base_column_ids(x, z);
                     let ids = generator.column_ids(x, z);
                     for (index, id) in ids.iter().enumerate() {
-                        let Some(id) = id else { continue };
                         let y = min_y + index as i32;
-                        match id.as_str() {
-                            "minecraft:granite" => {
-                                assert!(y < 50, "granite at y={y} outside the copper window");
-                                granite += 1;
+                        let before = base[index].as_deref();
+                        if let Some(id) = id {
+                            match id.as_str() {
+                                "minecraft:granite" => granite += 1,
+                                "minecraft:tuff" => tuff += 1,
+                                "minecraft:deepslate_iron_ore"
+                                | "minecraft:deepslate_copper_ore" => ores += 1,
+                                _ => {}
                             }
-                            "minecraft:tuff" => {
-                                assert!(y < -8, "tuff at y={y} outside the iron window");
-                                tuff += 1;
-                            }
-                            _ => {}
                         }
-                        // Between the iron window and the deepslate/stone
+                        // Between the iron band and the deepslate/stone
                         // transition only the underground rule, carving and
-                        // the dimension fluids can have written a row.
+                        // the dimension fluids can have written a row. An
+                        // unset row is the cave air the carvers left in the
+                        // column, so it is expected here too.
                         if (-8..=-2).contains(&y)
                             && !matches!(
-                                id.as_str(),
-                                "minecraft:deepslate"
-                                    | "minecraft:cave_air"
-                                    | "minecraft:water"
-                                    | "minecraft:lava"
+                                before,
+                                None | Some("minecraft:deepslate")
+                                    | Some("minecraft:cave_air")
+                                    | Some("minecraft:water")
+                                    | Some("minecraft:lava")
                             )
+                            && unexpected_deep.len() < 20
                         {
-                            unexpected_deep.push((x, z, y, id.clone()));
+                            unexpected_deep.push((x, z, y, before.unwrap_or_default().to_string()));
                         }
+                        if before == id.as_deref() {
+                            continue;
+                        }
+                        // A row the pass did change: it can only change one its
+                        // target test accepts.
+                        assert!(
+                            before
+                                .is_some_and(|before| tags
+                                    .contains("minecraft:base_stone_overworld", before)),
+                            "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
+                        );
                     }
+                    assert_eq!(
+                        ids.iter()
+                            .zip(base.iter())
+                            .filter(|(after, before)| after.is_some() != before.is_some())
+                            .count(),
+                        0,
+                        "({x}, {z}): a vein cannot create or remove a row, only recolor one"
+                    );
                 }
             }
         }
         assert!(granite > 0, "copper veins must leave granite filler");
-        assert!(tuff > 0, "iron veins must leave tuff filler");
+        assert!(tuff > 0, "the tuff band must fire");
+        assert!(ores > 0, "the iron or copper target rules must place ore");
         assert!(
             unexpected_deep.is_empty(),
-            "unexpected rows in the deep band: {unexpected_deep:?}"
+            "unexpected pre-feature rows in the deep band: {unexpected_deep:?}"
         );
     }
 
@@ -1483,5 +1761,216 @@ mod tests {
         assert_eq!(generator.biome(x, z, 8), before_biome);
         assert_eq!(generator.carved(x, 8, z), before_carved);
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The bounded pack plus a placement stage: one configured ore whose
+    /// target is a block tag, placed with count, square, band and biome
+    /// decorations, and listed by the fixture biome at the underground step.
+    /// The pack's solid band is y = 5..=23 and its descent ends in an
+    /// unconditional stone fallthrough, so granite anywhere in a column can
+    /// only come from a vein.
+    fn decorating_pack(root: &Path) {
+        bounded_pack(root);
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/vein.json"),
+            r#"{"type": "minecraft:ore", "size": 32, "discard_chance_on_air_exposure": 0.0,
+                "targets": [{"state": "minecraft:granite",
+                    "target": {"predicate_type": "minecraft:tag_match", "tag": "testns:filler"}}]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/block/filler.json"),
+            r#"{"values": ["minecraft:stone", {"tag": "testns:deep_filler"}]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/block/deep_filler.json"),
+            r#"{"values": ["minecraft:deepslate"]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/vein.json"),
+            r#"{"feature": "testns:vein", "placement": [
+                {"type": "minecraft:count", "count": 3},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:height_range", "height": {"type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": 5}, "max_inclusive": {"absolute": 23}}},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        // The eleventh-step slot the overworld pack uses for ore veins.
+        write(
+            &worldgen.join("biome/flat.json"),
+            r#"{"carvers": ["testns:scarce"],
+                "features": [[], [], [], [], [], [], [], [], ["testns:vein"], [], []]}"#,
+        );
+    }
+
+    /// Every column of one chunk, in a fixed read order.
+    fn chunk_columns(
+        generator: &VanillaGenerator,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<Vec<Option<String>>> {
+        let mut columns = Vec::with_capacity(256);
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                columns.push(generator.column_ids(chunk_x * 16 + local_x, chunk_z * 16 + local_z));
+            }
+        }
+        columns
+    }
+
+    fn decorating_generator(label: &str) -> (PathBuf, VanillaGenerator) {
+        let root = scratch_root(label);
+        decorating_pack(&root);
+        let generator = VanillaGenerator::new(&root, 2026, "testns:bounded")
+            .expect("decorating pack generator");
+        (root, generator)
+    }
+
+    /// End to end: the placement pass paints veins over the rule descent and
+    /// nothing else. Every granite block sits where the tag test held, every
+    /// other row keeps the descent's answer, and the base pass the cache is
+    /// built from places none of it.
+    #[test]
+    fn a_decorated_chunk_carries_the_pack_veins() {
+        let (root, generator) = decorating_generator("decorate");
+        assert!(generator.features.is_some(), "the fixture pack decorates");
+        let min_y = generator.min_y();
+        let mut painted = 0usize;
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                let (x, z) = (local_x, local_z);
+                let base = generator.base_column_ids(x, z);
+                assert_eq!(
+                    base.iter()
+                        .filter(|name| name.as_deref() == Some("minecraft:granite"))
+                        .count(),
+                    0,
+                    "the descent alone never writes the vein's state at ({x}, {z})"
+                );
+                let decorated = generator.column_ids(x, z);
+                for (index, name) in decorated.iter().enumerate() {
+                    if name.as_deref() != Some("minecraft:granite") {
+                        assert_eq!(
+                            name,
+                            &base[index],
+                            "row {} of ({x}, {z}) changed without a vein claiming it",
+                            min_y + index as i32
+                        );
+                        continue;
+                    }
+                    painted += 1;
+                    assert!(
+                        matches!(
+                            base[index].as_deref(),
+                            Some("minecraft:stone") | Some("minecraft:deepslate")
+                        ),
+                        "a vein only replaces what its target test accepts, saw {:?}",
+                        base[index]
+                    );
+                }
+            }
+        }
+        assert!(
+            painted > 0,
+            "the fixture must actually fire veins, or the assertions above are vacuous"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A chunk's grid is a pure function of its coordinates and the seed, so
+    /// the order chunks are asked for in cannot change a block: the answer a
+    /// neighbour reaches by replaying this anchor is the answer this chunk
+    /// reaches by clipping that replay to itself.
+    #[test]
+    fn decoration_does_not_depend_on_the_chunk_query_order() {
+        let (root, forward) = decorating_generator("decorate-order");
+        let reverse =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("second generator");
+        let block = [(0, 0), (0, 1), (1, 0), (1, 1)];
+        // Visit the chunk block in one order, then read it back in a fixed
+        // order: only the build order differs between the two generators.
+        let visit = |generator: &VanillaGenerator, order: &[(i32, i32)]| {
+            for &(chunk_x, chunk_z) in order {
+                let _ = chunk_columns(generator, chunk_x, chunk_z);
+            }
+            block
+                .iter()
+                .flat_map(|&(chunk_x, chunk_z)| chunk_columns(generator, chunk_x, chunk_z))
+                .collect::<Vec<_>>()
+        };
+        let mut backwards = block;
+        backwards.reverse();
+        let built_first = visit(&forward, &block);
+        let built_last = visit(&reverse, &backwards);
+        assert_eq!(built_first.len(), built_last.len());
+        assert!(
+            built_first
+                .iter()
+                .any(|column| column.iter().any(|name| name.is_some())),
+            "the fixture must produce terrain"
+        );
+        assert!(
+            built_first.iter().any(|column| column
+                .iter()
+                .any(|name| name.is_some() && name.as_deref() == Some("minecraft:granite"))),
+            "and veins to compare"
+        );
+        assert_eq!(
+            built_first, built_last,
+            "a chunk decorated after its neighbours differs from one decorated before them"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Eviction of a decorated grid is a recomputation, and the write zone
+    /// stays bounded: 300 chunk keys through `column_ids` may not pin 300
+    /// grids of 196 KiB each.
+    #[test]
+    fn decorated_chunk_cache_stays_bounded_across_chunk_sweeps() {
+        let (root, generator) = bounded_generator("cache-decorated");
+        for chunk in 0..300i32 {
+            let _ = generator.column_ids(chunk * 16 + 8, 3);
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.decorated_chunks > 0,
+            "the sweep did not populate the decorated-chunk memo: {occupancy:?}"
+        );
+        assert!(
+            occupancy.decorated_chunks <= 2 * VanillaGenerator::DECORATED_CHUNK_CACHE_CAPACITY,
+            "decorated grids grew past their bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.decorated_chunks < 300,
+            "one key per chunk and the sweep spans 300, so a growing map would pin all of \
+             them: {occupancy:?}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// An evicted grid rebuilds to the same blocks, veins included, which is
+    /// what makes the bound above safe to apply.
+    #[test]
+    fn an_evicted_decorated_chunk_rebuilds_identically() {
+        let (root, generator) = decorating_generator("decorate-eviction");
+        let before = chunk_columns(&generator, 0, 0);
+        assert!(
+            before
+                .iter()
+                .flatten()
+                .any(|name| name.as_deref() == Some("minecraft:granite")),
+            "the fixture chunk must hold vein blocks to compare"
+        );
+        // More chunk keys than the memo holds, none of them this chunk's.
+        for chunk in 0..60i32 {
+            let _ = generator.column_ids(chunk * 16 + 8, 91);
+        }
+        assert_eq!(
+            chunk_columns(&generator, 0, 0),
+            before,
+            "eviction must be a recomputation"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

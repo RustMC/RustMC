@@ -204,6 +204,22 @@ denominator as the T3 substance baseline in `docs/PROVENANCE.md`.
   652 beside an existing void (over-wide carving) and 515 in intact rock
   (invented caves).
 
+Re-measured on 5 October 2026, after the placement stage began painting ore and
+blob stone veins over the material-rule descent: the same grid scores 237,027 of
+those 338,217 positions exact (70.08%, from 80.86%) and 243,520 with the air
+family collapsed (72.00%, from 82.78%). The vein/blob confusion did shrink in the
+direction the runtime was added for — granite, diorite and andesite went from
+8,269, 8,757 and 8,393 save-side blocks resolved as plain stone to 6,115, 6,421
+and 6,118 — but a near-equal reverse pair appeared beside it (6,377 positions
+where the save holds
+stone and RustMC now holds granite, against 6,115 the other way). The same shape
+repeats on the seed-2026 `-384..384` grid, on seed 2027, and in the aggregate
+family census recorded under slice K of
+`docs/research/vanilla-worldgen-feasibility.md`: counts agree, coordinates do
+not, because a feature's ordinal is part of its seed and RustMC's ordinal
+schedule is not vanilla's. Exact per-position placement identity is open work,
+not a claim, and each figure here is one sample on one preset.
+
 Sample B, a sparser negative-coordinate grid (stride 32 over `-1024..-512`):
 289 requested grid points, 61 scored columns, 120 missing chunks, and 108
 stored-but-ungenerated columns. The sampler now reports that last case as a

@@ -391,8 +391,9 @@ directly attributable.
 
 - Synthetic descent tests pin the first-match-wins sequencing, the solid
   run/floor-run boundaries, and the below-floor depth sentinel; an
-  ignored smoke fires both vein rules over two 16×16 squares (granite
-  and tuff fillers observed inside their documented windows) and re-checks
+  ignored smoke fires both vein rules over 16×16 squares (granite and
+  tuff fillers observed, every placement-stage change confined to a
+  `base_stone_overworld` host) and re-checks
   the descent's top row against the T2 top-block result.
 - Vein marginals measured by RustMC (dense-window grids over seed 2026)
   versus vanilla's own classes at the same seed (session 10): mask ≥ 0 at
@@ -412,6 +413,122 @@ directly attributable.
 Slice J's exit condition — veins applied through full columns and shown
 distribution-faithful against vanilla's own marginals — is met. The
 staged plan continues with the feature runtime as T4's next slice.
+
+## T4 placement runtime measured (5 October 2026, slice K)
+
+The placement stage now runs. `vanilla::feature` compiles the operator pack's
+`configured_feature` and `placed_feature` documents, block tags and per-biome
+feature lists once at load, and `VanillaGenerator::column_ids` answers the
+material-rule descent with the veins painted over it. A chunk is decorated by
+replaying the placement passes of its own chunk plus the eight around it and
+keeping only the writes that land inside, which is what the measured per-anchor
+reach requires. `docs/PROVENANCE.md` session 12 records the consultation, the
+facts, the save-side shape measurements and the deviations. The 3D substance
+answer deliberately stays pre-feature, so T3 keeps measuring terrain.
+
+T4 census, seed 2026, block square `-128..127` (256 save chunks, 65,536
+columns per side), family counts from the save against RustMC, the vein
+descent alone versus with the placement stage:
+
+| family | save | before | after | after / save |
+| --- | --- | --- | --- | --- |
+| stone | 3,608,863 | 4,598,052 | 3,612,176 | 100.1% |
+| deepslate | 3,297,622 | 3,927,861 | 3,461,892 | 105.0% |
+| coal_ore | 38,272 | 0 | 40,076 | 104.7% |
+| deepslate_coal_ore | 177 | 0 | 187 | 105.6% |
+| iron_ore | 13,924 | 0 | 13,651 | 98.0% |
+| deepslate_iron_ore | 6,860 | 1,292 | 7,476 | 109.0% |
+| copper_ore | 39,696 | 525 | 40,513 | 102.1% |
+| deepslate_copper_ore | 2,326 | 0 | 2,180 | 93.7% |
+| gold_ore | 1,033 | 0 | 948 | 91.8% |
+| deepslate_gold_ore | 5,279 | 0 | 5,606 | 106.2% |
+| redstone_ore | 683 | 0 | 713 | 104.4% |
+| deepslate_redstone_ore | 7,964 | 0 | 8,383 | 105.3% |
+| lapis_ore | 2,559 | 0 | 2,693 | 105.2% |
+| deepslate_lapis_ore | 3,527 | 0 | 3,500 | 99.2% |
+| diamond_ore | 109 | 0 | 90 | 82.6% |
+| deepslate_diamond_ore | 5,739 | 0 | 6,322 | 110.2% |
+| emerald_ore | 33 | 0 | 28 | 84.8% |
+| deepslate_emerald_ore | 2 | 0 | 0 | 0.0% |
+| granite | 254,700 | 1,899 | 290,622 | 114.1% |
+| diorite | 265,385 | 0 | 274,396 | 103.4% |
+| andesite | 270,615 | 0 | 254,895 | 94.2% |
+| tuff | 271,727 | 5,053 | 290,724 | 107.0% |
+| raw_copper_block | 9 | 9 | 9 | 100.0% |
+| raw_iron_block | 30 | 31 | 31 | 103.3% |
+
+- Counting, for each of the 24 families above, the lesser of the two sides
+  over the sum of the save's counts, the square's aggregate agreement moves
+  from 85.4% to 99.8%. The four blob families sit at +3.4% (diorite), −5.8%
+  (andesite), +7.0% (tuff) and +14.1% (granite) against the save. Of the host
+  stones, `stone` is now within 0.1% of the save, from 27% over, and `deepslate`
+  is +5.0%. Every ore and raw-metal family is within ±10.2% except the four
+  small-count diamond and emerald rows: `diamond_ore` 82.6%,
+  `deepslate_diamond_ore` 110.2%, `emerald_ore` 84.8%, and `deepslate_emerald_ore`
+  against a save count of 2 blocks in the whole square.
+- What is still absent is explicit and measurable: `logs` 6,795, `leaves`
+  66,776, `grasses` 2,543 and `flowers` 95 blocks in the same square, all
+  counted at zero by RustMC — the vegetation and tree families of the
+  placement stage, plus structures, are the next slices and no claim is made
+  about them.
+- The T3 3D substance metric is unchanged by this slice: an A/B of the same
+  oracle command between the branch's base commit and this tree gives
+  byte-equal output — 2,401 columns, 347,483 substance positions, 342,641
+  exact (98.61%), with every band, residual and Y-marginal line identical.
+  The 98.61% here and the 98.64% recorded for the M3 sample grid are that same
+  metric measured over different windows, not a movement: this A/B strides
+  `-384..384` (347,483 positions) while `docs/milestones/M3-overworld-vanilla-preview.md`
+  strides `-256..512` (338,217 positions). Running `block_compare` on the base
+  commit over the milestone's `-256..512` window returns that recorded
+  273,498 / 338,217 = 80.86% exactly, which pins each denominator to its window
+  rather than to the code.
+- Exact base-block agreement, the metric that grid reports, moves the other way,
+  and this slice does not hide it. Three pairs of `block_compare` runs, identical
+  arguments within each pair, base commit against this tree: seed 2026 over
+  `-384..384` 282,440 / 347,483 = 81.28% → 246,110 = 70.83%; seed 2026 over the
+  milestone's `-256..512` grid 273,498 / 338,217 = 80.86% → 237,027 = 70.08%;
+  seed 2027 over `-384..384` 258,769 / 308,379 = 83.91% → 229,853 = 74.54%.
+  Collapsing the air family follows the same way (83.23% → 72.77%, 82.78% →
+  72.00%, 85.24% → 75.87%).
+- Where that loss sits is the informative part. The scored denominator, the
+  cave-void exact count and the carve residuals are unchanged in all three
+  pairs; the whole movement is on solid rows, and each blob family's residual is
+  nearly symmetric — seed 2026 over `-384..384` reports 6,482 positions where the
+  save holds stone and RustMC now holds granite against 6,215 the other way, and
+  8,373 deepslate→tuff against 8,446 tuff→deepslate. The placement stage
+  therefore delivers the measured *amount* of every family and almost none of
+  its *coordinates*. A feature's random identity is
+  `decoration_seed + ordinal + step × 10000`, so a feature numbered differently
+  from vanilla draws a different anchor while still drawing the same counts; that
+  is the expected mechanism, though this slice does not separate its cost from
+  the other three deviations.
+- Cost, release build, single thread, seed 2026, 4×4 chunk column-descent
+  sweep: 314.88 ms per chunk before this slice, 388.76 ms per chunk with it
+  (+23.5%), projecting 0.37 → 0.46 hours single-threaded for one radius-32
+  view. The decorated grid is a bounded cache of 32 chunks (6.3 MiB at
+  overworld height), and the same square's second pass answers at 0.93 ms per
+  chunk, i.e. 42,728 blocks per millisecond of cache reads; an evicted chunk
+  rebuilds to the identical grid, which the tests pin. Peak resident memory
+  over that sweep moved from 10,736 KiB to 17,568 KiB, the bounded cache rather
+  than unbounded growth.
+- Tests: the registry and placement runtime carry 20 unit tests over synthetic
+  packs (vein reproducibility and seed dependence, per-anchor reach never
+  passing the neighbour chunk, writes outside the decorated chunk refused, a
+  neighbour anchor reaching the target while a far anchor does not, air
+  exposure only removing blocks that touch air, each range provider's
+  documented draw count, rarity and count gating, the biome filter, unmodeled
+  features holding their ordinals, nested rule trees, tag references and
+  cycles, the identifier-ordered schedule); the generator adds pack-vein
+  presence, chunk-build-order independence, cache boundedness and eviction
+  invariance; the operator-data smokes check that both vein families fire over
+  1,024 columns at fixed grid origins and that every row the placement stage
+  changed held a `minecraft:base_stone_overworld` member before.
+
+This slice closes the ore/blob stone part of T4's census. It is an
+aggregate-count agreement plus self-consistency, not block-for-block placement:
+the counts are measured close and the coordinates are measurably not, and the
+ordinal schedule, the write radius and the world-gen heightmap are the open work
+between this state and per-position parity.
 
 ## Risks
 
