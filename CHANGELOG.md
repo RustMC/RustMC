@@ -8,6 +8,7 @@
 - Added bounded X/Z memoization for horizontal shift noise during cold vanilla-preview generation; a local 4×4-chunk sweep improved, with nine encoded packets unchanged. Feature-stage generation and client-visible speed remain open.
 - Corrected the read-only region oracle's chunk-length handling for unpadded Java 26.3 save files and recorded a seed-2027 comparison sample.
 - Prefer the forward edge within square chunk shells during movement and let stationary players use the configured worker pool for outer cold chunks, while keeping the same bounded maximum.
+- Use `rustc-hash` for bounded coordinate caches in the Overworld generator. A ten-run, cold four-chunk seed-2027 sample improved from a 1.134 s median to 1.062 s; packet bytes matched the prior build for 49 seed-2027 and nine seed-2026 chunks. Client loading speed remains unmeasured.
 
 ## Unreleased — Milestone 2 discovery
 

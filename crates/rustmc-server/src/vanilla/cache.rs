@@ -23,15 +23,15 @@
 //! six lines above. See the capacity comments on `VanillaGenerator` and
 //! `NoiseBasedAquifer` for the per-cache reasoning.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 
 /// A hash map bounded to `2 * capacity` entries by two-generation FIFO
 /// eviction with promotion on old-generation hits.
 pub(crate) struct BoundedCache<K, V> {
     capacity: usize,
-    young: HashMap<K, V>,
-    old: HashMap<K, V>,
+    young: FxHashMap<K, V>,
+    old: FxHashMap<K, V>,
 }
 
 impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
@@ -42,8 +42,8 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
         let capacity = capacity.max(1);
         Self {
             capacity,
-            young: HashMap::with_capacity(capacity),
-            old: HashMap::with_capacity(capacity),
+            young: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            old: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 
@@ -91,7 +91,7 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
 /// Ages the young generation into the old, dropping what was old. Swap
 /// plus `clear` keeps both allocations for reuse instead of reallocating
 /// the young map on every rotation.
-fn rotate<K, V>(young: &mut HashMap<K, V>, old: &mut HashMap<K, V>) {
+fn rotate<K, V>(young: &mut FxHashMap<K, V>, old: &mut FxHashMap<K, V>) {
     std::mem::swap(young, old);
     young.clear();
 }
