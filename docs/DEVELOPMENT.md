@@ -75,9 +75,12 @@ each shell. Cold work within three chunks of the player has priority for
 Generation of farther uncached chunks resumes when movement pauses, using up to
 the configured worker count. A far chunk already under construction
 is discarded at a column boundary if it falls outside the new near area.
-Previously delivered chunks remain visible until they leave the view; cached
-farther chunks can still stream during movement. This
-keeps CPU and memory bounded and reduces wasted work during fast flight, but a player
+Previously delivered chunks remain visible until they leave the view. The
+current three-chunk square fills before farther chunks are scheduled or sent;
+an early far result from the previous center is skipped and may be requested
+again. This makes nearby gaps less likely to sit beside distant rendered
+islands, but can delay the outer view while a cold nearby chunk finishes.
+The worker and queue limits remain bounded. A player
 moving continuously can still outrun cold generation; the advertised view
 distance is not a guarantee that every outer chunk is ready at once.
 
