@@ -68,16 +68,25 @@ Nine seed-2026 encoded packets matched the preceding build byte-for-byte.
 These are local generation timings, not a client render or all-seeds parity
 result; future feature placement will add work to cold chunks.
 
-During movement across chunk coordinates, the vanilla preview gives cold work
-within three chunks of the player priority for 750 ms after each change.
-Generation of farther uncached chunks resumes when movement pauses, with at
-most two workers on that background work. A far chunk already under construction
+During movement across chunk coordinates, the vanilla preview orders square
+chunk shells from the player's current chunk and prefers the forward edge of
+each shell. Cold work within three chunks of the player has priority for
+750 ms after each change.
+Generation of farther uncached chunks resumes when movement pauses, using up to
+the configured worker count. A far chunk already under construction
 is discarded at a column boundary if it falls outside the new near area.
 Previously delivered chunks remain visible until they leave the view; cached
 farther chunks can still stream during movement. This
 keeps CPU and memory bounded and reduces wasted work during fast flight, but a player
 moving continuously can still outrun cold generation; the advertised view
 distance is not a guarantee that every outer chunk is ready at once.
+
+For a cold seed-2027 radius-3 preparation (49 chunks, no cache hits), two
+workers took 5,933 ms and eight took 2,057 ms on the local test machine;
+all 49 encoded packets matched byte-for-byte across both runs. This measures
+generation and cache preparation, not client receipt or rendering. Using the
+full configured pool while stationary can increase CPU and memory use until
+the view is filled.
 
 Unknown fields, remote bind addresses, and invalid or conflicting values are rejected before startup. Loopback remains mandatory; no remote-access switch exists. Logs are line-oriented key-value events (`event`, `state`, `elapsed_ms`, and safe event-specific fields). Lifecycle control events are always emitted; `debug` or `trace` additionally emits connection admission/closure diagnostics. `elapsed_us` and `elapsed_ms` use a monotonic clock from the beginning of `main` to each event. `listener_bound` includes `protocol_ready=false world_ready=false`; `discovery_bound` names only the working discovery transports. A bound socket does not mean either client edition can play. No client payload or raw configuration is logged.
 
