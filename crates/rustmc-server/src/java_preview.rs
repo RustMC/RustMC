@@ -505,13 +505,21 @@ impl Preview {
         mut output: Vec<u8>,
         had_forgets: bool,
     ) -> Option<(Vec<u8>, u128, u128)> {
+        let mut near_unsent = self
+            .view_order
+            .iter()
+            .take_while(|&&(x, z)| {
+                (x - self.center.0).abs().max((z - self.center.1).abs()) <= MOVING_NEAR_RADIUS
+            })
+            .filter(|position| !self.sent.contains(position))
+            .count();
         let worker = self.vanilla.as_mut()?;
         let moving = self.last_center_change.elapsed() < MOVING_PRIORITY_WINDOW;
         while let Some(&position) = self.view_order.get(self.next_view_position) {
             let distance = (position.0 - self.center.0)
                 .abs()
                 .max((position.1 - self.center.1).abs());
-            if moving && distance > MOVING_NEAR_RADIUS {
+            if distance > MOVING_NEAR_RADIUS && (moving || near_unsent > 0) {
                 break;
             }
             if worker.in_flight.len() >= worker.capacity {
@@ -539,7 +547,10 @@ impl Preview {
                 }
             }
         }
-        if moving && let Some(cache) = &worker.cache {
+        if moving
+            && near_unsent == 0
+            && let Some(cache) = &worker.cache
+        {
             while worker.in_flight.len() < worker.capacity
                 && let Some(&position) = self.view_order.get(self.next_cached_position)
             {
@@ -602,6 +613,17 @@ impl Preview {
                 self.next_view_position = 0;
                 continue;
             }
+            let distance = (built.position.0 - self.center.0)
+                .abs()
+                .max((built.position.1 - self.center.1).abs());
+            if distance > MOVING_NEAR_RADIUS && near_unsent > 0 {
+                // A result from the previous center may finish after we move.
+                // It can be requested again once the nearby view is filled;
+                // sending it now creates distant islands.
+                worker.in_flight.remove(&built.position);
+                self.next_view_position = 0;
+                continue;
+            }
             let size = match &built.packet {
                 Ok(Some(packet)) if packet.len() < MAX_BATCH_BYTES => packet.len(),
                 _ => {
@@ -630,6 +652,9 @@ impl Preview {
                     .expect("checked non-cancelled"),
             );
             self.sent.insert(built.position);
+            if distance <= MOVING_NEAR_RADIUS {
+                near_unsent -= 1;
+            }
             generation_us += built.generation_us;
             encoding_us += built.encoding_us;
             packet_bytes += size;
@@ -1066,6 +1091,67 @@ mod tests {
         let queued: Vec<_> = queued.try_iter().map(|request| request.position).collect();
         assert_eq!(queued.len(), 8);
         assert!(queued.iter().all(|(x, z)| x.abs().max(z.abs()) == 4));
+    }
+
+    #[test]
+    fn nearby_hole_blocks_outer_requests_and_discards_early_far_result() {
+        let mut preview = Preview::new(2027, 5, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        preview.last_center_change = Instant::now() - MOVING_PRIORITY_WINDOW;
+        preview.sent.extend(
+            preview
+                .view_order
+                .iter()
+                .copied()
+                .filter(|(x, z)| x.abs().max(z.abs()) <= MOVING_NEAR_RADIUS && (*x, *z) != (0, 0)),
+        );
+        let (requests, queued) = mpsc::sync_channel(8);
+        let (results_sender, results) = mpsc::sync_channel(8);
+        results_sender
+            .send(BuiltChunk {
+                position: (4, 0),
+                packet: Ok(Some(frame(CHUNK, &[4]))),
+                generation_us: 0,
+                encoding_us: 0,
+            })
+            .unwrap();
+        results_sender
+            .send(BuiltChunk {
+                position: (0, 0),
+                packet: Ok(Some(frame(CHUNK, &[0]))),
+                generation_us: 0,
+                encoding_us: 0,
+            })
+            .unwrap();
+        preview.vanilla = Some(VanillaWorker {
+            requests: Some(requests),
+            results,
+            handles: Vec::new(),
+            in_flight: [(4, 0), (0, 0)].into_iter().collect(),
+            pending: None,
+            capacity: 8,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+        let (stream, _, _) = preview.next_chunk().expect("nearby chunk is ready");
+        assert_eq!(
+            packet_ids(&stream),
+            vec![CACHE_CENTER, BATCH_START, CHUNK, BATCH_END]
+        );
+        assert!(preview.sent.contains(&(0, 0)));
+        assert!(!preview.sent.contains(&(4, 0)));
+        assert!(queued.try_iter().next().is_none());
+        preview.awaiting_batch = false;
+        preview.next_chunk();
+        assert!(
+            preview
+                .vanilla
+                .as_ref()
+                .unwrap()
+                .in_flight
+                .iter()
+                .any(|(x, z)| x.abs().max(z.abs()) == 4)
+        );
     }
 
     #[test]
