@@ -1,6 +1,6 @@
 # Development
 
-Linux/Fedora is the initially tested environment. Install Git and rustup from trusted sources; `rust-toolchain.toml` pins Rust 1.98.1 with rustfmt and clippy. Other platforms are unverified. Current direct libraries are `toml` for configuration parsing, `signal-hook` for Unix shutdown signals, and `uuid` for a random, connection-scoped preview session ID; see [provenance](PROVENANCE.md) for locked licenses and review scope. Do not update dependencies or toolchain merely to hide a failing check.
+Linux/Fedora is the initially tested environment. Install Git and rustup from trusted sources; `rust-toolchain.toml` pins Rust 1.98.1 with rustfmt and clippy. Other platforms are unverified. Direct libraries include `toml` for configuration parsing, `signal-hook` for Unix shutdown signals, `uuid` for a random, connection-scoped preview session ID, and `rustc-hash` for bounded generator coordinate caches; see [provenance](PROVENANCE.md) for locked licenses and review scope. Do not update dependencies or toolchain merely to hide a failing check.
 
 From the repository root:
 

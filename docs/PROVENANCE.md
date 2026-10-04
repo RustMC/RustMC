@@ -7,6 +7,7 @@ RustMC core design and code are developed independently. Do not copy competing s
 | RustMC architecture and M0 scaffold | Project requirements and independent design | Proposed; owner review pending |
 | Rust toolchain/Cargo | Rust project documentation | Build behavior; toolchain pinned |
 | `toml` crate and transitive dependencies | crates.io packages in `Cargo.lock` | Configuration parsing; locked license metadata reviewed below; advisory review pending |
+| `rustc-hash` 2.1.3 | [crate source](https://crates.io/crates/rustc-hash/2.1.3) | Faster hashing of internal, bounded world-coordinate caches only. Declares `Apache-2.0 OR MIT`; no protocol, identity, or unbounded user-input map uses it. |
 | Java/Bedrock differences | [Microsoft Learn](https://learn.microsoft.com/en-us/minecraft/creator/documents/differencesbetweenbedrockandjava?view=minecraft-bedrock-stable) | Motivation for separate compatibility claims; not a protocol specification |
 | GitHub Actions security | [GitHub Docs](https://docs.github.com/en/actions/reference/security/secure-use) | CI permissions and action pinning |
 | M2 Java 26.3 release and protocol 777 | [Mojang version manifest](https://piston-meta.mojang.com/mc/game/version_manifest_v2.json) and `version.json` in the [official server archive](https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar) | Version metadata only; no server code or assets copied |

@@ -30,6 +30,7 @@ pub const REVIEWED: &[(&str, &str)] = &[
     ("proc-macro2", "MIT OR Apache-2.0"),
     ("quote", "MIT OR Apache-2.0"),
     ("r-efi", "MIT OR Apache-2.0 OR LGPL-2.1-or-later"),
+    ("rustc-hash", "Apache-2.0 OR MIT"),
     ("serde", "MIT OR Apache-2.0"),
     ("serde_core", "MIT OR Apache-2.0"),
     ("serde_derive", "MIT OR Apache-2.0"),
