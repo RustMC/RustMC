@@ -45,8 +45,15 @@ impl Region {
         if location == 0 {
             return Ok(None);
         }
-        let sector = (location >> 8) as usize;
-        let offset = sector * 4096;
+        let sector = ((location as u32) >> 8) as usize;
+        let sectors = (location as u32 & 0xff) as usize;
+        let offset = sector.checked_mul(4096).ok_or("region offset overflow")?;
+        if sectors == 0 {
+            return Err(format!(
+                "chunk {index} in {} has no sectors",
+                self.path.display()
+            ));
+        }
         if offset + 8 > self.bytes.len() {
             return Err(format!(
                 "chunk {index} in {} points outside the file",
@@ -54,10 +61,19 @@ impl Region {
             ));
         }
         let b = &self.bytes[offset..offset + 4];
-        let len = i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        // The stored length includes the compression byte, and need not fill
+        // the final allocated sector. 26.3 saves may end at the final payload
+        // byte without padding to a 4 KiB boundary.
+        let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        if len == 0 || len + 4 > sectors * 4096 {
+            return Err(format!(
+                "chunk {index} in {} has invalid length",
+                self.path.display()
+            ));
+        }
         let compression = self.bytes[offset + 4];
         let end = offset
-            .checked_add(5)
+            .checked_add(4)
             .and_then(|x| x.checked_add(len))
             .ok_or("chunk length overflow")?;
         if end > self.bytes.len() {
@@ -187,7 +203,7 @@ mod tests {
         file[index * 4..index * 4 + 4].copy_from_slice(&location.to_be_bytes());
         let payload_start = 8192; // sector 2: first sector after the 8 KiB header
         file[payload_start..payload_start + 4]
-            .copy_from_slice(&(compressed.len() as i32).to_be_bytes());
+            .copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
         file[payload_start + 4] = 2;
         file[payload_start + 5..payload_start + 5 + compressed.len()].copy_from_slice(&compressed);
         file
@@ -221,5 +237,20 @@ mod tests {
         // Missing region file is simply "no data", not an error.
         assert!(store.chunk_root(800, 800).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_a_chunk_whose_payload_ends_at_file_eof() {
+        let dir =
+            std::env::temp_dir().join(format!("rustmc-oracle-exact-eof-{}", std::process::id()));
+        let chunk = compound(&[("xPos", Tag::Int(3)), ("zPos", Tag::Int(5))]);
+        let mut region = synthetic_region(&chunk);
+        let start = 8192;
+        let len = u32::from_be_bytes(region[start..start + 4].try_into().unwrap()) as usize;
+        region.truncate(start + 4 + len);
+        store_with_region(&dir, region);
+        let mut store = RegionStore::new(&dir);
+        assert!(store.chunk_root(3, 5).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

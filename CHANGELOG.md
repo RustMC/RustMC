@@ -6,6 +6,7 @@
 - Added a local, size-bounded immutable chunk packet cache and a spawn prewarmer; it does not save block edits or player state.
 - Reduced measured cold generation cost on a pinned four-chunk sweep by about 10.6% through equivalent noise arithmetic, and combined completed chunks into bounded acknowledged batches. Exact vanilla parity and full-client loading speed remain unverified.
 - Added bounded X/Z memoization for horizontal shift noise during cold vanilla-preview generation; a local 4×4-chunk sweep improved, with nine encoded packets unchanged. Feature-stage generation and client-visible speed remain open.
+- Corrected the read-only region oracle's chunk-length handling for unpadded Java 26.3 save files and recorded a seed-2027 comparison sample.
 
 ## Unreleased — Milestone 2 discovery
 
