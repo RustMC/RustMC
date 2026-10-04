@@ -20,7 +20,6 @@ use std::{
 
 const MOVING_NEAR_RADIUS: i32 = 3;
 const MOVING_PRIORITY_WINDOW: Duration = Duration::from_millis(750);
-const BACKGROUND_FAR_WORKERS: usize = 2;
 
 fn packed_center((x, z): (i32, i32)) -> u64 {
     (u64::from(z as u32) << 32) | u64::from(x as u32)
@@ -282,7 +281,7 @@ impl Preview {
             generator: Generator::with_terrain(seed, terrain),
             radius: radius.into(),
             center: (0, 0),
-            view_order: ordered_view((0, 0), radius.into()),
+            view_order: ordered_view((0, 0), radius.into(), (0, 0)),
             next_view_position: 0,
             next_cached_position: 0,
             forget_dirty: false,
@@ -398,8 +397,12 @@ impl Preview {
             (z.floor() as i32).div_euclid(16),
         );
         if center != self.center {
+            let direction = (
+                (center.0 - self.center.0).signum(),
+                (center.1 - self.center.1).signum(),
+            );
             self.center = center;
-            self.view_order = ordered_view(center, self.radius);
+            self.view_order = ordered_view(center, self.radius, direction);
             self.next_view_position = 0;
             self.next_cached_position = 0;
             self.forget_dirty = true;
@@ -511,12 +514,7 @@ impl Preview {
             if moving && distance > MOVING_NEAR_RADIUS {
                 break;
             }
-            let limit = if distance > MOVING_NEAR_RADIUS {
-                worker.capacity.min(BACKGROUND_FAR_WORKERS)
-            } else {
-                worker.capacity
-            };
-            if worker.in_flight.len() >= limit {
+            if worker.in_flight.len() >= worker.capacity {
                 break;
             }
             if self.sent.contains(&position) || worker.in_flight.contains(&position) {
@@ -655,12 +653,21 @@ fn cache_center((x, z): (i32, i32)) -> Vec<u8> {
     frame(CACHE_CENTER, &body)
 }
 
-/// Near chunks first; rebuild only when the player enters another chunk.
-fn ordered_view((cx, cz): (i32, i32), radius: i32) -> Vec<(i32, i32)> {
+/// Square shells from the player, with each shell's forward edge first.
+fn ordered_view((cx, cz): (i32, i32), radius: i32, (dx, dz): (i32, i32)) -> Vec<(i32, i32)> {
     let mut positions: Vec<_> = (-radius..=radius)
         .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
         .collect();
-    positions.sort_unstable_by_key(|(x, z)| ((x - cx).abs().max((z - cz).abs()), *z, *x));
+    positions.sort_unstable_by_key(|(x, z)| {
+        let relative_x = x - cx;
+        let relative_z = z - cz;
+        (
+            relative_x.abs().max(relative_z.abs()),
+            -(relative_x * dx + relative_z * dz),
+            *z,
+            *x,
+        )
+    });
     positions
 }
 
@@ -1028,6 +1035,52 @@ mod tests {
         let stream = preview.next_chunk().expect("old edge unload").0;
         assert!(packet_ids(&stream).contains(&FORGET_CHUNK));
         assert!(preview.next_view_position < preview.view_order.len());
+    }
+
+    #[test]
+    fn stationary_view_uses_full_bounded_pool_for_outer_chunks() {
+        let mut preview = Preview::new(2027, 5, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+        preview.last_center_change = Instant::now() - MOVING_PRIORITY_WINDOW;
+        preview.sent.extend(
+            preview
+                .view_order
+                .iter()
+                .copied()
+                .filter(|(x, z)| x.abs().max(z.abs()) <= MOVING_NEAR_RADIUS),
+        );
+        let (requests, queued) = mpsc::sync_channel(8);
+        let (_results_sender, results) = mpsc::sync_channel(8);
+        preview.vanilla = Some(VanillaWorker {
+            requests: Some(requests),
+            results,
+            handles: Vec::new(),
+            in_flight: BTreeSet::new(),
+            pending: None,
+            capacity: 8,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+        assert!(preview.next_chunk().is_none());
+        assert_eq!(preview.vanilla.as_ref().unwrap().in_flight.len(), 8);
+        let queued: Vec<_> = queued.try_iter().map(|request| request.position).collect();
+        assert_eq!(queued.len(), 8);
+        assert!(queued.iter().all(|(x, z)| x.abs().max(z.abs()) == 4));
+    }
+
+    #[test]
+    fn moving_view_keeps_square_shells_and_prefers_travel_direction() {
+        let east = ordered_view((0, 0), 3, (1, 0));
+        let west = ordered_view((0, 0), 3, (-1, 0));
+        assert_eq!(east.len(), 49);
+        assert_eq!(east[0], (0, 0));
+        assert_eq!(east[1], (1, -1));
+        assert_eq!(west[1], (-1, -1));
+        assert!(east.windows(2).all(
+            |pair| pair[0].0.abs().max(pair[0].1.abs()) <= pair[1].0.abs().max(pair[1].1.abs())
+        ));
+        assert_eq!(east.iter().copied().collect::<BTreeSet<_>>().len(), 49);
+        assert_eq!(west.iter().copied().collect::<BTreeSet<_>>().len(), 49);
     }
 
     #[test]
