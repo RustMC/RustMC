@@ -81,6 +81,54 @@ fn air_chunk(chunk_x: i32, chunk_z: i32, tables: &RegistryTables) -> VanillaChun
     .expect("air column")
 }
 
+#[test]
+fn absolute_queries_use_euclidean_chunk_coordinates_and_absolute_y() {
+    let chunk = column_chunk(
+        -2,
+        1,
+        |x, y, z| {
+            if x == 0 && y == OVERWORLD_MIN_Y && z == 15 {
+                BEDROCK
+            } else if x == 15 && y == 319 && z == 0 {
+                STONE
+            } else {
+                AIR
+            }
+        },
+        |bx, _by, bz| if bx == 3 && bz == 0 { FOREST } else { PLAINS },
+    );
+    assert_eq!(chunk.state_at_world(-32, -64, 31), Some(BEDROCK));
+    assert_eq!(chunk.state_at_world(-17, 319, 16), Some(STONE));
+    assert_eq!(chunk.biome_at_world(-17, 319, 16), Some(FOREST));
+    assert_eq!(chunk.biome_at_world(-32, -64, 31), Some(PLAINS));
+    for (x, y, z) in [
+        (-33, -64, 31),
+        (-16, -64, 31),
+        (-32, -64, 15),
+        (-32, -64, 32),
+        (-32, -65, 31),
+        (-32, 320, 31),
+    ] {
+        assert_eq!(chunk.state_at_world(x, y, z), None, "{x},{y},{z}");
+        assert_eq!(chunk.biome_at_world(x, y, z), None, "{x},{y},{z}");
+    }
+}
+
+#[test]
+fn chunk_origins_reject_positions_that_overflow_absolute_block_coordinates() {
+    assert_eq!(chunk_origin(-2, 1), Ok((-32, 16)));
+    assert_eq!(
+        chunk_origin(i32::MIN / 16, i32::MAX / 16),
+        Ok((i32::MIN, i32::MAX - 15))
+    );
+    for (chunk_x, chunk_z) in [(i32::MAX / 16 + 1, 0), (0, i32::MIN / 16 - 1)] {
+        assert_eq!(
+            chunk_origin(chunk_x, chunk_z),
+            Err(EncodeError::ChunkCoordinateOverflow { chunk_x, chunk_z })
+        );
+    }
+}
+
 /// A whole-column chunk from a closure over absolute positions, the shape most
 /// fixtures want: they think in world coordinates, not flat indices.
 fn column_chunk(

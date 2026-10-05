@@ -152,6 +152,14 @@ Ordering rules:
   number today. The gameplay core must introduce one authoritative world-Y
   range, taken from the negotiated 26.3 dimension type rather than a constant,
   and the chunk adapter must translate at its edge. Owner decision D1 below.
+
+  The read-only Java Overworld adapter now accepts absolute `(x, y, z)` lookups
+  on its `VanillaChunk`: it uses Euclidean division for negative X/Z, checks
+  that the position belongs to the chunk, and rejects Y outside `-64..319`.
+  Generation also rejects chunk coordinates whose block origin cannot fit in
+  `i32`. This establishes the adapter-side coordinate seam only. It does not
+  choose the gameplay core's dimension model, make the preview mutable, or
+  close D1.
 - V7 Protected spawn: RustMC policy, not a vanilla mechanic. The first slice
   keeps a configurable protected box around the session spawn point in which
   block actions are denied (S4) and logged. Radius default `0` (disabled) for
