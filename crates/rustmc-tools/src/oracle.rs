@@ -575,12 +575,34 @@ fn surface_top(root: &Tag, lx: u8, lz: u8) -> Result<Option<i32>, String> {
         return Ok(None);
     };
     let min_y = root.get("yPos").and_then(Tag::as_i32).unwrap_or(-4) * 16;
-    let heights = unpack_spanning(packed, 9, 256);
+    let heights = heightmap_heights(packed, 256);
     let index = usize::from(lx) + usize::from(lz) * 16;
     Ok(match heights.get(index).copied() {
         Some(h) if h > 0 => Some(h as i32 - 1 + min_y),
         _ => None,
     })
+}
+
+/// Heightmap bit width: enough for `max_y - min_y + 1` up to 512 levels.
+const HEIGHTMAP_BITS: usize = 9;
+
+/// Decode a stored heightmap's 16x16 column values.
+///
+/// Heightmaps are 9-bit values, and 9 does not divide 64, so the two
+/// documented bit-storage layouts need different long counts: spanning
+/// (`ceil(256*9/64) = 36` longs) and non-spanning, where each long holds 7
+/// values and wastes the remaining 6 bits (`ceil(256/7) = 37` longs).
+/// Observed in the owner's 26.3 world (30 September 2026): every stored
+/// heightmap is the 37-long non-spanning form, and decoding it as spanning
+/// reads correct values only for the first seven columns. The long count
+/// selects the layout because the two counts never coincide.
+fn heightmap_heights(data: &[i64], count: usize) -> Vec<u32> {
+    let non_spanning_len = count.div_ceil(64 / HEIGHTMAP_BITS);
+    if data.len() == non_spanning_len {
+        unpack_non_spanning(data, HEIGHTMAP_BITS, count)
+    } else {
+        unpack_spanning(data, HEIGHTMAP_BITS, count)
+    }
 }
 
 /// Extract ground truth for one column of one stored chunk.
@@ -1465,6 +1487,45 @@ mod tests {
         }
         assert_eq!(unpack_spanning(&longs, 9, 256), values);
         assert_eq!(unpack_non_spanning(&[0b1010_0101], 4, 4), vec![5, 10, 0, 0]);
+    }
+
+    /// 26.3 stores heightmaps non-spanning (7 values per long, 37 longs);
+    /// reading that layout as spanning only gets the first seven columns
+    /// right, so every column must be checked here.
+    #[test]
+    fn heightmaps_decode_from_their_stored_long_count() {
+        let values: Vec<u32> = (0..256).map(|i| 1 + i as u32).collect();
+        let mut non_spanning = vec![0i64; 37];
+        let mut spanning = vec![0i64; 36];
+        for (i, v) in values.iter().enumerate() {
+            let long = i / 7;
+            non_spanning[long] |= (*v as i64) << ((i % 7) * 9);
+            let bit = i * 9;
+            spanning[bit / 64] |= (*v as i64) << (bit % 64);
+            if bit % 64 + 9 > 64 {
+                spanning[bit / 64 + 1] |= (*v as i64) >> (64 - bit % 64);
+            }
+        }
+        assert_eq!(heightmap_heights(&non_spanning, 256), values);
+        assert_eq!(heightmap_heights(&spanning, 256), values);
+        for index in [0usize, 6, 7, 135, 255] {
+            let mut heightmaps = std::collections::BTreeMap::new();
+            heightmaps.insert(
+                "WORLD_SURFACE".to_owned(),
+                Tag::LongArray(non_spanning.clone()),
+            );
+            let root = compound(&[
+                ("yPos", Tag::Int(-4)),
+                ("Heightmaps", Tag::Compound(heightmaps)),
+                ("sections", Tag::List(vec![])),
+            ]);
+            let (lx, lz) = ((index % 16) as u8, (index / 16) as u8);
+            assert_eq!(
+                surface_top(&root, lx, lz).unwrap(),
+                Some(index as i32 - 64),
+                "column {lx},{lz}"
+            );
+        }
     }
 
     #[test]

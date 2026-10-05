@@ -225,8 +225,13 @@ fn run(args: &[String]) -> Result<(), String> {
 /// Entries held by every coordinate-keyed cache after one mode's sweep.
 fn report_occupancy(mode: &str, occupancy: &CacheOccupancy) {
     println!(
-        "occupancy,{mode},masks,{},heights,{},biomes,{},chunk_carvers,{}",
-        occupancy.masks, occupancy.heights, occupancy.biomes, occupancy.chunk_carvers
+        "occupancy,{mode},masks,{},heights,{},ocean_floors,{},biomes,{},biome_regions,{},chunk_carvers,{}",
+        occupancy.masks,
+        occupancy.heights,
+        occupancy.ocean_floors,
+        occupancy.biomes,
+        occupancy.biome_regions,
+        occupancy.chunk_carvers
     );
     println!(
         "occupancy,{mode},aquifer_centers,{},aquifer_statuses,{},aquifer_surface_levels,{},aquifer_skip_bounds,{},total,{}",

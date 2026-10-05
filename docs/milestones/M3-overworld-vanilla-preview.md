@@ -220,6 +220,29 @@ not, because a feature's ordinal is part of its seed and RustMC's ordinal
 schedule is not vanilla's. Exact per-position placement identity is open work,
 not a claim, and each figure here is one sample on one preset.
 
+Re-measured on 6 October 2026, after two changes to that placement stage: a
+feature's ordinal is now the index its step's topological ordering gives it (the
+identifier-sorted stand-in above is gone), and an ore attempt whose whole box
+floats above the terrain is abandoned before it draws any radius, which is the
+footprint test vanilla's `OCEAN_FLOOR_WG` anchor gate documents. The same grid
+scores 321,365 of those 338,217 positions exact — 95.02%, from 70.08% — and the
+seed-2026 `-384..384` grid 329,559 of 347,483 (94.84%, from 70.83%); 96.94% and
+96.79% with the air family collapsed. The schedule deviation that paragraph
+named as the reason coordinates did not follow counts is closed: over the census
+square the 24 placed families now agree at 99.99% in aggregate and `lapis_ore`
+lands exactly on the save's 2,559 blocks, while the seed-2027 grid reaches 96.29%.
+What remains is displacement, not amount, and it now reads as three separable
+things — 6,740 of the 17,924 disagreeing positions on the traced grid are one air
+row under two names, 2,422 are void rows RustMC fills with deepslate (the deep
+carver residual the T3 baseline attributes), and the ore families disagree as a
+near-symmetric pair (703 coal-ore positions read as stone against 690 the other
+way), which the trace localises to anchors shifted 3.8 to 8.6 blocks inside the
+traced chunk rather than to veins of the wrong size. Closing that needs the
+decoration-time heightmap the carve stage maintains, which this stage does not
+hold; see `docs/research/vanilla-worldgen-feasibility.md`, slice L. Vegetation and
+tree families are still not placed, structures are out of scope here, and no
+figure in this milestone is a parity claim.
+
 Sample B, a sparser negative-coordinate grid (stride 32 over `-1024..-512`):
 289 requested grid points, 61 scored columns, 120 missing chunks, and 108
 stored-but-ungenerated columns. The sampler now reports that last case as a

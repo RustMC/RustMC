@@ -666,26 +666,36 @@ Documented deviations in RustMC's implementation of this stage:
   row-major replay order whereas vanilla lets each chunk's own pass write last;
   the difference is confined to positions two veins both claim, and tests pin
   that the assembled grid is independent of the order chunks are built in and
-  of cache eviction.
-- **Ordinals.** RustMC numbers one global per-step schedule sorted by feature
-  identifier instead of reproducing the reference runtime's dependency-graph
-  ordering, so a feature's reseed ordinal can differ from vanilla's whenever
-  that graph reorders a step. Features RustMC does not model still consume
-  their slot, so their neighbours keep stable ordinals. The measured
-  consequence, recorded in
+  of cache eviction. Session 13 measured the alternative — letting one chunk's
+  replay write past its border — and it answers no better, so this deviation
+  stands.
+- **Ordinals.** *(closed by session 13)* RustMC numbered one global per-step
+  schedule sorted by feature identifier instead of reproducing the reference
+  runtime's dependency-graph ordering, so a feature's reseed ordinal could
+  differ from vanilla's whenever that graph reorders a step. Features RustMC
+  does not model still consume their slot, so their neighbours kept stable
+  ordinals. The measured consequence, recorded in
   `docs/research/vanilla-worldgen-feasibility.md` under slice K: because the
   ordinal is part of the feature's seed, an ordinal that differs moves every
   anchor that feature draws, so family counts land close to the save while the
   sampled per-coordinate block identity falls from 81.28% to 70.83% on the
-  seed-2026 `-384..384` grid.
-- **Anchor gate.** The `OCEAN_FLOOR_WG` footprint gate is not reproduced. It is
-  a fast path rather than a placement rule — a box with no terrain in it can
-  only hold air and fluid, which every stone-family target test rejects — but
-  skipping it lets a floating vein draw its `size` radii here, which shifts the
-  stream for the attempts that follow it in the same chain.
-- **Heightmap.** Because the gate is absent, the world-gen heightmap is not
-  captured for decoration. That is a prerequisite for the vegetation families,
-  which do depend on surface heights, and is tracked in
+  seed-2026 `-384..384` grid. `StepSchedule` now builds the graph ordering and
+  the measured fall has reversed; see session 13.
+- **Anchor gate.** *(closed by session 13)* The `OCEAN_FLOOR_WG` footprint gate
+  was not reproduced. It is a fast path rather than a placement rule — a box
+  with no terrain in it can only hold air and fluid, which every stone-family
+  target test rejects — but skipping it lets a floating vein draw its `size`
+  radii here, which shifts the stream for the attempts that follow it in the
+  same chain. `vanilla::feature::anchored` now reproduces it; session 13
+  measures what the gate is worth and records the heightmap source that is
+  still an approximation.
+- **Heightmap.** *(partly closed by session 13)* With the gate absent, the
+  world-gen heightmap was not captured for decoration. Reproducing the gate
+  needs a height to compare against, and a finished save cannot supply one:
+  `keepAfterWorldgen()` drops the `*_WG` types, so RustMC descends its own
+  computed surface to the first solid block. A vegetation slice will need the
+  same state for the surface types. Both the stored-layout fact and the
+  remaining approximation are recorded in session 13 and in
   `docs/research/vanilla-worldgen-feasibility.md`.
 
 No parity claim rests on this slice. The measured census and base-block deltas
@@ -694,6 +704,293 @@ and structures remain absent, and the ore/blob placement is verified against
 aggregate save counts plus self-consistency invariants — not against a
 block-for-block vanilla reproduction. No new Cargo dependency was introduced,
 and no game data or consulted source entered the repository.
+
+### Session 13 (5–6 October 2026): decoration-time heightmaps, the step ordinal graph and the ore draw budget (T4 slice L)
+
+The slice consulted the owner's locally fetched, deobfuscated official Java 26.3
+server classes, read outside the repository under the ADR-0014 amendment:
+`Heightmap`, `Heightmap$Types` and `Heightmap$Usage`, `ChunkAccess` and the
+`ProtoChunk` block-write path, `AbstractOreFeature` and `OreFeature`
+re-consulted for the per-cell discard cost, `FeatureSorter`,
+`BiomeGenerationSettings`' per-step feature lists, the `blocks_motion*`
+block-tag chain, and the placement-chain classes already listed under session
+12. The operator datapack's `worldgen/feature`, `worldgen/placed_feature` and
+`tags/block` documents and the owner's seed-2026 and seed-2027 saves were read
+only through the `RUSTMC_VANILLA_DATA` / `RUSTMC_VANILLA_SAVE` paths and were
+never copied. Nothing consulted entered the repository: no dump, decompiled
+text, translation or derived file is tracked, and the design, implementation
+and tests are RustMC's own. The measurement tooling this session used — a
+standalone Anvil/NBT column and heightmap decoder, a vein cluster matcher, and
+a single-chunk decoration replay harness — is throwaway and lives outside the
+worktree.
+
+Behaviour facts established (26.3):
+
+- **Heightmaps are the non-spanning bit layout.** `Heightmap`'s constructor
+  builds a `SimpleBitStorage(ceillog2(chunk height + 1), 256)` per type: the
+  overworld's 385 levels need 9 bits, that storage puts `64 / 9 = 7` values in a
+  long and wastes the remaining 6 bits, and 256 columns therefore occupy 37
+  longs where a spanning read would need 36.
+- **A world-gen heightmap is a running maximum, not a snapshot of finished
+  terrain.** `ProtoChunk.setBlockState` walks the types in
+  `ChunkStatus.heightmapsAfter()` and calls `Heightmap.update(x, y, z, state)`
+  for each, and priming scans a column downward from the top, so the stored
+  value is the highest Y so far passing that type's predicate.
+  `keepAfterWorldgen()` drops the `*_WG` types, so the `OCEAN_FLOOR_WG` the ore
+  anchor gate reads is not present in a finished save: the nearest stored key,
+  `OCEAN_FLOOR`, describes terrain after decoration.
+- **`OCEAN_FLOOR_WG`'s predicate** is the `blocks_motion_in_heightmap` tag test
+  with no fluid clause, so water does not raise it and a carved ceiling does
+  lower it.
+- **Per-cell discard cost.** `AbstractOreFeature.canPlaceOre` evaluates the
+  target rules, then `shouldSkipAirCheck(random, discard)`, then the six
+  neighbour air test, in that order, and `shouldSkipAirCheck` draws one
+  `nextFloat` only when `0 < discard < 1`. A feature carrying a fractional
+  discard chance therefore consumes one draw per cell its target rules accepted,
+  so how far it moves the decoration stream depends on terrain and not only on
+  geometry, and every later attempt of that feature resumes from wherever the
+  accepted cells left it.
+- **Where the fractional chances sit** in 26.3's `worldgen/feature` documents:
+  `ore_coal_buried`, `ore_gold_buried`, `ore_diamond_small` and
+  `ore_diamond_medium` at 0.5, `ore_diamond_large` at 0.7, `ore_diamond_buried`,
+  `ore_lapis_buried` and both ancient-debris features at 1.0, against 0.0 for
+  every stone family (`ore_dirt`, `ore_gravel`, `ore_granite`, `ore_diorite`,
+  `ore_andesite`, `ore_tuff`) and for the plain coal, iron, gold, redstone,
+  lapis, copper and emerald features. The placed features choose between them:
+  `ore_coal_lower` runs `ore_coal_buried` while `ore_coal_upper` runs
+  `ore_coal`, and `ore_gold_lower` runs `ore_gold_buried`.
+
+Save-format facts measured independently of RustMC, from the owner's seed-2026
+world (2,048 chunks over two region files, 524,288 columns, decoded by the
+standalone reader):
+
+- Every stored heightmap is 37 longs — all four kept keys, in every chunk
+  surveyed — and the decoded values span Y 32..195.
+- Decoded non-spanning, the values agree with the column tops read straight from
+  the section palettes: `WORLD_SURFACE` exact in 524,288 of 524,288 columns,
+  `MOTION_BLOCKING` 75.32% exact and 99.17% within one block,
+  `MOTION_BLOCKING_NO_LEAVES` 57.10% and 81.50% (that type ignores leaves, so it
+  legitimately reads lower), `OCEAN_FLOOR` 64.16% and 89.27% (fluids excluded).
+- Decoded spanning, the same arrays answer 3.86–5.69% exact and produce values
+  from −65 to 446, outside the world's −64..319 span — the signature of a
+  wrong-layout read rather than of a noisy measurement.
+- Section palettes use the packed layout too, including the power-of-two sizes:
+  a 32-entry palette at 5 bits is stored in 342 longs where spanning would need
+  320, and a 56-entry palette at 6 bits in 410 where spanning would need 384.
+  RustMC's palette decode already followed the packed rule and was left alone.
+
+RustMC's own defect, found by that measurement and fixed: `oracle::surface_top`
+decoded stored heightmaps as spanning, which is right only for the first seven
+columns of each chunk. The scope of the damage is measurable: the M3 exact-grid
+samplers stride 16 blocks, so they read local column index 0, and their
+denominators (347,483, 338,217 and 308,379 positions) are identical before and
+after the fix — every earlier A/B comparison in this research stood on correct
+heights by that accident of stride. Any other stride, and every per-column
+inspection, was reading garbage. The decode now selects the layout from the
+stored long count, which is unambiguous because the two counts never coincide,
+and `oracle::tests::heightmaps_decode_from_their_stored_long_count` packs
+1..=256 both ways and checks columns 0, 6, 7, 135 and 255.
+
+RustMC changes this slice makes, each one demonstrated rather than assumed:
+
+- **Step ordinal graph.** `vanilla::feature` builds a `StepSchedule` per
+  decoration step by the documented topological descent over each biome's
+  per-step list, with a bounded retry when a biome pair yields a cyclic order,
+  and `region_ordinals` hands a feature the index inside the step's sorted list
+  — the value `setFeatureSeed` mixes into the seed. The biome set feeding the
+  graph is `generator::region_biomes`, the biomes appearing in the 3×3 chunk
+  range intersected with `biome::possible_biomes()`, replacing the earlier
+  identifier-sorted stand-in.
+  That bounded retry (`MAX_CYCLE_ATTEMPTS = 8`, against the reference's
+  unbounded recursion, which is exponential in the number of biomes) is a
+  deviation, and the pack this slice measures is shown not to reach it:
+  `vanilla::generator::tests::smoke_operator_feature_schedule_needs_no_cycle_recovery`
+  builds the real schedule, asserts neither `feature_order_cycle` nor
+  `feature_order_cycle_unresolved` is reported, and prints the shape it found —
+  9 generation steps carrying 171 placed features over the 56 biomes the
+  dimension's biome source declares. A pack that did need more than eight prunes
+  would get an empty schedule and that counter instead, so the bound cannot fail
+  silently.
+- **Anchor gate.** `vanilla::feature::anchored` reproduces the
+  `OCEAN_FLOOR_WG` footprint scan over the vein box's columns, so an attempt
+  whose box floats entirely above the terrain costs only its three axis draws,
+  and the stream after it lands where vanilla's does. The heightmap it consults
+  is `VanillaGenerator::ocean_floor_height`, descended from the computed surface
+  to the first solid block.
+
+Measured, on the M3 `block_compare` grids (seed 2026 over `-384..384`, seed 2026
+over the milestone's `-256..512`, seed 2027 over `-384..384`; each round re-run
+whole, successive intermediate builds, exact base-block agreement):
+
+| build | `-384..384` | `-256..512` | seed 2027 |
+| --- | --- | --- | --- |
+| pre-feature terrain only | 81.28% | 80.86% | 83.91% |
+| placement with identifier-sorted ordinals | 70.83% | 70.08% | 74.54% |
+| step ordinal graph, region biome set included | 91.19% | 91.27% | 92.65% |
+| and the anchor gate (this slice's tree) | 94.84% | 95.02% | 96.29% |
+
+Two notes on what those rows are, because the tree was edited in place between
+rounds and a label is then not evidence. First, the rounds are identified by
+their own output, not by their names: the `-128..127` family census over seed
+2026 paints `coal_ore` 38,512 blocks on the pre-gate graph build and 37,951 on
+the gated one, which is what separates the third row from the fourth.
+Second, that fourth row was mis-labelled when this section was first written —
+the grids it calls "the decoration region's biome set" were run on a tree that
+already carried the anchor gate too. The ablation settles which change earned
+the movement. This tree with `anchored` patched to report every box as anchored
+answers the pre-gate census byte-for-byte, every family line included, and on the
+grids it answers 316,872, 308,680 and 285,714 exact positions — the pre-gate
+round's three numbers again, to the position. So the region biome set carries no
+measurable gain of its own and the whole movement is the anchor gate's: 12,687,
+12,685 and 11,239 positions, 3.65, 3.75 and 3.65 points. Every one of those is a
+solid-row identity, since the air-collapsed counts move by exactly the same
+numbers. The row label is corrected rather than the numbers, because the numbers
+were never in question.
+
+A third round then re-ran all three grids after the stored-heightmap decode fix
+described above, which changes the oracle's read of the save rather than the
+generator. Every report came back byte-identical to the gated round, exactly as
+the stride argument predicts: those grids sample local column index 0, the one
+column the two decoders agree on. So the ladder is not a comparison across a
+measurement change, and the fix's value is to the per-column inspections, which
+had no valid earlier reading.
+
+The terrain answer is untouched by all of it: `substance` over the same window
+reads 342,641 of 347,483 positions exact (98.61%) and its whole report is
+byte-identical between the session-12 baseline build and every round of this
+slice, so the movement above is placement, not terrain. The census moves with
+it: over the `-128..127` square the aggregate family agreement (the lesser of
+the two sides over the save's sum, the 24 families slice K tabulated) reaches
+99.99%, with `granite` from 114.1% to 100.6% of the save's count, `coal_ore`
+from 104.7% to 99.2%, `copper_ore` from 102.1% to 99.7%, `lapis_ore` from 105.2%
+to exactly the save's 2,559 blocks, and the four vegetation families still at
+zero because this slice does not place them.
+
+Cost, measured in one machine state — release build, single thread, seed 2026,
+the bench's default 4×4 `column_ids` sweep, every binary run within the same
+hour with three oracle grids busy on other cores — and attributed with an
+ablation, this same tree patched so `anchored` reports every box as anchored
+(which is the placement work the no-gate tree does, minus the footprint scan):
+
+| | `f86ef84` | this tree, gate ablated | this tree |
+| --- | --- | --- | --- |
+| cold pass | 570.47 ms/chunk | 784.84 ms/chunk | 1,750.75 ms/chunk |
+| warm cache-read pass | 1.34 ms/chunk | 1.55 ms/chunk | 1.54 ms/chunk |
+| radius-32 view, single thread | 0.67 h | 0.92 h | 1.99 h |
+| peak resident set | 17,780 KiB | 17,556 KiB | 17,524 KiB |
+
+The ablation is checked rather than trusted: its `-128..127` family census
+reproduces the pre-gate round's report byte-for-byte, every family line included
+(`coal_ore` 38,512 against the gated round's 37,951), so what is measured is the
+footprint scan and not some other difference between the builds.
+
+The terrain modes do not move (`heights` 203.17 → 204.65, `carve` 2.42 → 2.54,
+`substance` 433.98 → 435.23 ms per chunk, with the substance answer
+byte-identical between the trees), so the increase is entirely on the decorated
+path, and the ablation splits it: +214 ms per chunk for the ordinal graph and
+the decoration region's biome union together, then +966 ms per chunk for the
+anchor gate on top — 55% of the tree's cost. The cause is the missing piece
+session 12's deviation list already names: RustMC holds no decoration-time
+heightmap, so the gate's per-column question is answered by computation, and the
+sweep ends with 4,843 ocean-floor columns memoised over a cache bounded at
+4,096, each descent walking the density graph row by row. Peak resident set is
+flat across all three columns, so this is recomputation and not growth. Keeping
+the heightmap per chunk through the fill and carve passes would turn the largest
+cost of this slice into an array read, which makes that work a cost item as well
+as a correctness one. Absolute milliseconds are conditioned on the state of the
+machine — the same `f86ef84` binary answers 570.47 today against the 388.76
+recorded for it under session 12 — which is why the table is read as ratios and
+not as levels; repeated runs of one binary agreed to within 0.5%.
+
+One consequence of that cost is a test change rather than a generator change. The
+operator smoke `java_preview::tests::local_vanilla_worker_delivers_a_framed_chunk_without_blocking_network_poll`
+carried a 20-second bound on the first delivered chunk, which held while a cold
+column descent was pre-placement work. With the gate in, the same run from a
+debug build delivers its first chunk in 91 s measured — a debug build is far
+slower than the 1,750 ms per chunk the release bench reports, and each of the
+smoke's eight workers compiles the provisioned pack before drawing anything — so
+the bound is now 600 s. It is a hang detector, not a performance gate: what this
+path costs is what `bench_vanilla_chunks` measures and the table above reports,
+and the smoke's actual claim, that the network poll never blocks on generation,
+is unchanged and still asserted at 100 ms. The whole nine-smoke operator set now
+takes 475 s in a debug build, which is the same cost seen from the other side;
+that figure is machine-state conditioned (three oracle grids were busy through
+it) and is reported as why the bound had to move, not as a measurement.
+
+Decoration replay evidence for one chunk (seed 2026, chunk `(-8, -8)`, the
+step-6 chain, ordinals 0..33, our replay reading that chunk's stored terrain):
+
+- With the anchor gate forced never to pass, the chain paints nothing: the
+  footprint test is load-bearing, not decorative.
+- With it forced to pass, the chain paints 4,365 ore positions of which 2,953
+  (67.65%) sit on a block the save holds — floating boxes draw their radii and
+  shift the chain behind them.
+- With it as documented, 3,362 positions, 2,953 of them (87.83%) on a save ore
+  block.
+- Allowing writes past the decorated chunk's border gives 3,417 positions and
+  the same 2,953 (86.42%), so the clipped 3×3 ring replay stays.
+- Per feature the split is sharp. The discard-0 stone families reproduce
+  positionally: `ore_tuff` 398 of 398, `ore_diorite_lower` 1,067 of 1,071,
+  `ore_andesite_lower` 787 of 812, `ore_granite_lower` 701 of 896, and their
+  misses are host-block disagreements rather than misplaced veins. `ore_coal_lower`
+  — the first feature in the chain carrying a fractional discard — places 159
+  positions and matches none, and so does every small ore after it
+  (`ore_iron_upper` 6, `ore_gold` 14, `ore_diamond_medium` 6, all unmatched).
+- Matching our coal veins to the save's over a 4-chunk window: the ten clusters
+  of five blocks or more that RustMC paints in the traced chunk each face a save
+  cluster between 3.8 and 8.6 blocks from their centroid, and none within 2;
+  cluster sizes run 9–48 blocks against the save's 5–27. The rate, the box and
+  the Y band are right, the anchors are shifted.
+
+What that demonstrates, and what it does not:
+
+- The seed, the ordinal and the vein geometry reproduce. The discard-0 families
+  match to within a few percent of their painted positions under the same
+  ordinals and the same streams that miss for coal, iron, gold and diamond, so
+  the residual is no longer an ordinal or seed defect — session 12's ordinal
+  deviation is closed by the graph, and the numbers above are its measurement.
+- The remaining gap is terrain-dependent draw consumption. A fractional-discard
+  feature spends a draw per accepted cell, so how many draws a chain has
+  consumed before the next feature reseeds depends on which cells the terrain
+  let through. Two differences in that terrain are documented here. The replay
+  those numbers come from reads the save's *final* blocks, which carry the later
+  features' writes and not the state the decoration pass had. And the gate
+  compares against `ocean_floor_height` — RustMC's own descent from the computed
+  surface through carved air — where vanilla compares against a heightmap its
+  write path maintained as the chunk was built. The two agree more often than
+  not, and the distance is measured: over the traced chunk's 256 columns the
+  generator answers the save's topmost non-air row exactly in 231 of them, and
+  in the remaining 25 it sits 2 to 8 rows *below* it — never above — which is
+  the direction the semantics predict, since a saved column top can be a block
+  the world-gen gate never saw. An earlier reading of that same comparison,
+  which had the generator answering 87 to 171 rows too high, was the
+  spanning-decode artifact described above rather than a generator defect.
+- Either difference moves the anchors of every feature downstream, and after
+  that the veins are simply somewhere else. What is *not* demonstrated is any
+  per-vein attribution between the two: a chain shifted by an accepted-cell roll
+  and a chain shifted by a gate decision are the same observable — a different
+  number of draws before the next feature reseeds. The next piece of work for
+  this stage is therefore a decoration-time heightmap maintained through the
+  carver stage, not more ordinal work, and that is recorded in
+  `docs/research/vanilla-worldgen-feasibility.md`.
+
+No parity claim rests on this slice. The table above is a measured improvement
+over the pre-feature baseline on three grids and two seeds, not parity: 17,924 of
+the traced grid's 347,483 scored positions still disagree (5.16%), and 11,159 of
+them (3.21%) once the two sides' air families collapse to one name. The shape of
+what is left is recorded rather than smoothed over. 6,740 of the exact residual
+is one air position named two ways — `cave_air` where the save holds `air`.
+2,422 is a row the save leaves void that RustMC fills with deepslate, which is
+the deep-carver residual the T3 baseline already attributed. The vein families
+disagree as a near-symmetric pair (703 positions where the save holds coal ore
+and RustMC holds stone, against 690 the other way), which is the anchor
+displacement described above rather than a wrong amount. The vegetation families
+and structures are absent, and the deviation list carried forward is the
+write-zone radius (vanilla's `blockStateWriteRadius` integer is still unverified
+from the dumps) and the decoration-time heightmap. No new Cargo
+dependency was introduced, no game data or consulted source entered the
+repository, and the operator preview's packet-cache identity moved to
+`rustmc-preview-cache-v3` because the decorated generator it caches changed.
 
 ## Vanilla research review hardening (2 October 2026)
 

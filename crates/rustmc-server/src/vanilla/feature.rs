@@ -9,6 +9,13 @@
 //! its generation step, and the number is part of that feature's random
 //! identity, so the numbering must stay stable whether or not the runtime
 //! models the feature itself.
+//!
+//! That number — the ordinal — is not the position in the biome's own list.
+//! The reference runtime derives one ordering per generation step from the
+//! whole biome source before it decorates anything, and a chunk runs the
+//! ordinals its 3x3 biome union contributes to a step, ascending. Both the
+//! order and the union are reproduced here from the pack's own data; see
+//! `docs/PROVENANCE.md` session 13 for the rules and their derivation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -401,13 +408,69 @@ pub struct FeatureData {
     /// somewhere in the pack, in the order the decoration loop runs them.
     /// A feature's index in this list is its ordinal, and the ordinal is
     /// part of its random identity, so unmodeled features keep a slot.
-    steps: Vec<Vec<Rc<PlacedFeature>>>,
+    steps: Vec<StepSchedule>,
+    /// Biome id → generation step index → the ordinals that biome lists at
+    /// that step, deduplicated and ascending. A chunk decorates the union
+    /// of these lists over the biomes in its 3x3 neighbourhood.
+    biome_ordinals: HashMap<String, Vec<Vec<usize>>>,
+    /// The biomes the schedule is built over, in the order the dimension's
+    /// biome source declares them. Empty until the generator supplies the
+    /// source's list, which is when the schedule falls back to the pack's
+    /// own identifier order.
+    biome_order: Vec<String>,
     /// The pack's block tags, used by `minecraft:tag_match` targets.
     tags: BlockTags,
     /// Feature kinds seen in the pack without a runtime here, for the
     /// startup report; keyed by `minecraft:` type name.
     pub(crate) unimplemented_features: HashMap<String, usize>,
 }
+
+/// One generation step's ordered features, plus the lookup that turns a
+/// placed feature into its ordinal within the step.
+#[derive(Debug, Default)]
+pub struct StepSchedule {
+    features: Vec<Rc<PlacedFeature>>,
+    /// Feature id → its position in `features`. The graph the schedule is
+    /// derived from is keyed by (feature, step), so a step can list a given
+    /// placed feature at most once and this is a bijection.
+    ordinals: HashMap<String, usize>,
+}
+
+impl StepSchedule {
+    /// The step's features in the order the decoration loop runs them.
+    pub fn features(&self) -> &[Rc<PlacedFeature>] {
+        &self.features
+    }
+
+    /// The ordinal this step gives one placed feature, or `None` when the
+    /// step does not carry it.
+    fn ordinal_of(&self, id: &str) -> Option<usize> {
+        self.ordinals.get(id).copied()
+    }
+}
+
+/// One node of the ordering graph: a placed feature's global number paired
+/// with the generation step it appears in. The reference runtime's node
+/// record carries the feature too, but its number identifies the instance,
+/// so the pair is the node's identity.
+type Node = (usize, usize);
+
+/// The ordered steps a candidate biome list produces.
+#[derive(Debug, Default)]
+struct BuiltSchedule {
+    steps: Vec<StepSchedule>,
+    biome_ordinals: HashMap<String, Vec<Vec<usize>>>,
+}
+
+/// How many rebuilds the cycle recovery may try before RustMC gives up on
+/// the ordering. The reference runtime recurses without a bound, and its
+/// search is exponential in the number of biomes; see
+/// `docs/PROVENANCE.md` session 13 for the deviation and why it is safe to
+/// take. The provisioned pack is shown not to reach the bound by
+/// `generator::tests::smoke_operator_feature_schedule_needs_no_cycle_recovery`,
+/// which is an operator-data smoke because the bound only matters for a pack
+/// whose biome chains contradict each other.
+const MAX_CYCLE_ATTEMPTS: usize = 8;
 
 /// The number of generation steps a biome's `features` array must have for
 /// the overworld pack shape; the array is positional, so the length is part
@@ -456,6 +519,12 @@ impl FeatureData {
                 biome_docs.push((format!("{ns}:{}", stem(&entry)), read_json(&entry)?));
             }
         }
+        // Directory order is the filesystem's, so the documents are sorted
+        // by identifier before anything is parsed: the schedule a biome's
+        // inline feature reference gets must not depend on that order.
+        configured_docs.sort_by(|left, right| left.0.cmp(&right.0));
+        placed_docs.sort_by(|left, right| left.0.cmp(&right.0));
+        biome_docs.sort_by(|left, right| left.0.cmp(&right.0));
         for (id, document) in configured_docs {
             let feature = parse_configured_feature(&document)?;
             match &feature {
@@ -476,6 +545,7 @@ impl FeatureData {
         }
         let placed_ids: Vec<String> = data.placed.keys().cloned().collect();
         let configured_ids: Vec<String> = data.configured.keys().cloned().collect();
+        let mut inline_sites = 0usize;
         for (id, document) in biome_docs {
             let steps = parse_biome_steps(
                 &id,
@@ -484,6 +554,7 @@ impl FeatureData {
                 &data.configured,
                 &placed_ids,
                 &configured_ids,
+                &mut inline_sites,
             )?;
             let membership: HashSet<String> = steps
                 .iter()
@@ -496,32 +567,202 @@ impl FeatureData {
         Ok(data)
     }
 
-    /// Numbers each step's placed features. The order is the identifier
-    /// order of the features the pack references at that step, which is
-    /// stable across runs and independent of the iteration order of the
-    /// biome maps that reference them.
+    /// Orders the generation steps over the biomes the dimension's biome
+    /// source can produce, in its declaration order. The reference runtime
+    /// builds its feature order once from exactly that list, so both which
+    /// biomes contribute and the ordinal each feature gets depend on it.
+    /// An empty list leaves the pack's own identifier order in place.
+    pub fn set_biome_order(&mut self, order: &[&str]) {
+        self.biome_order = order.iter().map(|id| (*id).to_owned()).collect();
+        self.build_step_schedule();
+    }
+
+    /// The biomes the current schedule was built over, empty when it fell
+    /// back to the pack's identifier order.
+    pub fn biome_order(&self) -> &[String] {
+        &self.biome_order
+    }
+
     fn build_step_schedule(&mut self) {
-        let width = self
-            .biomes
-            .values()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(GENERATION_STEPS);
-        let mut steps: Vec<Vec<Rc<PlacedFeature>>> = vec![Vec::new(); width];
-        for list in self.biomes.values() {
-            for (index, features) in list.iter().enumerate() {
-                for feature in features {
-                    let slot = &mut steps[index.min(width - 1)];
-                    if !slot.iter().any(|known| known.id == feature.id) {
-                        slot.push(Rc::clone(feature));
+        let order: Vec<&str> = if self.biome_order.is_empty() {
+            // A hash map's iteration order would give the ordinals a
+            // different answer on every run, so the fallback is the pack's
+            // identifier order.
+            let mut names: Vec<&str> = self.biomes.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names
+        } else {
+            self.biome_order.iter().map(String::as_str).collect()
+        };
+        let mut attempts = MAX_CYCLE_ATTEMPTS;
+        let built = match self.schedule_with_retry(&order, &mut attempts) {
+            Some((built, dropped)) => {
+                if dropped > 0 {
+                    *self
+                        .unimplemented_features
+                        .entry("feature_order_cycle".to_string())
+                        .or_insert(0) += dropped;
+                }
+                built
+            }
+            None => {
+                // A pack whose biome feature chains contradict each other has
+                // no order to run, and a cycle the bounded recovery cannot
+                // break is reported instead of guessed at.
+                *self
+                    .unimplemented_features
+                    .entry("feature_order_cycle_unresolved".to_string())
+                    .or_insert(0) += 1;
+                BuiltSchedule::default()
+            }
+        };
+        self.steps = built.steps;
+        self.biome_ordinals = built.biome_ordinals;
+    }
+
+    /// The reference runtime's cycle recovery: when a biome list cannot be
+    /// ordered, take one biome out at a time, in list order, and rebuild
+    /// from scratch — the first list that orders wins. The reference has no
+    /// budget for those rebuilds; `MAX_CYCLE_ATTEMPTS` bounds this one, and
+    /// the count returned is how many biomes it had to drop.
+    fn schedule_with_retry(
+        &self,
+        order: &[&str],
+        attempts: &mut usize,
+    ) -> Option<(BuiltSchedule, usize)> {
+        if let Some(built) = self.attempt_schedule(order) {
+            return Some((built, 0));
+        }
+        for index in 0..order.len() {
+            if *attempts == 0 {
+                return None;
+            }
+            *attempts -= 1;
+            let mut pruned = order.to_vec();
+            pruned.remove(index);
+            if let Some((built, dropped)) = self.schedule_with_retry(&pruned, attempts) {
+                return Some((built, dropped + 1));
+            }
+        }
+        None
+    }
+
+    /// Orders one candidate biome list: number every placed feature by its
+    /// first appearance, link each feature to the next one in the same
+    /// biome's flattened list, topologically sort those links, and split the
+    /// result per generation step. `None` when the links contradict.
+    fn attempt_schedule(&self, order: &[&str]) -> Option<BuiltSchedule> {
+        let mut numbers: HashMap<&str, usize> = HashMap::new();
+        let mut numbered: Vec<Rc<PlacedFeature>> = Vec::new();
+        let mut width = 0usize;
+        let mut chains: Vec<Vec<Node>> = Vec::with_capacity(order.len());
+        for biome in order {
+            let Some(biome_steps) = self.biomes.get(*biome) else {
+                chains.push(Vec::new());
+                continue;
+            };
+            width = width.max(biome_steps.len());
+            let mut chain = Vec::with_capacity(biome_steps.iter().map(Vec::len).sum());
+            for (step, list) in biome_steps.iter().enumerate() {
+                for feature in list {
+                    let number = match numbers.get(feature.id.as_str()) {
+                        Some(number) => *number,
+                        None => {
+                            let number = numbered.len();
+                            numbers.insert(feature.id.as_str(), number);
+                            numbered.push(Rc::clone(feature));
+                            number
+                        }
+                    };
+                    chain.push((number, step));
+                }
+            }
+            chains.push(chain);
+        }
+
+        // Each biome's flattened list is a chain: an edge from every element
+        // to the one after it, so the topological order keeps each biome's
+        // own relative order. Both the node list and each node's successors
+        // are walked in (step, number) order, which is what decides the
+        // interleaving of two biomes that share no features.
+        let mut successors: HashMap<Node, Vec<Node>> = HashMap::new();
+        for chain in &chains {
+            for (index, node) in chain.iter().enumerate() {
+                successors.entry(*node).or_default();
+                if let Some(next) = chain.get(index + 1) {
+                    let edges = successors.get_mut(node).expect("node just entered");
+                    if !edges.contains(next) {
+                        edges.push(*next);
                     }
                 }
             }
         }
-        for slot in &mut steps {
-            slot.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut nodes: Vec<Node> = successors.keys().copied().collect();
+        nodes.sort_by_key(|&(number, step)| (step, number));
+        for edges in successors.values_mut() {
+            edges.sort_by_key(|&(number, step)| (step, number));
+            edges.dedup();
         }
-        self.steps = steps;
+
+        let mut visited: HashSet<Node> = HashSet::new();
+        let mut in_progress: HashSet<Node> = HashSet::new();
+        let mut emitted: Vec<Node> = Vec::with_capacity(nodes.len());
+        for root in &nodes {
+            if visited.contains(root) {
+                continue;
+            }
+            if depth_first_visit(
+                &successors,
+                *root,
+                &mut visited,
+                &mut in_progress,
+                &mut emitted,
+            ) {
+                return None;
+            }
+        }
+        // A node is emitted only after all of its successors, so reversing
+        // the emission turns each edge into a forward one.
+        emitted.reverse();
+
+        let mut steps: Vec<StepSchedule> = (0..width).map(|_| StepSchedule::default()).collect();
+        for &(number, step) in &emitted {
+            if let Some(schedule) = steps.get_mut(step) {
+                schedule.features.push(Rc::clone(&numbered[number]));
+            }
+        }
+        for schedule in &mut steps {
+            for (index, feature) in schedule.features.iter().enumerate() {
+                schedule.ordinals.insert(feature.id.clone(), index);
+            }
+        }
+
+        let mut biome_ordinals: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
+        for biome in order {
+            let Some(biome_steps) = self.biomes.get(*biome) else {
+                continue;
+            };
+            let mut per_step = vec![Vec::new(); width];
+            for (step, list) in biome_steps.iter().enumerate() {
+                let Some(schedule) = steps.get(step) else {
+                    continue;
+                };
+                let mut indices = Vec::with_capacity(list.len());
+                for feature in list {
+                    if let Some(ordinal) = schedule.ordinal_of(&feature.id) {
+                        indices.push(ordinal);
+                    }
+                }
+                indices.sort_unstable();
+                indices.dedup();
+                per_step[step] = indices;
+            }
+            biome_ordinals.insert((*biome).to_owned(), per_step);
+        }
+        Some(BuiltSchedule {
+            steps,
+            biome_ordinals,
+        })
     }
 
     /// The pack's block tags, for `minecraft:tag_match` target tests.
@@ -531,7 +772,29 @@ impl FeatureData {
 
     /// The placed features a generation step runs, in ordinal order.
     pub fn step(&self, index: usize) -> Option<&[Rc<PlacedFeature>]> {
-        self.steps.get(index).map(Vec::as_slice)
+        self.steps.get(index).map(StepSchedule::features)
+    }
+
+    /// The ordinals one chunk's decoration pass runs for one generation
+    /// step, given the biomes its 3x3 neighbourhood contains. The reference
+    /// runtime collects the step index of every feature any of those biomes
+    /// lists at that step, then sorts them ascending; a biome the dimension
+    /// cannot produce contributes nothing, which is its `retainAll` over the
+    /// source's possible biomes.
+    pub fn region_ordinals(&self, step: usize, biomes: &[String]) -> Vec<usize> {
+        let mut ordinals = Vec::new();
+        for biome in biomes {
+            if let Some(indices) = self
+                .biome_ordinals
+                .get(biome)
+                .and_then(|per_step| per_step.get(step))
+            {
+                ordinals.extend_from_slice(indices);
+            }
+        }
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        ordinals
     }
 
     /// Whether one biome lists this placed feature at all, which is what the
@@ -551,23 +814,57 @@ impl FeatureData {
     /// pack, ascending. Vanilla iterates its own fixed step list; here the
     /// list is derived from the data so an empty pack decorates nothing.
     pub fn decorated_steps(&self) -> Vec<usize> {
-        let width = self
-            .biomes
-            .values()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(GENERATION_STEPS);
-        (0..width)
-            .filter(|step| {
-                self.biomes
-                    .values()
-                    .any(|steps| steps.get(*step).is_some_and(|list| !list.is_empty()))
-            })
+        (0..self.steps.len())
+            .filter(|step| !self.steps[*step].features.is_empty())
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
         self.biomes.is_empty() && self.placed.is_empty() && self.configured.is_empty()
+    }
+}
+
+/// Walks the ordering graph from one root, emitting a node only once every
+/// node it points to has been emitted, and reporting whether it met a node
+/// that is still on the path. The walk keeps its own stack rather than
+/// recursing: a pack's chain can be longer than a call stack wants to hold.
+fn depth_first_visit(
+    successors: &HashMap<Node, Vec<Node>>,
+    start: Node,
+    visited: &mut HashSet<Node>,
+    in_progress: &mut HashSet<Node>,
+    emitted: &mut Vec<Node>,
+) -> bool {
+    let mut path: Vec<(Node, usize)> = Vec::new();
+    let mut pending = Some(start);
+    loop {
+        if let Some(node) = pending.take() {
+            if visited.contains(&node) {
+                if path.is_empty() {
+                    return false;
+                }
+                continue;
+            }
+            if in_progress.contains(&node) {
+                return true;
+            }
+            in_progress.insert(node);
+            path.push((node, 0));
+        }
+        let Some((node, cursor)) = path.last_mut() else {
+            return false;
+        };
+        let edges = successors.get(node).map(Vec::as_slice).unwrap_or(&[]);
+        if *cursor < edges.len() {
+            let next = edges[*cursor];
+            *cursor += 1;
+            pending = Some(next);
+            continue;
+        }
+        let (done, _) = path.pop().expect("a frame to finish");
+        in_progress.remove(&done);
+        visited.insert(done);
+        emitted.push(done);
     }
 }
 
@@ -820,6 +1117,7 @@ fn parse_biome_steps(
     configured: &HashMap<String, Rc<ConfiguredFeature>>,
     placed_ids: &[String],
     configured_ids: &[String],
+    inline_sites: &mut usize,
 ) -> Result<Vec<Vec<Rc<PlacedFeature>>>, WorldgenError> {
     let Some(steps) = document.get("features").and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -844,8 +1142,9 @@ fn parse_biome_steps(
                     // is kept as a placed feature with an empty modifier
                     // list when the kind is known, and rejected otherwise.
                     if configured.contains_key(name) {
+                        *inline_sites += 1;
                         return Ok(Rc::new(PlacedFeature {
-                            id: name.to_string(),
+                            id: format!("{name}#{}", *inline_sites - 1),
                             feature: Rc::clone(&configured[name]),
                             modifiers: Vec::new(),
                         }));
@@ -929,9 +1228,11 @@ pub struct DecorationPos {
 /// this over one chunk's resolved columns; writing it here keeps the vein
 /// geometry independent of how the terrain was produced.
 ///
-/// Every position the pass writes is inside the implementation's own chunk,
-/// and reads stay inside it apart from the six-neighbour air test, so a
-/// decoration pass costs no new terrain work beyond the chunk it decorates.
+/// Every position the pass writes is inside the implementation's own chunk.
+/// Reads reach one column beyond it: the six-neighbour air test, and the
+/// heightmap the ore anchor gate walks over its box's footprint, whose halo
+/// columns stay within the 3x3 chunk region the pass already resolves biomes
+/// over.
 pub trait DecorationTarget {
     /// The dimension's lowest buildable row.
     fn min_y(&self) -> i32;
@@ -954,6 +1255,11 @@ pub trait DecorationTarget {
     fn set_block(&mut self, x: i32, y: i32, z: i32, name: &str);
     /// The biome at a position, which the `minecraft:biome` filter asks for.
     fn biome_at(&self, x: i32, y: i32, z: i32) -> Option<String>;
+    /// The absolute Y of the highest terrain row of the column, as the
+    /// world-gen ocean-floor heightmap reports it: fluid and air above a sea
+    /// floor do not count. The ore anchor gate reads it for every column of
+    /// its box's footprint, including the halo over the neighbour chunks.
+    fn ocean_floor_height(&self, x: i32, z: i32) -> i32;
 }
 
 /// Java `Mth.SIN`: a 65536-entry table indexed by a fixed-point multiple of
@@ -1022,24 +1328,35 @@ fn adjacent_to_air(target: &dyn DecorationTarget, x: i32, y: i32, z: i32) -> boo
     .any(|(nx, ny, nz)| target.is_air(*nx, *ny, *nz))
 }
 
+/// Whether any column of a box's footprint reaches down to the box's base
+/// row. The reference runtime's ore placement asks its world-gen ocean-floor
+/// heightmap this question over the `width + 1` by `width + 1` grid of columns
+/// the box covers, and gives up on the attempt when none of them answers: a
+/// box that floats entirely above the terrain can hold nothing a stone-family
+/// replacement test accepts, so the attempt is over before it draws a radius.
+/// What it *does* decide is where the attempt leaves the stream: the rejected
+/// one costs only the three draws that fixed its axis, and every later attempt
+/// of the same feature resumes from there.
+fn anchored(
+    target: &dyn DecorationTarget,
+    base_x: i32,
+    base_y: i32,
+    base_z: i32,
+    width: i32,
+) -> bool {
+    (base_x..=base_x + width)
+        .flat_map(|x| (base_z..=base_z + width).map(move |z| (x, z)))
+        .any(|(x, z)| base_y <= target.ocean_floor_height(x, z))
+}
+
 /// Places one `minecraft:ore` vein, returning the number of blocks written.
 ///
 /// The shape is the documented two-endpoint ellipsoid sweep: three draws fix
-/// the vein's axis and height jitter, `size` points along the axis each get a
-/// radius from a single `nextDouble`, points whose radius difference exceeds
-/// their distance are culled, and the surviving spheres are written where the
-/// column's replacement rules accept them.
-///
-/// Not reproduced: the reference runtime's anchor gate, which walks the vein
-/// box's footprint over the world-gen heightmap and gives up before drawing
-/// any radius when no column reaches down to the box's base row. It is a
-/// fast path, not a placement rule — a box with no terrain in it can only
-/// hold air and fluid, which every stone-family replacement test rejects, so
-/// the same blocks land either way. Skipping it saves us a density re-scan of
-/// the footprint's halo columns; the cost is that a floating vein draws its
-/// `size` radii here, which shifts the stream for the attempts that follow it
-/// in the same feature chain. `docs/PROVENANCE.md` records it as a known
-/// deviation.
+/// the vein's axis and height jitter, the box those endpoints define is
+/// anchored [`anchored`] against the heightmap, `size` points along the axis
+/// each get a radius from a single `nextDouble`, points whose radius difference
+/// exceeds their distance are culled, and the surviving spheres are written
+/// where the column's replacement rules accept them.
 fn place_ore(
     target: &mut dyn DecorationTarget,
     random: &mut DecorationRandom,
@@ -1066,6 +1383,9 @@ fn place_ore(
     let base_z = origin.z - reach - span;
     let width = 2 * (reach + span);
     let box_height = 2 * (span + 2);
+    if !anchored(target, base_x, base_y, base_z, width) {
+        return 0;
+    }
     let points = size.max(0) as usize;
     let mut vein = vec![0.0f64; points * 4];
     for index in 0..points {
@@ -1172,6 +1492,11 @@ impl FeatureData {
     /// from the stream the step's ordinal gives that chunk, and returns the
     /// number of blocks written.
     ///
+    /// Only the ordinals the chunk's 3x3 biome union lists at this step run:
+    /// the reference runtime collects exactly that set before it places
+    /// anything, so a feature whose only biomes lie outside the neighbourhood
+    /// is never attempted here, whatever its own biome filter would say.
+    ///
     /// Each feature restarts its stream from the chunk's decoration seed plus
     /// its ordinal and step, so a feature with no runtime here contributes
     /// nothing without moving the seeds of the features around it — which is
@@ -1183,10 +1508,40 @@ impl FeatureData {
         chunk_x: i32,
         chunk_z: i32,
         world_seed: i64,
+        region_biomes: &[String],
     ) -> usize {
-        let Some(schedule) = self.step(step) else {
+        let mut written = 0usize;
+        for ordinal in self.region_ordinals(step, region_biomes) {
+            written += self.decorate_ordinal(target, step, ordinal, chunk_x, chunk_z, world_seed);
+        }
+        written
+    }
+
+    /// Runs the one feature a step's schedule holds at `ordinal` for one
+    /// chunk, exactly as [`Self::decorate_step`] would run it, and returns the
+    /// number of blocks written.
+    ///
+    /// Splitting this out is only sound because a feature's stream restarts
+    /// from the chunk's decoration seed with its own ordinal and step: no
+    /// ordinal can borrow state from the one before it, so running one alone
+    /// draws the same sequence as running it inside the step's loop. That is
+    /// what lets a measurement attribute a written block to the feature that
+    /// placed it.
+    pub fn decorate_ordinal(
+        &self,
+        target: &mut dyn DecorationTarget,
+        step: usize,
+        ordinal: usize,
+        chunk_x: i32,
+        chunk_z: i32,
+        world_seed: i64,
+    ) -> usize {
+        let Some(placed) = self.step(step).and_then(|s| s.get(ordinal)) else {
             return 0;
         };
+        if !placed.is_modelable() {
+            return 0;
+        }
         let origin = DecorationPos {
             x: chunk_x << 4,
             y: target.min_y(),
@@ -1194,15 +1549,8 @@ impl FeatureData {
         };
         let mut random = DecorationRandom::new(world_seed);
         let decoration_seed = random.set_decoration_seed(world_seed, origin.x, origin.z);
-        let mut written = 0usize;
-        for (ordinal, placed) in schedule.iter().enumerate() {
-            if !placed.is_modelable() {
-                continue;
-            }
-            random.set_feature_seed(decoration_seed, ordinal as i32, step as i32);
-            written += self.run_chain(target, placed, 0, origin, &mut random);
-        }
-        written
+        random.set_feature_seed(decoration_seed, ordinal as i32, step as i32);
+        self.run_chain(target, placed, 0, origin, &mut random)
     }
 
     /// Walks one placed feature's decoration list. Each modifier either
@@ -1497,6 +1845,7 @@ mod tests {
             &data.configured,
             &[],
             &[],
+            &mut 0,
         )
         .expect_err("rejected");
         assert!(error.to_string().contains("references unknown"), "{error}");
@@ -1511,6 +1860,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &[],
+            &mut 0,
         )
         .expect("a biome without features contributes nothing");
         assert!(steps.is_empty());
@@ -1532,6 +1882,7 @@ mod tests {
         chunk_z: i32,
         base: String,
         write_anywhere: bool,
+        ground: i32,
         written: HashMap<(i32, i32, i32), String>,
         biome: Option<String>,
     }
@@ -1545,6 +1896,7 @@ mod tests {
                 chunk_z: 0,
                 base: "minecraft:stone".to_string(),
                 write_anywhere: false,
+                ground: 127,
                 written: HashMap::new(),
                 biome: Some("minecraft:plains".to_string()),
             }
@@ -1561,6 +1913,15 @@ mod tests {
         /// measure a vein's true extent instead of its clipped one.
         fn write_anywhere(mut self) -> Self {
             self.write_anywhere = true;
+            self
+        }
+
+        /// The row every column's ocean-floor heightmap reports. The fixture
+        /// terrain fills the build volume, so the default is its top row and no
+        /// attempt is ever unanchored; a lower row leaves the sky above it empty
+        /// for the anchor gate to read.
+        fn with_ground(mut self, y: i32) -> Self {
+            self.ground = y;
             self
         }
 
@@ -1622,6 +1983,10 @@ mod tests {
         fn biome_at(&self, _x: i32, _y: i32, _z: i32) -> Option<String> {
             self.biome.clone()
         }
+
+        fn ocean_floor_height(&self, _x: i32, _z: i32) -> i32 {
+            self.ground
+        }
     }
 
     /// An ore that replaces the fixture terrain's base block.
@@ -1651,14 +2016,41 @@ mod tests {
     }
 
     /// A registry running one step's schedule, listing everything it carries
-    /// in the fixture biome.
+    /// in the fixture biome. A single biome whose only chain is that step's
+    /// list is numbered by position, which is what the derived ordering gives
+    /// when one biome is the whole source.
     fn registry(step: Vec<Rc<PlacedFeature>>) -> FeatureData {
         let membership: HashSet<String> = step.iter().map(|feature| feature.id.clone()).collect();
+        let mut ordinals = HashMap::new();
+        let mut positions = Vec::new();
+        for (index, feature) in step.iter().enumerate() {
+            ordinals.insert(feature.id.clone(), index);
+            positions.push(index);
+        }
         FeatureData {
-            steps: vec![step],
+            steps: vec![StepSchedule {
+                features: step,
+                ordinals,
+            }],
+            biome_ordinals: HashMap::from([("minecraft:plains".to_string(), vec![positions])]),
             membership: HashMap::from([("minecraft:plains".to_string(), membership)]),
             ..Default::default()
         }
+    }
+
+    /// The fixture decoration region: one anchor chunk whose biome volume is
+    /// the fixture biome every `TestTarget` reports.
+    fn region() -> Vec<String> {
+        vec!["minecraft:plains".to_string()]
+    }
+
+    /// The identifiers one generation step's schedule runs, in ordinal order.
+    fn step_ids(data: &FeatureData, step: usize) -> Vec<String> {
+        data.step(step)
+            .unwrap_or_else(|| panic!("the pack has no step {step}"))
+            .iter()
+            .map(|feature| feature.id.clone())
+            .collect()
     }
 
     /// Runs one vein on `target` from the stream `seed`/`ordinal` gives it.
@@ -1696,6 +2088,33 @@ mod tests {
             "one vein writes each position once"
         );
         target
+    }
+
+    /// Runs one ore attempt against a target that keeps its own stream, so a
+    /// test can watch what the attempts of one chain spend in order.
+    fn attempt(
+        target: &mut TestTarget,
+        random: &mut DecorationRandom,
+        origin: DecorationPos,
+        feature: &ConfiguredFeature,
+    ) -> usize {
+        let ConfiguredFeature::Ore {
+            size,
+            targets,
+            discard_chance_on_air_exposure,
+        } = feature
+        else {
+            panic!("the fixture ore is an ore: {feature:?}");
+        };
+        place_ore(
+            target,
+            random,
+            &BlockTags::default(),
+            *size,
+            targets,
+            *discard_chance_on_air_exposure,
+            origin,
+        )
     }
 
     /// The next three delegate draws of a stream, so it can be compared
@@ -1736,6 +2155,117 @@ mod tests {
         assert_ne!(
             first.written, other.written,
             "a different world seed must move the stream"
+        );
+    }
+
+    /// The anchor gate: a vein's box is measured against the heightmap row of
+    /// the columns under its footprint, and an attempt whose base row clears
+    /// every one of them is abandoned before it draws a radius. The row that
+    /// decides is the box's own base — seven under the origin for a size-64
+    /// vein — so the boundary sits a whole box-height above where the shape
+    /// would first miss the ground, and what a dropped attempt costs the chain
+    /// is the three draws that fixed its axis.
+    #[test]
+    fn a_box_that_clears_the_terrain_costs_only_its_axis_draws() {
+        let ore = stone_replacement("minecraft:granite", 64, 0.0);
+        let ground = 40;
+        let origin = DecorationPos {
+            x: 4,
+            y: ground + 7,
+            z: 4,
+        };
+
+        let mut boundary = TestTarget::new().with_ground(ground);
+        let mut random = DecorationRandom::new(2026);
+        random.set_feature_seed(2026, 0, 0);
+        let placed = attempt(&mut boundary, &mut random, origin, &ore);
+        assert!(
+            placed > 0,
+            "a box whose base row reaches the terrain places, got {placed}"
+        );
+
+        let mut floating = TestTarget::new().with_ground(ground);
+        let mut random = DecorationRandom::new(2026);
+        random.set_feature_seed(2026, 0, 0);
+        let dropped = attempt(
+            &mut floating,
+            &mut random,
+            DecorationPos { y: 48, ..origin },
+            &ore,
+        );
+        assert_eq!(dropped, 0, "the same box one row higher is dropped");
+        assert_eq!(
+            floating.total(),
+            0,
+            "and the abandoned box leaves nothing behind"
+        );
+
+        // The fixture's terrain fills the build volume unless a test lowers it,
+        // so the row above is the gate's doing, not a vein that lands nowhere:
+        // the identical attempt places into a full column.
+        let mut full_column = TestTarget::new();
+        let mut random = DecorationRandom::new(2026);
+        random.set_feature_seed(2026, 0, 0);
+        let unbounded = attempt(
+            &mut full_column,
+            &mut random,
+            DecorationPos { y: 48, ..origin },
+            &ore,
+        );
+        assert!(
+            unbounded > 0,
+            "without the heightmap floor the same attempt places, got {unbounded}"
+        );
+
+        // A dropped attempt is over the moment the gate answers, so the stream
+        // it leaves behind is the stream three draws — the angle and the two
+        // height jitters — would have left, with none of the vein's radii spent.
+        let mut baseline = DecorationRandom::new(2026);
+        baseline.set_feature_seed(2026, 0, 0);
+
+        let mut dropped = TestTarget::new().with_ground(ground);
+        let mut spent = baseline.clone();
+        let skipped = attempt(
+            &mut dropped,
+            &mut spent,
+            DecorationPos { y: 100, ..origin },
+            &ore,
+        );
+        assert_eq!(skipped, 0, "the sky-high box is dropped");
+        assert_eq!(
+            signature(&spent),
+            reference(&baseline, 3),
+            "a dropped attempt costs its three axis draws, not its radii"
+        );
+
+        // Which is what the next attempt of the same chain is written against:
+        // it lands where three draws leave the stream, not where a full vein
+        // would have left it.
+        let mut chained = TestTarget::new().with_ground(ground);
+        let mut random = baseline.clone();
+        attempt(
+            &mut chained,
+            &mut random,
+            DecorationPos { y: 100, ..origin },
+            &ore,
+        );
+        let after = attempt(&mut chained, &mut random, origin, &ore);
+
+        let mut resumed = TestTarget::new().with_ground(ground);
+        let mut random = baseline.clone();
+        let _ = random.next_float();
+        let _ = random.next_int_bounded(3);
+        let _ = random.next_int_bounded(3);
+        let direct = attempt(&mut resumed, &mut random, origin, &ore);
+
+        assert!(direct > 0, "the anchored attempt places, got {direct}");
+        assert_eq!(
+            after, direct,
+            "the attempt after a dropped one draws the numbers a three-draw gap leaves"
+        );
+        assert_eq!(
+            chained.written, resumed.written,
+            "and lands the same blocks at the same positions"
         );
     }
 
@@ -1985,14 +2515,14 @@ mod tests {
             )])
         };
         let mut always = TestTarget::new().write_anywhere();
-        let written = chain(1).decorate_step(&mut always, 0, 0, 0, 2026);
+        let written = chain(1).decorate_step(&mut always, 0, 0, 0, 2026, &region());
         assert!(
             written > 0 && always.blocks("minecraft:granite") > 0,
             "a chance of one fires every time and the count multiplies the attempt"
         );
         let mut rare = TestTarget::new().write_anywhere();
         assert_eq!(
-            chain(1_000_000).decorate_step(&mut rare, 0, 0, 0, 2026),
+            chain(1_000_000).decorate_step(&mut rare, 0, 0, 0, 2026, &region()),
             0,
             "one attempt in a million does not fire on this stream"
         );
@@ -2016,19 +2546,22 @@ mod tests {
         )]);
         let mut listed = TestTarget::new().write_anywhere();
         assert!(
-            data.decorate_step(&mut listed, 0, 0, 0, 2026) > 0,
+            data.decorate_step(&mut listed, 0, 0, 0, 2026, &region()) > 0,
             "the fixture biome lists the feature"
         );
         let mut elsewhere = TestTarget::new()
             .write_anywhere()
             .in_biome(Some("minecraft:desert"));
         assert_eq!(
-            data.decorate_step(&mut elsewhere, 0, 0, 0, 2026),
+            data.decorate_step(&mut elsewhere, 0, 0, 0, 2026, &region()),
             0,
             "a biome that does not list it places nothing"
         );
         let mut unknown = TestTarget::new().write_anywhere().in_biome(None);
-        assert_eq!(data.decorate_step(&mut unknown, 0, 0, 0, 2026), 0);
+        assert_eq!(
+            data.decorate_step(&mut unknown, 0, 0, 0, 2026, &region()),
+            0
+        );
     }
 
     /// A feature with no runtime here places nothing and still costs no
@@ -2057,7 +2590,7 @@ mod tests {
             Vec::new(),
         );
         let mut alone = TestTarget::new().write_anywhere();
-        registry(vec![Rc::clone(&vein)]).decorate_step(&mut alone, 0, 0, 0, 2026);
+        registry(vec![Rc::clone(&vein)]).decorate_step(&mut alone, 0, 0, 0, 2026, &region());
         let mut shifted = TestTarget::new().write_anywhere();
         registry(vec![Rc::clone(&forest), Rc::clone(&vein)]).decorate_step(
             &mut shifted,
@@ -2065,6 +2598,7 @@ mod tests {
             0,
             0,
             2026,
+            &region(),
         );
         assert!(!alone.written.is_empty() && !shifted.written.is_empty());
         assert!(shifted.blocks("minecraft:granite") > 0 && alone.blocks("minecraft:granite") > 0);
@@ -2180,9 +2714,9 @@ mod tests {
     }
 
     /// A hand-built decorating pack: two ores and an unmodeled tree, placed
-    /// features that reference them, and two biomes that list the same step
-    /// in different orders.
-    fn schedule_pack(label: &str) -> PathBuf {
+    /// features that reference them, nested block tags, and two biomes whose
+    /// positional `features` arrays the caller supplies.
+    fn schedule_pack(label: &str, biome_one: &str, biome_two: &str) -> PathBuf {
         let root = scratch_root(label);
         let worldgen = root.join("data/testns/worldgen");
         write(
@@ -2232,40 +2766,78 @@ mod tests {
         );
         write(
             &worldgen.join("biome/one.json"),
-            r#"{"features": [["testns:ore_b", "testns:aa_forest", "testns:ore_a"], [], ["testns:ore_a"]]}"#,
+            &format!(r#"{{"features": {biome_one}}}"#),
         );
         write(
             &worldgen.join("biome/two.json"),
-            r#"{"features": [["testns:ore_a", "testns:ore_b"]]}"#,
+            &format!(r#"{{"features": {biome_two}}}"#),
         );
         root
     }
 
     #[test]
-    fn the_step_schedule_numbers_features_by_identifier() {
-        let root = schedule_pack("schedule");
+    fn the_step_schedule_orders_the_biome_chains_into_step_schedules() {
+        // Biome `one` lists ore_b and the tree at step 0 and ore_a at step 2;
+        // biome `two` lists ore_a at step 0 and ore_b at step 3. Neither
+        // contradicts the other, so the walk has one answer: every biome's
+        // own relative order holds, across the step boundaries too.
+        let root = schedule_pack(
+            "schedule",
+            r#"[["testns:ore_b", "testns:aa_forest"], [], ["testns:ore_a"]]"#,
+            r#"[["testns:ore_a"], [], [], ["testns:ore_b"]]"#,
+        );
         let data = FeatureData::load(&root).expect("loads");
-        let ids: Vec<&str> = data
-            .step(0)
-            .expect("step 0")
-            .iter()
-            .map(|feature| feature.id.as_str())
-            .collect();
+        let ids = |step: usize| -> Vec<&str> {
+            data.step(step)
+                .unwrap_or_else(|| panic!("step {step}"))
+                .iter()
+                .map(|feature| feature.id.as_str())
+                .collect()
+        };
         assert_eq!(
-            ids,
-            ["testns:aa_forest", "testns:ore_a", "testns:ore_b"],
-            "the ordinal is identifier order, whatever order a biome listed them in"
+            ids(0),
+            ["testns:ore_a", "testns:ore_b", "testns:aa_forest"],
+            "the step order comes from the two chains, not from the identifiers"
         );
         assert!(
-            !data.step(0).expect("step 0")[0].is_modelable(),
+            !data.step(0).expect("step 0")[2].is_modelable(),
             "the tree holds its slot without being modeled"
         );
         assert_eq!(
             data.decorated_steps(),
-            [0, 2],
-            "an empty step carries nothing"
+            [0, 2, 3],
+            "an empty step carries nothing and the schedule is as wide as the widest biome"
         );
-        assert_eq!(data.step(2).expect("step 2").len(), 1);
+        assert_eq!(ids(2), ["testns:ore_a"]);
+        assert_eq!(ids(3), ["testns:ore_b"]);
+        // A feature listed at two steps is numbered separately in each, and
+        // the pair of step and ordinal is its random identity.
+        assert_eq!(
+            data.steps[0].ordinal_of("testns:ore_b"),
+            Some(1),
+            "ore_b is second in step 0's schedule"
+        );
+        assert_eq!(
+            data.steps[3].ordinal_of("testns:ore_b"),
+            Some(0),
+            "and first in step 3's"
+        );
+
+        // The ordinals a chunk runs come from the biomes in its neighbourhood,
+        // not from the biome a candidate position lands in.
+        let one = "testns:one".to_string();
+        let two = "testns:two".to_string();
+        let only_one = vec![one.clone()];
+        let only_two = vec![two.clone()];
+        let both = vec![two.clone(), one.clone()];
+        assert_eq!(data.region_ordinals(0, &only_one), vec![1, 2]);
+        assert_eq!(data.region_ordinals(0, &only_two), vec![0]);
+        assert_eq!(data.region_ordinals(0, &both), vec![0, 1, 2]);
+        assert_eq!(data.region_ordinals(2, &only_one), vec![0]);
+        assert_eq!(data.region_ordinals(3, &only_two), vec![0]);
+        assert!(data.region_ordinals(3, &only_one).is_empty());
+        assert!(data.region_ordinals(1, &only_two).is_empty());
+
         assert!(data.biome_lists("testns:one", "testns:ore_a"));
         assert!(
             data.biome_lists("testns:two", "testns:ore_b"),
@@ -2282,18 +2854,20 @@ mod tests {
         );
         assert!(data.tags().contains("testns:base_stone", "minecraft:dirt"));
 
-        // And the runtime actually decorates from it: the granite ore needs
-        // the tag, the biome filter needs the membership.
+        // And the runtime decorates from it: the granite ore needs the tag,
+        // the biome filter needs the membership, and a region that leaves an
+        // ordinal out runs nothing at all.
+        let both = vec![one, two];
         let mut plains = TestTarget::new()
             .anchored_at(0, 0)
             .in_biome(Some("testns:one"));
-        data.decorate_step(&mut plains, 0, 0, 0, 2026);
+        data.decorate_step(&mut plains, 0, 0, 0, 2026, &both);
         assert!(plains.blocks("minecraft:granite") > 0, "tag_match fired");
         assert!(plains.blocks("minecraft:tuff") > 0, "block_match fired");
         let mut desert = TestTarget::new()
             .anchored_at(0, 0)
             .in_biome(Some("minecraft:desert"));
-        data.decorate_step(&mut desert, 0, 0, 0, 2026);
+        data.decorate_step(&mut desert, 0, 0, 0, 2026, &both);
         assert_eq!(
             desert.blocks("minecraft:granite"),
             0,
@@ -2303,10 +2877,164 @@ mod tests {
             desert.blocks("minecraft:tuff") > 0,
             "ore_b has no biome filter"
         );
+        let mut single = TestTarget::new()
+            .anchored_at(0, 0)
+            .in_biome(Some("testns:one"));
+        data.decorate_step(&mut single, 0, 0, 0, 2026, &only_two);
+        assert!(
+            single.blocks("minecraft:granite") > 0,
+            "the one ordinal that region contributes is ore_a"
+        );
+        assert_eq!(
+            single.blocks("minecraft:tuff"),
+            0,
+            "ore_b is not listed at step 0 by that biome"
+        );
 
         let empty = scratch_root("no-features");
         assert!(FeatureData::load(&empty).expect("loads").is_empty());
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(empty).expect("cleanup");
+    }
+
+    /// Running one ordinal alone is the same as running it inside its step,
+    /// because each feature reseeds from the chunk's decoration seed with its
+    /// own ordinal and step and never borrows a neighbour's stream. This is
+    /// what lets a measurement attribute a written block to one feature.
+    #[test]
+    fn one_ordinal_alone_reproduces_its_share_of_the_step() {
+        let root = schedule_pack(
+            "attribution",
+            r#"[["testns:ore_b", "testns:aa_forest"], [], ["testns:ore_a"]]"#,
+            r#"[["testns:ore_a"], [], [], ["testns:ore_b"]]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        let both = vec!["testns:one".to_string(), "testns:two".to_string()];
+
+        let mut step = TestTarget::new()
+            .anchored_at(0, 0)
+            .in_biome(Some("testns:one"));
+        data.decorate_step(&mut step, 0, 0, 0, 2026, &both);
+        let mut granite = TestTarget::new()
+            .anchored_at(0, 0)
+            .in_biome(Some("testns:one"));
+        let granite_draws = data.decorate_ordinal(&mut granite, 0, 0, 0, 0, 2026);
+        let mut tuff = TestTarget::new()
+            .anchored_at(0, 0)
+            .in_biome(Some("testns:one"));
+        let tuff_draws = data.decorate_ordinal(&mut tuff, 0, 1, 0, 0, 2026);
+        assert!(
+            granite_draws > 0 && tuff_draws > 0,
+            "both veins place when run alone"
+        );
+
+        // The step runs its ordinals ascending, so a position the granite
+        // ordinal reached keeps granite: the later tuff ordinal reads stone
+        // there, fails its own target test and does not overwrite it.
+        let mut expected = granite.written.clone();
+        for (position, name) in &tuff.written {
+            expected.entry(*position).or_insert_with(|| name.clone());
+        }
+        assert_eq!(
+            step.written, expected,
+            "each ordinal draws alone exactly as it draws inside its step"
+        );
+
+        let mut unmodeled = TestTarget::new()
+            .anchored_at(0, 0)
+            .in_biome(Some("testns:one"));
+        assert_eq!(
+            data.decorate_ordinal(&mut unmodeled, 0, 2, 0, 0, 2026),
+            0,
+            "the tree keeps its slot in the schedule but places nothing here"
+        );
+
+        let mut past_end = TestTarget::new().anchored_at(0, 0);
+        assert_eq!(
+            data.decorate_ordinal(&mut past_end, 0, 9, 0, 0, 2026),
+            0,
+            "an ordinal past the step's schedule holds nothing"
+        );
+        let mut no_step = TestTarget::new().anchored_at(0, 0);
+        assert_eq!(
+            data.decorate_ordinal(&mut no_step, 9, 0, 0, 0, 2026),
+            0,
+            "a step the schedule never built contributes nothing"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Two biomes that list the same pair of features in opposite orders give
+    /// the ordering nothing consistent to build: the reference runtime drops
+    /// one biome at a time, in source order, and rebuilds from scratch.
+    #[test]
+    fn the_step_schedule_recovers_from_a_biome_order_cycle() {
+        let root = schedule_pack(
+            "cycle",
+            r#"[["testns:ore_b", "testns:aa_forest", "testns:ore_a"], [], ["testns:ore_a"]]"#,
+            r#"[["testns:ore_a", "testns:ore_b"]]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        let ids: Vec<&str> = data
+            .step(0)
+            .expect("step 0")
+            .iter()
+            .map(|feature| feature.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["testns:ore_a", "testns:ore_b"],
+            "the surviving biome's own order is all that is left"
+        );
+        assert_eq!(
+            data.decorated_steps(),
+            [0],
+            "the dropped biome was the only one listing steps 1 and 2"
+        );
+        assert_eq!(
+            data.unimplemented_features.get("feature_order_cycle"),
+            Some(&1),
+            "the recovery is reported, not silent"
+        );
+        let one = "testns:one".to_string();
+        let two = "testns:two".to_string();
+        assert!(
+            data.region_ordinals(0, &[one]).is_empty(),
+            "a biome the schedule dropped contributes nothing"
+        );
+        assert_eq!(data.region_ordinals(0, &[two]), vec![0, 1]);
+        assert!(
+            data.biome_lists("testns:one", "testns:aa_forest"),
+            "membership is read from the pack, not from the surviving order"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Two biomes that share no features give the ordering nothing to
+    /// interleave by, so which step-0 list comes first is decided by the
+    /// source's own declaration order.
+    #[test]
+    fn incomparable_biomes_are_ordered_by_the_biome_source() {
+        let ore = stone_replacement("minecraft:granite", 8, 0.0);
+        let a = wrapper("testns:ore_a", &ore, Vec::new());
+        let b = wrapper("testns:ore_b", &ore, Vec::new());
+        let mut data = FeatureData {
+            biomes: HashMap::from([
+                ("testns:one".to_string(), vec![vec![Rc::clone(&a)]]),
+                ("testns:two".to_string(), vec![vec![Rc::clone(&b)]]),
+            ]),
+            ..Default::default()
+        };
+        data.set_biome_order(&["testns:one", "testns:two"]);
+        // The walk emits a node only after everything it points to, and the
+        // schedule is the reversal of that emission, so the biome listed
+        // later by the source ends up with the lower ordinal.
+        assert_eq!(step_ids(&data, 0), ["testns:ore_b", "testns:ore_a"]);
+        let one = "testns:one".to_string();
+        let only_one = vec![one];
+        assert_eq!(data.region_ordinals(0, &only_one), vec![1]);
+        data.set_biome_order(&["testns:two", "testns:one"]);
+        assert_eq!(step_ids(&data, 0), ["testns:ore_a", "testns:ore_b"]);
+        assert_eq!(data.region_ordinals(0, &only_one), vec![0]);
     }
 }

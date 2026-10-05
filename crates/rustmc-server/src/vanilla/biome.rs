@@ -160,6 +160,22 @@ impl BiomePlacement {
         best.map(|(_, id)| id)
     }
 
+    /// The biomes this table can select, in the order the table declares
+    /// them and with repeats dropped. A biome with several parameter ranges
+    /// occupies several rows, so the reference runtime's set of possible
+    /// biomes is this same first-appearance dedupe of the table, and the
+    /// placement stage numbers its features over exactly that list.
+    pub fn possible_biomes(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for (id, _) in &self.entries {
+            if seen.insert(id.as_str()) {
+                names.push(id.as_str());
+            }
+        }
+        names
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -259,6 +275,24 @@ mod tests {
         assert_eq!(param.distance(-10), 6);
         assert_eq!(param.distance(0), 0);
         assert_eq!(param.distance(10), 3);
+    }
+
+    /// The dimension's possible-biome set is the table read in order with
+    /// repeats dropped: a biome with two parameter ranges occupies two rows
+    /// but one slot, and the slot is its first row's.
+    #[test]
+    fn possible_biomes_follow_declaration_order_and_drop_repeats() {
+        let text = concat!(
+            "0|minecraft:plains|t=[-2000-2000]|h=[-10000-10000]|c=0|e=[-100-100]|d=0|w=[-10000-10000]|off=0\n",
+            "1|minecraft:forest|t=[2000-10000]|h=[-10000-10000]|c=0|e=[-100-100]|d=0|w=[-10000-10000]|off=0\n",
+            "2|minecraft:plains|t=[-10000--2000]|h=[-10000-10000]|c=0|e=[-100-100]|d=0|w=[-10000-10000]|off=0\n",
+        );
+        let table = BiomePlacement::parse(text).expect("test table parses");
+        assert_eq!(table.len(), 3);
+        assert_eq!(
+            table.possible_biomes(),
+            vec!["minecraft:plains", "minecraft:forest"],
+        );
     }
 
     #[test]

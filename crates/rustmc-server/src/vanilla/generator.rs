@@ -22,7 +22,7 @@
 //! the exhaustive scan is therefore the default.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -121,6 +121,13 @@ struct ChunkView<'a> {
     chunk: &'a mut DecoratedChunk,
 }
 
+/// The biomes present somewhere in one chunk's whole 4x4x4-cell volume,
+/// ascending and deduplicated. The reference runtime collects the palette of
+/// every section of a chunk (`LevelChunkSection.getBiomes().getAll(sink)`)
+/// when it decides which features may run, so the set spans the full column
+/// height rather than only the surface band.
+type BiomeRegion = Vec<String>;
+
 /// Entry counts of the generator's coordinate-keyed caches. Every one of
 /// them is keyed by world coordinates, so the count grows with the volume
 /// of world the generator has been asked about; `VanillaGenerator` bounds
@@ -134,8 +141,12 @@ pub struct CacheOccupancy {
     pub chunk_carvers: usize,
     /// Columns with a memoised surface top.
     pub heights: usize,
+    /// Columns with a memoised ocean-floor heightmap row.
+    pub ocean_floors: usize,
     /// Quart-grid biome choices retained for nearby samples.
     pub biomes: usize,
+    /// Chunks whose full biome volume has been enumerated.
+    pub biome_regions: usize,
     /// Aquifer fluid cells with a memoised center.
     pub aquifer_centers: usize,
     /// Aquifer fluid cells with a memoised status.
@@ -154,7 +165,9 @@ impl CacheOccupancy {
         self.masks
             + self.chunk_carvers
             + self.heights
+            + self.ocean_floors
             + self.biomes
+            + self.biome_regions
             + self.aquifer_centers
             + self.aquifer_statuses
             + self.aquifer_surface_levels
@@ -169,7 +182,7 @@ impl CacheOccupancy {
 /// noise stack and random factory it needs, so the engine is used only
 /// while wiring.
 ///
-/// The three coordinate-keyed memos below are fixed-capacity caches, not
+/// The coordinate-keyed memos below are fixed-capacity caches, not
 /// growing maps: every value they hold is a pure function of world
 /// coordinates and the seed, so eviction only costs a recomputation. See
 /// `vanilla::cache` and the capacity comments for the sizing reasoning.
@@ -193,8 +206,15 @@ pub struct VanillaGenerator {
     /// Column-top memo: the descent's steep-gradient lookups re-read
     /// neighbouring columns, whose top scan is otherwise O(height).
     heights: RefCell<BoundedCache<(i32, i32), i32>>,
+    /// Ocean-floor memo: the ore anchor gate reads a column's heightmap row
+    /// repeatedly across its attempts, and the answer costs a descent through
+    /// whatever fluid the filler left above the floor.
+    ocean_floors: RefCell<BoundedCache<(i32, i32), i32>>,
     /// One immutable biome choice per quantized 4x4x4 world cell.
     biomes: RefCell<BoundedCache<(i32, i32, i32), Option<String>>>,
+    /// Chunks whose whole biome volume has been enumerated, for the union a
+    /// decoration pass runs its ordinals over.
+    biome_regions: RefCell<BoundedCache<(i32, i32), Rc<BiomeRegion>>>,
     /// Chunks whose columns have been decorated. The value is a pure
     /// function of the chunk position and the seed, so an eviction only
     /// costs a replay of the nine anchor chunks' placement passes.
@@ -228,6 +248,11 @@ impl VanillaGenerator {
     /// streaming for a full-radius view's worth of 1,081,600 columns,
     /// i.e. tens of KiB instead of ~14 MB.
     pub const HEIGHT_CACHE_CAPACITY: usize = 4_096;
+    /// Columns with a memoised ocean-floor heightmap row. The ore anchor gate
+    /// reads a column for every attempt whose box might float, over a footprint
+    /// of up to 27×27 columns for the pack's largest vein — the same
+    /// neighbourhood the surface tops cover — so the bound matches theirs.
+    pub const OCEAN_FLOOR_CACHE_CAPACITY: usize = 4_096;
     /// A full chunk has at most 4×4×96 quart cells; neighboring chunk and
     /// surface-rule probes reuse them before a streaming sweep evicts them.
     pub const BIOME_CACHE_CAPACITY: usize = 4_096;
@@ -240,6 +265,15 @@ impl VanillaGenerator {
     /// bound costs 6.3 MiB; a smaller square or a chunk-at-a-time consumer
     /// simply never fills it.
     pub const DECORATED_CHUNK_CACHE_CAPACITY: usize = 32;
+    /// Chunks whose whole biome volume has been enumerated, for the union a
+    /// decoration pass runs one anchor's ordinals over. Moving the anchor one
+    /// column adds three chunk volumes to the nine it already holds, so 16
+    /// cover a straight sweep; 64 also cover a 4x4 target batch's nine
+    /// anchor windows. An entry is the sorted list of the distinct biome
+    /// identifiers in the chunk — a few hundred bytes — so the bound costs
+    /// tens of KiB instead of pinning one volume per chunk a radius-32 view
+    /// touches (1,089 chunks).
+    pub const BIOME_REGION_CACHE_CAPACITY: usize = 64;
 
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
     /// the noise engine to `world_seed`.
@@ -299,7 +333,13 @@ impl VanillaGenerator {
         // Placement documents are optional in the same sense the carver
         // documents are: a pack without them leaves the generator with the
         // terrain, carving, and surface passes only.
-        let feature_data = FeatureData::load(data_root)?;
+        let mut feature_data = FeatureData::load(data_root)?;
+        // The step schedules number their features over the biome source's
+        // possible-biome set, and for this pack that set is the placement
+        // table's own declaration order with repeats dropped.
+        if let Some(placement) = placement.as_ref() {
+            feature_data.set_biome_order(&placement.possible_biomes());
+        }
         let features = (!feature_data.is_empty()).then_some(feature_data);
         Ok(Self {
             router,
@@ -315,7 +355,9 @@ impl VanillaGenerator {
             masks: RefCell::new(BoundedCache::new(Self::MASK_CACHE_CAPACITY)),
             chunk_carvers: RefCell::new(BoundedCache::new(Self::CHUNK_CARVERS_CACHE_CAPACITY)),
             heights: RefCell::new(BoundedCache::new(Self::HEIGHT_CACHE_CAPACITY)),
+            ocean_floors: RefCell::new(BoundedCache::new(Self::OCEAN_FLOOR_CACHE_CAPACITY)),
             biomes: RefCell::new(BoundedCache::new(Self::BIOME_CACHE_CAPACITY)),
+            biome_regions: RefCell::new(BoundedCache::new(Self::BIOME_REGION_CACHE_CAPACITY)),
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
         })
     }
@@ -332,6 +374,52 @@ impl VanillaGenerator {
         let value = self.climate.biome(placement, x, surface_y, z);
         self.biomes.borrow_mut().insert(key, value.clone());
         value
+    }
+
+    /// The distinct biomes anywhere in one chunk's 4x4x4-cell volume,
+    /// ascending and deduplicated. The reference runtime collects the biome
+    /// palette of every section of the chunk, so the walk covers the whole
+    /// build height rather than only the surface band; one chunk is
+    /// 4x4x(height/4) quart cells, 1,536 in an overworld-sized dimension.
+    fn chunk_biomes(&self, chunk_x: i32, chunk_z: i32) -> Rc<BiomeRegion> {
+        if let Some(region) = self.biome_regions.borrow_mut().get_mut(&(chunk_x, chunk_z)) {
+            return Rc::clone(region);
+        }
+        let min_y = self.router.min_y;
+        let mut names = BTreeSet::new();
+        for local_x in 0..4 {
+            for local_z in 0..4 {
+                let x = chunk_x * 16 + local_x * 4;
+                let z = chunk_z * 16 + local_z * 4;
+                for row in 0..self.router.height / 4 {
+                    if let Some(name) = self.biome(x, z, min_y + row * 4) {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        let region = Rc::new(names.into_iter().collect::<BiomeRegion>());
+        self.biome_regions
+            .borrow_mut()
+            .insert((chunk_x, chunk_z), Rc::clone(&region));
+        region
+    }
+
+    /// The biome set one anchor chunk decorates with: the union of its own
+    /// volume and the eight around it. The reference runtime retains only the
+    /// biome source's possible biomes from that union, and every identifier
+    /// the placement table can return is in its own possible set, so the
+    /// retention is a no-op here.
+    fn region_biomes(&self, chunk_x: i32, chunk_z: i32) -> Vec<String> {
+        let mut names = Vec::new();
+        for anchor_z in chunk_z - 1..=chunk_z + 1 {
+            for anchor_x in chunk_x - 1..=chunk_x + 1 {
+                names.extend(self.chunk_biomes(anchor_x, anchor_z).iter().cloned());
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// The block id left at the column's highest non-air position by the
@@ -456,6 +544,7 @@ impl VanillaGenerator {
         }
         for anchor_z in chunk_z - 1..=chunk_z + 1 {
             for anchor_x in chunk_x - 1..=chunk_x + 1 {
+                let region = self.region_biomes(anchor_x, anchor_z);
                 let mut view = ChunkView {
                     generator: self,
                     chunk_x,
@@ -463,7 +552,14 @@ impl VanillaGenerator {
                     chunk: &mut chunk,
                 };
                 for &step in &steps {
-                    features.decorate_step(&mut view, step, anchor_x, anchor_z, self.world_seed);
+                    features.decorate_step(
+                        &mut view,
+                        step,
+                        anchor_x,
+                        anchor_z,
+                        self.world_seed,
+                        &region,
+                    );
                 }
             }
         }
@@ -592,6 +688,26 @@ impl VanillaGenerator {
         }
         let y = self.surface(x, z).map_or(self.router.min_y, |(y, _)| y);
         self.heights.borrow_mut().insert((x, z), y);
+        y
+    }
+
+    /// Absolute Y of the highest terrain row of the column as its world-gen
+    /// ocean-floor heightmap has it: the surface top, walked down past the
+    /// fluid and air the filler and the carvers leave above a sea floor. Rows
+    /// the reference counts are the ones its `blocks_motion_in_heightmap` tag
+    /// holds, which for a pre-decoration column is every solid the density
+    /// filler and surface rules can write and neither water nor lava. Memoised
+    /// because the ore anchor gate re-reads the same footprint columns across
+    /// the attempts of one chunk.
+    pub fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
+        if let Some(&y) = self.ocean_floors.borrow_mut().get_mut(&(x, z)) {
+            return y;
+        }
+        let mut y = self.surface_height(x, z);
+        while y > self.min_y() && self.substance(x, y, z) != Substance::Solid {
+            y -= 1;
+        }
+        self.ocean_floors.borrow_mut().insert((x, z), y);
         y
     }
 
@@ -749,7 +865,9 @@ impl VanillaGenerator {
             masks: self.masks.borrow().entries(),
             chunk_carvers: self.chunk_carvers.borrow().entries(),
             heights: self.heights.borrow().entries(),
+            ocean_floors: self.ocean_floors.borrow().entries(),
             biomes: self.biomes.borrow().entries(),
+            biome_regions: self.biome_regions.borrow().entries(),
             aquifer_centers: aquifer.centers,
             aquifer_statuses: aquifer.statuses,
             aquifer_surface_levels: aquifer.surface_levels,
@@ -835,6 +953,10 @@ impl DecorationTarget for ChunkView<'_> {
 
     fn biome_at(&self, _x: i32, y: i32, z: i32) -> Option<String> {
         self.generator.biome(_x, z, y)
+    }
+
+    fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
+        self.generator.ocean_floor_height(x, z)
     }
 }
 
@@ -1476,6 +1598,49 @@ mod tests {
         }
     }
 
+    /// Requires the operator-provisioned 26.3 worldgen data. A feature's
+    /// ordinal is part of its seed, and the ordinal graph has a bounded cycle
+    /// recovery (`MAX_CYCLE_ATTEMPTS`) where the reference runtime recurses
+    /// without a bound. That bound is only safe while the pack never needs it,
+    /// so this checks the schedule really is the graph over the biome source's
+    /// own list and that neither cycle counter was reported, and prints the
+    /// shape it found.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_operator_feature_schedule_needs_no_cycle_recovery() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let data = generator
+            .features
+            .as_ref()
+            .expect("the provisioned pack decorates");
+        assert!(
+            !data.biome_order().is_empty(),
+            "the schedule fell back to the pack's identifier order"
+        );
+        for counter in ["feature_order_cycle", "feature_order_cycle_unresolved"] {
+            assert!(
+                !data.unimplemented_features.contains_key(counter),
+                "the provisioned pack needed the bounded cycle recovery ({counter})"
+            );
+        }
+        let steps = data.decorated_steps();
+        let slots: usize = steps
+            .iter()
+            .map(|step| data.step(*step).map_or(0, |list| list.len()))
+            .sum();
+        println!(
+            "smoke OK: schedule over {} biomes, {} steps carrying {} placed features, root {}",
+            data.biome_order().len(),
+            steps.len(),
+            slots,
+            root.display()
+        );
+    }
+
     /// A fabricated pack that drives every coordinate-keyed cache of the
     /// generator and the aquifer without touching the operator's data: a
     /// y-only density band (solid on y = 5..=23, identical in all
@@ -1827,6 +1992,90 @@ mod tests {
         (root, generator)
     }
 
+    /// The decorating pack plus a second dimension whose placement table
+    /// splits the world along x: `testns:low` west of x = 32, `testns:peak`
+    /// east of it. Only `peak` lists a placed vein, and that vein carries no
+    /// `minecraft:biome` filter, so the only thing that can keep it out of a
+    /// chunk is the biome union the pass runs its ordinals over. The
+    /// `testns:flat` biome of the decorating dimension stays out of this
+    /// dimension's possible set, so its own granite vein must not run here.
+    fn region_pack(root: &Path) {
+        decorating_pack(root);
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/slope.json"),
+            r#"{"type": "gradient", "axis": "x", "from_coordinate": 0,
+                "to_coordinate": 64, "from_value": -1.0, "to_value": 1.0}"#,
+        );
+        write(
+            &worldgen.join("feature/raw.json"),
+            r#"{"type": "minecraft:ore", "size": 32, "discard_chance_on_air_exposure": 0.0,
+                "targets": [{"state": "minecraft:diorite",
+                    "target": {"predicate_type": "minecraft:block_match", "block": "minecraft:stone"}}]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/raw.json"),
+            r#"{"feature": "testns:raw", "placement": [
+                {"type": "minecraft:count", "count": 3},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:height_range", "height": {"type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": 5}, "max_inclusive": {"absolute": 23}}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/low.json"),
+            r#"{"carvers": [], "features": [[], [], [], [], [], [], [], [], [], [], []]}"#,
+        );
+        write(
+            &worldgen.join("biome/peak.json"),
+            r#"{"carvers": [], "features": [[], [], [], [], [], [], [], [], ["testns:raw"], [], []]}"#,
+        );
+        write(
+            &worldgen.join("noise_settings/split.json"),
+            r#"{
+                "noise": {"min_y": 0, "height": 128},
+                "sea_level": -1000,
+                "default_fluid": "minecraft:water",
+                "default_block": "minecraft:granite",
+                "noise_router": {
+                    "final_density": "testns:band",
+                    "continents": 0.0,
+                    "erosion": 0.0,
+                    "depth": 0.0,
+                    "ridges": 0.0,
+                    "temperature": "testns:slope",
+                    "vegetation": 0.0
+                },
+                "aquifers": {
+                    "barrier": 0.0,
+                    "fluid_level_floodedness": 0.0,
+                    "fluid_level_spread": 0.0,
+                    "lava": 0.0,
+                    "exclusion": 0.0,
+                    "surface_level": 0.0
+                },
+                "material_rule": "testns:root"
+            }"#,
+        );
+        write(
+            &root.join("rustmc/biome_placement/split.psv"),
+            concat!(
+                "0|testns:low|t=[-10000-0]|h=[-10000-10000]|c=[-10000-10000]|",
+                "e=[-10000-10000]|d=[-10000-10000]|w=[-10000-10000]|off=0\n",
+                "1|testns:peak|t=[0-10000]|h=[-10000-10000]|c=[-10000-10000]|",
+                "e=[-10000-10000]|d=[-10000-10000]|w=[-10000-10000]|off=0\n"
+            ),
+        );
+    }
+
+    fn region_generator(label: &str) -> (PathBuf, VanillaGenerator) {
+        let root = scratch_root(label);
+        region_pack(&root);
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:split").expect("region pack generator");
+        (root, generator)
+    }
+
     /// End to end: the placement pass paints veins over the rule descent and
     /// nothing else. Every granite block sits where the tag test held, every
     /// other row keeps the descent's answer, and the base pass the cache is
@@ -1874,6 +2123,91 @@ mod tests {
         assert!(
             painted > 0,
             "the fixture must actually fire veins, or the assertions above are vacuous"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The decoration pass runs the ordinals the biomes of a nine-chunk
+    /// window contribute, and a window's biome set is enumerated over the
+    /// whole chunk volume, not just the surface band.
+    #[test]
+    fn the_decoration_region_covers_the_chunk_volume_and_the_nine_window() {
+        let (root, generator) = region_generator("region");
+        let low = "testns:low".to_string();
+        let peak = "testns:peak".to_string();
+        // One chunk's enumeration visits every 4x4x4 cell of its volume: 4x4
+        // quart columns over height/4 rows, all distinct sampler keys.
+        let cells = 4 * 4 * (generator.router.height / 4) as usize;
+        assert_eq!(*generator.chunk_biomes(1, 0), vec![low.clone()]);
+        let occupancy = generator.cache_occupancy();
+        assert_eq!(occupancy.biomes, cells, "the quart scan came up short");
+        assert_eq!(occupancy.biome_regions, 1);
+        assert_eq!(*generator.chunk_biomes(3, 0), vec![peak.clone()]);
+        let occupancy = generator.cache_occupancy();
+        assert_eq!(occupancy.biomes, 2 * cells);
+        assert_eq!(occupancy.biome_regions, 2);
+        // A cached volume is not re-sampled.
+        let _ = generator.chunk_biomes(1, 0);
+        assert_eq!(generator.cache_occupancy().biomes, 2 * cells);
+
+        // The fixture's climate split runs at x = 32, so chunk 1 sits wholly
+        // west of it and chunk 3 wholly east, and the nine-chunk union
+        // reaches across the split as soon as the window does: each biome
+        // once, in identifier order.
+        assert_eq!(
+            generator.region_biomes(2, 0),
+            vec![low.clone(), peak.clone()]
+        );
+        assert_eq!(generator.region_biomes(0, 0), vec![low.clone()]);
+        assert_eq!(generator.region_biomes(8, 0), vec![peak.clone()]);
+
+        // The volume cache is bounded like the others: a sweep along a row
+        // touches far more chunk volumes than it may hold.
+        for chunk_x in 0..200i32 {
+            let _ = generator.region_biomes(chunk_x, 0);
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.biome_regions <= 2 * VanillaGenerator::BIOME_REGION_CACHE_CAPACITY,
+            "the region cache grew past its bound: {occupancy:?}"
+        );
+        assert!(occupancy.biome_regions < 220);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A placed feature with no biome filter of its own is still gated by the
+    /// region: the chunk whose nine-chunk window holds only the biome that
+    /// does not list it runs none of its ordinals at all.
+    #[test]
+    fn a_feature_only_the_neighbouring_biome_lists_stays_out_of_the_far_chunks() {
+        let (root, generator) = region_generator("region-reach");
+        let count = |generator: &VanillaGenerator, chunk_x: i32, name: &str| -> usize {
+            chunk_columns(generator, chunk_x, 0)
+                .iter()
+                .map(|column| {
+                    column
+                        .iter()
+                        .filter(|state| state.as_deref() == Some(name))
+                        .count()
+                })
+                .sum()
+        };
+        let west = count(&generator, 0, "minecraft:diorite");
+        let east = count(&generator, 5, "minecraft:diorite");
+        let border = count(&generator, 2, "minecraft:diorite");
+        assert_eq!(
+            west, 0,
+            "the chunks west of the split list the vein nowhere"
+        );
+        assert!(east > 0, "the peak biome's own chunk must be decorated");
+        assert!(
+            border > 0,
+            "a window that reaches one chunk into the peak half is decorated too"
+        );
+        assert_eq!(
+            count(&generator, 5, "minecraft:granite"),
+            0,
+            "a biome the dimension cannot produce contributes no ordinals"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

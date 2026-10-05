@@ -197,7 +197,7 @@ fn prune(budget: &mut Budget) -> io::Result<()> {
 
 fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
-    hasher.update(b"rustmc-preview-cache-v2:java-26.3:protocol-777");
+    hasher.update(b"rustmc-preview-cache-v3:java-26.3:protocol-777");
     hasher.update(seed.to_be_bytes());
     let mut paths = Vec::new();
     collect_files(data_root, &mut paths)?;

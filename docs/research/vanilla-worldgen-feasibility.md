@@ -518,7 +518,9 @@ descent alone versus with the placement stage:
   exposure only removing blocks that touch air, each range provider's
   documented draw count, rarity and count gating, the biome filter, unmodeled
   features holding their ordinals, nested rule trees, tag references and
-  cycles, the identifier-ordered schedule); the generator adds pack-vein
+  cycles, the schedule's ordering — slice K pinned that to identifier order and
+  slice L replaced the test with the graph ordering's); the generator adds
+  pack-vein
   presence, chunk-build-order independence, cache boundedness and eviction
   invariance; the operator-data smokes check that both vein families fire over
   1,024 columns at fixed grid origins and that every row the placement stage
@@ -529,6 +531,139 @@ aggregate-count agreement plus self-consistency, not block-for-block placement:
 the counts are measured close and the coordinates are measurably not, and the
 ordinal schedule, the write radius and the world-gen heightmap are the open work
 between this state and per-position parity.
+
+## T4 ordinal graph and anchor gate measured (6 October 2026, slice L)
+
+Slice K left four deviations open and one number unresolved: the placement stage
+delivered every family's amount and almost none of its coordinates. This slice
+closes two of those deviations and puts the remaining gap on a measured
+mechanism rather than on a guess. `docs/PROVENANCE.md` session 13 records the
+consultation, the save-format facts and the evidence; this section records what
+moved.
+
+Two changes are in the tree:
+
+- `vanilla::feature::StepSchedule` builds each decoration step's ordering the
+  way the reference runtime does — a topological descent over the per-step lists
+  of the biomes in range, retried under a bound when a biome pair produces a
+  cyclic order — and a feature's reseed ordinal is its index in that list. The
+  biomes in range come from `VanillaGenerator::region_biomes`, the 3×3 chunk
+  window intersected with the generator's possible biomes, replacing the
+  identifier-sorted stand-in whose ordinals could differ from vanilla's.
+- `vanilla::feature::anchored` reproduces the `OCEAN_FLOOR_WG` footprint test an
+  ore placement runs before it draws any radius. It consults
+  `VanillaGenerator::ocean_floor_height`, the computed surface descended to the
+  first solid block, because a finished save cannot carry the world-gen type:
+  `keepAfterWorldgen()` drops it.
+
+An independent defect this slice found is in the oracle, not the generator. The
+26.3 saves store heightmaps in the non-spanning bit layout — 7 nine-bit values
+per long, 37 longs per chunk column array — and `oracle::surface_top` was
+reading them as spanning, which is correct only for the first seven columns of
+each chunk. Measured over 2,048 chunks: non-spanning decoding agrees with the
+palette-decoded column tops in 524,288 of 524,288 columns for `WORLD_SURFACE`,
+while spanning decoding answers 3.86–5.69% and yields heights from −65 to 446,
+outside the world. The M3 grids stride 16 blocks and so read local column index
+0, which is the one column both decoders agree on; their denominators are
+identical before and after the fix, so every comparison in this note stands on
+correct heights. Other strides and per-column inspections did not, and now do.
+Palettes are packed as well, including power-of-two sizes (a 32-entry palette at
+5 bits is 342 longs, where spanning would need 320); RustMC's palette decode
+already matched and is unchanged.
+
+The grids, on the M3 `block_compare` squares (exact base-block agreement, each
+round re-run whole):
+
+| build | `-384..384` | `-256..512` | seed 2027 |
+| --- | --- | --- | --- |
+| pre-feature terrain only | 81.28% | 80.86% | 83.91% |
+| placement with identifier-sorted ordinals | 70.83% | 70.08% | 74.54% |
+| step ordinal graph, region biome set included | 91.19% | 91.27% | 92.65% |
+| and the anchor gate | 94.84% | 95.02% | 96.29% |
+
+The last row is the anchor gate's and not the biome set's, which took an ablation
+to establish: the tree was edited in place between rounds, so the rounds are
+identified by what they paint (`coal_ore` 38,512 over the census square before
+the gate, 37,951 after), and this tree with the footprint test neutered answers
+the pre-gate census byte-for-byte *and* the pre-gate grids to the position —
+316,872, 308,680 and 285,714 exact, the third row's three numbers again. The
+biome set therefore carries no separable gain on these metrics, and the gate on
+its own is worth 12,687, 12,685 and 11,239 positions — 3.65, 3.75 and 3.65
+points — all of them solid-row identities, since the air-collapsed counts move by
+exactly the same numbers. What the gate removes is the ore attempts whose whole
+box floats above the terrain, whose radii were otherwise drawn and consumed ahead
+of every feature downstream.
+
+The third round, run after the decode fix, returned all three reports
+byte-identical to the gated ones — those grids sample local column index 0, the
+one column both decoders read correctly — so the ladder above is one measurement
+series and not a comparison across an oracle change.
+
+Residual after the gate, on the traced grid: 17,924 of 347,483 positions, of
+which 6,740 are the same air position under two names and 2,422 are void rows
+RustMC fills with deepslate (the T3 carver residual). The vein families disagree
+as a near-symmetric pair — 703 coal-ore positions read as stone against 690 the
+other way — which is displacement, not amount: the census of every placed family
+sits at 99.99% in aggregate.
+
+Cost, as one comparison in one machine state: release build, single thread,
+seed 2026, the bench's default 4×4 `column_ids` sweep, every binary run in the
+same hour while three oracle grids were busy on other cores. The middle column
+is an ablation — this tree with `anchored` patched to report every box as
+anchored, so the placement work is what the no-gate tree does and only the
+footprint scan is missing. That ablation is demonstrably faithful: its
+`-128..127` family census reproduces the pre-gate round's report byte-for-byte
+over all 24 families (`coal_ore` 38,512, against the gated round's 37,951), so
+the extra milliseconds are the footprint scan and not a build that happens to
+differ somewhere else.
+
+| | f86ef84 (slice K's tree) | this tree, gate ablated | this tree |
+| --- | --- | --- | --- |
+| cold pass | 570.47 ms/chunk | 784.84 ms/chunk | 1,750.75 ms/chunk |
+| warm pass (cache reads) | 1.34 ms/chunk | 1.55 ms/chunk | 1.54 ms/chunk |
+| one radius-32 view, single thread | 0.67 h | 0.92 h | 1.99 h |
+| ocean-floor columns memoised | — | 0 | 4,843 |
+| peak resident set | 17,780 KiB | 17,556 KiB | 17,524 KiB |
+
+The terrain modes do not move: `heights` 203.17 → 204.65, `carve` 2.42 → 2.54,
+`substance` 433.98 → 435.23 ms/chunk, and the substance answer itself is
+byte-identical between the trees. The ablation attributes the rest: the ordinal
+graph and the decoration region's biome union together cost +214 ms per chunk,
+and the anchor gate costs +966 on top of that — 55% of the tree's total. The
+reason is the one session 12's deviation list already names: RustMC holds no
+decoration-time heightmap, so the gate's per-column question is answered by
+computation, and the sweep ends with 4,843 ocean-floor columns over a cache
+bounded at 4,096, each descent walking the density graph row by row. Peak
+resident set is flat across all three columns, so this is recomputation and not
+growth — building the heightmap once per chunk during the fill and carve passes
+turns the largest cost of this slice into an array read, and that work is now a
+cost item as well as a correctness one.
+
+These absolute milliseconds are not comparable with the 388.76 ms/chunk slice K
+recorded for that same f86ef84 tree, which was measured in a different machine
+state; the same binary answers 570.47 today. Every column of the table above
+comes from a run under one state, which is why the comparison is reported as
+ratios rather than as levels.
+
+Tests added by the slice: the schedule's graph ordering, its cycle recovery and
+its biome-source tie-break; that one ordinal replayed alone reproduces its own
+share of a step; the footprint gate's draw accounting, that a box whose base row
+clears every column under it is abandoned for exactly the three draws that fixed
+its axis; that the decorated region covers the chunk volume and the nine-chunk
+window and that a feature only a neighbouring biome lists stays out of the far
+chunks; that the provisioned pack's schedule is the graph over the source's 56
+biomes — 9 steps carrying 171 placed features — with neither bounded-retry cycle
+counter reported, which is what makes the `MAX_CYCLE_ATTEMPTS` deviation safe to
+take; and, in the oracle, that both heightmap layouts decode from the stored
+long count.
+
+One existing smoke moved with the cost rather than with the behaviour. The
+operator-data preview delivery test asserted the first chunk inside 20 s, which
+held while a cold descent was pre-placement work and does not hold with the gate:
+measured from a debug build it delivers in 91 s, since a debug column descent is
+far past the release 1,750 ms per chunk and every worker compiles the provisioned
+pack first. Its bound is now 600 s, making it a hang detector; the non-blocking
+poll claim it exists for is asserted at 100 ms and untouched.
 
 ## Risks
 
