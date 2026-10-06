@@ -139,6 +139,13 @@ pub enum EncodeError {
         /// Chunk-relative Z.
         z: usize,
     },
+    /// A chunk coordinate cannot be represented as an absolute block origin.
+    ChunkCoordinateOverflow {
+        /// Chunk X from the requested column.
+        chunk_x: i32,
+        /// Chunk Z from the requested column.
+        chunk_z: i32,
+    },
     /// A state id is not inside the versioned block-state registry.
     StateOutOfRange {
         /// Offending id.
@@ -184,6 +191,10 @@ impl std::fmt::Display for EncodeError {
             Self::CellOutOfRange { x, y, z } => {
                 write!(f, "position {x},{y},{z} is outside the chunk column")
             }
+            Self::ChunkCoordinateOverflow { chunk_x, chunk_z } => write!(
+                f,
+                "chunk {chunk_x},{chunk_z} cannot be addressed with i32 block coordinates"
+            ),
             Self::StateOutOfRange { id, count } => {
                 write!(f, "block state id {id} is outside 0..{count}")
             }
@@ -289,6 +300,21 @@ impl VanillaChunk {
         self.states.get(state_index(x, y, z)).copied()
     }
 
+    /// Protocol id at an absolute world block position. The caller cannot
+    /// accidentally read this chunk using another chunk's local coordinates.
+    pub fn state_at_world(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        if x.div_euclid(CHUNK_SIDE as i32) != self.chunk_x
+            || z.div_euclid(CHUNK_SIDE as i32) != self.chunk_z
+        {
+            return None;
+        }
+        self.state_at(
+            x.rem_euclid(CHUNK_SIDE as i32) as usize,
+            y,
+            z.rem_euclid(CHUNK_SIDE as i32) as usize,
+        )
+    }
+
     /// Biome id of the 4x4x4 cell containing one absolute position.
     pub fn biome_at(&self, bx: usize, by: i32, bz: usize) -> Option<u32> {
         if bx >= SECTION_BIOME_SIDE
@@ -299,6 +325,20 @@ impl VanillaChunk {
             return None;
         }
         self.biomes.get(biome_index(bx, by, bz)).copied()
+    }
+
+    /// Biome id at an absolute world block position, including negative X/Z.
+    pub fn biome_at_world(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        if x.div_euclid(CHUNK_SIDE as i32) != self.chunk_x
+            || z.div_euclid(CHUNK_SIDE as i32) != self.chunk_z
+        {
+            return None;
+        }
+        self.biome_at(
+            x.rem_euclid(CHUNK_SIDE as i32) as usize / SECTION_BIOME_SIDE,
+            y,
+            z.rem_euclid(CHUNK_SIDE as i32) as usize / SECTION_BIOME_SIDE,
+        )
     }
 
     /// The `256` state ids of one section, in the client's cell order.
@@ -348,6 +388,22 @@ pub fn chunk_from_generator(
         .map(|chunk| chunk.expect("unconditional generation cannot cancel"))
 }
 
+fn chunk_origin(chunk_x: i32, chunk_z: i32) -> Result<(i32, i32), EncodeError> {
+    let overflow = || EncodeError::ChunkCoordinateOverflow { chunk_x, chunk_z };
+    let x = chunk_x
+        .checked_mul(CHUNK_SIDE as i32)
+        .ok_or_else(overflow)?;
+    let z = chunk_z
+        .checked_mul(CHUNK_SIDE as i32)
+        .ok_or_else(overflow)?;
+    if x.checked_add(CHUNK_SIDE as i32 - 1).is_none()
+        || z.checked_add(CHUNK_SIDE as i32 - 1).is_none()
+    {
+        return Err(overflow());
+    }
+    Ok((x, z))
+}
+
 /// Discards a partly built chunk when it is no longer useful to the caller.
 pub fn chunk_from_generator_cancellable(
     generator: &VanillaGenerator,
@@ -361,6 +417,7 @@ pub fn chunk_from_generator_cancellable(
             min_y: generator.min_y(),
         });
     }
+    let (origin_x, origin_z) = chunk_origin(chunk_x, chunk_z)?;
     let air = tables.air_state();
     let mut states = vec![air; CHUNK_CELLS];
     for z in 0..CHUNK_SIDE {
@@ -368,8 +425,8 @@ pub fn chunk_from_generator_cancellable(
             if should_cancel() {
                 return Ok(None);
             }
-            let wx = chunk_x * CHUNK_SIDE as i32 + x as i32;
-            let wz = chunk_z * CHUNK_SIDE as i32 + z as i32;
+            let wx = origin_x + x as i32;
+            let wz = origin_z + z as i32;
             let column = generator.column_ids(wx, wz);
             if column.len() != OVERWORLD_HEIGHT {
                 return Err(EncodeError::WrongColumnLength {
@@ -390,12 +447,10 @@ pub fn chunk_from_generator_cancellable(
     let mut biomes = vec![0u32; CHUNK_BIOMES];
     for bz in 0..SECTION_BIOME_SIDE {
         for bx in 0..SECTION_BIOME_SIDE {
-            let wx = chunk_x * CHUNK_SIDE as i32
-                + bx as i32 * SECTION_BIOME_SIDE as i32
-                + (SECTION_BIOME_SIDE / 2) as i32;
-            let wz = chunk_z * CHUNK_SIDE as i32
-                + bz as i32 * SECTION_BIOME_SIDE as i32
-                + (SECTION_BIOME_SIDE / 2) as i32;
+            let wx =
+                origin_x + bx as i32 * SECTION_BIOME_SIDE as i32 + (SECTION_BIOME_SIDE / 2) as i32;
+            let wz =
+                origin_z + bz as i32 * SECTION_BIOME_SIDE as i32 + (SECTION_BIOME_SIDE / 2) as i32;
             // `surface_y` is the column's own top: the sampler's depth axis is
             // measured from it, so a fixed per-column value is the faithful
             // reading until vertical biome sampling exists.
