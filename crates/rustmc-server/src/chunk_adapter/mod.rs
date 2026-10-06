@@ -32,9 +32,6 @@
 //!   generator's decorations are not yet entities.
 //! * Border blocks: section containers hold only this chunk's 16x16 columns;
 //!   no neighbour-chunk block or biome data is transferred here.
-//! * Vertical biome layering: one biome per column, resolved at that column's
-//!   surface height, replicated over all 4x4x4 cells (see
-//!   [`chunk_from_generator`]).
 //! * Block light: no emitting states are modelled, so the block-light update
 //!   list is empty and every block section is declared empty.
 
@@ -374,10 +371,8 @@ impl VanillaChunk {
 /// [`EncodeError::Registry`] error, never a fallback id. Rows the generator
 /// left unwritten become `minecraft:air`.
 ///
-/// Biomes are resolved once per 4x4 column at the column's own surface height
-/// (the climate sampler derives its depth target from the column top) and
-/// copied down all [`BIOME_LAYERS`] layers; per-layer vertical biome selection
-/// is deferred.
+/// Biomes are resolved at the bottom block of each 4x4x4 cell. The climate
+/// sampler quantizes block positions to this grid, including Y.
 pub fn chunk_from_generator(
     generator: &VanillaGenerator,
     chunk_x: i32,
@@ -447,20 +442,17 @@ pub fn chunk_from_generator_cancellable(
     let mut biomes = vec![0u32; CHUNK_BIOMES];
     for bz in 0..SECTION_BIOME_SIDE {
         for bx in 0..SECTION_BIOME_SIDE {
-            let wx =
-                origin_x + bx as i32 * SECTION_BIOME_SIDE as i32 + (SECTION_BIOME_SIDE / 2) as i32;
-            let wz =
-                origin_z + bz as i32 * SECTION_BIOME_SIDE as i32 + (SECTION_BIOME_SIDE / 2) as i32;
-            // `surface_y` is the column's own top: the sampler's depth axis is
-            // measured from it, so a fixed per-column value is the faithful
-            // reading until vertical biome sampling exists.
-            let surface_y = generator.surface_height(wx, wz);
-            let name = generator
-                .biome(wx, wz, surface_y)
-                .ok_or(EncodeError::MissingBiomePlacement)?;
-            let id = tables.biome(&name)?;
+            let wx = origin_x + bx as i32 * SECTION_BIOME_SIDE as i32;
+            let wz = origin_z + bz as i32 * SECTION_BIOME_SIDE as i32;
             for layer in 0..BIOME_LAYERS {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 let by = OVERWORLD_MIN_Y + layer as i32 * SECTION_BIOME_SIDE as i32;
+                let name = generator
+                    .biome(wx, wz, by)
+                    .ok_or(EncodeError::MissingBiomePlacement)?;
+                let id = tables.biome(&name)?;
                 biomes[biome_index(bx, by, bz)] = id;
             }
         }
