@@ -51,7 +51,9 @@ above is checked by them, and the sequence below says exactly where each one sto
   any unclassified id a typed error; `chunk_adapter` encodes all 24 sections, three
   heightmaps, per-section fluid counts, and 26 skylight layers, with the tests decoding
   the bytes back off the wire. Deferred and stated in the module docs: block entities,
-  neighbour-chunk border blocks, per-layer vertical biome selection, and block light. A
+  neighbour-chunk border blocks and block light. Per-layer vertical biome selection
+  now samples the generator at each 4x4x4 cell's bottom block; the
+  operator-data adapter smoke checks both the sampled cells and wire round-trip. A
   real 26.3 client has **not** been shown an adapter-built column, and the worst-case
   251,457-byte column against the preview's own 786,432-byte batch budget means the
   budget binds at batch level.
