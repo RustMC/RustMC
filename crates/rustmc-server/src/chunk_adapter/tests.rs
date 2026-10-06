@@ -1150,9 +1150,11 @@ fn smoke_encodes_a_provisioned_overworld_column() {
             for z in 0..4 {
                 for x in 0..32 {
                     states.extend(generator.column_ids(x, z).into_iter().flatten());
-                    let top = generator.surface_height(x, z);
-                    if let Some(biome) = generator.biome(x, z, top) {
-                        biomes.insert(biome);
+                    for layer in 0..BIOME_LAYERS {
+                        let y = OVERWORLD_MIN_Y + layer as i32 * SECTION_BIOME_SIDE as i32;
+                        if let Some(biome) = generator.biome(x, z, y) {
+                            biomes.insert(biome);
+                        }
                     }
                 }
             }
@@ -1189,6 +1191,7 @@ fn smoke_encodes_a_provisioned_overworld_column() {
     .expect("cancel after a few complete columns");
     assert!(cancelled.is_none());
     assert_eq!(visited_columns, 9);
+    let mut vertically_distinct_columns = 0;
     for (chunk_x, chunk_z) in [(0, 0), (-1, 2)] {
         let chunk =
             chunk_from_generator(&generator, chunk_x, chunk_z, &tables).expect("resolve a column");
@@ -1205,6 +1208,26 @@ fn smoke_encodes_a_provisioned_overworld_column() {
             chunk.biomes().to_vec(),
             "real biomes survive"
         );
+        let origin_x = chunk_x * CHUNK_SIDE as i32;
+        let origin_z = chunk_z * CHUNK_SIDE as i32;
+        for bz in 0..SECTION_BIOME_SIDE {
+            for bx in 0..SECTION_BIOME_SIDE {
+                let x = origin_x + (bx * SECTION_BIOME_SIDE) as i32;
+                let z = origin_z + (bz * SECTION_BIOME_SIDE) as i32;
+                let mut column_biomes = BTreeSet::new();
+                for layer in 0..BIOME_LAYERS {
+                    let y = OVERWORLD_MIN_Y + (layer * SECTION_BIOME_SIDE) as i32;
+                    let expected = generator.biome(x, z, y).expect("placed biome");
+                    column_biomes.insert(expected.clone());
+                    assert_eq!(
+                        chunk.biome_at_world(x, y, z),
+                        Some(tables.biome(&expected).expect("registered biome")),
+                        "quart cell at ({x}, {y}, {z})"
+                    );
+                }
+                vertically_distinct_columns += usize::from(column_biomes.len() > 1);
+            }
+        }
         let surface = decoded.heightmap(HeightmapKind::WorldSurface);
         assert!(
             surface.iter().any(|value| *value > 0),
@@ -1223,4 +1246,8 @@ fn smoke_encodes_a_provisioned_overworld_column() {
             packet.len()
         );
     }
+    assert!(
+        vertically_distinct_columns > 0,
+        "operator data must exercise biome changes with height"
+    );
 }
