@@ -477,9 +477,9 @@ impl Density {
                 horizontal,
             } => {
                 if *kind != ShiftKind::X
-                    && let Some(&cached) = horizontal.borrow_mut().get_mut(&[x, z])
+                    && let Some(cached) = horizontal.borrow_mut().get_mut(&[x, z])
                 {
-                    return cached;
+                    return *cached;
                 }
                 let fx = f64::from(x) * 0.25;
                 let fy = f64::from(y) * 0.25;

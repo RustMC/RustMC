@@ -815,8 +815,13 @@ RustMC changes this slice makes, each one demonstrated rather than assumed:
   `OCEAN_FLOOR_WG` footprint scan over the vein box's columns, so an attempt
   whose box floats entirely above the terrain costs only its three axis draws,
   and the stream after it lands where vanilla's does. The heightmap it consults
-  is `VanillaGenerator::ocean_floor_height`, descended from the computed surface
-  to the first solid block.
+  is `VanillaGenerator::ocean_floor_height`, the computed surface descended to the
+  first solid block — served since session 13's follow-up slice from a heightmap
+  stored per chunk, whose rows the column fill derives from the substances it had
+  already sampled and a halo lookup adds one column at a time. That is RustMC's
+  own representation, not a claim about how the reference builds or mutates its
+  `*_WG` heightmaps; the documented observable, the row answered for a column, is
+  what is held fixed and tested.
 
 Measured, on the M3 `block_compare` grids (seed 2026 over `-384..384`, seed 2026
 over the milestone's `-256..512`, seed 2027 over `-384..384`; each round re-run
@@ -916,6 +921,29 @@ is unchanged and still asserted at 100 ms. The whole nine-smoke operator set now
 takes 475 s in a debug build, which is the same cost seen from the other side;
 that figure is machine-state conditioned (three oracle grids were busy through
 it) and is reported as why the bound had to move, not as a measurement.
+
+Follow-up slice, same day: the decoration-time heightmap the gate asks for is now
+stored per chunk and derived inside the column fill, from the substances that fill
+had already sampled. This is a RustMC-side representation decision, and the only
+vanilla-shaped fact it touches is the documented observable — the row the
+`OCEAN_FLOOR_WG` footprint test reads for a pre-decoration column — which it holds
+fixed. Evidence that it holds fixed: `ocean_floor_height` equals
+`ocean_floor_by_descent` (the pre-change body, kept as the fallback) on every
+column of the four new tests and of the new operator-data smoke, including after
+whole-chunk fills overwrite lazily stored rows and after a sweep rotates every
+original map out of the cache; the 3D `substance` report is byte-identical between
+the builds (md5 28f153fd93ebb5d299544a3447f195c1); the `-128..127` family census
+report is byte-identical, all 24 placed families and `coal_ore` 37,951 included,
+which is the feature stream and the gate's decisions; and the three
+`block_compare` grids re-measure to the same lines and the same numerators —
+329,559 of 347,483, 321,365 of 338,217, 296,953 of 308,379. The baseline side of
+those grid and census comparisons is the round this worktree produced before the
+slice's edits, whose figures are the ones committed above; the candidate side ran
+with `fail-cap` 5 against that round's 20, and the oracle truncates that list by
+prefix (`if report.fail_positions.len() < fail_cap`), so the compared lines are
+the same lines. What the slice does not claim: that the reference stores or mutates
+a heightmap this way, and that the remaining ore displacement is anything other
+than what the trace localises, since the gate's answers did not move.
 
 Decoration replay evidence for one chunk (seed 2026, chunk `(-8, -8)`, the
 step-6 chain, ordinals 0..33, our replay reading that chunk's stored terrain):

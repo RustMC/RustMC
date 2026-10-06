@@ -237,9 +237,18 @@ row under two names, 2,422 are void rows RustMC fills with deepslate (the deep
 carver residual the T3 baseline attributes), and the ore families disagree as a
 near-symmetric pair (703 coal-ore positions read as stone against 690 the other
 way), which the trace localises to anchors shifted 3.8 to 8.6 blocks inside the
-traced chunk rather than to veins of the wrong size. Closing that needs the
-decoration-time heightmap the carve stage maintains, which this stage does not
-hold; see `docs/research/vanilla-worldgen-feasibility.md`, slice L. Vegetation and
+traced chunk rather than to veins of the wrong size. That question needed a
+decoration-time heightmap, and the stage now has one: slice M stores each chunk's
+`OCEAN_FLOOR_WG` rows, derived inside the column fill from substances it had
+already sampled, and the gate answers identically from it. The three grids above
+re-measure to the same report, line for line, including the fail entries the
+re-run listed: 329,559 of 347,483 exact (94.84%) on the seed-2026 `-384..384`
+grid, 321,365 of 338,217 (95.02%) on `-256..512`, and 296,953 of 308,379 (96.29%)
+on seed 2027. The `-128..127` family census is byte-identical between the two
+builds, and the cold 4×4 column sweep costs 18.2% less — 1,694.19 against
+1,385.36 ms per chunk, medians of three interleaved rounds each — which projects
+1.99 h to 1.63 h for one radius-32 view. So the displacement above is not a
+caching artifact; it stays where the trace put it. Vegetation and
 tree families are still not placed, structures are out of scope here, and no
 figure in this milestone is a parity claim.
 

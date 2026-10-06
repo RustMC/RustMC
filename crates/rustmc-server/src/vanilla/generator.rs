@@ -128,6 +128,36 @@ struct ChunkView<'a> {
 /// height rather than only the surface band.
 type BiomeRegion = Vec<String>;
 
+/// Sentinel for a heightmap row neither the chunk's fill pass nor an
+/// earlier anchor-gate lookup has answered yet. No real row value can
+/// collide with it: absolute build heights sit far inside `i32`'s range.
+const UNCOMPUTED_OCEAN_FLOOR: i32 = i32::MIN;
+
+/// One chunk's decoration-time `OCEAN_FLOOR_WG` heightmap: the 16x16
+/// column rows in the same `local_x * 16 + local_z` layout as the
+/// decorated grid. The chunk fill pass writes all 256 rows from the
+/// substances it already sampled while descending the column for its
+/// block ids, and an anchor-gate lookup into a neighbour's halo adds the
+/// columns it touches, so no column of the decoration window descends
+/// the density graph a second time.
+#[derive(Debug, Clone)]
+struct OceanFloorMap {
+    entries: [i32; 256],
+}
+
+impl OceanFloorMap {
+    fn new() -> Self {
+        Self {
+            entries: [UNCOMPUTED_OCEAN_FLOOR; 256],
+        }
+    }
+
+    /// Slot of one absolute column within its chunk's map.
+    fn slot(x: i32, z: i32) -> usize {
+        ((x & 15) * 16 + (z & 15)) as usize
+    }
+}
+
 /// Entry counts of the generator's coordinate-keyed caches. Every one of
 /// them is keyed by world coordinates, so the count grows with the volume
 /// of world the generator has been asked about; `VanillaGenerator` bounds
@@ -141,8 +171,8 @@ pub struct CacheOccupancy {
     pub chunk_carvers: usize,
     /// Columns with a memoised surface top.
     pub heights: usize,
-    /// Columns with a memoised ocean-floor heightmap row.
-    pub ocean_floors: usize,
+    /// Chunks with a stored decoration-time ocean-floor heightmap.
+    pub ocean_floor_maps: usize,
     /// Quart-grid biome choices retained for nearby samples.
     pub biomes: usize,
     /// Chunks whose full biome volume has been enumerated.
@@ -165,7 +195,7 @@ impl CacheOccupancy {
         self.masks
             + self.chunk_carvers
             + self.heights
-            + self.ocean_floors
+            + self.ocean_floor_maps
             + self.biomes
             + self.biome_regions
             + self.aquifer_centers
@@ -206,10 +236,11 @@ pub struct VanillaGenerator {
     /// Column-top memo: the descent's steep-gradient lookups re-read
     /// neighbouring columns, whose top scan is otherwise O(height).
     heights: RefCell<BoundedCache<(i32, i32), i32>>,
-    /// Ocean-floor memo: the ore anchor gate reads a column's heightmap row
-    /// repeatedly across its attempts, and the answer costs a descent through
-    /// whatever fluid the filler left above the floor.
-    ocean_floors: RefCell<BoundedCache<(i32, i32), i32>>,
+    /// Ocean-floor heightmaps by chunk: the anchor gate's footprint reads
+    /// are served from the rows the chunk fill pass derived from the
+    /// substances it had already sampled, plus the halo columns it looked
+    /// up. See `OceanFloorMap`.
+    ocean_floor_maps: RefCell<BoundedCache<(i32, i32), OceanFloorMap>>,
     /// One immutable biome choice per quantized 4x4x4 world cell.
     biomes: RefCell<BoundedCache<(i32, i32, i32), Option<String>>>,
     /// Chunks whose whole biome volume has been enumerated, for the union a
@@ -248,11 +279,20 @@ impl VanillaGenerator {
     /// streaming for a full-radius view's worth of 1,081,600 columns,
     /// i.e. tens of KiB instead of ~14 MB.
     pub const HEIGHT_CACHE_CAPACITY: usize = 4_096;
-    /// Columns with a memoised ocean-floor heightmap row. The ore anchor gate
-    /// reads a column for every attempt whose box might float, over a footprint
-    /// of up to 27×27 columns for the pack's largest vein — the same
-    /// neighbourhood the surface tops cover — so the bound matches theirs.
-    pub const OCEAN_FLOOR_CACHE_CAPACITY: usize = 4_096;
+    /// Chunks with a stored ocean-floor heightmap. One map is 256 four-byte
+    /// rows, a KiB. The anchor gate reads the footprint columns of boxes
+    /// inside the nine anchor chunks of a decoration, and the widest box
+    /// spills about thirteen blocks past its anchor chunk, so one target's
+    /// gate touches a five-by-five band of maps and a row-major sweep keeps
+    /// re-reading the band it has already stored. The previous 4,096-column
+    /// memo thrashed on exactly that working set — a 4x4 batch touches some
+    /// 4,800 distinct columns — recomputing each descent through the density
+    /// graph; the same sweep stored chunk-keyed holds all 4,800 answers in
+    /// at most 25 maps — the batch's sixteen target chunks plus the halo of
+    /// anchor chunks around them — and every map carries its chunk's full
+    /// 256 rows whether or not the gate ever reaches that chunk again.
+    /// 32 keys, 64 maps at the doubled bound, costs 64 KiB per generator.
+    pub const OCEAN_FLOOR_MAP_CACHE_CAPACITY: usize = 32;
     /// A full chunk has at most 4×4×96 quart cells; neighboring chunk and
     /// surface-rule probes reuse them before a streaming sweep evicts them.
     pub const BIOME_CACHE_CAPACITY: usize = 4_096;
@@ -355,7 +395,7 @@ impl VanillaGenerator {
             masks: RefCell::new(BoundedCache::new(Self::MASK_CACHE_CAPACITY)),
             chunk_carvers: RefCell::new(BoundedCache::new(Self::CHUNK_CARVERS_CACHE_CAPACITY)),
             heights: RefCell::new(BoundedCache::new(Self::HEIGHT_CACHE_CAPACITY)),
-            ocean_floors: RefCell::new(BoundedCache::new(Self::OCEAN_FLOOR_CACHE_CAPACITY)),
+            ocean_floor_maps: RefCell::new(BoundedCache::new(Self::OCEAN_FLOOR_MAP_CACHE_CAPACITY)),
             biomes: RefCell::new(BoundedCache::new(Self::BIOME_CACHE_CAPACITY)),
             biome_regions: RefCell::new(BoundedCache::new(Self::BIOME_REGION_CACHE_CAPACITY)),
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
@@ -598,7 +638,10 @@ impl VanillaGenerator {
                 filled.push(substance);
             }
         }
-        let Some(top) = top else { return ids };
+        let Some(top) = top else {
+            self.record_ocean_floor(x, z, min_y);
+            return ids;
+        };
         filled.reverse();
         self.heights.borrow_mut().insert((x, z), top);
         let rules = self.surface.as_ref();
@@ -676,6 +719,28 @@ impl VanillaGenerator {
                 };
             }
         }
+        // The decoration-time ocean-floor heightmap row for this column,
+        // read off the substances this pass already sampled: from the same
+        // surface top, down past every row the post-carve substance does
+        // not count as terrain — the walk `ocean_floor_by_descent` makes
+        // from `substance`, which for a column fill has in hand is exactly
+        // `filled` where the carvers left the row and the density-0
+        // aquifer answer where they stamped it. The anchor gate then reads
+        // this column's row from the chunk map instead of descending the
+        // density graph over the fluid above its sea floor a second time.
+        let mut floor = top;
+        while floor > min_y {
+            let solid = if self.carved(x, floor, z) {
+                matches!(self.aquifer.substance(x, floor, z, 0.0), Substance::Solid)
+            } else {
+                filled[(floor - min_y) as usize] == Substance::Solid
+            };
+            if solid {
+                break;
+            }
+            floor -= 1;
+        }
+        self.record_ocean_floor(x, z, floor);
         ids
     }
 
@@ -683,8 +748,8 @@ impl VanillaGenerator {
     /// fluid surface where terrain does not reach above it. Memoised
     /// because the descent's steep gradients re-read neighbours.
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {
-        if let Some(&y) = self.heights.borrow_mut().get_mut(&(x, z)) {
-            return y;
+        if let Some(y) = self.heights.borrow_mut().get_mut(&(x, z)) {
+            return *y;
         }
         let y = self.surface(x, z).map_or(self.router.min_y, |(y, _)| y);
         self.heights.borrow_mut().insert((x, z), y);
@@ -696,19 +761,59 @@ impl VanillaGenerator {
     /// fluid and air the filler and the carvers leave above a sea floor. Rows
     /// the reference counts are the ones its `blocks_motion_in_heightmap` tag
     /// holds, which for a pre-decoration column is every solid the density
-    /// filler and surface rules can write and neither water nor lava. Memoised
-    /// because the ore anchor gate re-reads the same footprint columns across
-    /// the attempts of one chunk.
+    /// filler and surface rules can write and neither water nor lava.
+    ///
+    /// Answers come from the column's chunk heightmap: the chunk fill pass
+    /// derives all 256 rows from the substances it sampled for the column's
+    /// block ids, and a gate lookup into a chunk nobody has filled yet adds
+    /// just the column it needs, by the `ocean_floor_by_descent` walk.
+    /// Every row is therefore computed once while the density graph has to
+    /// be read for that column anyway, and the anchor gate's footprint
+    /// scans are map reads. Evicting a map costs only recomputation: each
+    /// row is a pure function of the column's coordinates and the seed.
     pub fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
-        if let Some(&y) = self.ocean_floors.borrow_mut().get_mut(&(x, z)) {
+        let key = (x >> 4, z >> 4);
+        let slot = OceanFloorMap::slot(x, z);
+        let served = {
+            let mut maps = self.ocean_floor_maps.borrow_mut();
+            maps.get_mut(&key).and_then(|map| {
+                (map.entries[slot] != UNCOMPUTED_OCEAN_FLOOR).then_some(map.entries[slot])
+            })
+        };
+        if let Some(y) = served {
             return y;
         }
+        let y = self.ocean_floor_by_descent(x, z);
+        self.record_ocean_floor(x, z, y);
+        y
+    }
+
+    /// The heightmap row of one column recomputed from scratch: the top the
+    /// surface reports, walked down past every row the post-carve substance
+    /// does not count as terrain. This is what a gate lookup into an
+    /// uncomputed heightmap slot falls back to, and the identity reference
+    /// the fill pass's derivation is tested against.
+    fn ocean_floor_by_descent(&self, x: i32, z: i32) -> i32 {
         let mut y = self.surface_height(x, z);
         while y > self.min_y() && self.substance(x, y, z) != Substance::Solid {
             y -= 1;
         }
-        self.ocean_floors.borrow_mut().insert((x, z), y);
         y
+    }
+
+    /// Writes one column's heightmap row into its chunk's map, creating the
+    /// map when this is the chunk's first stored row.
+    fn record_ocean_floor(&self, x: i32, z: i32, y: i32) {
+        let key = (x >> 4, z >> 4);
+        let slot = OceanFloorMap::slot(x, z);
+        let mut maps = self.ocean_floor_maps.borrow_mut();
+        if let Some(map) = maps.get_mut(&key) {
+            map.entries[slot] = y;
+        } else {
+            let mut map = OceanFloorMap::new();
+            map.entries[slot] = y;
+            maps.insert(key, map);
+        }
     }
 
     /// The dimension's minimum build height: index 0 of `column_ids`.
@@ -865,7 +970,7 @@ impl VanillaGenerator {
             masks: self.masks.borrow().entries(),
             chunk_carvers: self.chunk_carvers.borrow().entries(),
             heights: self.heights.borrow().entries(),
-            ocean_floors: self.ocean_floors.borrow().entries(),
+            ocean_floor_maps: self.ocean_floor_maps.borrow().entries(),
             biomes: self.biomes.borrow().entries(),
             biome_regions: self.biome_regions.borrow().entries(),
             aquifer_centers: aquifer.centers,
@@ -1598,6 +1703,89 @@ mod tests {
         }
     }
 
+    /// Requires the operator-provisioned 26.3 worldgen data. On real terrain
+    /// the stored heightmap must be the descent: the target chunk is filled
+    /// through the block-id pass, which derives its 256 rows, and then the
+    /// chunk's rows and the halo band the anchor gate's footprints spill into
+    /// are served from the maps and compared against `ocean_floor_by_descent`,
+    /// which never reads a map. The sampled band must reach rows above ocean
+    /// floors that the filler left as fluid and rows a carver stamped, so a
+    /// pack that only ever answered "the top is solid" could not pass.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_ocean_floor_heightmap_serves_the_descent_on_real_terrain() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let mut fluid_rows = 0usize;
+        let mut carved_rows = 0usize;
+        let mut columns = 0usize;
+        for (chunk_x, chunk_z) in [(-20, -8), (4, -20), (-4, 5)] {
+            for local_x in 0..16 {
+                for local_z in 0..16 {
+                    let (x, z) = (chunk_x * 16 + local_x, chunk_z * 16 + local_z);
+                    let _ = generator.base_column_ids(x, z);
+                }
+            }
+            let stored = generator
+                .ocean_floor_maps
+                .borrow_mut()
+                .get_mut(&(chunk_x, chunk_z))
+                .expect("the fill pass stored the target chunk map")
+                .entries;
+            assert!(
+                stored.iter().all(|row| *row != UNCOMPUTED_OCEAN_FLOOR),
+                "chunk ({chunk_x}, {chunk_z}): the fill pass left a row uncomputed"
+            );
+            // The widest box in the pack spills about thirteen blocks past its
+            // anchor chunk, so the gate can read this band without the band's
+            // own chunk ever being filled. The target chunk is checked column
+            // by column; outside it a one-in-four lattice is enough, since the
+            // answer of every column is computed the same way and the descent
+            // — not the coverage — is what a smoke can afford to pay.
+            for x in chunk_x * 16 - 13..chunk_x * 16 + 16 + 13 {
+                for z in chunk_z * 16 - 13..chunk_z * 16 + 16 + 13 {
+                    let in_target = x >> 4 == chunk_x && z >> 4 == chunk_z;
+                    if !in_target && ((x & 3) | (z & 3)) != 0 {
+                        continue;
+                    }
+                    let floor = generator.ocean_floor_height(x, z);
+                    assert_eq!(
+                        floor,
+                        generator.ocean_floor_by_descent(x, z),
+                        "column ({x}, {z}): stored row and descent disagree"
+                    );
+                    let top = generator.surface_height(x, z);
+                    // Split the rows the walk left above the floor by what
+                    // they are: a row a carver stamped, and a row the filler
+                    // itself left as fluid. Both have to appear for the smoke
+                    // to have crossed the terrain the gate is asked about.
+                    for y in floor..top {
+                        if generator.carved(x, y, z) {
+                            carved_rows += 1;
+                        } else if matches!(generator.substance(x, y, z), Substance::Fluid(_)) {
+                            fluid_rows += 1;
+                        }
+                    }
+                    columns += 1;
+                }
+            }
+        }
+        assert!(columns > 1_000, "the smoke sampled {columns} columns");
+        assert!(
+            carved_rows > 0 && fluid_rows > 0,
+            "the sampled band crossed {fluid_rows} filler-fluid rows and {carved_rows} \
+             carve-stamped rows above ocean floors"
+        );
+        println!(
+            "smoke OK: {columns} columns, {fluid_rows} filler-fluid rows and {carved_rows} \
+             carved rows above their floors, root {}",
+            root.display()
+        );
+    }
+
     /// Requires the operator-provisioned 26.3 worldgen data. A feature's
     /// ordinal is part of its seed, and the ordinal graph has a bounded cycle
     /// recovery (`MAX_CYCLE_ATTEMPTS`) where the reference runtime recurses
@@ -1884,6 +2072,7 @@ mod tests {
         let (root, generator) = bounded_generator("cache-invariance");
         let (x, z) = (6i32, -2i32);
         let before_height = generator.surface_height(x, z);
+        let before_floor = generator.ocean_floor_height(x, z);
         let before_ids = generator.column_ids(x, z);
         let before_top = generator.top_block(x, z);
         let before_biome = generator.biome(x, z, 8);
@@ -1914,6 +2103,8 @@ mod tests {
         assert!(
             occupancy.masks <= 2 * VanillaGenerator::MASK_CACHE_CAPACITY
                 && occupancy.heights <= 2 * VanillaGenerator::HEIGHT_CACHE_CAPACITY
+                && occupancy.ocean_floor_maps
+                    <= 2 * VanillaGenerator::OCEAN_FLOOR_MAP_CACHE_CAPACITY
                 && occupancy.biomes <= 2 * VanillaGenerator::BIOME_CACHE_CAPACITY
                 && occupancy.aquifer_centers <= 2 * NoiseBasedAquifer::CENTER_CACHE_CAPACITY,
             "the sweeps above must have rotated the caches while keeping them bounded: \
@@ -1921,6 +2112,7 @@ mod tests {
         );
 
         assert_eq!(generator.surface_height(x, z), before_height);
+        assert_eq!(generator.ocean_floor_height(x, z), before_floor);
         assert_eq!(generator.column_ids(x, z), before_ids);
         assert_eq!(generator.top_block(x, z), before_top);
         assert_eq!(generator.biome(x, z, 8), before_biome);
@@ -2306,5 +2498,217 @@ mod tests {
             "eviction must be a recomputation"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The fill pass seeds the whole chunk heightmap: after the 256 columns
+    /// of a chunk are built, every row of its ocean-floor map is stored, and
+    /// each stored row equals what the reference descent — surface top, then
+    /// down past every row the post-carve substance does not count as
+    /// terrain — answers for that column. The dry pack exercises rows whose
+    /// top is already solid (the walk stops at once); the wet pack, a sea
+    /// above the volume, exercises columns whose descent crosses more than a
+    /// hundred fluid rows before the sea floor, and both at negative and
+    /// positive chunk coordinates.
+    #[test]
+    fn the_fill_pass_seeds_the_heightmap_and_matches_the_descent() {
+        let root = scratch_root("heightmap-fill");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/band.json"),
+            r#"{"type": "mul",
+                "left": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": -1.0,
+                    "to_coordinate": 8, "to_value": 1.0},
+                "right": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": 1.0,
+                    "to_coordinate": 48, "to_value": -1.0}}"#,
+        );
+        write(&worldgen.join("material_rule/root.json"), DESCENT_ROOT);
+        descent_pack_noise(&root);
+        descent_pack_settings(&root, "dry", "band", -1000, "root");
+        descent_pack_settings(&root, "wet", "band", 200, "root");
+        for (id, floor, fluid_above) in [
+            ("testns:dry", 23i32, false),
+            // A sea above the volume: the surface top is the water ceiling
+            // and the ocean floor is still the run's top solid row.
+            ("testns:wet", 23, true),
+        ] {
+            let generator = VanillaGenerator::new(&root, 2026, id).expect("generator");
+            for (chunk_x, chunk_z) in [(1, 0), (-2, 3)] {
+                for local_x in 0..16 {
+                    for local_z in 0..16 {
+                        let (x, z) = (chunk_x * 16 + local_x, chunk_z * 16 + local_z);
+                        let _ = generator.column_ids(x, z);
+                    }
+                }
+                let map = generator
+                    .ocean_floor_maps
+                    .borrow_mut()
+                    .get_mut(&(chunk_x, chunk_z))
+                    .expect("the fill pass seeded the chunk map")
+                    .clone();
+                for local_x in 0..16 {
+                    for local_z in 0..16 {
+                        let (x, z) = (chunk_x * 16 + local_x, chunk_z * 16 + local_z);
+                        let stored = map.entries[OceanFloorMap::slot(x, z)];
+                        assert_ne!(
+                            stored, UNCOMPUTED_OCEAN_FLOOR,
+                            "({x}, {z}): the fill pass must seed every row"
+                        );
+                        assert_eq!(
+                            stored,
+                            generator.ocean_floor_by_descent(x, z),
+                            "({x}, {z}): fill-derived row against the descent"
+                        );
+                        assert_eq!(
+                            generator.ocean_floor_height(x, z),
+                            stored,
+                            "({x}, {z}): the served row equals the stored row"
+                        );
+                        assert_eq!(stored, floor, "({x}, {z}): the sea floor row");
+                        if fluid_above {
+                            assert!(
+                                generator.surface_height(x, z) > floor,
+                                "({x}, {z}): the wet column descends through fluid"
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                generator.cache_occupancy().ocean_floor_maps,
+                2,
+                "two target chunks filled, two maps: the fill pass adds no halo keys"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Halo and eviction cannot move an answer. A carved, decorated pack is
+    /// queried in three orders — plain gate lookups over a block of chunks
+    /// including negative coordinates, then whole-chunk fills that overwrite
+    /// the lazily stored halo rows with fill-derived rows, then a sweep past
+    /// the map cache's bound so every original map rotates out and back. In
+    /// every phase the answer per column equals the reference descent.
+    #[test]
+    fn heightmap_halo_lookups_and_eviction_match_the_descent() {
+        let root = scratch_root("heightmap-halo");
+        bounded_pack(&root);
+        // Same pack, but the carver actually carves: rows it stamps sit
+        // inside the solid band, so descents cross post-carve substance.
+        write(
+            &root.join("data/testns/worldgen/carver/scarce.json"),
+            r#"{"type": "minecraft:cave", "probability": 1.0,
+                "y": {"type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": 6},
+                    "max_inclusive": {"absolute": 22}},
+                "count": 4, "thickness": 1.5,
+                "room_vertical_radius_multiplier": 1.0,
+                "horizontal_radius_multiplier": 1.0,
+                "vertical_radius_multiplier": 1.0,
+                "floor_level": -0.7}"#,
+        );
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("carving pack generator");
+        // A three-chunk block straddling the origin's negatives.
+        let area: Vec<(i32, i32)> = (-3..=3)
+            .flat_map(|chunk_x| (-2..=2).map(move |chunk_z| (chunk_x, chunk_z)))
+            .collect();
+        let mut carved_rows = 0usize;
+        let mut reference = Vec::new();
+        for &(chunk_x, chunk_z) in &area {
+            for local_x in 0..16 {
+                for local_z in 0..16 {
+                    let (x, z) = (chunk_x * 16 + local_x, chunk_z * 16 + local_z);
+                    let descent = generator.ocean_floor_by_descent(x, z);
+                    for y in generator.min_y()..generator.min_y() + generator.height() {
+                        if generator.carved(x, y, z) {
+                            carved_rows += 1;
+                        }
+                    }
+                    reference.push((x, z, descent));
+                }
+            }
+        }
+        assert!(carved_rows > 0, "the fixture must actually carve rows");
+        // Phase 1: gate-style lookups (lazy per-column recording).
+        for &(x, z, descent) in &reference {
+            assert_eq!(generator.ocean_floor_height(x, z), descent, "({x}, {z})");
+        }
+        // Phase 2: fill the same chunks; the fill-derived rows must agree
+        // with the descent exactly where the lazy rows sit.
+        for &(chunk_x, chunk_z) in &area {
+            for local_x in 0..16 {
+                for local_z in 0..16 {
+                    let (x, z) = (chunk_x * 16 + local_x, chunk_z * 16 + local_z);
+                    let _ = generator.column_ids(x, z);
+                }
+            }
+        }
+        for &(x, z, descent) in &reference {
+            assert_eq!(
+                generator.ocean_floor_height(x, z),
+                descent,
+                "({x}, {z}) after the fill overwrote the map"
+            );
+        }
+        // Phase 3: rotate every one of these maps out of the cache with
+        // far-apart chunk keys, then answer again from rebuilt maps.
+        for chunk in 0..(4 * VanillaGenerator::OCEAN_FLOOR_MAP_CACHE_CAPACITY) as i32 {
+            let _ = generator.ocean_floor_height(chunk * 512 + 7, -4 * chunk + 3);
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(
+            occupancy.ocean_floor_maps <= 2 * VanillaGenerator::OCEAN_FLOOR_MAP_CACHE_CAPACITY,
+            "heightmap cache grew past its bound: {occupancy:?}"
+        );
+        assert!(
+            occupancy.ocean_floor_maps
+                < area.len() + 4 * VanillaGenerator::OCEAN_FLOOR_MAP_CACHE_CAPACITY,
+            "the sweep touched one map per chunk of the area plus four per capacity, so a \
+             growing map would pin all of them: {occupancy:?}"
+        );
+        for &(x, z, descent) in &reference {
+            assert_eq!(
+                generator.ocean_floor_height(x, z),
+                descent,
+                "({x}, {z}) after eviction"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The chunk-and-slot split of an absolute column is the Euclidean one
+    /// the decorated grid already uses, at negative coordinates too.
+    #[test]
+    fn heightmap_slots_split_absolute_columns_euclideanly() {
+        for x in [
+            -4_194_321i32,
+            -70_824,
+            -300,
+            -17,
+            -16,
+            -1,
+            0,
+            1,
+            15,
+            16,
+            303,
+        ] {
+            for z in [-70_824i32, -33, -16, -1, 0, 7, 16, 511] {
+                let slot = OceanFloorMap::slot(x, z);
+                assert!(slot < 256, "({x}, {z}) → {slot}");
+                let (chunk_x, chunk_z) = (x >> 4, z >> 4);
+                // Euclidean round trip: chunk base plus local offset is back.
+                assert_eq!(
+                    (
+                        chunk_x * 16 + (slot as i32 / 16),
+                        chunk_z * 16 + (slot as i32 % 16)
+                    ),
+                    (x, z),
+                    "({x}, {z}) → chunk ({chunk_x}, {chunk_z}) slot {slot}"
+                );
+            }
+        }
     }
 }

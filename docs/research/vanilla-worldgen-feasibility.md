@@ -665,6 +665,97 @@ far past the release 1,750 ms per chunk and every worker compiles the provisione
 pack first. Its bound is now 600 s, making it a hang detector; the non-blocking
 poll claim it exists for is asserted at 100 ms and untouched.
 
+## T4 decoration-time heightmap stored (6 October 2026, slice M)
+
+Slice L ended with the anchor gate costing +966 ms per chunk, 55% of that tree,
+and attributed it to the missing decoration-time heightmap: 4,843 ocean-floor
+columns memoised over a cache bounded at 4,096, so the sweep thrashed and each
+miss walked the density graph row by row. This slice stores that heightmap.
+
+`VanillaGenerator` now keys the heightmap by chunk rather than by column. One
+`OceanFloorMap` is a chunk's 16×16 rows in the decorated grid's own
+`local_x * 16 + local_z` layout, a KiB, and the fill pass writes all 256 of them
+from the substances it sampled for that column's block ids: from the same surface
+top the descent starts at, down past every row the post-carve substance does not
+count as terrain, reading `filled` where the carvers left the column alone and the
+density-0 aquifer answer where they stamped it — the two branches `substance`
+itself takes. So the row is derived while the density graph is already open for
+that column, at no new samples, and the gate's footprint scans are array reads. A
+lookup into a chunk nobody has filled — the halo an anchor's box spills into —
+still walks the descent, and records that one column into that chunk's map, so no
+column of the decoration window is descended twice for its row and no chunk's fill
+is duplicated to answer a neighbour. The bound is 32 chunk keys, 64 maps at the
+doubled generation limit, 65 KiB per generator against the 160 KiB the column memo
+budgeted; a 4×4 batch answers some 4,800 gate columns from at most 25 maps.
+Eviction costs recomputation only, because every row is a pure function of the
+column's coordinates and the seed.
+
+The answer per column is unchanged, and that is what the slice claims rather than
+assumes:
+
+- Three unit tests and one operator-data smoke pin it. The fill pass seeds every
+  row of both a dry and a wet pack (a sea above the volume, so the walk crosses
+  more than a hundred fluid rows) at positive and negative chunk coordinates, and
+  each stored row equals the descent; a carved, decorated pack is queried in three
+  orders — lazy gate lookups, whole-chunk fills that overwrite those rows, then a
+  sweep past the map bound so every original map rotates out and back — and the
+  answer is the reference descent in all three phases; the chunk-and-slot split is
+  checked as a Euclidean round trip over negative coordinates; and the provisioned
+  26.3 pack serves 1,083 real columns whose stored rows equal the descent, with
+  6,769 filler-fluid rows and 21 carve-stamped rows above their floors so the
+  sample is not the trivial "top is solid" case.
+- All ten operator-data smokes pass against the provisioned data in 953.6 s of a
+  debug build on an otherwise idle machine, the heightmap smoke included. Slice L
+  recorded 475 s for nine of them with three oracle grids busy, so these two
+  figures are the same work under different machine states and are not a
+  comparison.
+- `bench_vanilla_chunks` reports 636,822 written rows in every run of both trees,
+  the terrain itself unmoved.
+- The 3D `substance` report is byte-identical between the trees (md5
+  28f153fd93ebb5d299544a3447f195c1, still 342,641 of 347,483 exact, 98.61%), and
+  so is the `-128..127` family census over seed 2026 — every one of the 24 placed
+  families, `coal_ore` 37,951 included — which is the feature random stream and
+  the gate's accept/reject decisions, not just the terrain.
+- All three M3 `block_compare` grids are identical to the recorded gated round line
+  for line above the fail list, and on its entries: seed 2026 `-384..384`
+  329,559 of 347,483 (94.84%, 336,324 or 96.79% with the air family collapsed),
+  the milestone `-256..512` 321,365 of 338,217 (95.02%, 327,858 or 96.94%), and
+  seed 2027 `-384..384` 296,953 of 308,379 (96.29%, 301,056 or 97.63%). The
+  baseline side is the round measured on this worktree before the slice's edits,
+  whose numbers are the ones slice L committed; the candidate side ran with
+  `fail-cap` 5 against that round's 20, which is a prefix of the same list because
+  the oracle pushes a failure only `if report.fail_positions.len() < fail_cap`.
+
+Cost, as one interleaved comparison in one machine state: release build, single
+thread pinned to one core, seed 2026, the default 4×4 `column_ids` sweep, three
+rounds with each binary in the same order and the machine otherwise idle.
+
+| | e3f6499 | this tree |
+| --- | --- | --- |
+| cold pass, ms/chunk | 1,699.22 / 1,694.19 / 1,690.00 | 1,391.44 / 1,385.36 / 1,384.65 |
+| cold pass, ms/column | 6.6376 / 6.6179 / 6.6015 | 5.4353 / 5.4115 / 5.4088 |
+| warm pass, ms/chunk | 1.55 / 1.54 / 1.53 | 1.55 / 1.57 / 1.53 |
+| one radius-32 view, single thread | 1.99 h | 1.63 h |
+| ocean-floor state after the sweep | 4,843 columns over a 4,096 bound | 40 chunk maps over a 64-map bound |
+| height columns after the sweep | 6,076 | 4,990 |
+| coordinate entries, all caches | 20,998 | 15,103 |
+| peak resident set, KiB | 17,744 / 18,004 / 18,092 | 17,840 / 17,928 / 17,792 |
+
+Median cold cost falls 18.2% — 308.83 ms per chunk, 1.99 h to 1.63 h on one view —
+with each binary's own three runs agreeing to within 0.5%, and peak resident set
+flat. So the stored heightmap recovers part of slice L's +966 ms gate charge, not
+all of it, and this slice does not attribute what remains: measuring that would
+need another ablation of the gate against the same tree, which is not what was
+authorized here. Absolute milliseconds stay
+conditioned on the machine — this state's `e3f6499` answers 1,694.19 against the
+1,750.75 slice L recorded for the same binary under three busy oracle grids — so
+the claim is the ratio, measured with the two binaries interleaved.
+
+Two reporting changes came with it rather than as cleanup: the bench's occupancy
+line counts chunk maps instead of columns, and its fixed-budget line now includes
+the heightmap cache, which it had been leaving out — the committed 1,791 KiB total
+understated the per-generator state by the 160 KiB column memo.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

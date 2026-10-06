@@ -225,10 +225,10 @@ fn run(args: &[String]) -> Result<(), String> {
 /// Entries held by every coordinate-keyed cache after one mode's sweep.
 fn report_occupancy(mode: &str, occupancy: &CacheOccupancy) {
     println!(
-        "occupancy,{mode},masks,{},heights,{},ocean_floors,{},biomes,{},biome_regions,{},chunk_carvers,{}",
+        "occupancy,{mode},masks,{},heights,{},ocean_floor_maps,{},biomes,{},biome_regions,{},chunk_carvers,{}",
         occupancy.masks,
         occupancy.heights,
-        occupancy.ocean_floors,
+        occupancy.ocean_floor_maps,
         occupancy.biomes,
         occupancy.biome_regions,
         occupancy.chunk_carvers
@@ -272,16 +272,18 @@ fn report_budget(mask_bytes: usize) {
     let masks = entries(VanillaGenerator::MASK_CACHE_CAPACITY, mask_bytes);
     let carvers = entries(VanillaGenerator::CHUNK_CARVERS_CACHE_CAPACITY, 8);
     let heights = entries(VanillaGenerator::HEIGHT_CACHE_CAPACITY, 4);
+    let floors = entries(VanillaGenerator::OCEAN_FLOOR_MAP_CACHE_CAPACITY, 256 * 4);
     let biomes = entries(VanillaGenerator::BIOME_CACHE_CAPACITY, 32);
     let centers = entries(NoiseBasedAquifer::CENTER_CACHE_CAPACITY, 24);
     let statuses = entries(NoiseBasedAquifer::STATUS_CACHE_CAPACITY, 24);
     let surfaces = entries(NoiseBasedAquifer::SURFACE_CACHE_CAPACITY, 12);
     let skips = entries(NoiseBasedAquifer::SKIP_CACHE_CAPACITY, 12);
     println!(
-        "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},biomes,{},aquifer_centers,{}",
+        "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},ocean_floor_maps,{},biomes,{},aquifer_centers,{}",
         masks / 1024,
         carvers / 1024,
         heights / 1024,
+        floors / 1024,
         biomes / 1024,
         centers / 1024
     );
@@ -290,7 +292,8 @@ fn report_budget(mask_bytes: usize) {
         statuses / 1024,
         surfaces / 1024,
         skips / 1024,
-        (masks + carvers + heights + biomes + centers + statuses + surfaces + skips) / 1024
+        (masks + carvers + heights + floors + biomes + centers + statuses + surfaces + skips)
+            / 1024
     );
 }
 
