@@ -1110,3 +1110,15 @@ Apache-2.0` except `winnow`, which declares `MIT`; each has a compatible
 option under RustMC's Apache-2.0 policy. `toml_edit` and `toml_write` leave
 the lockfile. The locked license gate checks these declarations, while a
 binary release still needs the required third-party notice review.
+
+## Vertical biome save comparison (7 October 2026)
+
+The `vanilla_oracle biome_volume` reader decodes each stored section's 64
+biome palette cells with the existing tested NBT and packed-palette reader.
+Each cell is scored at its 4×4×4 bottom block coordinate against the
+independent generator's 3D climate placement. The owner-generated Java 26.3
+seed-2026 save supplied 81 generated chunks over `-4..4` in X and Z; the
+aggregate result and residual counts are in the M3 Overworld milestone note.
+No save content or bulk placement table is checked in. A self-authored
+two-biome section fixture checks quart Y, negative chunk origins, and palette
+decoding; the comparison was then run against the local save.

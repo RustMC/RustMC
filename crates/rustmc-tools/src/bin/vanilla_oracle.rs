@@ -9,6 +9,7 @@
 //! vanilla_oracle compare <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [mismatch-cap]]
 //! vanilla_oracle substance <world-dir> <seed> <min> <max> <stride> [preview|experimental|vanilla[:settings-id] [data-root] [fail-cap]]
 //! vanilla_oracle block_compare <world-dir> <seed> <min> <max> <stride> [data-root [fail-cap]]
+//! vanilla_oracle biome_volume <world-dir> <seed> <min-chunk> <max-chunk> [data-root]
 //! vanilla_oracle census <world-dir> <min> <max>
 //! vanilla_oracle census_names <world-dir> <min> <max> [cap]
 //! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
@@ -45,7 +46,7 @@ fn main() {
 fn run(args: &[String]) -> Result<(), String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err(
-            "usage: vanilla_oracle inspect|worksheet|compare|substance|column <world-dir> ..."
+            "usage: vanilla_oracle inspect|worksheet|compare|substance|biome_volume|column <world-dir> ..."
                 .to_string(),
         );
     };
@@ -357,6 +358,43 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             if report.columns == 0 {
                 return Err("no generated chunks found in the sampled range".to_string());
+            }
+        }
+        "biome_volume" => {
+            let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
+            let min = parse_i64(args.get(3).ok_or("missing <min-chunk>")?)?
+                .try_into()
+                .map_err(|_| "min chunk does not fit i32")?;
+            let max = parse_i64(args.get(4).ok_or("missing <max-chunk>")?)?
+                .try_into()
+                .map_err(|_| "max chunk does not fit i32")?;
+            let generator =
+                VanillaGenerator::new(&resolve_data_root(args.get(5)), seed, "minecraft:overworld")
+                    .map_err(|error| error.to_string())?;
+            let report = oracle::compare_biome_volume(&mut store, &generator, min, max)?;
+            if report.chunks == 0 {
+                return Err("no generated chunks found in the sampled range".to_owned());
+            }
+            println!(
+                "chunks={} missing_chunks={} cells={} exact={} ({:.2}%) unresolved={}",
+                report.chunks,
+                report.missing_chunks,
+                report.cells,
+                report.matches,
+                oracle::percent(report.matches, report.cells),
+                report.unresolved
+            );
+            for (band, (cells, matches)) in report.bands {
+                println!(
+                    "band_y={band} cells={cells} exact={matches} ({:.2}%)",
+                    oracle::percent(matches, cells)
+                );
+            }
+            let mut residuals: Vec<_> = report.residuals.into_iter().collect();
+            residuals
+                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            for ((saved, generated), count) in residuals.into_iter().take(15) {
+                println!("residual {count}x vanilla={saved} rustmc={generated}");
             }
         }
         "census" => {
