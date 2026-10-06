@@ -849,7 +849,7 @@ rounds and a label is then not evidence. First, the rounds are identified by
 their own output, not by their names: the `-128..127` family census over seed
 2026 paints `coal_ore` 38,512 blocks on the pre-gate graph build and 37,951 on
 the gated one, which is what separates the third row from the fourth.
-Second, that fourth row was mis-labelled when this section was first written —
+Second, that fourth row was labeled incorrectly when this section was first written —
 the grids it calls "the decoration region's biome set" were run on a tree that
 already carried the anchor gate too. The ablation settles which change earned
 the movement. This tree with `anchored` patched to report every box as anchored
