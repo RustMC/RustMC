@@ -245,8 +245,13 @@ impl VerticalAnchor {
     /// Parses the datapack representation: either a bare number (absolute)
     /// or an object with exactly one of the three keys.
     fn from_value(value: &Value) -> Option<Self> {
+        let bounded = |number: i64| {
+            i32::try_from(number)
+                .ok()
+                .filter(|n| (-32_768..=32_768).contains(n))
+        };
         if let Some(y) = value.as_i64() {
-            return Some(Self::Absolute(y as i32));
+            return Some(Self::Absolute(bounded(y)?));
         }
         let object = value.as_object()?;
         for key in ["absolute", "above_bottom", "below_top"] {
@@ -254,9 +259,9 @@ impl VerticalAnchor {
                 && object.len() == 1
             {
                 return Some(match key {
-                    "absolute" => Self::Absolute(offset as i32),
-                    "above_bottom" => Self::AboveBottom(offset as i32),
-                    _ => Self::BelowTop(offset as i32),
+                    "absolute" => Self::Absolute(bounded(offset)?),
+                    "above_bottom" => Self::AboveBottom(bounded(offset)?),
+                    _ => Self::BelowTop(bounded(offset)?),
                 });
             }
         }
@@ -293,7 +298,11 @@ impl RangeProvider {
     /// ranges only).
     fn from_value(value: &Value, anchors_allowed: bool) -> Option<Self> {
         if let Some(n) = value.as_i64() {
-            return Some(Self::Constant(n as i32));
+            let n = i32::try_from(n).ok()?;
+            if anchors_allowed && !(-32_768..=32_768).contains(&n) {
+                return None;
+            }
+            return Some(Self::Constant(n));
         }
         let object = value.as_object()?;
         let anchored = |kind: &str| -> Option<Self> {
@@ -330,7 +339,11 @@ impl RangeProvider {
                         max_inclusive: anchor,
                     });
                 }
-                Some(Self::Constant(value.as_i64()? as i32))
+                let n = i32::try_from(value.as_i64()?).ok()?;
+                if anchors_allowed && !(-32_768..=32_768).contains(&n) {
+                    return None;
+                }
+                Some(Self::Constant(n))
             }
             Some(kind @ ("minecraft:uniform" | "minecraft:trapezoid")) => anchored(kind),
             Some(other) => Some(Self::Unsupported {
@@ -891,13 +904,16 @@ pub(crate) fn parse_configured_feature(
     let size = body
         .get("size")
         .and_then(Value::as_i64)
-        .ok_or_else(|| WorldgenError::Invalid("ore feature without a size".to_string()))?
-        as i32;
-    if size <= 0 {
+        .ok_or_else(|| WorldgenError::Invalid("ore feature without a size".to_string()))?;
+    // The supported ore placer builds a cubic scratch box and compares all
+    // vein points pairwise. Reject operator-pack values that exceed the
+    // bounded runtime this implementation can provide.
+    if !(1..=128).contains(&size) {
         return Err(WorldgenError::Invalid(format!(
-            "ore feature size must be positive, got {size}"
+            "ore feature size must be in 1..=128, got {size}"
         )));
     }
+    let size = i32::try_from(size).expect("checked ore size");
     let discard_chance_on_air_exposure = body
         .get("discard_chance_on_air_exposure")
         .and_then(Value::as_f64)
@@ -1011,13 +1027,21 @@ fn parse_rule_test(value: Option<&Value>) -> Result<RuleTest, WorldgenError> {
                 .and_then(Value::as_i64)
                 .ok_or_else(|| {
                     WorldgenError::Invalid("height_match target without a minimum".to_string())
-                })? as i32,
+                })?
+                .try_into()
+                .map_err(|_| {
+                    WorldgenError::Invalid("height_match minimum is out of range".to_string())
+                })?,
             max_inclusive: value
                 .get("max_inclusive")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| {
                     WorldgenError::Invalid("height_match target without a maximum".to_string())
-                })? as i32,
+                })?
+                .try_into()
+                .map_err(|_| {
+                    WorldgenError::Invalid("height_match maximum is out of range".to_string())
+                })?,
         }),
         "minecraft:any_of" => Ok(RuleTest::AnyOf(nested("rules")?)),
         "minecraft:all_of" => Ok(RuleTest::AllOf(nested("rules")?)),
@@ -1053,6 +1077,21 @@ pub(crate) fn parse_placed_feature(
         .enumerate()
         .map(|(index, entry)| parse_placement_modifier(id, index, entry))
         .collect::<Result<Vec<_>, _>>()?;
+    let attempt_budget = modifiers.iter().try_fold(1u32, |product, modifier| {
+        if let PlacementModifier::Count { count } = modifier {
+            match count.range(0, 0) {
+                Some((_, max)) => product.checked_mul(max.max(0) as u32),
+                None => Some(product),
+            }
+        } else {
+            Some(product)
+        }
+    });
+    if !matches!(attempt_budget, Some(0..=4096)) {
+        return Err(WorldgenError::Invalid(format!(
+            "{id}: count modifiers exceed the 4096-attempt placement budget"
+        )));
+    }
     Ok(PlacedFeature {
         id: id.to_string(),
         feature,
@@ -1074,11 +1113,16 @@ fn parse_placement_modifier(
             let count = entry.get("count").ok_or_else(|| {
                 WorldgenError::Invalid(format!("{id}: count placement without a count"))
             })?;
-            Ok(PlacementModifier::Count {
-                count: RangeProvider::from_value(count, false).ok_or_else(|| {
-                    WorldgenError::Invalid(format!("{id}: count placement is not an int provider"))
-                })?,
-            })
+            let count = RangeProvider::from_value(count, false).ok_or_else(|| {
+                WorldgenError::Invalid(format!("{id}: count placement is not an int provider"))
+            })?;
+            if matches!(count.range(0, 0), Some((min, max)) if !(0..=256).contains(&min) || !(0..=256).contains(&max))
+            {
+                return Err(WorldgenError::Invalid(format!(
+                    "{id}: count placement must be in 0..=256"
+                )));
+            }
+            Ok(PlacementModifier::Count { count })
         }
         "minecraft:rarity_filter" => {
             let chance = entry.get("chance").and_then(Value::as_i64).ok_or_else(|| {
@@ -1697,8 +1741,8 @@ mod tests {
     }
 
     #[test]
-    fn a_non_positive_ore_size_is_rejected() {
-        for size in [0, -8] {
+    fn an_out_of_budget_ore_size_is_rejected() {
+        for size in [0, -8, 129, i64::MAX] {
             let error = parse_configured_feature(&json!({
                 "type": "minecraft:ore",
                 "size": size,
@@ -1709,8 +1753,38 @@ mod tests {
             }))
             .expect_err("rejected");
             assert!(
-                error.to_string().contains("size must be positive"),
+                error.to_string().contains("size must be in 1..=128"),
                 "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_rejects_overflowing_and_unbounded_inputs() {
+        let configured = HashMap::from([(
+            "minecraft:test".to_string(),
+            Rc::new(ConfiguredFeature::Unsupported {
+                kind: "minecraft:tree".to_string(),
+            }),
+        )]);
+        for placement in [
+            json!([{"type": "minecraft:count", "count": i64::MAX}]),
+            json!([{"type": "minecraft:count", "count": 257}]),
+            json!([{"type": "minecraft:count", "count": {
+                "type": "minecraft:uniform", "min_inclusive": {"absolute": 0},
+                "max_inclusive": {"absolute": 257}
+            }}]),
+            json!([{"type": "minecraft:height_range", "height": {
+                "type": "minecraft:uniform", "min_inclusive": {"absolute": i64::MAX},
+                "max_inclusive": {"absolute": 0}
+            }}]),
+            json!([{"type": "minecraft:count", "count": 256},
+                   {"type": "minecraft:count", "count": 256}]),
+        ] {
+            let document = json!({"feature": "minecraft:test", "placement": placement});
+            assert!(
+                parse_placed_feature("minecraft:test_placed", &document, &configured).is_err(),
+                "oversized input must fail at load time: {document}"
             );
         }
     }

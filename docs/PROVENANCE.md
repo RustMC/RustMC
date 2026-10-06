@@ -707,6 +707,16 @@ and no game data or consulted source entered the repository.
 
 ### Session 13 (5–6 October 2026): decoration-time heightmaps, the step ordinal graph and the ore draw budget (T4 slice L)
 
+The RustMC feature runtime accepts operator-provisioned JSON, so it also
+checks resource bounds at load time. Ore `size` is limited to 1–128 because
+the independent placer uses a cubic scratch box and compares vein points
+pairwise. Each count modifier is limited to 0–256 attempts, and their maximum
+combined attempt count is 4,096 per placed feature; numeric anchors must fit within
+±32,768 and JSON integers must convert to `i32` without truncation. These
+are RustMC runtime limits, not claims about vanilla's codecs. Invalid local
+packs fail to load rather than allocating unbounded scratch space or silently
+wrapping values. The owner's provisioned 26.3 pack passes these checks.
+
 The slice consulted the owner's locally fetched, deobfuscated official Java 26.3
 server classes, read outside the repository under the ADR-0014 amendment:
 `Heightmap`, `Heightmap$Types` and `Heightmap$Usage`, `ChunkAccess` and the
