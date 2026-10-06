@@ -297,6 +297,113 @@ impl LegacyRandom {
     }
 }
 
+/// The stream the decoration loop draws through: Java's `WorldgenRandom`
+/// keeps the derived primitive shapes of `LegacyRandomSource` but forwards
+/// every `next(bits)` to an xoroshiro delegate, so each `bits` request costs
+/// exactly one delegate long while the composite draws (`nextLong`,
+/// `nextDouble`) cost two. That is a different contract from
+/// [`RandomSource`]'s own derived draws, which take one long each, and the
+/// decoration order depends on it (`docs/PROVENANCE.md`, the feature-runtime
+/// consultation).
+#[derive(Clone)]
+pub struct DecorationRandom {
+    delegate: RandomSource,
+}
+
+impl DecorationRandom {
+    /// A stream whose delegate is reseeded from `seed`, matching the
+    /// constructor's state being irrelevant after `set_decoration_seed`.
+    pub fn new(seed: i64) -> Self {
+        Self {
+            delegate: RandomSource::from_world_seed(seed as u64),
+        }
+    }
+
+    /// Java `setSeed`: the xoroshiro delegate re-derives both halves from the
+    /// single 64-bit value.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.delegate = RandomSource::from_world_seed(seed as u64);
+    }
+
+    /// Java `next(int)`: one delegate long, logically shifted so the top
+    /// `bits` bits are the value, then truncated to `int`.
+    pub fn next_bits(&mut self, bits: u32) -> i32 {
+        debug_assert!(bits > 0 && bits <= 32, "bits must be in 1..=32");
+        (self.delegate.next_long() >> (64 - bits)) as u32 as i32
+    }
+
+    pub fn next_int(&mut self) -> i32 {
+        self.next_bits(32)
+    }
+
+    /// `BitRandomSource`'s bounded draw: the power-of-two shortcut, else the
+    /// rejection loop, both expressed through `next`.
+    pub fn next_int_bounded(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0, "bound must be positive");
+        if bound & (bound - 1) == 0 {
+            return ((bound as i64 * i64::from(self.next_bits(31))) >> 31) as i32;
+        }
+        loop {
+            let sample = self.next_bits(31);
+            let modulo = sample % bound;
+            if !sample
+                .wrapping_sub(modulo)
+                .wrapping_add(bound - 1)
+                .is_negative()
+            {
+                return modulo;
+            }
+        }
+    }
+
+    /// Java: `(next(32) << 32) + next(32)` with both halves sign-extended,
+    /// i.e. two delegate longs.
+    pub fn next_long(&mut self) -> i64 {
+        let upper = i64::from(self.next_bits(32)) << 32;
+        upper.wrapping_add(i64::from(self.next_bits(32)))
+    }
+
+    pub fn next_float(&mut self) -> f32 {
+        self.next_bits(24) as f32 * FLOAT_UNIT
+    }
+
+    /// Java: `(next(26) << 27) + next(27)` scaled by the double multiplier;
+    /// two delegate longs, unlike [`RandomSource::next_double`].
+    pub fn next_double(&mut self) -> f64 {
+        let upper = (i64::from(self.next_bits(26))) << 27;
+        upper.wrapping_add(i64::from(self.next_bits(27))) as f64 * DOUBLE_UNIT
+    }
+
+    pub fn next_bool(&mut self) -> bool {
+        self.next_bits(1) != 0
+    }
+
+    /// `WorldgenRandom.setDecorationSeed`: two odd scale longs mixed with the
+    /// chunk origin and the world seed. Returns the seed the per-feature
+    /// reseeds are based on.
+    pub fn set_decoration_seed(&mut self, world_seed: i64, x: i32, z: i32) -> i64 {
+        self.set_seed(world_seed);
+        let x_scale = self.next_long() | 1;
+        let z_scale = self.next_long() | 1;
+        let mixed = (i64::from(x))
+            .wrapping_mul(x_scale)
+            .wrapping_add(i64::from(z).wrapping_mul(z_scale))
+            ^ world_seed;
+        self.set_seed(mixed);
+        mixed
+    }
+
+    /// `WorldgenRandom.setFeatureSeed`: the feature's own stream starts from
+    /// the decoration seed plus its ordinal and step, without drawing.
+    pub fn set_feature_seed(&mut self, decoration_seed: i64, ordinal: i32, step: i32) {
+        self.set_seed(
+            decoration_seed
+                .wrapping_add(i64::from(ordinal))
+                .wrapping_add(i64::from(step).wrapping_mul(10_000)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +495,117 @@ mod tests {
         r.set_large_feature_seed(2026, 40, -17);
         assert_eq!(r.next_bits(32) as u32, 0x0c64_b921);
         assert_eq!(r.next_bits(32) as u32, 0x61ae_4307);
+    }
+
+    /// Decoration-seed parity against the deobfuscated 26.3
+    /// `WorldgenRandom`/`XoroshiroRandomSource`, generated with
+    /// `java -cp server-26.3.jar:libraries/*` on 2026-10-05 and recorded in
+    /// `docs/PROVENANCE.md`. The chunk coordinates are the decoration
+    /// origin, i.e. the chunk position shifted left by four.
+    #[test]
+    fn decoration_seed_matches_parity_vectors() {
+        for ((chunk_x, chunk_z), expected) in [
+            ((0, 0), 2026_i64),
+            ((-1, 2), -6_273_982_822_019_529_638),
+            ((40, -17), 7_892_031_622_368_679_610),
+            ((-128, -128), -7_560_045_051_374_004_246),
+        ] {
+            let mut random = DecorationRandom::new(12_345);
+            let seed = random.set_decoration_seed(2026, chunk_x << 4, chunk_z << 4);
+            assert_eq!(seed, expected, "decoration seed for {chunk_x},{chunk_z}");
+        }
+    }
+
+    /// The draw sequence a single ore decoration makes: `nextFloat` for the
+    /// vein angle, `nextInt(16)` for the in-square offsets, `nextInt(3)` for
+    /// the two height jitters, then `nextDouble` for each vein point. Expected
+    /// values come from the same 2026-10-05 reference run as the seeds above and
+    /// are recorded in `docs/PROVENANCE.md`.
+    #[test]
+    fn decoration_draw_sequence_matches_parity_vectors() {
+        let mut random = DecorationRandom::new(12_345);
+        let seed = random.set_decoration_seed(2026, -16, 32);
+        random.set_feature_seed(seed, 3, 6);
+        // The reference run draws one of each shape per round, in this order.
+        let mut floats = Vec::new();
+        let mut square = Vec::new();
+        let mut jitter = Vec::new();
+        let mut doubles = Vec::new();
+        for _ in 0..3 {
+            floats.push(random.next_float());
+            square.push(random.next_int_bounded(16));
+            jitter.push(random.next_int_bounded(3));
+            doubles.push(random.next_double().to_bits());
+        }
+        assert_eq!(floats, [0.665_943_2, 0.530_540_35, 0.203_523_93]);
+        assert_eq!(square, [8, 0, 2]);
+        assert_eq!(jitter, [1, 1, 0]);
+        assert_eq!(
+            doubles,
+            [
+                4_605_220_165_685_422_423_u64,
+                4_605_330_769_301_753_330,
+                4_599_212_402_979_728_424,
+            ]
+        );
+    }
+
+    /// The composite shapes: `nextInt`, the non-power-of-two bounded draw,
+    /// `nextLong` (two delegate longs) and `nextBoolean` (one). Expected values
+    /// come from the same 2026-10-05 reference run and are recorded in
+    /// `docs/PROVENANCE.md`.
+    #[test]
+    fn decoration_composite_draws_match_parity_vectors() {
+        let mut random = DecorationRandom::new(12_345);
+        let seed = random.set_decoration_seed(2026, -2048, -2048);
+        random.set_feature_seed(seed, 17, 6);
+        let mut ints = Vec::new();
+        let mut bounded = Vec::new();
+        let mut longs = Vec::new();
+        let mut bools = Vec::new();
+        for _ in 0..3 {
+            ints.push(random.next_int());
+            bounded.push(random.next_int_bounded(237));
+            longs.push(random.next_long());
+            bools.push(random.next_bool());
+        }
+        assert_eq!(ints, [1_389_737_797, -218_130_023, 1_811_641_268]);
+        assert_eq!(bounded, [209, 53, 69]);
+        assert_eq!(
+            longs,
+            [
+                -7_926_701_679_838_353_624,
+                -5_402_565_863_842_856_637,
+                -1_590_638_501_234_764_267
+            ]
+        );
+        assert_eq!(bools, [true, true, true]);
+    }
+
+    /// A feature's stream is a pure function of its ordinal and step, so
+    /// reseeding the same feature twice repeats the sequence exactly.
+    #[test]
+    fn feature_seed_streams_are_independent_and_repeatable() {
+        for ordinal in [0, 3, 17] {
+            let mut first = DecorationRandom::new(1);
+            let mut second = DecorationRandom::new(-999);
+            let seed = first.set_decoration_seed(2027, 64, -64);
+            second.set_decoration_seed(2027, 64, -64);
+            first.set_feature_seed(seed, ordinal, 6);
+            second.set_feature_seed(seed, ordinal, 6);
+            let left: Vec<i32> = (0..8).map(|_| first.next_int_bounded(16)).collect();
+            let right: Vec<i32> = (0..8).map(|_| second.next_int_bounded(16)).collect();
+            assert_eq!(left, right, "ordinal {ordinal}");
+        }
+        let mut a = DecorationRandom::new(1);
+        let seed = a.set_decoration_seed(2027, 64, -64);
+        a.set_feature_seed(seed, 4, 6);
+        let mut b = DecorationRandom::new(1);
+        b.set_decoration_seed(2027, 64, -64);
+        b.set_feature_seed(seed, 5, 6);
+        assert_ne!(
+            (0..8).map(|_| a.next_float()).collect::<Vec<f32>>(),
+            (0..8).map(|_| b.next_float()).collect::<Vec<f32>>()
+        );
     }
 }

@@ -1134,6 +1134,7 @@ fn smoke_encodes_a_provisioned_overworld_column() {
     let generator =
         VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("operator data loads");
     assert_eq!(generator.min_y(), OVERWORLD_MIN_Y, "overworld profile");
+    let encoded_chunks = [(0_i32, 0_i32), (-1, 2)];
     let tables = match std::env::var("RUSTMC_REGISTRY_TABLE") {
         Ok(table) => {
             let text = if table.trim_start().starts_with('{') {
@@ -1147,13 +1148,21 @@ fn smoke_encodes_a_provisioned_overworld_column() {
         Err(_) => {
             let mut states: BTreeSet<String> = BTreeSet::new();
             let mut biomes: BTreeSet<String> = BTreeSet::new();
-            for z in 0..4 {
-                for x in 0..32 {
-                    states.extend(generator.column_ids(x, z).into_iter().flatten());
-                    for layer in 0..BIOME_LAYERS {
-                        let y = OVERWORLD_MIN_Y + layer as i32 * SECTION_BIOME_SIDE as i32;
-                        if let Some(biome) = generator.biome(x, z, y) {
-                            biomes.insert(biome);
+            // Veins are local: a stone column two chunks over can hold an ore
+            // this chunk never emits. The invented vocabulary therefore has to
+            // be collected from exactly the columns that are encoded below,
+            // not from a sample elsewhere.
+            for (chunk_x, chunk_z) in encoded_chunks {
+                for local_z in 0..16 {
+                    for local_x in 0..16 {
+                        let x = chunk_x * 16 + local_x;
+                        let z = chunk_z * 16 + local_z;
+                        states.extend(generator.column_ids(x, z).into_iter().flatten());
+                        for layer in 0..BIOME_LAYERS {
+                            let y = OVERWORLD_MIN_Y + layer as i32 * SECTION_BIOME_SIDE as i32;
+                            if let Some(biome) = generator.biome(x, z, y) {
+                                biomes.insert(biome);
+                            }
                         }
                     }
                 }
@@ -1192,7 +1201,7 @@ fn smoke_encodes_a_provisioned_overworld_column() {
     assert!(cancelled.is_none());
     assert_eq!(visited_columns, 9);
     let mut vertically_distinct_columns = 0;
-    for (chunk_x, chunk_z) in [(0, 0), (-1, 2)] {
+    for (chunk_x, chunk_z) in encoded_chunks {
         let chunk =
             chunk_from_generator(&generator, chunk_x, chunk_z, &tables).expect("resolve a column");
         let packet = encode_chunk(&chunk, &tables).expect("encode a real column");

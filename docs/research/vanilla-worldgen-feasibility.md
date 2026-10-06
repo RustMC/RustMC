@@ -391,8 +391,9 @@ directly attributable.
 
 - Synthetic descent tests pin the first-match-wins sequencing, the solid
   run/floor-run boundaries, and the below-floor depth sentinel; an
-  ignored smoke fires both vein rules over two 16×16 squares (granite
-  and tuff fillers observed inside their documented windows) and re-checks
+  ignored smoke fires both vein rules over 16×16 squares (granite and
+  tuff fillers observed, every placement-stage change confined to a
+  `base_stone_overworld` host) and re-checks
   the descent's top row against the T2 top-block result.
 - Vein marginals measured by RustMC (dense-window grids over seed 2026)
   versus vanilla's own classes at the same seed (session 10): mask ≥ 0 at
@@ -412,6 +413,348 @@ directly attributable.
 Slice J's exit condition — veins applied through full columns and shown
 distribution-faithful against vanilla's own marginals — is met. The
 staged plan continues with the feature runtime as T4's next slice.
+
+## T4 placement runtime measured (5 October 2026, slice K)
+
+The placement stage now runs. `vanilla::feature` compiles the operator pack's
+`configured_feature` and `placed_feature` documents, block tags and per-biome
+feature lists once at load, and `VanillaGenerator::column_ids` answers the
+material-rule descent with the veins painted over it. A chunk is decorated by
+replaying the placement passes of its own chunk plus the eight around it and
+keeping only the writes that land inside, which is what the measured per-anchor
+reach requires. `docs/PROVENANCE.md` session 12 records the consultation, the
+facts, the save-side shape measurements and the deviations. The 3D substance
+answer deliberately stays pre-feature, so T3 keeps measuring terrain.
+
+T4 census, seed 2026, block square `-128..127` (256 save chunks, 65,536
+columns per side), family counts from the save against RustMC, the vein
+descent alone versus with the placement stage:
+
+| family | save | before | after | after / save |
+| --- | --- | --- | --- | --- |
+| stone | 3,608,863 | 4,598,052 | 3,612,176 | 100.1% |
+| deepslate | 3,297,622 | 3,927,861 | 3,461,892 | 105.0% |
+| coal_ore | 38,272 | 0 | 40,076 | 104.7% |
+| deepslate_coal_ore | 177 | 0 | 187 | 105.6% |
+| iron_ore | 13,924 | 0 | 13,651 | 98.0% |
+| deepslate_iron_ore | 6,860 | 1,292 | 7,476 | 109.0% |
+| copper_ore | 39,696 | 525 | 40,513 | 102.1% |
+| deepslate_copper_ore | 2,326 | 0 | 2,180 | 93.7% |
+| gold_ore | 1,033 | 0 | 948 | 91.8% |
+| deepslate_gold_ore | 5,279 | 0 | 5,606 | 106.2% |
+| redstone_ore | 683 | 0 | 713 | 104.4% |
+| deepslate_redstone_ore | 7,964 | 0 | 8,383 | 105.3% |
+| lapis_ore | 2,559 | 0 | 2,693 | 105.2% |
+| deepslate_lapis_ore | 3,527 | 0 | 3,500 | 99.2% |
+| diamond_ore | 109 | 0 | 90 | 82.6% |
+| deepslate_diamond_ore | 5,739 | 0 | 6,322 | 110.2% |
+| emerald_ore | 33 | 0 | 28 | 84.8% |
+| deepslate_emerald_ore | 2 | 0 | 0 | 0.0% |
+| granite | 254,700 | 1,899 | 290,622 | 114.1% |
+| diorite | 265,385 | 0 | 274,396 | 103.4% |
+| andesite | 270,615 | 0 | 254,895 | 94.2% |
+| tuff | 271,727 | 5,053 | 290,724 | 107.0% |
+| raw_copper_block | 9 | 9 | 9 | 100.0% |
+| raw_iron_block | 30 | 31 | 31 | 103.3% |
+
+- Counting, for each of the 24 families above, the lesser of the two sides
+  over the sum of the save's counts, the square's aggregate agreement moves
+  from 85.4% to 99.8%. The four blob families sit at +3.4% (diorite), −5.8%
+  (andesite), +7.0% (tuff) and +14.1% (granite) against the save. Of the host
+  stones, `stone` is now within 0.1% of the save, from 27% over, and `deepslate`
+  is +5.0%. Every ore and raw-metal family is within ±10.2% except the four
+  small-count diamond and emerald rows: `diamond_ore` 82.6%,
+  `deepslate_diamond_ore` 110.2%, `emerald_ore` 84.8%, and `deepslate_emerald_ore`
+  against a save count of 2 blocks in the whole square.
+- What is still absent is explicit and measurable: `logs` 6,795, `leaves`
+  66,776, `grasses` 2,543 and `flowers` 95 blocks in the same square, all
+  counted at zero by RustMC — the vegetation and tree families of the
+  placement stage, plus structures, are the next slices and no claim is made
+  about them.
+- The T3 3D substance metric is unchanged by this slice: an A/B of the same
+  oracle command between the branch's base commit and this tree gives
+  byte-equal output — 2,401 columns, 347,483 substance positions, 342,641
+  exact (98.61%), with every band, residual and Y-marginal line identical.
+  The 98.61% here and the 98.64% recorded for the M3 sample grid are that same
+  metric measured over different windows, not a movement: this A/B strides
+  `-384..384` (347,483 positions) while `docs/milestones/M3-overworld-vanilla-preview.md`
+  strides `-256..512` (338,217 positions). Running `block_compare` on the base
+  commit over the milestone's `-256..512` window returns that recorded
+  273,498 / 338,217 = 80.86% exactly, which pins each denominator to its window
+  rather than to the code.
+- Exact base-block agreement, the metric that grid reports, moves the other way,
+  and this slice does not hide it. Three pairs of `block_compare` runs, identical
+  arguments within each pair, base commit against this tree: seed 2026 over
+  `-384..384` 282,440 / 347,483 = 81.28% → 246,110 = 70.83%; seed 2026 over the
+  milestone's `-256..512` grid 273,498 / 338,217 = 80.86% → 237,027 = 70.08%;
+  seed 2027 over `-384..384` 258,769 / 308,379 = 83.91% → 229,853 = 74.54%.
+  Collapsing the air family follows the same way (83.23% → 72.77%, 82.78% →
+  72.00%, 85.24% → 75.87%).
+- Where that loss sits is the informative part. The scored denominator, the
+  cave-void exact count and the carve residuals are unchanged in all three
+  pairs; the whole movement is on solid rows, and each blob family's residual is
+  nearly symmetric — seed 2026 over `-384..384` reports 6,482 positions where the
+  save holds stone and RustMC now holds granite against 6,215 the other way, and
+  8,373 deepslate→tuff against 8,446 tuff→deepslate. The placement stage
+  therefore delivers the measured *amount* of every family and almost none of
+  its *coordinates*. A feature's random identity is
+  `decoration_seed + ordinal + step × 10000`, so a feature numbered differently
+  from vanilla draws a different anchor while still drawing the same counts; that
+  is the expected mechanism, though this slice does not separate its cost from
+  the other three deviations.
+- Cost, release build, single thread, seed 2026, 4×4 chunk column-descent
+  sweep: 314.88 ms per chunk before this slice, 388.76 ms per chunk with it
+  (+23.5%), projecting 0.37 → 0.46 hours single-threaded for one radius-32
+  view. The decorated grid is a bounded cache of 32 chunks (6.3 MiB at
+  overworld height), and the same square's second pass answers at 0.93 ms per
+  chunk, i.e. 42,728 blocks per millisecond of cache reads; an evicted chunk
+  rebuilds to the identical grid, which the tests pin. Peak resident memory
+  over that sweep moved from 10,736 KiB to 17,568 KiB, the bounded cache rather
+  than unbounded growth.
+- Tests: the registry and placement runtime carry 20 unit tests over synthetic
+  packs (vein reproducibility and seed dependence, per-anchor reach never
+  passing the neighbour chunk, writes outside the decorated chunk refused, a
+  neighbour anchor reaching the target while a far anchor does not, air
+  exposure only removing blocks that touch air, each range provider's
+  documented draw count, rarity and count gating, the biome filter, unmodeled
+  features holding their ordinals, nested rule trees, tag references and
+  cycles, the schedule's ordering — slice K pinned that to identifier order and
+  slice L replaced the test with the graph ordering's); the generator adds
+  pack-vein
+  presence, chunk-build-order independence, cache boundedness and eviction
+  invariance; the operator-data smokes check that both vein families fire over
+  1,024 columns at fixed grid origins and that every row the placement stage
+  changed held a `minecraft:base_stone_overworld` member before.
+
+This slice closes the ore/blob stone part of T4's census. It is an
+aggregate-count agreement plus self-consistency, not block-for-block placement:
+the counts are measured close and the coordinates are measurably not, and the
+ordinal schedule, the write radius and the world-gen heightmap are the open work
+between this state and per-position parity.
+
+## T4 ordinal graph and anchor gate measured (6 October 2026, slice L)
+
+Slice K left four deviations open and one number unresolved: the placement stage
+delivered every family's amount and almost none of its coordinates. This slice
+closes two of those deviations and puts the remaining gap on a measured
+mechanism rather than on a guess. `docs/PROVENANCE.md` session 13 records the
+consultation, the save-format facts and the evidence; this section records what
+moved.
+
+Two changes are in the tree:
+
+- `vanilla::feature::StepSchedule` builds each decoration step's ordering the
+  way the reference runtime does — a topological descent over the per-step lists
+  of the biomes in range, retried under a bound when a biome pair produces a
+  cyclic order — and a feature's reseed ordinal is its index in that list. The
+  biomes in range come from `VanillaGenerator::region_biomes`, the 3×3 chunk
+  window intersected with the generator's possible biomes, replacing the
+  identifier-sorted stand-in whose ordinals could differ from vanilla's.
+- `vanilla::feature::anchored` reproduces the `OCEAN_FLOOR_WG` footprint test an
+  ore placement runs before it draws any radius. It consults
+  `VanillaGenerator::ocean_floor_height`, the computed surface descended to the
+  first solid block, because a finished save cannot carry the world-gen type:
+  `keepAfterWorldgen()` drops it.
+
+An independent defect this slice found is in the oracle, not the generator. The
+26.3 saves store heightmaps in the non-spanning bit layout — 7 nine-bit values
+per long, 37 longs per chunk column array — and `oracle::surface_top` was
+reading them as spanning, which is correct only for the first seven columns of
+each chunk. Measured over 2,048 chunks: non-spanning decoding agrees with the
+palette-decoded column tops in 524,288 of 524,288 columns for `WORLD_SURFACE`,
+while spanning decoding answers 3.86–5.69% and yields heights from −65 to 446,
+outside the world. The M3 grids stride 16 blocks and so read local column index
+0, which is the one column both decoders agree on; their denominators are
+identical before and after the fix, so every comparison in this note stands on
+correct heights. Other strides and per-column inspections did not, and now do.
+Palettes are packed as well, including power-of-two sizes (a 32-entry palette at
+5 bits is 342 longs, where spanning would need 320); RustMC's palette decode
+already matched and is unchanged.
+
+The grids, on the M3 `block_compare` squares (exact base-block agreement, each
+round re-run whole):
+
+| build | `-384..384` | `-256..512` | seed 2027 |
+| --- | --- | --- | --- |
+| pre-feature terrain only | 81.28% | 80.86% | 83.91% |
+| placement with identifier-sorted ordinals | 70.83% | 70.08% | 74.54% |
+| step ordinal graph, region biome set included | 91.19% | 91.27% | 92.65% |
+| and the anchor gate | 94.84% | 95.02% | 96.29% |
+
+The last row is the anchor gate's and not the biome set's, which took an ablation
+to establish: the tree was edited in place between rounds, so the rounds are
+identified by what they paint (`coal_ore` 38,512 over the census square before
+the gate, 37,951 after), and this tree with the footprint test neutered answers
+the pre-gate census byte-for-byte *and* the pre-gate grids to the position —
+316,872, 308,680 and 285,714 exact, the third row's three numbers again. The
+biome set therefore carries no separable gain on these metrics, and the gate on
+its own is worth 12,687, 12,685 and 11,239 positions — 3.65, 3.75 and 3.65
+points — all of them solid-row identities, since the air-collapsed counts move by
+exactly the same numbers. What the gate removes is the ore attempts whose whole
+box floats above the terrain, whose radii were otherwise drawn and consumed ahead
+of every feature downstream.
+
+The third round, run after the decode fix, returned all three reports
+byte-identical to the gated ones — those grids sample local column index 0, the
+one column both decoders read correctly — so the ladder above is one measurement
+series and not a comparison across an oracle change.
+
+Residual after the gate, on the traced grid: 17,924 of 347,483 positions, of
+which 6,740 are the same air position under two names and 2,422 are void rows
+RustMC fills with deepslate (the T3 carver residual). The vein families disagree
+as a near-symmetric pair — 703 coal-ore positions read as stone against 690 the
+other way — which is displacement, not amount: the census of every placed family
+sits at 99.99% in aggregate.
+
+Cost, as one comparison in one machine state: release build, single thread,
+seed 2026, the bench's default 4×4 `column_ids` sweep, every binary run in the
+same hour while three oracle grids were busy on other cores. The middle column
+is an ablation — this tree with `anchored` patched to report every box as
+anchored, so the placement work is what the no-gate tree does and only the
+footprint scan is missing. That ablation is demonstrably faithful: its
+`-128..127` family census reproduces the pre-gate round's report byte-for-byte
+over all 24 families (`coal_ore` 38,512, against the gated round's 37,951), so
+the extra milliseconds are the footprint scan and not a build that happens to
+differ somewhere else.
+
+| | f86ef84 (slice K's tree) | this tree, gate ablated | this tree |
+| --- | --- | --- | --- |
+| cold pass | 570.47 ms/chunk | 784.84 ms/chunk | 1,750.75 ms/chunk |
+| warm pass (cache reads) | 1.34 ms/chunk | 1.55 ms/chunk | 1.54 ms/chunk |
+| one radius-32 view, single thread | 0.67 h | 0.92 h | 1.99 h |
+| ocean-floor columns memoised | — | 0 | 4,843 |
+| peak resident set | 17,780 KiB | 17,556 KiB | 17,524 KiB |
+
+The terrain modes do not move: `heights` 203.17 → 204.65, `carve` 2.42 → 2.54,
+`substance` 433.98 → 435.23 ms/chunk, and the substance answer itself is
+byte-identical between the trees. The ablation attributes the rest: the ordinal
+graph and the decoration region's biome union together cost +214 ms per chunk,
+and the anchor gate costs +966 on top of that — 55% of the tree's total. The
+reason is the one session 12's deviation list already names: RustMC holds no
+decoration-time heightmap, so the gate's per-column question is answered by
+computation, and the sweep ends with 4,843 ocean-floor columns over a cache
+bounded at 4,096, each descent walking the density graph row by row. Peak
+resident set is flat across all three columns, so this is recomputation and not
+growth — building the heightmap once per chunk during the fill and carve passes
+turns the largest cost of this slice into an array read, and that work is now a
+cost item as well as a correctness one.
+
+These absolute milliseconds are not comparable with the 388.76 ms/chunk slice K
+recorded for that same f86ef84 tree, which was measured in a different machine
+state; the same binary answers 570.47 today. Every column of the table above
+comes from a run under one state, which is why the comparison is reported as
+ratios rather than as levels.
+
+Tests added by the slice: the schedule's graph ordering, its cycle recovery and
+its biome-source tie-break; that one ordinal replayed alone reproduces its own
+share of a step; the footprint gate's draw accounting, that a box whose base row
+clears every column under it is abandoned for exactly the three draws that fixed
+its axis; that the decorated region covers the chunk volume and the nine-chunk
+window and that a feature only a neighbouring biome lists stays out of the far
+chunks; that the provisioned pack's schedule is the graph over the source's 56
+biomes — 9 steps carrying 171 placed features — with neither bounded-retry cycle
+counter reported, which is what makes the `MAX_CYCLE_ATTEMPTS` deviation safe to
+take; and, in the oracle, that both heightmap layouts decode from the stored
+long count.
+
+One existing smoke moved with the cost rather than with the behaviour. The
+operator-data preview delivery test asserted the first chunk inside 20 s, which
+held while a cold descent was pre-placement work and does not hold with the gate:
+measured from a debug build it delivers in 91 s, since a debug column descent is
+far past the release 1,750 ms per chunk and every worker compiles the provisioned
+pack first. Its bound is now 600 s, making it a hang detector; the non-blocking
+poll claim it exists for is asserted at 100 ms and untouched.
+
+## T4 decoration-time heightmap stored (6 October 2026, slice M)
+
+Slice L ended with the anchor gate costing +966 ms per chunk, 55% of that tree,
+and attributed it to the missing decoration-time heightmap: 4,843 ocean-floor
+columns memoised over a cache bounded at 4,096, so the sweep thrashed and each
+miss walked the density graph row by row. This slice stores that heightmap.
+
+`VanillaGenerator` now keys the heightmap by chunk rather than by column. One
+`OceanFloorMap` is a chunk's 16×16 rows in the decorated grid's own
+`local_x * 16 + local_z` layout, a KiB, and the fill pass writes all 256 of them
+from the substances it sampled for that column's block ids: from the same surface
+top the descent starts at, down past every row the post-carve substance does not
+count as terrain, reading `filled` where the carvers left the column alone and the
+density-0 aquifer answer where they stamped it — the two branches `substance`
+itself takes. So the row is derived while the density graph is already open for
+that column, at no new samples, and the gate's footprint scans are array reads. A
+lookup into a chunk nobody has filled — the halo an anchor's box spills into —
+still walks the descent, and records that one column into that chunk's map, so no
+column of the decoration window is descended twice for its row and no chunk's fill
+is duplicated to answer a neighbour. The bound is 32 chunk keys, 64 maps at the
+doubled generation limit, 65 KiB per generator against the 160 KiB the column memo
+budgeted; a 4×4 batch answers some 4,800 gate columns from at most 25 maps.
+Eviction costs recomputation only, because every row is a pure function of the
+column's coordinates and the seed.
+
+The answer per column is unchanged, and that is what the slice claims rather than
+assumes:
+
+- Three unit tests and one operator-data smoke pin it. The fill pass seeds every
+  row of both a dry and a wet pack (a sea above the volume, so the walk crosses
+  more than a hundred fluid rows) at positive and negative chunk coordinates, and
+  each stored row equals the descent; a carved, decorated pack is queried in three
+  orders — lazy gate lookups, whole-chunk fills that overwrite those rows, then a
+  sweep past the map bound so every original map rotates out and back — and the
+  answer is the reference descent in all three phases; the chunk-and-slot split is
+  checked as a Euclidean round trip over negative coordinates; and the provisioned
+  26.3 pack serves 1,083 real columns whose stored rows equal the descent, with
+  6,769 filler-fluid rows and 21 carve-stamped rows above their floors so the
+  sample is not the trivial "top is solid" case.
+- All ten operator-data smokes pass against the provisioned data in 953.6 s of a
+  debug build on an otherwise idle machine, the heightmap smoke included. Slice L
+  recorded 475 s for nine of them with three oracle grids busy, so these two
+  figures are the same work under different machine states and are not a
+  comparison.
+- `bench_vanilla_chunks` reports 636,822 written rows in every run of both trees,
+  the terrain itself unmoved.
+- The 3D `substance` report is byte-identical between the trees (md5
+  28f153fd93ebb5d299544a3447f195c1, still 342,641 of 347,483 exact, 98.61%), and
+  so is the `-128..127` family census over seed 2026 — every one of the 24 placed
+  families, `coal_ore` 37,951 included — which is the feature random stream and
+  the gate's accept/reject decisions, not just the terrain.
+- All three M3 `block_compare` grids are identical to the recorded gated round line
+  for line above the fail list, and on its entries: seed 2026 `-384..384`
+  329,559 of 347,483 (94.84%, 336,324 or 96.79% with the air family collapsed),
+  the milestone `-256..512` 321,365 of 338,217 (95.02%, 327,858 or 96.94%), and
+  seed 2027 `-384..384` 296,953 of 308,379 (96.29%, 301,056 or 97.63%). The
+  baseline side is the round measured on this worktree before the slice's edits,
+  whose numbers are the ones slice L committed; the candidate side ran with
+  `fail-cap` 5 against that round's 20, which is a prefix of the same list because
+  the oracle pushes a failure only `if report.fail_positions.len() < fail_cap`.
+
+Cost, as one interleaved comparison in one machine state: release build, single
+thread pinned to one core, seed 2026, the default 4×4 `column_ids` sweep, three
+rounds with each binary in the same order and the machine otherwise idle.
+
+| | e3f6499 | this tree |
+| --- | --- | --- |
+| cold pass, ms/chunk | 1,699.22 / 1,694.19 / 1,690.00 | 1,391.44 / 1,385.36 / 1,384.65 |
+| cold pass, ms/column | 6.6376 / 6.6179 / 6.6015 | 5.4353 / 5.4115 / 5.4088 |
+| warm pass, ms/chunk | 1.55 / 1.54 / 1.53 | 1.55 / 1.57 / 1.53 |
+| one radius-32 view, single thread | 1.99 h | 1.63 h |
+| ocean-floor state after the sweep | 4,843 columns over a 4,096 bound | 40 chunk maps over a 64-map bound |
+| height columns after the sweep | 6,076 | 4,990 |
+| coordinate entries, all caches | 20,998 | 15,103 |
+| peak resident set, KiB | 17,744 / 18,004 / 18,092 | 17,840 / 17,928 / 17,792 |
+
+Median cold cost falls 18.2% — 308.83 ms per chunk, 1.99 h to 1.63 h on one view —
+with each binary's own three runs agreeing to within 0.5%, and peak resident set
+flat. So the stored heightmap recovers part of slice L's +966 ms gate charge, not
+all of it, and this slice does not attribute what remains: measuring that would
+need another ablation of the gate against the same tree, which is not what was
+authorized here. Absolute milliseconds stay
+conditioned on the machine — this state's `e3f6499` answers 1,694.19 against the
+1,750.75 slice L recorded for the same binary under three busy oracle grids — so
+the claim is the ratio, measured with the two binaries interleaved.
+
+Two reporting changes came with it rather than as cleanup: the bench's occupancy
+line counts chunk maps instead of columns, and its fixed-budget line now includes
+the heightmap cache, which it had been leaving out — the committed 1,791 KiB total
+understated the per-generator state by the 160 KiB column memo.
 
 ## Risks
 

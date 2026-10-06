@@ -47,14 +47,15 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
         }
     }
 
-    /// Looks a key up, aging a hit in the older generation back into the
-    /// young one so a reused entry outlives the sweep that touched it.
+    /// Looks a key up for reading or in-place update, aging a hit in the
+    /// older generation back into the young one so a reused entry outlives
+    /// the sweep that touched it.
     ///
     /// All mutation happens before any reference escapes, because the only
     /// borrow that may outlive this call is the final lookup: a young hit
     /// therefore costs one extra `contains_key` probe, the price of
     /// expressing the promotion without the unstable `raw_entry_mut`.
-    pub fn get_mut(&mut self, key: &K) -> Option<&V> {
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         if !self.young.contains_key(key)
             && let Some(value) = self.old.remove(key)
         {
@@ -63,7 +64,7 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
             }
             self.young.insert(key.clone(), value);
         }
-        self.young.get(key)
+        self.young.get_mut(key)
     }
 
     /// Inserts a value, evicting the oldest generation when the young one
@@ -109,8 +110,8 @@ mod tests {
         }
         // The most recent keys are still there; everything older flowed
         // through and out.
-        assert_eq!(cache.get_mut(&9_999), Some(&19_998));
-        assert_eq!(cache.get_mut(&0), None);
+        assert_eq!(cache.get_mut(&9_999).cloned(), Some(19_998));
+        assert_eq!(cache.get_mut(&0).cloned(), None);
     }
 
     #[test]
@@ -120,14 +121,22 @@ mod tests {
         cache.insert(2, 20);
         // Third insert ages the first generation out.
         cache.insert(3, 30);
-        assert_eq!(cache.get_mut(&1), Some(&10));
-        assert_eq!(cache.get_mut(&2), Some(&20));
-        assert_eq!(cache.get_mut(&3), Some(&30));
+        assert_eq!(cache.get_mut(&1).cloned(), Some(10));
+        assert_eq!(cache.get_mut(&2).cloned(), Some(20));
+        assert_eq!(cache.get_mut(&3).cloned(), Some(30));
         // Both promoted entries now sit in the young generation; the next
         // rotation drops only the aged-out one.
         cache.insert(4, 40);
-        assert_eq!(cache.get_mut(&2), Some(&20), "a promoted entry survives");
-        assert_eq!(cache.get_mut(&1), None, "an untouched entry is evicted");
+        assert_eq!(
+            cache.get_mut(&2).cloned(),
+            Some(20),
+            "a promoted entry survives"
+        );
+        assert_eq!(
+            cache.get_mut(&1).cloned(),
+            None,
+            "an untouched entry is evicted"
+        );
     }
 
     #[test]
@@ -136,7 +145,7 @@ mod tests {
         cache.insert(7, 1);
         cache.insert(7, 2);
         assert_eq!(cache.entries(), 1);
-        assert_eq!(cache.get_mut(&7), Some(&2));
+        assert_eq!(cache.get_mut(&7).cloned(), Some(2));
         // Replacing must not rotate the generations either.
         for key in 0..4 {
             cache.insert(key, key);
@@ -144,7 +153,7 @@ mod tests {
         let before = cache.entries();
         cache.insert(7, 3);
         assert_eq!(cache.entries(), before);
-        assert_eq!(cache.get_mut(&7), Some(&3));
+        assert_eq!(cache.get_mut(&7).cloned(), Some(3));
     }
 
     #[test]
@@ -153,6 +162,10 @@ mod tests {
         cache.insert(1, 1);
         cache.insert(2, 2);
         assert!(cache.entries() <= 2);
-        assert_eq!(cache.get_mut(&2), Some(&2), "the newest entry survives");
+        assert_eq!(
+            cache.get_mut(&2).cloned(),
+            Some(2),
+            "the newest entry survives"
+        );
     }
 }

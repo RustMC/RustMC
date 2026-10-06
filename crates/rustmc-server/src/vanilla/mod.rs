@@ -22,6 +22,7 @@ pub mod biome;
 pub mod cache;
 pub mod carver;
 pub mod density;
+pub mod feature;
 pub mod generator;
 pub mod noise;
 pub mod random;

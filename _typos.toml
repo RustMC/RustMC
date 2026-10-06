@@ -6,3 +6,7 @@ flate2 = "flate2"
 # Arbitrary short NBT key used by the round-trip test in
 # crates/rustmc-tools/src/nbt.rs.
 ba = "ba"
+# Vanilla block-tag identifiers contain this plural form.
+stone_ore_replaceables = "stone_ore_replaceables"
+deepslate_ore_replaceables = "deepslate_ore_replaceables"
+height_specific_ore_replaceables = "height_specific_ore_replaceables"

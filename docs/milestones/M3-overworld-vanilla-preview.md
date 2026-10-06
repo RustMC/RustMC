@@ -206,6 +206,54 @@ denominator as the T3 substance baseline in `docs/PROVENANCE.md`.
   652 beside an existing void (over-wide carving) and 515 in intact rock
   (invented caves).
 
+Re-measured on 5 October 2026, after the placement stage began painting ore and
+blob stone veins over the material-rule descent: the same grid scores 237,027 of
+those 338,217 positions exact (70.08%, from 80.86%) and 243,520 with the air
+family collapsed (72.00%, from 82.78%). The vein/blob confusion did shrink in the
+direction the runtime was added for — granite, diorite and andesite went from
+8,269, 8,757 and 8,393 save-side blocks resolved as plain stone to 6,115, 6,421
+and 6,118 — but a near-equal reverse pair appeared beside it (6,377 positions
+where the save holds
+stone and RustMC now holds granite, against 6,115 the other way). The same shape
+repeats on the seed-2026 `-384..384` grid, on seed 2027, and in the aggregate
+family census recorded under slice K of
+`docs/research/vanilla-worldgen-feasibility.md`: counts agree, coordinates do
+not, because a feature's ordinal is part of its seed and RustMC's ordinal
+schedule is not vanilla's. Exact per-position placement identity is open work,
+not a claim, and each figure here is one sample on one preset.
+
+Re-measured on 6 October 2026, after two changes to that placement stage: a
+feature's ordinal is now the index its step's topological ordering gives it (the
+identifier-sorted stand-in above is gone), and an ore attempt whose whole box
+floats above the terrain is abandoned before it draws any radius, which is the
+footprint test vanilla's `OCEAN_FLOOR_WG` anchor gate documents. The same grid
+scores 321,365 of those 338,217 positions exact — 95.02%, from 70.08% — and the
+seed-2026 `-384..384` grid 329,559 of 347,483 (94.84%, from 70.83%); 96.94% and
+96.79% with the air family collapsed. The schedule deviation that paragraph
+named as the reason coordinates did not follow counts is closed: over the census
+square the 24 placed families now agree at 99.99% in aggregate and `lapis_ore`
+lands exactly on the save's 2,559 blocks, while the seed-2027 grid reaches 96.29%.
+What remains is displacement, not amount, and it now reads as three separable
+things — 6,740 of the 17,924 disagreeing positions on the traced grid are one air
+row under two names, 2,422 are void rows RustMC fills with deepslate (the deep
+carver residual the T3 baseline attributes), and the ore families disagree as a
+near-symmetric pair (703 coal-ore positions read as stone against 690 the other
+way), which the trace localises to anchors shifted 3.8 to 8.6 blocks inside the
+traced chunk rather than to veins of the wrong size. That question needed a
+decoration-time heightmap, and the stage now has one: slice M stores each chunk's
+`OCEAN_FLOOR_WG` rows, derived inside the column fill from substances it had
+already sampled, and the gate answers identically from it. The three grids above
+re-measure to the same report, line for line, including the fail entries the
+re-run listed: 329,559 of 347,483 exact (94.84%) on the seed-2026 `-384..384`
+grid, 321,365 of 338,217 (95.02%) on `-256..512`, and 296,953 of 308,379 (96.29%)
+on seed 2027. The `-128..127` family census is byte-identical between the two
+builds, and the cold 4×4 column sweep costs 18.2% less — 1,694.19 against
+1,385.36 ms per chunk, medians of three interleaved rounds each — which projects
+1.99 h to 1.63 h for one radius-32 view. So the displacement above is not a
+caching artifact; it stays where the trace put it. Vegetation and
+tree families are still not placed, structures are out of scope here, and no
+figure in this milestone is a parity claim.
+
 Sample B, a sparser negative-coordinate grid (stride 32 over `-1024..-512`):
 289 requested grid points, 61 scored columns, 120 missing chunks, and 108
 stored-but-ungenerated columns. The sampler now reports that last case as a

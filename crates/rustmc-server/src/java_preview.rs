@@ -1256,7 +1256,15 @@ mod tests {
                 break stream;
             }
             assert!(!preview.failed, "worker failed before returning a chunk");
-            assert!(started.elapsed() < std::time::Duration::from_secs(20));
+            // A bound on delivery, not on speed. This smoke runs the decorated
+            // generator from a debug build, where one cold column descent costs
+            // tens of times the 1,750 ms per chunk the release bench measures
+            // (91 s to first delivery observed here, on a machine also running
+            // three oracle grids), and each worker compiles the provisioned pack
+            // before it draws anything. So this is a hang detector; the measured
+            // cost of this path is `bench_vanilla_chunks` and
+            // `docs/PROVENANCE.md`.
+            assert!(started.elapsed() < std::time::Duration::from_secs(600));
             thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(packet_ids(&delivered).contains(&CHUNK));
