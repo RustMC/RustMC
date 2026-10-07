@@ -781,6 +781,107 @@ fn biome_at(section: &Tag, lx: u8, y: i32, lz: u8) -> Result<Option<String>, Str
     Ok(value.and_then(|tag| tag.as_str().map(str::to_string)))
 }
 
+/// One stored quart-grid biome cell at its bottom block coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiomeCell {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub name: String,
+}
+
+/// Decode the saved 4×4×4 biome cells of a chunk, preserving their Y levels.
+/// Missing sections are not scored: the save provides no biome answer there.
+pub fn biome_cells(root: &Tag, chunk_x: i32, chunk_z: i32) -> Result<Vec<BiomeCell>, String> {
+    let origin_x = chunk_x
+        .checked_mul(16)
+        .ok_or("chunk X overflows block coordinates")?;
+    let origin_z = chunk_z
+        .checked_mul(16)
+        .ok_or("chunk Z overflows block coordinates")?;
+    let mut cells = Vec::new();
+    for section in chunk_sections(root)? {
+        let section_y = section
+            .get("Y")
+            .and_then(Tag::as_i32)
+            .ok_or("section without Y")?;
+        let base_y = section_y
+            .checked_mul(16)
+            .ok_or("section Y overflows block coordinates")?;
+        for by in 0..4 {
+            for bz in 0..4 {
+                for bx in 0..4 {
+                    let y = base_y
+                        .checked_add(by * 4)
+                        .ok_or("section Y overflows block coordinates")?;
+                    let Some(name) = biome_at(section, (bx * 4) as u8, y, (bz * 4) as u8)? else {
+                        return Err("saved biome cell has no palette entry".to_owned());
+                    };
+                    cells.push(BiomeCell {
+                        x: origin_x + bx * 4,
+                        y,
+                        z: origin_z + bz * 4,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+    Ok(cells)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BiomeVolumeReport {
+    pub chunks: usize,
+    pub missing_chunks: usize,
+    pub cells: usize,
+    pub matches: usize,
+    pub unresolved: usize,
+    /// 32-block Y band -> (scored cells, exact matches).
+    pub bands: std::collections::BTreeMap<i32, (usize, usize)>,
+    pub residuals: std::collections::BTreeMap<(String, String), usize>,
+}
+
+/// Compare every stored quart cell in an inclusive square of saved chunks
+/// against the generated biome at the same bottom block coordinate.
+pub fn compare_biome_volume(
+    store: &mut RegionStore,
+    generator: &VanillaGenerator,
+    min_chunk: i32,
+    max_chunk: i32,
+) -> Result<BiomeVolumeReport, String> {
+    if min_chunk > max_chunk || i64::from(max_chunk) - i64::from(min_chunk) > 31 {
+        return Err("chunk range must be ordered and at most 32 wide".to_owned());
+    }
+    let mut report = BiomeVolumeReport::default();
+    for chunk_z in min_chunk..=max_chunk {
+        for chunk_x in min_chunk..=max_chunk {
+            let Some(root) = store.chunk_root(chunk_x, chunk_z)? else {
+                report.missing_chunks += 1;
+                continue;
+            };
+            report.chunks += 1;
+            for cell in biome_cells(&root, chunk_x, chunk_z)? {
+                report.cells += 1;
+                let band = cell.y.div_euclid(32) * 32;
+                let entry = report.bands.entry(band).or_default();
+                entry.0 += 1;
+                let Some(ours) = generator.biome(cell.x, cell.z, cell.y) else {
+                    report.unresolved += 1;
+                    continue;
+                };
+                let matched = ours == cell.name;
+                report.matches += usize::from(matched);
+                entry.1 += usize::from(matched);
+                if !matched {
+                    *report.residuals.entry((cell.name, ours)).or_default() += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn palette_value<'a>(
     palette: &'a [Tag],
     data: Option<&'a Tag>,
@@ -1469,6 +1570,31 @@ mod tests {
         assert_eq!(first.biome.as_deref(), Some("minecraft:plains"));
         let second = column_truth(&root, 0, 0, 0, 15).unwrap().unwrap();
         assert_eq!(second.biome.as_deref(), Some("minecraft:forest"));
+    }
+
+    #[test]
+    fn saved_biome_cells_keep_quart_bottom_y_and_negative_chunk_origin() {
+        let cells = biome_cells(&synthetic_chunk(false), 1, -2).expect("saved quart cells");
+        assert_eq!(cells.len(), 64);
+        assert_eq!(
+            cells.first(),
+            Some(&BiomeCell {
+                x: 16,
+                y: 64,
+                z: -32,
+                name: "minecraft:plains".to_owned(),
+            })
+        );
+        assert!(cells.contains(&BiomeCell {
+            x: 16,
+            y: 72,
+            z: -24,
+            name: "minecraft:forest".to_owned(),
+        }));
+        assert_eq!(
+            cells.last().map(|cell| (cell.x, cell.y, cell.z)),
+            Some((28, 76, -20))
+        );
     }
 
     #[test]

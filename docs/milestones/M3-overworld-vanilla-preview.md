@@ -318,3 +318,17 @@ following acknowledgement. Tests cover multiple packets in one batch and
 budget deferral. This reduces protocol acknowledgement overhead when workers
 finish near one another; it does not shorten the density computation for a
 cold chunk. Real-client movement still needs operator observation.
+
+## Vertical biome volume check (7 October 2026)
+
+The oracle's `biome_volume` mode reads saved 4×4×4 biome cells and compares
+their exact bottom block coordinates with `VanillaGenerator::biome`. On the
+owner's local Java 26.3 default Overworld, seed 2026, chunks `(-4,-4)` through
+`(4,4)`, all 81 chunks and 124,416 stored cells were available. RustMC matched
+124,321 cells (99.92%) across all 24 vertical sections; no cell was unresolved.
+The 95 residuals were 93 saved `birch_forest` versus generated
+`old_growth_birch_forest`, and two saved `dripstone_caves` versus generated
+`birch_forest` or `forest`. This measures biome identity in saved data, not
+the live client's display. It does not establish exact parity outside this
+window or explain the residuals. The operator save and placement table remain
+local; the repository contains only the reader and aggregate report.
