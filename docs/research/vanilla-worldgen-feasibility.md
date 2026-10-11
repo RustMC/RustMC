@@ -1027,7 +1027,8 @@ write is refused and lost and is recorded as a grid-aligned under-count.
 
 **What this slice licenses.** The pack's air filter is now a working gate over the
 whole column, so the vegetation families can be compared as distributions rather
-than as a zero artifact — and this commit shows that comparison failing by 2–7×,
+than as a zero artifact — and this commit shows that comparison failing by
+2.06×–5.20× on grasses and 2.00×–7.74× on flowers over the four measured squares,
 with the heightmap-anchor question named as the first testable step. Trees,
 structures and the noise-driven flower providers still need their own slices, and
 the T4 gate remains unmet.
