@@ -981,7 +981,7 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
 /// than registry entries, so two files with the same identifier stem would
 /// each contribute. An unmodeled modifier keeps its place in the chain and the
 /// chain then yields nothing, so without this key a feature whose configured
-/// type *is* modeled — `minecraft:simple_block`, `minecraft:tree` — would be
+/// type *is* modeled — `minecraft:ore` — would be
 /// missing from the gap report entirely.
 fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &PlacedFeature) {
     let mut seen: HashSet<&str> = HashSet::new();

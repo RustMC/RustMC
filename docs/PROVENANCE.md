@@ -1168,5 +1168,6 @@ production consumer yet — the server does not print it at startup; the ignored
 `smoke_prints_the_pack_wide_gap_report` is what surfaces it, and the counts are
 asserted by unit tests, so the gap report is currently a verified diagnostic
 rather than an operator-visible surface. Second, the `placement:` and `target:`
-prefixes are a naming convention, not a namespace check, and the counters track
-documents rather than registry entries.
+prefixes are a naming convention, not a namespace check. Configured-type and
+`placement:` counts track documents rather than registry entries; `target:`
+counts track unsupported rule occurrences, including nested rules.
