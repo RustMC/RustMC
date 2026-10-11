@@ -433,8 +433,11 @@ pub struct FeatureData {
     biome_order: Vec<String>,
     /// The pack's block tags, used by `minecraft:tag_match` targets.
     tags: BlockTags,
-    /// Feature kinds seen in the pack without a runtime here, for the
-    /// startup report; keyed by `minecraft:` type name.
+    /// What the pack asks for that this generator does not do, for the
+    /// startup report. Keyed by a configured feature's `minecraft:` type
+    /// name, by `target:<rule>` for an unmodeled ore-target predicate, and
+    /// by `placement:<modifier>` for an unmodeled decoration; both prefixes
+    /// keep their namespaced kind names from reading as a feature type.
     pub(crate) unimplemented_features: HashMap<String, usize>,
 }
 
@@ -554,6 +557,7 @@ impl FeatureData {
         }
         for (id, document) in placed_docs {
             let feature = parse_placed_feature(&id, &document, &data.configured)?;
+            record_unmodeled_modifiers(&mut data.unimplemented_features, &feature);
             data.placed.insert(id, Rc::new(feature));
         }
         let placed_ids: Vec<String> = data.placed.keys().cloned().collect();
@@ -960,6 +964,28 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
         }
         RuleTest::Not(nested) => record_unmodeled_rule(counts, nested),
         _ => {}
+    }
+}
+
+/// Counts the placement-modifier kinds a placed-feature document asks for
+/// without a runtime here, keyed `placement:<kind>` so the namespaced kinds
+/// cannot read as configured-feature types or as `target:` rules. One
+/// increment per document carrying the kind, matching the configured-kind
+/// counters: the report answers "which placed features does this pack ask
+/// for that this generator cannot run", not how many times a chain repeats a
+/// decoration. An unmodeled modifier keeps its place in the chain and the
+/// chain then yields nothing, so without this key a feature whose configured
+/// type *is* modeled — `minecraft:simple_block`, `minecraft:tree` — would be
+/// missing from the gap report entirely.
+fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &PlacedFeature) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for modifier in &placed.modifiers {
+        let PlacementModifier::Unsupported { kind } = modifier else {
+            continue;
+        };
+        if seen.insert(kind.as_str()) {
+            *counts.entry(format!("placement:{kind}")).or_insert(0) += 1;
+        }
     }
 }
 
@@ -1907,6 +1933,172 @@ mod tests {
             !placed.is_modelable(),
             "an unmodeled provider or decoration must not be silently run"
         );
+    }
+
+    /// A pack of one modeled ore feature, one placed feature whose
+    /// `placement` array the caller supplies verbatim, and one biome listing
+    /// it — so the only thing the report can be talking about is the
+    /// decorations.
+    fn report_pack(label: &str, placement: &str) -> PathBuf {
+        let root = scratch_root(label);
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/andesite.json"),
+            r#"{"type": "minecraft:ore", "size": 8, "discard_chance_on_air_exposure": 0.0,
+                "targets": [{"state": "minecraft:andesite",
+                    "target": {"predicate_type": "minecraft:matching_blocks",
+                        "blocks": ["minecraft:stone"]}}]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/one.json"),
+            &format!(r#"{{"feature": "testns:andesite", "placement": {placement}}}"#),
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [["testns:one"]]}"#,
+        );
+        root
+    }
+
+    #[test]
+    fn an_unmodeled_decoration_is_named_in_the_report() {
+        // The configured type here is `minecraft:ore`, which this runtime
+        // models, so before this counter the feature places nothing and the
+        // report says nothing about why.
+        let root = report_pack(
+            "report-modifier",
+            r#"[{"type": "minecraft:count", "count": 2},
+                {"type": "minecraft:random_offset", "xz_spread": 7, "y_spread": 3},
+                {"type": "minecraft:biome"}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert_eq!(
+            data.unimplemented_features
+                .get("placement:minecraft:random_offset"),
+            Some(&1),
+            "the decoration that gates the chain is named"
+        );
+        assert_eq!(
+            data.unimplemented_features.len(),
+            1,
+            "every other decoration in the chain is modeled: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            !data.step(0).expect("step 0")[0].is_modelable(),
+            "and the feature is still gated out of the run"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_fully_modeled_chain_adds_nothing_to_the_report() {
+        let root = report_pack(
+            "report-clean",
+            r#"[{"type": "minecraft:count", "count": 2},
+                {"type": "minecraft:rarity_filter", "chance": 4},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:height_range", "height": {"type": "minecraft:uniform",
+                    "min_inclusive": {"absolute": 10}, "max_inclusive": {"absolute": 60}}},
+                {"type": "minecraft:biome"}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert!(
+            data.unimplemented_features.is_empty(),
+            "a chain this runtime runs is not a gap: {:?}",
+            data.unimplemented_features
+        );
+        assert!(data.step(0).expect("step 0")[0].is_modelable());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_repeated_decoration_counts_once_per_document() {
+        let root = report_pack(
+            "report-dedup",
+            r#"[{"type": "minecraft:random_offset", "xz_spread": 7, "y_spread": 3},
+                {"type": "minecraft:random_offset", "xz_spread": 2, "y_spread": 1},
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:biome"}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        // One document, one kind, two occurrences: the counter counts the
+        // feature the report is about, not the modifier's repetition.
+        assert_eq!(
+            data.unimplemented_features
+                .get("placement:minecraft:random_offset"),
+            Some(&1)
+        );
+        assert_eq!(
+            data.unimplemented_features
+                .get("placement:minecraft:heightmap"),
+            Some(&1),
+            "a second unmodeled kind in the same document gets its own key"
+        );
+        assert_eq!(data.unimplemented_features.len(), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_configured_and_target_keys_keep_their_meaning() {
+        let root = scratch_root("report-kinds");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/swamp.json"),
+            r#"{"type": "minecraft:tree"}"#,
+        );
+        write(
+            &worldgen.join("feature/diorite.json"),
+            r#"{"type": "minecraft:ore", "size": 8, "discard_chance_on_air_exposure": 0.0,
+                "targets": [
+                    {"state": "minecraft:diorite",
+                        "target": {"predicate_type": "minecraft:matching_blocks",
+                            "blocks": ["minecraft:stone"]}},
+                    {"state": "minecraft:granite",
+                        "target": {"predicate_type": "minecraft:random_block_match",
+                            "block": "minecraft:stone", "probability": 0.5}}
+                ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/one.json"),
+            r#"{"feature": "testns:diorite", "placement": [
+                {"type": "minecraft:offset", "location": {"positive": true}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [["testns:one"]]}"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert_eq!(
+            data.unimplemented_features.get("minecraft:tree"),
+            Some(&1),
+            "one increment per configured document of an unmodeled type"
+        );
+        assert_eq!(
+            data.unimplemented_features
+                .get("target:minecraft:random_block_match"),
+            Some(&1),
+            "one increment per ore target using an unmodeled predicate"
+        );
+        assert_eq!(
+            data.unimplemented_features
+                .get("placement:minecraft:offset"),
+            Some(&1)
+        );
+        assert_eq!(
+            data.unimplemented_features.len(),
+            3,
+            "the three namespaces stay separate: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("minecraft:random_block_match"),
+            "a rule or decoration kind never reads as a feature type"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -3110,5 +3302,40 @@ mod tests {
         data.set_biome_order(&["testns:two", "testns:one"]);
         assert_eq!(step_ids(&data, 0), ["testns:ore_a", "testns:ore_b"]);
         assert_eq!(data.region_ordinals(0, &only_one), vec![0]);
+    }
+
+    /// Requires the operator-provisioned data pack. Prints the startup
+    /// report the loader builds from it — the honest gap list, per key and
+    /// per count. `FeatureData::load` has no dimension filter (the overworld
+    /// biome order only shapes the schedule), so the report covers every
+    /// placed and configured document in the pack. Run with
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_prints_the_pack_wide_gap_report() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = FeatureData::load(&root).expect("the provisioned pack loads");
+        assert!(
+            !data.unimplemented_features.is_empty(),
+            "the provisioned pack asks for nothing this generator lacks"
+        );
+        let mut entries: Vec<(&String, &usize)> = data.unimplemented_features.iter().collect();
+        entries.sort_unstable_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+        let placements = entries
+            .iter()
+            .filter(|(key, _)| key.starts_with("placement:"))
+            .count();
+        println!(
+            "gap report: {} keys ({} of them placement modifiers), root {}",
+            entries.len(),
+            placements,
+            root.display()
+        );
+        for (key, count) in entries {
+            println!("  {key} {count}");
+        }
     }
 }

@@ -1137,3 +1137,20 @@ aggregate result and residual counts are in the M3 Overworld milestone note.
 No save content or bulk placement table is checked in. A self-authored
 two-biome section fixture checks quart Y, negative chunk origins, and palette
 decoding; the comparison was then run against the local save.
+
+## Unmodeled placement-modifier gap report (11 October 2026)
+
+`vanilla::feature` now counts placement modifiers it recognizes but does not
+model in `unimplemented_features`, keyed `placement:<kind>`, once per
+placed-feature document carrying the kind — the same per-document shape the
+configured-type counter already used, so the map stays a statement of what the
+pack asks for rather than what this generator does. The kinds and their counts
+come from the operator-provisioned data pack's own `worldgen/placed_feature`
+JSON, walked with `python3` in the same session that ran the loader, and from
+this repository's `parse_placement_modifier`; no Mojang or Paper source,
+binary, or decompiled class was read or needed. Over the provisioned pack's
+273 placed features, 419 of 1,170 modifier occurrences use one of 10 kinds this
+generator does not model, and the report grows from 46 to 56 keys with those
+keys' per-document counts 148, 111, 91, 26, 12, 8, 6, 4, 3, 1. Nothing about
+the placement itself changed: no draw count, no position and no written block
+moves, and the report's pre-existing keys came out identical.
