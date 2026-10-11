@@ -1137,3 +1137,37 @@ aggregate result and residual counts are in the M3 Overworld milestone note.
 No save content or bulk placement table is checked in. A self-authored
 two-biome section fixture checks quart Y, negative chunk origins, and palette
 decoding; the comparison was then run against the local save.
+
+## Unmodeled placement-modifier gap report (11 October 2026)
+
+`vanilla::feature` now counts placement modifiers it recognizes but does not
+model in `unimplemented_features`, keyed `placement:<kind>`, once per
+placed-feature document carrying the kind — the same per-document shape the
+configured-type counter already used, so the map stays a statement of what the
+pack asks for rather than what this generator does. The kinds and their counts
+come from the operator-provisioned data pack's own `worldgen/placed_feature`
+JSON, walked with `python3` in the same session that ran the loader, and from
+this repository's `parse_placement_modifier`; no Mojang or Paper source,
+binary, or decompiled class was read or needed. Over the provisioned pack's
+273 placed features, 419 of 1,170 modifier occurrences use one of 10 kinds this
+generator does not model, and the report grows from 46 to 56 keys. The 10 new
+keys' per-document counts are 148, 111, 91, 26, 12, 8, 6, 4, 3, 1 — 410
+increments from 419 occurrences, because 7 documents repeat
+`minecraft:block_predicate_filter` and `twisting_vines.json` repeats
+`minecraft:offset` three times, suppressing 9 repeats. Counting per document
+rather than per occurrence is what makes the key a statement about placed
+features instead of about chains.
+Nothing about the placement itself changed: no draw count, no position and no
+written block moves, and the report's pre-existing keys came out identical.
+The evidence is a whole-column comparison rather than a sampled one: the
+generator's `column_ids` path, run at both commits over seed-2026 1×1 and 2×2
+chunk squares and a seed-2027 1×1 square (43,580, 169,660 and 32,243 columns),
+wrote byte-equal block content and identical occupancy and growth aggregates.
+Two limits are stated rather than implied. First, this ledger has no
+production consumer yet — the server does not print it at startup; the ignored
+`smoke_prints_the_pack_wide_gap_report` is what surfaces it, and the counts are
+asserted by unit tests, so the gap report is currently a verified diagnostic
+rather than an operator-visible surface. Second, the `placement:` and `target:`
+prefixes are a naming convention, not a namespace check. Configured-type and
+`placement:` counts track documents rather than registry entries; `target:`
+counts track unsupported rule occurrences, including nested rules.
