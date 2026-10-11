@@ -272,6 +272,44 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Why: an exact-pin refresh of `sha2` must not change cached-preview
+    /// bytes, so the digests below were captured from the 0.10.9 stack before
+    /// the bump and are asserted unchanged; the inputs cover the empty value,
+    /// a partial block, one whole SHA-256 block, a multi-block packet, a
+    /// 4 KiB payload, and the packet body the round-trip test caches.
+    #[test]
+    fn digests_match_the_0_10_stack() {
+        for (len, expected) in [
+            (
+                0usize,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                1,
+                "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            ),
+            (
+                64,
+                "2fcd5a0d60e4c941381fcc4e00a4bf8be422c3ddfafb93c809e8d1e2bfffae8e",
+            ),
+            (
+                200,
+                "8013a82140d916576e2cf550b27449a368abec66cc154a7d9f599019d33aa3d2",
+            ),
+            (
+                4_096,
+                "bc45051ac426475f459ec0b0c88a6646d037b8dfb1b9fa3ca3ef9203ce33e283",
+            ),
+        ] {
+            let input: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            assert_eq!(hex(&Sha256::digest(&input)), expected, "{len} bytes");
+        }
+        assert_eq!(
+            hex(&Sha256::digest(b"framed-packet")),
+            "53d64589780947efe64b83ee9e653fb5ec34fd46f4f12a196d8a8fb2a1faac19"
+        );
+    }
+
     #[test]
     fn roundtrip_corruption_and_input_invalidation() {
         let root = std::env::temp_dir().join(format!(
