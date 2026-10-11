@@ -408,6 +408,74 @@ impl DecorationRandom {
 mod tests {
     use super::*;
 
+    /// Why: an exact-pin refresh of `md-5` must not change decoration seeds,
+    /// so the MD5 digests and the hash-named seed halves below were captured
+    /// from the 0.10.6 stack before the bump and are asserted unchanged. The
+    /// inputs cover the empty value, a partial block, one whole MD5 block, a
+    /// multi-block name, and a 4 KiB payload.
+    #[test]
+    fn digests_match_the_0_10_stack() {
+        for (len, expected) in [
+            (0usize, "d41d8cd98f00b204e9800998ecf8427e"),
+            (1, "0cc175b9c0f1b6a831c399e269772661"),
+            (64, "a2eaf6295c32adc403865fd96a2f182b"),
+            (200, "32cce8c4f2bf6f04dbb71b5cb9e37c30"),
+            (4_096, "ab6bc685710814791f9d9a4570514525"),
+        ] {
+            let input: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            let mut hasher = Md5::new();
+            hasher.update(&input);
+            assert_eq!(hex(&hasher.finalize()), expected, "{len} bytes");
+        }
+        for (name, expected_lo, expected_hi) in [
+            ("", 0xd41d_8cd9_8f00_b204, 0xe980_0998_ecf8_427e),
+            (
+                "minecraft:continentalness",
+                0x8388_6c9d_0ae3_a662,
+                0xafa6_38a6_1b42_e8ad,
+            ),
+            (
+                "minecraft:clay_bands",
+                0x1656_8f44_636e_3bc9,
+                0xc1fd_d673_95e0_296c,
+            ),
+            (
+                "minecraft:terrain",
+                0x1ee5_5522_2ef9_6f14,
+                0xe2be_dfdb_ebe4_3d33,
+            ),
+        ] {
+            let seed = seed_from_hash_of(name);
+            assert_eq!(seed.lo, expected_lo, "hash seed lo for {name:?}");
+            assert_eq!(seed.hi, expected_hi, "hash seed hi for {name:?}");
+        }
+        // The salted construction the positional factory performs: MD5 of the
+        // name XOR-folded into the factory state of world seed 2026.
+        let factory = RandomSource::from_world_seed(2026).fork_positional();
+        assert_eq!(factory.lo, 0x3a6e_71c4_5539_8e64);
+        assert_eq!(factory.hi, 0x7779_c4ab_560b_df3a);
+        for (name, expected_lo, expected_hi) in [
+            (
+                "minecraft:continentalness",
+                0xb9e6_1d59_5fda_2806,
+                0xd8df_fc0d_4d49_3797,
+            ),
+            (
+                "minecraft:clay_bands",
+                0x2c38_fe80_3657_b5ad,
+                0xb684_12d8_c3eb_f656,
+            ),
+        ] {
+            let source = factory.from_hash_of(name);
+            assert_eq!(source.core.lo, expected_lo, "salted lo for {name:?}");
+            assert_eq!(source.core.hi, expected_hi, "salted hi for {name:?}");
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     #[test]
     fn xoroshiro_stream_matches_vanilla_parity_vector() {
         // Generated 2026-09-30 by executing the owner's local deobfuscated

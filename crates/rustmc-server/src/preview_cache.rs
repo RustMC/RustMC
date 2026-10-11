@@ -272,6 +272,79 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Input lengths and the SHA-256 hex `sha2 0.10.9` produced for them: a
+    /// repeating `a..z` filler of each length, and the packet body the
+    /// round-trip test caches.
+    const SHA256_KAT: &[(usize, &str)] = &[
+        (
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            1,
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+        ),
+        (
+            64,
+            "2fcd5a0d60e4c941381fcc4e00a4bf8be422c3ddfafb93c809e8d1e2bfffae8e",
+        ),
+        (
+            200,
+            "8013a82140d916576e2cf550b27449a368abec66cc154a7d9f599019d33aa3d2",
+        ),
+        (
+            4_096,
+            "bc45051ac426475f459ec0b0c88a6646d037b8dfb1b9fa3ca3ef9203ce33e283",
+        ),
+    ];
+
+    fn filler(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    /// Why: an exact-pin refresh of `sha2` must not change cached-preview
+    /// bytes, so the digests below were captured from the 0.10.9 stack before
+    /// the bump and are asserted unchanged; the inputs cover the empty value,
+    /// a partial block, one whole SHA-256 block, a multi-block packet, a
+    /// 4 KiB payload, and the packet body the round-trip test caches.
+    #[test]
+    fn digests_match_the_0_10_stack() {
+        for (len, expected) in SHA256_KAT {
+            assert_eq!(hex(&Sha256::digest(filler(*len))), *expected, "{len} bytes");
+        }
+        assert_eq!(
+            hex(&Sha256::digest(b"framed-packet")),
+            "53d64589780947efe64b83ee9e653fb5ec34fd46f4f12a196d8a8fb2a1faac19"
+        );
+    }
+
+    /// The cache hashes its inputs through several `update` calls per record,
+    /// so a single-shot digest per input would leave the incremental path
+    /// unpinned: these are the same 0.10.9 digests fed across block boundaries
+    /// at every chunk size that could split a SHA-256 block differently.
+    #[test]
+    fn streamed_updates_match_the_0_10_stack() {
+        for (len, expected) in SHA256_KAT {
+            let len = *len;
+            let input = filler(len);
+            for chunk in [1usize, 7, 63, 64, 65] {
+                let mut hasher = Sha256::new();
+                for part in input.chunks(chunk) {
+                    hasher.update(part);
+                }
+                assert_eq!(
+                    hex(&hasher.finalize()),
+                    *expected,
+                    "{len} bytes in {chunk}-byte updates"
+                );
+            }
+            let mut split = Sha256::new();
+            split.update(&input[..len.min(1)]);
+            split.update(&input[len.min(1)..]);
+            assert_eq!(hex(&split.finalize()), *expected, "{len} bytes split");
+        }
+    }
+
     #[test]
     fn roundtrip_corruption_and_input_invalidation() {
         let root = std::env::temp_dir().join(format!(
