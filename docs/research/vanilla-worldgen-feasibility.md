@@ -927,7 +927,8 @@ copied from the pack.
 
 The two squares measured on both builds differ by *exactly* those lines: each
 report's diff is the two `compare` lines plus the four band lines that
-`census_compare` only emits once a family is non-zero, and every other line —
+`census_compare` emits only once a family is non-zero on *both* sides, and every
+other line —
 75 in the published square, 63 in the small one, covering all ore, host-stone,
 raw-metal, log and leaf families — is byte-identical. The
 pinned 3D `substance` report re-measures to the same 40 lines and the same md5
@@ -962,10 +963,14 @@ it, or the first free row above it — the two answers differ by exactly the one
 row that this fix made the air filter admit, and the save-side heightmap arrays
 in the owner's region files can settle it; (b) per-chain attribution of the
 `count`-style draw denominators, since the census counts a fixed family list
-rather than chains; and (c) the vertical distribution, where this build puts 27
-grasses in the `-64..-33` band of the `0..255` square while the save puts 1,043
-of its grass below y = 32 and this build puts none there — both ends are wrong in
-opposite directions and neither is explained by this slice. The T4 gate is
+rather than chains; and (c) the vertical distribution, where the census reports 27
+grasses for this build in the `-64..-33` band of the `0..255` square while
+reporting 1,043 of that save's grass in bands below y = 32 and none of ours there
+— both ends disagree in opposite directions, neither is explained by this slice,
+and the save-side low-band reading is itself worth checking before it is leaned
+on, because 40% of a square's grass below y = 32 is geologically odd enough that
+the census's save-side y attribution should be confirmed against a hand-decoded
+column before the number is used for anything but a discrepancy. The T4 gate is
 therefore *not* met by this commit: it makes the pack's own filter mean what the
 pack says, and measures how far the result still is.
 
