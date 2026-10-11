@@ -999,10 +999,15 @@ is outside the paired band above; the invocation shape differs from every
 published cold figure in this document, so neither number is used as a cost
 claim. Recomputed from this build's paired median, the same projection is
 1.63 h against the published 1.62 h. On the path where the placements actually
-happen, the published `-128..127` census square took 475 s at main, 478 s at slice
-N and 480.4 s here in wall clock for a single-threaded run (+0.5% for this fix;
-`user` time for this run was 478.4 s of the 480.4 s, so the square is CPU-bound
-and the comparison is sound). Occupancy for the
+happen, the `-128..127` census square took 475 s at main and 478 s at slice N in
+one paired script that ran the two builds concurrently, and 480.4 s for this
+build in a solo run whose artifact no longer survives in `/tmp`. Those three
+figures therefore do **not** share an invocation shape, and this document makes
+no cost claim from them: the cold-cost statement is the paired bench band above,
+measured ten times per build in one alternating session. A solo, sequential,
+one-build-per-run re-measurement of all three builds on the same square is
+running to replace this sentence; until its artifact is on disk the numbers are
+recorded here as history, not as a comparison. Occupancy for the
 columns phase is 15,185 entries (+1 over slice N), the bounded cache budget is
 unchanged at 1,856 KiB, and peak RSS measured 17,600 KiB against slice N's 17,708.
 
