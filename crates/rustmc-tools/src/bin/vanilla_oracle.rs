@@ -22,7 +22,11 @@
 //! save's own seed from `level.dat` plus `data/minecraft/world_gen_settings.dat`
 //! (see `rustmc_tools::save`) and exits non-zero when the argument differs,
 //! naming both values: the oracle can only measure the save it is pointed at,
-//! and an unreadable `level.dat` is an error rather than a skipped check.
+//! and an unreadable `level.dat` is an error rather than a skipped check. That
+//! reader also carries the version pin it inherited from `inspect_vanilla_save`:
+//! a save whose stored `Version.Name` is not `26.3` is refused outright, so a
+//! version is never measured silently. What the attestation does *not* compare
+//! is the dimension and the active data packs.
 //!
 //! Every scoring mode then prints exactly one machine-readable denominator
 //! line, `coverage scored=N expected=M missing=K unaccounted=U source=S`, on
@@ -45,7 +49,10 @@
 //! `--allow-partial` downgrades only the non-zero exit: the coverage line is
 //! printed identically, followed by a `warning:` line, both on stderr. It exists
 //! for exploratory runs on a save that is still generating, and its output is
-//! not comparable with a published baseline.
+//! not comparable with a published baseline. One shortfall it does not rescue: a
+//! run that scored *nothing* — the save holds none of the units asked for — exits
+//! non-zero with or without the flag, because zeros over an empty sample are
+//! exactly the error-shaped result this guard exists to catch.
 //!
 //! The world directory is a single-player save root (contains region/).
 //! Nothing from the save is copied into the repository; only aggregate

@@ -622,10 +622,11 @@ impl Coverage {
         )
     }
 
-    /// Why this run is not comparable with a full-coverage baseline.
-    fn shortfall(self) -> String {
+    /// The diagnosis, shared by both verdicts so the accepted warning and the
+    /// rejected error describe the same shortfall in the same words.
+    fn shortfall_reason(self) -> String {
         format!(
-            "incomplete measurement: scored={} of expected={} with missing={} unaccounted={} (source={}); a partial population is not comparable with a published baseline, and this mode exits non-zero unless the run is complete (rerun with --allow-partial to accept a partial measurement)",
+            "incomplete measurement: scored={} of expected={} with missing={} unaccounted={} (source={})",
             self.scored,
             self.expected,
             self.missing,
@@ -634,22 +635,52 @@ impl Coverage {
         )
     }
 
+    /// Why this run is not comparable with a full-coverage baseline, and the
+    /// flag that would have accepted it.
+    fn shortfall(self) -> String {
+        format!(
+            "{}; a partial population is not comparable with a published baseline, and this mode exits non-zero unless the run is complete (rerun with --allow-partial to accept a partial measurement)",
+            self.shortfall_reason()
+        )
+    }
+
+    /// The one shortfall `--allow-partial` does not rescue: nothing at all was
+    /// scored, so there is no partial measurement to read.
+    fn empty(self) -> String {
+        format!(
+            "nothing was scored: expected={} with missing={} unaccounted={} (source={}); the save holds none of the units this run asked for, and --allow-partial accepts a partially populated save, not an empty measurement",
+            self.expected,
+            self.missing,
+            self.unaccounted,
+            self.source.name()
+        )
+    }
+
     /// The lines to print and the exit status: `allow_partial` downgrades a
-    /// shortfall to a warning and never changes the coverage line.
+    /// shortfall to a warning and never changes the coverage line — except a
+    /// run that scored nothing, which fails whatever the flag says, because
+    /// zeros over an empty sample are the failure this guard exists to catch.
     pub fn outcome(self, allow_partial: bool) -> CoverageOutcome {
         if self.is_complete() {
             return CoverageOutcome::Complete { line: self.line() };
         }
-        let shortfall = self.shortfall();
-        if allow_partial {
+        if allow_partial && self.scored > 0 {
             return CoverageOutcome::PartialAccepted {
                 line: self.line(),
-                warning: shortfall,
+                warning: format!(
+                    "{}; accepted because --allow-partial is present, so this output is not comparable with a published baseline",
+                    self.shortfall_reason()
+                ),
             };
         }
+        let message = if self.scored == 0 {
+            self.empty()
+        } else {
+            self.shortfall()
+        };
         CoverageOutcome::PartialRejected {
             line: self.line(),
-            message: shortfall,
+            message,
         }
     }
 }
@@ -2451,6 +2482,13 @@ mod tests {
             assert!(message.contains("--allow-partial"), "{message}");
             assert!(message.contains("scored=2040"), "{message}");
         }
+        if let CoverageOutcome::PartialAccepted { warning, .. } = &accepted {
+            assert!(warning.contains("--allow-partial is present"), "{warning}");
+            assert!(
+                !warning.contains("rerun with --allow-partial"),
+                "{warning} must not offer a flag the operator already gave"
+            );
+        }
         let full = Coverage::new(2401, 2401, 0, ScoredSource::Vanilla);
         assert!(matches!(
             full.outcome(false),
@@ -2459,6 +2497,27 @@ mod tests {
         assert!(matches!(
             full.outcome(true),
             CoverageOutcome::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_partial_never_rescues_a_run_that_scored_nothing() {
+        let empty = Coverage::new(0, 1, 1, ScoredSource::Vanilla);
+        for allow_partial in [false, true] {
+            let CoverageOutcome::PartialRejected { line, message } = empty.outcome(allow_partial)
+            else {
+                panic!("an empty measurement must fail even with --allow-partial");
+            };
+            assert_eq!(line, empty.line());
+            assert!(message.contains("nothing was scored"), "{message}");
+            assert!(
+                !message.contains("rerun with --allow-partial"),
+                "{message} must not offer a flag that will not help"
+            );
+        }
+        assert!(matches!(
+            Coverage::new(2040, 2401, 361, ScoredSource::Vanilla).outcome(true),
+            CoverageOutcome::PartialAccepted { .. }
         ));
     }
 }
