@@ -11,7 +11,6 @@ pub const REVIEWED: &[(&str, &str)] = &[
     ("adler2", "0BSD OR MIT OR Apache-2.0"),
     ("block-buffer", "MIT OR Apache-2.0"),
     ("cfg-if", "MIT OR Apache-2.0"),
-    ("const-oid", "Apache-2.0 OR MIT"),
     ("crc32fast", "MIT OR Apache-2.0"),
     ("crypto-common", "MIT OR Apache-2.0"),
     ("cpufeatures", "MIT OR Apache-2.0"),
