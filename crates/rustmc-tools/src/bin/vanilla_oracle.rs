@@ -461,7 +461,24 @@ fn run(raw_args: &[String]) -> Result<(), String> {
                 VanillaGenerator::new(&resolve_data_root(args.get(5)), seed, "minecraft:overworld")
                     .map_err(|error| error.to_string())?;
             let report = oracle::compare_biome_volume(&mut store, &generator, min, max)?;
+            let expected = chunk_square_of(min, max)?;
             if report.chunks == 0 {
+                // The one arm that used to answer an empty square with an error
+                // and no denominator at all, which is exactly the failure this
+                // guard exists to prevent. `chunk_square_of` guarantees at least
+                // one unit, so a square scoring nothing can never be complete and
+                // the guard refuses it with or without `--allow-partial`; the
+                // refusal after it is what keeps a loosened guard from printing
+                // a `nan%` report over an empty save.
+                report_coverage(
+                    Coverage::new(
+                        report.chunks,
+                        expected,
+                        report.missing_chunks,
+                        ScoredSource::Vanilla,
+                    ),
+                    allow_partial,
+                )?;
                 return Err("no generated chunks found in the sampled range".to_owned());
             }
             println!(
@@ -476,7 +493,7 @@ fn run(raw_args: &[String]) -> Result<(), String> {
             report_coverage(
                 Coverage::new(
                     report.chunks,
-                    chunk_square_of(min, max)?,
+                    expected,
                     report.missing_chunks,
                     ScoredSource::Vanilla,
                 ),
@@ -810,4 +827,94 @@ fn parse_i64(value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
         .map_err(|_| format!("invalid integer: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("vanilla_oracle.rs");
+
+    /// The documented usage block is what an operator actually runs, so a mode
+    /// that takes a seed there has to be attested here — and a mode that does
+    /// not must not be listed, or `run` would demand a seed argument the docs
+    /// never mention.
+    #[test]
+    fn seed_modes_match_the_documented_usage_lines() {
+        let mut documented: Vec<&str> = Vec::new();
+        let mut unseeded: Vec<&str> = Vec::new();
+        for line in SOURCE.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("//! vanilla_oracle ") else {
+                continue;
+            };
+            let mut tokens = rest.split_whitespace();
+            let (Some(mode), Some("<world-dir>")) = (tokens.next(), tokens.next()) else {
+                continue;
+            };
+            if tokens.next() == Some("<seed>") {
+                documented.push(mode);
+            } else {
+                unseeded.push(mode);
+            }
+        }
+        assert!(
+            !documented.is_empty(),
+            "no usage line documents a seed argument at all"
+        );
+        for mode in &documented {
+            assert!(
+                SEED_MODES.contains(mode),
+                "usage documents `{mode} <world-dir> <seed>` but {mode} is missing from SEED_MODES, so its seed is never attested"
+            );
+        }
+        for mode in SEED_MODES {
+            assert!(
+                documented.contains(&mode),
+                "{mode} is attested but no usage line gives it a seed"
+            );
+            assert!(
+                SOURCE.contains(&format!("\"{mode}\" =>")),
+                "{mode} is in SEED_MODES but has no match arm"
+            );
+        }
+        assert_eq!(
+            documented.len(),
+            SEED_MODES.len(),
+            "SEED_MODES and the usage block disagree about which modes take a seed"
+        );
+        for mode in &unseeded {
+            assert!(
+                !SEED_MODES.contains(mode),
+                "{mode} takes no seed per the usage block"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_error_lists_every_dispatched_mode() {
+        let help = SOURCE
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("\"usage: vanilla_oracle "))
+            .expect("the missing-mode usage error is present");
+        let listed: Vec<&str> = help
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .collect();
+        for mode in &listed {
+            assert!(
+                SOURCE.contains(&format!("\"{mode}\" =>")),
+                "the usage error offers {mode} but nothing dispatches it"
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            SOURCE
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//! vanilla_oracle "))
+                .count(),
+            "the usage error and the documented usage block cover different mode sets"
+        );
+    }
 }

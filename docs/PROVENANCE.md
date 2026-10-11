@@ -1252,8 +1252,44 @@ identified before the codec reaches a chunk, and a bzip2 save is still refused
 loudly in its own right. A third layout fact is recorded here because it wasted
 an operator-looking check during this slice: these 26.3 single-player saves hold
 the overworld chunks under
-`dimensions/minecraft/overworld/region/` — 175 region files in the seed-2026 save
-— and there is no top-level `region/` directory at all, so a "the save has no
+`dimensions/minecraft/overworld/region/` — 27 region files there in the seed-2026
+save — and there is no top-level `region/` directory at all, so a "the save has no
 chunks" conclusion drawn from `ls <save>/region` is a path error, not an empty
-world. No Mojang or third-party server code was read for this change; the
+world. The count is easy to over-report: `find <save> -name '*.mca'` returns 175
+files for that save, but only 107 of them are region directories (27 under
+`overworld/region`, 50 under `the_end/region`, 30 under `the_nether/region`) and
+the other 68 are sibling `entities/` and `poi/` stores, so 27 is the number of
+region files whose chunks this oracle can compare. That split was re-counted here
+because an earlier draft of this paragraph published the 175 as overworld region
+files. No Mojang or third-party server code was read for this change; the
 attested fields and this layout are structure observed in the owner's own saves.
+
+Independent review of this branch then found a hole in the guard's own coverage:
+`biome_volume` returned `no generated chunks found in the sampled range` from its
+empty-square path *before* printing any denominator, so a seeded scoring mode
+could still exit 1 with a zero-byte standard output and no denominator at all —
+the exact shape the guard exists to close. Measured on the seed-2026 save,
+`biome_volume <save> 2026 60000 60003 <root>` asks for a chunk square the save
+does not hold and printed nothing before the change; it now prints
+`coverage scored=0 expected=16 missing=16 unaccounted=0 source=vanilla` on
+standard error and exits 1 naming the empty measurement, identically with
+`--allow-partial`, while `biome_volume <save> 2026 0 3 <root>` still exits 0 with
+656 bytes of report and `coverage scored=16 expected=16 missing=0`. The ordering
+is not a regression this branch introduced: the same early return was reproduced
+against the pre-change binary, so it is recorded here as a gap the guard left
+open rather than as a behaviour change against main.
+
+Two hardenings came out of the same review. `rustmc_tools::nbt` bounded every
+read by the size of the input but not the recursion: a crafted stream of list and
+compound headers descends once per six bytes and overflows the stack long before
+it runs out of input, so `payload`, `compound` and `anonymous` now carry a depth
+and refuse anything past `MAX_DEPTH = 64` levels with
+`NBT nesting exceeds 64 levels` instead of crashing the tool. That ceiling is
+reasoned, not measured — 26.3 chunk and `level.dat` storage nests a handful of
+levels, and the new tests pin that a 62-deep list chain parses while the next
+level is refused — and every real-chunk run recorded in this section still parses
+under it, so the bound does not reject the owner's saves. `SEED_MODES` was a list
+with nothing behind it: two tests in the binary now read the tool's own usage
+block, require the modes that document a `<seed>` to be exactly the attested
+modes, and require every mode the usage error offers to have a dispatch arm, so a
+future seed-taking mode cannot be documented and left unattested.
