@@ -1106,8 +1106,11 @@ player edits. The dependency license policy records every package above and
 its reviewed ledger was refreshed with this change; the on-disk framing, the
 `rustmc-preview-cache-v3` cache-identity tag, and the SHA-256 digests they
 cover are unchanged, the digest output having been re-verified byte-identical
-to the 0.10 stack by the known-answer test
-`preview_cache::tests::digests_match_the_0_10_stack`.
+to the 0.10 stack by the known-answer tests
+`preview_cache::tests::digests_match_the_0_10_stack` and
+`preview_cache::tests::streamed_updates_match_the_0_10_stack`, the second
+feeding the same inputs through repeated `update` calls, because that is how
+the cache actually hashes a record.
 ## TOML 1.1 dependency review (2 October 2026)
 
 The configuration parser upgrade to `toml 1.1.6+spec-1.1.0` changes the
