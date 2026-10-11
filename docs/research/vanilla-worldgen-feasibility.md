@@ -963,12 +963,14 @@ it, or the first free row above it — the two answers differ by exactly the one
 row that this fix made the air filter admit, and the save-side heightmap arrays
 in the owner's region files can settle it; (b) per-chain attribution of the
 `count`-style draw denominators, since the census counts a fixed family list
-rather than chains; and (c) the vertical distribution, where the census reports 27
-grasses for this build in the `-64..-33` band of the `0..255` square while
-reporting 1,043 of that save's grass in bands below y = 32 and none of ours there
-— both ends disagree in opposite directions, neither is explained by this slice,
-and the save-side low-band reading is itself worth checking before it is leaned
-on, because 40% of a square's grass below y = 32 is geologically odd enough that
+rather than chains; and (c) the vertical distribution, where each side puts its
+grass in different bands of the `0..255` square, in opposite directions: that
+save has 1,043 of its 2,622 grasses below y = 32 (459 in `-32..-1`, 584 in
+`0..31`) and none in `-64..-33`, while this build has 27 in `-64..-33`, none in
+`-32..-1` or `0..31`, and the other 5,368 of its 5,395 above y = 32. Neither
+end is explained by this slice, and the save-side low-band reading is itself
+worth checking before it is leaned on, because 40% of a square's grass below
+y = 32 is geologically odd enough that
 the census's save-side y attribution should be confirmed against a hand-decoded
 column before the number is used for anything but a discrepancy. The T4 gate is
 therefore *not* met by this commit: it makes the pack's own filter mean what the
