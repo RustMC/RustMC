@@ -1171,3 +1171,51 @@ rather than an operator-visible surface. Second, the `placement:` and `target:`
 prefixes are a naming convention, not a namespace check. Configured-type and
 `placement:` counts track documents rather than registry entries; `target:`
 counts track unsupported rule occurrences, including nested rules.
+## Oracle measurement attestation and denominators (11 October 2026)
+
+Two measurement failures on one day produced plausible numbers instead of
+errors, so the oracle now refuses to answer a question it cannot actually
+answer. A save directory was passed as the seed-2026 reference while it was a
+different world (seed `1792166558050215585`, bzip2-compressed chunks), and a
+second run compared against a still-populating save and reported 71.49% over
+2,040 of 2,401 columns as if it were the committed 98.61% baseline. Neither was
+flagged: the tool never read `level.dat`, and its denominators are save-driven,
+so a missing chunk shrinks the denominator instead of failing the run.
+
+`rustmc_tools::save` is now the single reader of a save's own version and world
+seed — `level.dat` plus `data/minecraft/world_gen_settings.dat`, the same
+storage layout `inspect_vanilla_save` already validated against the owner's
+26.3 saves — and every mode that takes a `<seed>` (`worksheet`, `compare`,
+`substance`, `block_compare`, `biome_volume`, `census_compare`, `column`)
+attests that argument against the stored value before measuring, exits non-zero
+naming both seeds and the path when they differ, and treats unreadable metadata
+as an error rather than a skipped check. `inspect` deliberately stays
+unattested: it is the tool you reach for when attestation fails. Every scoring
+mode then prints one machine-readable denominator line,
+`coverage scored=N expected=M missing=K unaccounted=U source=S`, and exits
+non-zero unless the run is complete; `--allow-partial` downgrades only the exit
+status for exploratory runs on a partially generated save, and an entirely
+ungenerated square still fails. `preview` and `experimental` terrain tokens keep
+their zero exit but label their source, so a mode that scores nothing can never
+be read as agreement.
+
+The denominator line goes to standard error, not standard output: the 3D
+`substance` report is pinned in this file by md5 and the M3 `block_compare`
+grids line-for-line, so a measurement-integrity change must not become a change
+to the published measurement. Verified against the pre-change binary on the
+seed-2026 save, standard output is byte-identical for `census 0 15`,
+`column 0 0`, `substance 0 0 1 vanilla` and `block_compare 0 15 8` with the same
+exit statuses, while `substance` against a mismatched seed argument now exits 1
+where it previously emitted an 18-line report and exited 0.
+
+What attestation does *not* cover, stated so it is not assumed: it compares the
+stored world seed, not the dimension, not the active data packs and not the
+game version — the seed-2027 save reports `was_modded=true` with
+`fabric-convention-tags-v2` enabled — so a matching seed still requires the
+operator to know which packs generated the terrain. The bzip2 (compression type
+4) region limitation is unchanged and was already loud: this repository's reader
+decodes zlib and uncompressed chunks only and exits 1 naming the codec. On the
+wrong-world run above, the seed attestation now fires first and names the stored
+seed `1792166558050215585`, so a mismatched save is identified before the codec
+even reaches a chunk. No Mojang or third-party server code was read for this
+change; the attested fields are structure observed in the owner's own saves.
