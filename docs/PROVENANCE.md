@@ -1287,8 +1287,16 @@ and refuse anything past `MAX_DEPTH = 64` levels with
 `NBT nesting exceeds 64 levels` instead of crashing the tool. That ceiling is
 reasoned, not measured — 26.3 chunk and `level.dat` storage nests a handful of
 levels, and the new tests pin that a 62-deep list chain parses while the next
-level is refused — and every real-chunk run recorded in this section still parses
-under it, so the bound does not reject the owner's saves. `SEED_MODES` was a list
+level is refused. Under the bound the release binary re-ran, on the owner's own
+saves: `substance <save> 2026 -384 384 16 vanilla <root>` (2,401 columns, 40
+lines, the pinned md5 unchanged), `census <save> 0 63` (16 chunks, exit 0),
+`inspect <save> 0 0` (both metadata files, exit 0) and
+`compare <save> 2027 -384 384 16 vanilla <root>` (exit 0, `scored=2401
+expected=2401`). Those cover every chunk of both published squares plus the save
+metadata, so the bound rejects no real data here; it does not re-verify the
+`column`, `block_compare 0 15 8` or the hour-long seed-2027 `block_compare`
+recipes recorded above, which all read through the same `parse_root` path and
+passed on the previous head. `SEED_MODES` was a list
 with nothing behind it: two tests in the binary now read the tool's own usage
 block, require the modes that document a `<seed>` to be exactly the attested
 modes, and require every mode the usage error offers to have a dispatch arm, so a
