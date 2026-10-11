@@ -1150,7 +1150,23 @@ JSON, walked with `python3` in the same session that ran the loader, and from
 this repository's `parse_placement_modifier`; no Mojang or Paper source,
 binary, or decompiled class was read or needed. Over the provisioned pack's
 273 placed features, 419 of 1,170 modifier occurrences use one of 10 kinds this
-generator does not model, and the report grows from 46 to 56 keys with those
-keys' per-document counts 148, 111, 91, 26, 12, 8, 6, 4, 3, 1. Nothing about
-the placement itself changed: no draw count, no position and no written block
-moves, and the report's pre-existing keys came out identical.
+generator does not model, and the report grows from 46 to 56 keys. The 10 new
+keys' per-document counts are 148, 111, 91, 26, 12, 8, 6, 4, 3, 1 — 410
+increments from 419 occurrences, because 7 documents repeat
+`minecraft:block_predicate_filter` and `twisting_vines.json` repeats
+`minecraft:offset` three times, suppressing 9 repeats. Counting per document
+rather than per occurrence is what makes the key a statement about placed
+features instead of about chains.
+Nothing about the placement itself changed: no draw count, no position and no
+written block moves, and the report's pre-existing keys came out identical.
+The evidence is a whole-column comparison rather than a sampled one: the
+generator's `column_ids` path, run at both commits over seed-2026 1×1 and 2×2
+chunk squares and a seed-2027 1×1 square (43,580, 169,660 and 32,243 columns),
+wrote byte-equal block content and identical occupancy and growth aggregates.
+Two limits are stated rather than implied. First, this ledger has no
+production consumer yet — the server does not print it at startup; the ignored
+`smoke_prints_the_pack_wide_gap_report` is what surfaces it, and the counts are
+asserted by unit tests, so the gap report is currently a verified diagnostic
+rather than an operator-visible surface. Second, the `placement:` and `target:`
+prefixes are a naming convention, not a namespace check, and the counters track
+documents rather than registry entries.

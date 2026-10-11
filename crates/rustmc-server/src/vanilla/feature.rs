@@ -433,11 +433,13 @@ pub struct FeatureData {
     biome_order: Vec<String>,
     /// The pack's block tags, used by `minecraft:tag_match` targets.
     tags: BlockTags,
-    /// What the pack asks for that this generator does not do, for the
-    /// startup report. Keyed by a configured feature's `minecraft:` type
-    /// name, by `target:<rule>` for an unmodeled ore-target predicate, and
-    /// by `placement:<modifier>` for an unmodeled decoration; both prefixes
+    /// What the pack asks for that this generator does not do: the gap
+    /// report. Keyed by a configured feature's `minecraft:` type name, by
+    /// `target:<rule>` for an unmodeled ore-target predicate, and by
+    /// `placement:<modifier>` for an unmodeled decoration; both prefixes
     /// keep their namespaced kind names from reading as a feature type.
+    /// Nothing prints it from the server yet — the operator-data smoke is
+    /// its only reader until a startup surface exists.
     pub(crate) unimplemented_features: HashMap<String, usize>,
 }
 
@@ -968,12 +970,16 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
 }
 
 /// Counts the placement-modifier kinds a placed-feature document asks for
-/// without a runtime here, keyed `placement:<kind>` so the namespaced kinds
-/// cannot read as configured-feature types or as `target:` rules. One
-/// increment per document carrying the kind, matching the configured-kind
-/// counters: the report answers "which placed features does this pack ask
-/// for that this generator cannot run", not how many times a chain repeats a
-/// decoration. An unmodeled modifier keeps its place in the chain and the
+/// without a runtime here, keyed `placement:<kind>` to keep those namespaced
+/// kinds from reading as configured-feature types or as `target:` rules. The
+/// prefixes are a naming convention, not a namespace check: a configured type
+/// whose name itself began `placement:` would land in the same key, which no
+/// provisioned pack does today. One increment per document carrying the kind,
+/// matching the configured-kind counters: the report answers "which placed
+/// features does this pack ask for that this generator cannot run", not how
+/// many times a chain repeats a decoration, and it counts documents rather
+/// than registry entries, so two files with the same identifier stem would
+/// each contribute. An unmodeled modifier keeps its place in the chain and the
 /// chain then yields nothing, so without this key a feature whose configured
 /// type *is* modeled — `minecraft:simple_block`, `minecraft:tree` — would be
 /// missing from the gap report entirely.
@@ -3304,9 +3310,10 @@ mod tests {
         assert_eq!(data.region_ordinals(0, &only_one), vec![0]);
     }
 
-    /// Requires the operator-provisioned data pack. Prints the startup
-    /// report the loader builds from it — the honest gap list, per key and
-    /// per count. `FeatureData::load` has no dimension filter (the overworld
+    /// Requires the operator-provisioned data pack. Prints the gap ledger the
+    /// loader builds from it — the honest gap list, per key and per count;
+    /// this smoke, not the server, is what surfaces it today.
+    /// `FeatureData::load` has no dimension filter (the overworld
     /// biome order only shapes the schedule), so the report covers every
     /// placed and configured document in the pack. Run with
     /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib --
