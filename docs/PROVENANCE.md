@@ -1171,6 +1171,7 @@ rather than an operator-visible surface. Second, the `placement:` and `target:`
 prefixes are a naming convention, not a namespace check. Configured-type and
 `placement:` counts track documents rather than registry entries; `target:`
 counts track unsupported rule occurrences, including nested rules.
+
 ## Oracle measurement attestation and denominators (11 October 2026)
 
 Two measurement failures on one day produced plausible numbers instead of
@@ -1193,29 +1194,62 @@ as an error rather than a skipped check. `inspect` deliberately stays
 unattested: it is the tool you reach for when attestation fails. Every scoring
 mode then prints one machine-readable denominator line,
 `coverage scored=N expected=M missing=K unaccounted=U source=S`, and exits
-non-zero unless the run is complete; `--allow-partial` downgrades only the exit
-status for exploratory runs on a partially generated save, and an entirely
-ungenerated square still fails. `preview` and `experimental` terrain tokens keep
-their zero exit but label their source, so a mode that scores nothing can never
-be read as agreement.
+non-zero unless the run is complete — where `scored` and `expected` count the
+columns or chunks the mode asked the save for, not the positions inside them.
+`--allow-partial` downgrades only the exit status, for exploratory runs on a
+save that is still generating; it does not rescue a run that scored nothing.
+Measured on the seed-2026 save: `block_compare <save> 2026 60000 60003 8 <root>`
+asks for a square the save does not hold, prints
+`coverage scored=0 expected=1 missing=1 unaccounted=0 source=vanilla` and exits
+1 with `nothing was scored` whether or not the flag is present, while the same
+command over `0 … 15 … 8` prints `coverage scored=4 expected=4 missing=0` and
+exits 0. Letting the empty case pass under `--allow-partial` was this guard's own
+first defect, found by running it rather than by reading it; a unit test now
+pins both halves. `preview` and `experimental` terrain tokens keep their zero
+exit and label their source, because those modes legitimately answer no
+per-position substance at all — a zero there is labelled, never implied.
 
 The denominator line goes to standard error, not standard output: the 3D
 `substance` report is pinned in this file by md5 and the M3 `block_compare`
 grids line-for-line, so a measurement-integrity change must not become a change
-to the published measurement. Verified against the pre-change binary on the
-seed-2026 save, standard output is byte-identical for `census 0 15`,
-`column 0 0`, `substance 0 0 1 vanilla` and `block_compare 0 15 8` with the same
-exit statuses, while `substance` against a mismatched seed argument now exits 1
-where it previously emitted an 18-line report and exited 0.
+to the published measurement. Verified against the pre-change binary, built from
+`e8ee4d0` whose tree is identical to the merged main this branch carries,
+standard output is byte-identical and the exit statuses match for these exact
+commands on the seed-2026 save: `census <save> 0 15`;
+`column <save> 2026 0 0 vanilla <root>` (183 lines);
+`substance <save> 2026 0 0 1 vanilla <root>`; and
+`block_compare <save> 2026 0 15 8 <root>`. The argument slots are load-bearing
+for the claim itself: an earlier run put the data root in `column`'s terrain slot,
+so both binaries failed identically and the "byte-identical stdout" it recorded
+was two empty files proving nothing. Against a mismatched seed argument,
+`substance <save> 2027 0 0 1 vanilla <root>` used to emit a 37-line report and
+exit 0; it now prints nothing and exits 1 naming both seeds.
+
+A real partial square shows the middle case: `block_compare <save> 2026 0 4080
+255 <root>` reaches past what the owner's save holds and reports
+`coverage scored=35 expected=289 missing=254 unaccounted=0 source=vanilla`
+(`missing_chunks=247`, `ungenerated_columns=7`), exiting 1 without the flag and 0
+with it, printing the same coverage line either way.
 
 What attestation does *not* cover, stated so it is not assumed: it compares the
-stored world seed, not the dimension, not the active data packs and not the
-game version — the seed-2027 save reports `was_modded=true` with
-`fabric-convention-tags-v2` enabled — so a matching seed still requires the
-operator to know which packs generated the terrain. The bzip2 (compression type
-4) region limitation is unchanged and was already loud: this repository's reader
-decodes zlib and uncompressed chunks only and exits 1 naming the codec. On the
-wrong-world run above, the seed attestation now fires first and names the stored
-seed `1792166558050215585`, so a mismatched save is identified before the codec
-even reaches a chunk. No Mojang or third-party server code was read for this
-change; the attested fields are structure observed in the owner's own saves.
+stored world seed, and it pins the game version rather than reporting it — the
+shared reader refuses any save whose stored `Version.Name` is not `26.3`, the
+rule `inspect_vanilla_save` already applied — but it does not compare the
+dimension or the active data packs: the seed-2027 save reports
+`was_modded=true` with `fabric-convention-tags-v2` enabled, so a matching seed
+still requires the operator to know which packs generated the terrain. The bzip2
+(compression type 4) region limitation is unchanged: this repository's reader
+decodes zlib and uncompressed chunks only, and now says so rather than silently
+reporting fewer columns. On the wrong-world run, the seed attestation now fires
+first and names the stored seed `1792166558050215585`, while the seedless
+`census` mode on the same directory still exits 1 with
+`unsupported chunk compression type 4 in (0, 0)` — so a mismatched save is
+identified before the codec reaches a chunk, and a bzip2 save is still refused
+loudly in its own right. A third layout fact is recorded here because it wasted
+an operator-looking check during this slice: these 26.3 single-player saves hold
+the overworld chunks under
+`dimensions/minecraft/overworld/region/` — 175 region files in the seed-2026 save
+— and there is no top-level `region/` directory at all, so a "the save has no
+chunks" conclusion drawn from `ls <save>/region` is a path error, not an empty
+world. No Mojang or third-party server code was read for this change; the
+attested fields and this layout are structure observed in the owner's own saves.
