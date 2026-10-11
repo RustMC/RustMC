@@ -942,7 +942,11 @@ fixed. Evidence that it holds fixed: `ocean_floor_height` equals
 column of the four new tests and of the new operator-data smoke, including after
 whole-chunk fills overwrite lazily stored rows and after a sweep rotates every
 original map out of the cache; the 3D `substance` report is byte-identical between
-the builds (md5 28f153fd93ebb5d299544a3447f195c1); the `-128..127` family census
+the builds (md5 28f153fd93ebb5d299544a3447f195c1, reproducible as
+`vanilla_oracle substance <seed-2026 save> 2026 -384 384 16 vanilla <data-root>`
+— 40 standard-output lines, `columns=2401`, 347,483 positions, 342,641 exact at
+98.61%, re-measured to the same md5 on 11 October 2026 with the attestation guard
+in place, in 12.1 s of single-threaded release CPU); the `-128..127` family census
 report is byte-identical, all 24 placed families and `coal_ore` 37,951 included,
 which is the feature stream and the gate's decisions; and the three
 `block_compare` grids re-measure to the same lines and the same numerators —
