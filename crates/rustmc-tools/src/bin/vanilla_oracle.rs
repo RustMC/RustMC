@@ -25,9 +25,13 @@
 //! and an unreadable `level.dat` is an error rather than a skipped check.
 //!
 //! Every scoring mode then prints exactly one machine-readable denominator
-//! line, `coverage scored=N expected=M missing=K unaccounted=U source=S`, next
-//! to the report it qualifies, and exits non-zero unless the run is complete
-//! (`scored == expected`, `missing == 0`, `unaccounted == 0`). `expected` is
+//! line, `coverage scored=N expected=M missing=K unaccounted=U source=S`, on
+//! standard error next to the report it qualifies, and exits non-zero unless
+//! the run is complete (`scored == expected`, `missing == 0`,
+//! `unaccounted == 0`). It goes to stderr deliberately: the report itself stays
+//! byte-for-byte the published measurement, so the recorded `substance` md5 and
+//! the line-for-line `block_compare` comparisons in `docs/PROVENANCE.md` remain
+//! reproducible. `expected` is
 //! the sample grid or chunk square the mode asked the save for, `missing` the
 //! units the save could not supply (absent chunks, ungenerated columns,
 //! declined or out-of-domain columns), `unaccounted` anything else unexplained,
@@ -39,9 +43,9 @@
 //! of being comparable; their exit status is unchanged.
 //!
 //! `--allow-partial` downgrades only the non-zero exit: the coverage line is
-//! printed identically, followed by a `warning:` line. It exists for
-//! exploratory runs on a save that is still generating, and its output is not
-//! comparable with a published baseline.
+//! printed identically, followed by a `warning:` line, both on stderr. It exists
+//! for exploratory runs on a save that is still generating, and its output is
+//! not comparable with a published baseline.
 //!
 //! The world directory is a single-player save root (contains region/).
 //! Nothing from the save is copied into the repository; only aggregate
@@ -694,20 +698,22 @@ fn attest_seed(world: &Path, argument: i64) -> Result<(), String> {
     save::attest_seed(stored, argument).map_err(|error| format!("{error} ({})", world.display()))
 }
 
-/// Prints one mode's coverage line and applies its verdict.
+/// Prints one mode's coverage line and applies its verdict. The line goes to
+/// standard error so a mode's own report stays byte-identical to the
+/// measurements already recorded in `docs/PROVENANCE.md`.
 fn report_coverage(coverage: Coverage, allow_partial: bool) -> Result<(), String> {
     match coverage.outcome(allow_partial) {
         CoverageOutcome::Complete { line } => {
-            println!("{line}");
+            eprintln!("{line}");
             Ok(())
         }
         CoverageOutcome::PartialAccepted { line, warning } => {
-            println!("{line}");
-            println!("warning: {warning}");
+            eprintln!("{line}");
+            eprintln!("warning: {warning}");
             Ok(())
         }
         CoverageOutcome::PartialRejected { line, message } => {
-            println!("{line}");
+            eprintln!("{line}");
             Err(message)
         }
     }
