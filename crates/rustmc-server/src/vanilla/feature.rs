@@ -1287,12 +1287,13 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
 /// type *is* modeled — `minecraft:ore` — would be
 /// missing from the gap report entirely.
 ///
-/// The three decorations this runtime models carry their own parameter, and
-/// a parameter without a runtime gates the chain out just as an unknown
-/// modifier type does. Those get the modifier-level key above *and* a key
-/// naming the parameter (`heightmap:<name>`, `offset:<name>`,
-/// `predicate:<name>`), so the report says which inner shape is missing
-/// rather than only which modifier was carrying it.
+/// The decorations this runtime models carry their own parameter, and a
+/// parameter without a runtime gates the chain out just as an unknown modifier
+/// type does. Those get the modifier-level key above *and* a key naming the
+/// parameter (`heightmap:<name>`, `offset:<name>`, `predicate:<name>`, and
+/// `range:<name>` for the two int-provider parameters `minecraft:count` and
+/// `minecraft:height_range` take), so the report says which inner shape is
+/// missing rather than only which modifier was carrying it.
 fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &PlacedFeature) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut record = |key: String| {
@@ -1303,6 +1304,18 @@ fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &Plac
     for modifier in &placed.modifiers {
         match modifier {
             PlacementModifier::Unsupported { kind } => record(format!("placement:{kind}")),
+            PlacementModifier::Count {
+                count: RangeProvider::Unsupported { kind },
+            } => {
+                record("placement:minecraft:count".to_string());
+                record(format!("range:{kind}"));
+            }
+            PlacementModifier::HeightRange {
+                height: RangeProvider::Unsupported { kind },
+            } => {
+                record("placement:minecraft:height_range".to_string());
+                record(format!("range:{kind}"));
+            }
             PlacementModifier::Heightmap {
                 heightmap: HeightmapType::Unsupported { kind },
             } => {
@@ -1920,12 +1933,21 @@ pub trait DecorationTarget {
     fn height(&self) -> i32;
     /// Whether a position may be written at all. Positions outside the
     /// decorated chunk are refused *before* the replacement rules are
-    /// evaluated, so they cost no draws either; the neighbour chunk's own
-    /// pass paints its half of a vein that straddles the border.
+    /// evaluated, so they cost no draws either. A vein that straddles the
+    /// border is covered because the pass replays the eight neighbouring
+    /// anchors and clips to itself — but only as far as that nine-chunk
+    /// window reaches: a predicate offset of up to ±16 or an offset provider
+    /// of up to ±32768 can ask for a column outside it, and the write there
+    /// is refused and lost. `docs/PROVENANCE.md` records that as a
+    /// grid-aligned under-count, not as parity.
     fn writable(&self, x: i32, y: i32, z: i32) -> bool;
-    /// The block name currently at the position, `None` where the world
-    /// holds air. Earlier decorations in this pass have already painted
-    /// here: a later vein may replace stone a blob turned to granite.
+    /// The block name at the position. Inside the decorated chunk this is
+    /// always a name: a row the fill pass left empty holds air and answers
+    /// `minecraft:air`, which is the same answer [`Self::is_air`] gives, while
+    /// a carved row answers the carver's own `minecraft:cave_air`. `None`
+    /// means the position is outside the chunk the view writes. Earlier
+    /// decorations in this pass have already painted here: a later vein may
+    /// replace stone a blob turned to granite.
     fn block_at(&self, x: i32, y: i32, z: i32) -> Option<&str>;
     /// Whether the position holds air, for the air-exposure test. Reads
     /// beyond the writable zone still have an answer, because the six
@@ -2672,6 +2694,84 @@ mod tests {
             "and the feature is still gated out of the run"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A modeled decoration whose *parameter* has no runtime gates the chain
+    /// out exactly as an unknown decoration type does, and both halves have to
+    /// be named: the decoration that carried it and the provider shape that
+    /// broke it. `minecraft:count` and `minecraft:height_range` take an int
+    /// provider, and were the two the report stayed silent about — the pack
+    /// writes `minecraft:weighted_list` for the count of its bamboo and birch
+    /// ordinals, and those chains vanished from the gap report entirely.
+    #[test]
+    fn an_unmodeled_modifier_parameter_names_the_modifier_and_its_provider() {
+        let root = report_pack(
+            "report-range-params",
+            r#"[{"type": "minecraft:count", "count": {"type": "minecraft:weighted_list",
+                    "distribution": [{"data": 3, "weight": 1}, {"data": 5, "weight": 2}]}},
+                {"type": "minecraft:height_range", "height": {"type": "minecraft:clamped_normal",
+                    "mean": 30, "deviation": 4,
+                    "min_inclusive": {"absolute": 5}, "max_inclusive": {"absolute": 60}}},
+                {"type": "minecraft:biome"}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        for key in [
+            "placement:minecraft:count",
+            "range:minecraft:weighted_list",
+            "placement:minecraft:height_range",
+            "range:minecraft:clamped_normal",
+        ] {
+            assert_eq!(
+                data.unimplemented_features.get(key),
+                Some(&1),
+                "{key} is a named gap: {:?}",
+                data.unimplemented_features
+            );
+        }
+        assert!(
+            !data.step(0).expect("step 0")[0].is_modelable(),
+            "and both chains stay gated out of the run"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The offset a position predicate may carry: three integers inside ±16,
+    /// which is as far as the decoration pass resolves a neighbouring column.
+    /// Anything wider or malformed is refused rather than read, because a
+    /// predicate reaching past the nine-chunk window would answer from terrain
+    /// the pass never resolved.
+    #[test]
+    fn a_predicate_offset_outside_the_resolved_window_is_refused() {
+        let offset = |text: &str| {
+            let value: Value = serde_json::from_str(text).expect("predicate object");
+            parse_block_offset(value.as_object().expect("object"))
+        };
+        assert_eq!(
+            offset("{}"),
+            Some((0, 0, 0)),
+            "a document writing no offset means the position itself"
+        );
+        assert_eq!(
+            offset(r#"{"offset": [-16, 0, 16]}"#),
+            Some((-16, 0, 16)),
+            "the bound is inclusive"
+        );
+        for text in [
+            r#"{"offset": [17, 0, 0]}"#,
+            r#"{"offset": [0, -17, 0]}"#,
+            r#"{"offset": [0, 0, 32768]}"#,
+            r#"{"offset": [0, 0]}"#,
+            r#"{"offset": [0, 0, 0, 0]}"#,
+            r#"{"offset": "up"}"#,
+            r#"{"offset": [0, 1.5, 0]}"#,
+            r#"{"offset": [[0], 0, 0]}"#,
+        ] {
+            assert_eq!(
+                offset(text),
+                None,
+                "{text} is not an offset this runtime reads"
+            );
+        }
     }
 
     #[test]
@@ -4876,6 +4976,7 @@ mod tests {
                 || key.starts_with("provider:")
                 || key.starts_with("predicate:")
                 || key.starts_with("offset:")
+                || key.starts_with("range:")
                 || key.starts_with("heightmap:")
                 || inner == "minecraft:simple_block"
             {
@@ -4891,13 +4992,13 @@ mod tests {
             "37 configured documents less the three registry references and \
              the one randomized-int provider"
         );
-        assert!(
-            decorations_modeled >= 50,
+        assert_eq!(
+            decorations_modeled, 50,
             "the three decorations plus the configured type were to unlock most of \
              the {targeting} chains, got {decorations_modeled} with every decoration modeled"
         );
-        assert!(
-            modelable >= 45,
+        assert_eq!(
+            modelable, 46,
             "of those, {modelable} are modelable overall: the difference is the chains whose \
              state provider this runtime still cannot resolve"
         );

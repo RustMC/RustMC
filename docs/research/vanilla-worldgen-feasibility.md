@@ -770,14 +770,24 @@ what that unlocks. The pack documents these shapes are cited in
 `minecraft:simple_block` configured feature, and 37 configured documents of that
 type exist, 33 of them with a state provider this runtime can resolve. After this
 slice 50 of the 64 chains have every decoration modeled and 46 are modelable end
-to end; the 4-chain difference is chains whose provider is a
-`block_state_provider` reference. The 18 still-gated chains each name their own
+to end. The 4-chain difference is the chains whose state provider this runtime
+still cannot resolve, and the pack's counters name both kinds: 3 documents take
+their state from a `block_state_provider` registry reference and 1 from a
+`minecraft:randomized_int` provider. The 18 still-gated chains each name their own
 reason: 6 by `minecraft:noise_threshold_count`, 4 by an unmodeled predicate nested
 inside a filter they do model (`would_survive`, `matching_fluids`, `replaceable`),
 4 by their state provider, 3 by `minecraft:count_on_every_layer`, and 1 by
 `minecraft:environment_scan`. Three of those 18 are nether canopy chains, which
 never fire in an overworld column anyway, so the overworld-relevant remainder is
 15 chains.
+
+These 64, 46 and 18 are counts *within the ground-cover census*: the placed
+features that target a `minecraft:simple_block` configured feature. The gap
+report's own keys are a different denominator — pack-wide counts of placed-feature
+documents carrying each unmodeled shape, over every configured type, not only
+ground cover — so a key like `placement:minecraft:block_predicate_filter 72` is
+not 72 of these 64 chains, and `placement:minecraft:surface_water_depth_filter 26`
+and `placement:minecraft:offset 2` gate none of them at all.
 
 **The measured blocks.** `census_compare` over fully generated seed-2026 squares
 (`missing_chunks=0` in every run, the save side identical in both binaries because
@@ -818,24 +828,194 @@ once per binary:
 
 Written rows are identical (636,822 / 4,096 / 31,052 / 615,830 units) and the
 cache budget is unchanged at 1,856 KiB; the columns phase's occupancy grew by 81
-entries (15,103 → 15,184, of which 49 are the surface rows the heightmap
-decoration now reads) and peak RSS by 492 KiB (17,216 → 17,708). The phase that
+entries (15,103 → 15,184) and peak RSS by 492 KiB (17,216 → 17,708). The 81
+entries are not attributed by this run: the occupancy line reports totals per
+cache, and the 49 surface rows a heightmap decoration reads are the largest
+plausible component, but they are not separately counted, so only the total is a
+measurement here. The phase that
 actually places ground cover is the census square, whose cost is not in this
 table: `0..127` moved 118.6 → 119.2 s for 16,384 columns (+0.51%) and the
 published `-128..127` square moved 475 → 478 s for 65,536 columns (+0.63%).
 
-One measurement does not line up and is reported rather than smoothed over: the
-bench's non-air row tally is identical (636,822) although the same `0..63` square
-gains 2 grass blocks in the census, which would predict 636,824. The census and
-the bench call the same `column_ids` path. This note does not resolve why; the
-slice's cost claim does not depend on the direction of a 2-row count, but a
-follow-up should before any per-chunk write denominator is quoted as exact.
+One measurement did not line up at the time and is now resolved: the bench's
+non-air row tally was identical (636,822) although the same `0..63` square gained
+2 grass blocks in the census, which would have predicted 636,824. The census and
+the bench call the same `column_ids` path. Slice O found the reason by fixing it:
+an unnamed row answered no block to a position predicate, so the only candidates
+that survived to a placement were the ones sitting on *carved* air — and a carved
+row is already counted as written, because the carver stamped it by name. Two
+grass blocks replacing two cave-air rows therefore moves the census and leaves the
+tally alone. The same square under
+slice O writes 637,619 rows (+797) and the census there reads 485 grasses and 4
+flowers, so 489 of those 797 rows are the two vegetation families and the
+remaining 308 are states no census family names — the census counts a fixed list
+of families, and the chains this commit unlocks also write block states outside
+it. Reconciling those 308 by state name is the follow-up's first job; no per-chunk
+write denominator should be quoted as exact before it is.
 
 **What this slice licenses.** T4's remaining scope is now named and bounded
 rather than open-ended: the ground-cover placement stage runs, packs its own
-blocks through 46 modelable chains, and leaves 18 chains and 18 keys documented
-by name. Trees, structures and the flower providers need their own slices, and
+blocks through 46 modelable chains, and leaves 18 chains and the report's keys
+documented by name (18 keys at this commit; slice O's two new modifier arms raise
+that to 24, all of them pack-wide document counts rather than chain counts).
+Trees, structures and the flower providers need their own slices, and
 the T4 gate (distribution-level agreement for vegetation) is **not** met yet.
+
+## T4 open-sky air named, over-count measured (11 October 2026, slice O)
+
+**The contradiction.** `601f02a` shipped a placement stage that ran and placed
+almost nothing: 77 grass blocks against the save's 2,543 in the published square,
+1 flower against 95. The cause was one position with two answers.
+`ChunkView::block_at` returned `None` for every row the fill pass left unnamed,
+while `is_air` on the same view read such a row as air. `BlockPredicate::test`
+asked the first question through `is_some_and`, so
+`minecraft:matching_block_tag` with tag `minecraft:air` — the filter the pack's
+vegetation chains hang on — passed only where the *carver* had stamped a named
+`minecraft:cave_air`, and failed on open sky. Ground cover therefore could only
+land in caves.
+
+The size of that filter's reach is a property of the provisioned pack, measured
+here by walking `data/minecraft/worldgen/placed_feature/*.json` with `python3`
+(read-only; no pack file is copied into this repository): of its 273 placed
+features, 84 use `minecraft:matching_block_tag`, and those documents carry 92
+predicate occurrences over three tags — `minecraft:air` 87, `minecraft:nylium` 3,
+`minecraft:cannot_support_kelp` 2 — so 82 documents test air at least once. The
+air tests come in two shapes, a bare `{tag: minecraft:air}` and one carrying
+`offset: [0, 1, 0]`, i.e. the row above the placement position. No Mojang or
+other-server code was read for any of this; these are counts over the
+operator-provisioned data files.
+
+**The invariant, corrected while the test was being written.** The first version
+of the fix's comment claimed that inside a decorated chunk every row from the
+column top downward is named and only the sky above it is not. Writing the test
+disproved that: `base_column_ids` leaves *interior* air rows unnamed too (its
+`Substance::Air` arm does not name them), so "unnamed ⟹ above the top" is false.
+What is true, and what the fix now rests on, is the weaker claim
+"unnamed ⟹ the substance pass calls that row air". The test checks it row by row
+against `generator.substance`, and `block_at` and `is_air` cannot disagree at any
+position in the chunk.
+
+**Two production regressions, not fixture checks.** The feature module's own
+synthetic `DecorationTarget` answered air above its surface from the first, which
+is why `601f02a` passed 259 tests while placing nothing real: the divergence was
+between a fixture target and the production view. `unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold`
+builds a production chunk through `build_decorated_chunk`, partitions all 32,768
+rows of that 16×16×128 chunk into named and unnamed (and fails if either set is
+empty, so the checks cannot go vacuous), asserts the substance claim above for
+every unnamed row plus
+`block_at == Some("minecraft:air")` and `is_air` agreement, and asserts that every
+named row still answers its own name.
+`a_pack_air_filter_places_ground_cover_on_generated_terrain` runs the whole pass
+over generated terrain with a pack-shaped chain — `simple_block`, `count`,
+`in_square`, `heightmap MOTION_BLOCKING`, `offset y = 1`,
+`block_predicate_filter` on the `minecraft:air` tag, `biome` — and requires each
+placed flower to sit exactly one row above that column's highest named row, on a
+row the fill pass left empty, and requires the placement count to be non-zero.
+A minimal `data/minecraft/tags/block/air.json` fixture is written by the test,
+mirroring the tag-resolution shape `feature.rs`' existing fixtures use; it is not
+copied from the pack.
+
+**Blast radius, paired in one session.** `census_compare` over seed 2026 with
+`missing_chunks=0` in every run; "main" is `9abf311`, "slice N" is `601f02a`:
+
+| square | columns | family | save | main | slice N | this build |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0..63` | 4,096 | grasses | 95 | 0 | 2 | 485 |
+| `0..63` | 4,096 | flowers | 2 | 0 | 0 | 4 |
+| `-128..127` (published) | 65,536 | grasses | 2,543 | 0 | 77 | 5,885 |
+| `-128..127` (published) | 65,536 | flowers | 95 | 0 | 1 | 222 |
+
+The two squares measured on both builds differ by *exactly* those lines: each
+report's diff is the two `compare` lines plus the four band lines that
+`census_compare` only emits once a family is non-zero, and every other line —
+75 in the published square, 63 in the small one, covering all ore, host-stone,
+raw-metal, log and leaf families — is byte-identical. The
+pinned 3D `substance` report re-measures to the same 40 lines and the same md5
+`28f153fd93ebb5d299544a3447f195c1` (`substance_positions=347483 exact=342641`,
+98.61%), so nothing below the placement stage moved.
+
+**The over-count is published, not explained.** Two squares never run before
+bound it, one at spawn and one ~1,000 blocks away, so that the shape of the
+error is visible rather than averaged:
+
+| square | columns | family | save | this build | ratio |
+| --- | --- | --- | --- | --- | --- |
+| `0..255` | 65,536 | grasses | 2,622 | 5,395 | 2.06× |
+| `0..255` | 65,536 | flowers | 34 | 263 | 7.74× |
+| `1024..1279` | 65,536 | grasses | 788 | 4,101 | 5.20× |
+| `1024..1279` | 65,536 | flowers | 39 | 184 | 4.72× |
+
+The excess is *larger* away from the owner's spawn area, so farming the saved
+terrain does not account for it and this note does not offer that explanation.
+`logs` (6,837 / 3,517 in the save) and `leaves` (51,475 / 36,512) stay at zero in
+both new squares, consistent with no tree feature being modeled. Three mechanisms
+could each produce an over-placement of this shape and none is tested here, so
+they are recorded as the follow-up's agenda: (a) whether the reference
+`minecraft:heightmap` anchor is the highest non-air row as this runtime computes
+it, or the first free row above it — the two answers differ by exactly the one
+row that this fix made the air filter admit, and the save-side heightmap arrays
+in the owner's region files can settle it; (b) per-chain attribution of the
+`count`-style draw denominators, since the census counts a fixed family list
+rather than chains; and (c) the vertical distribution, where this build puts 27
+grasses in the `-64..-33` band of the `0..255` square while the save puts 1,043
+of its grass below y = 32 and this build puts none there — both ends are wrong in
+opposite directions and neither is explained by this slice. The T4 gate is
+therefore *not* met by this commit: it makes the pack's own filter mean what the
+pack says, and measures how far the result still is.
+
+**Cost, paired.** The claim needs a band rather than a sample, because a single
+cold pass on this host moves more than the effect being looked for. Ten
+`bench_vanilla_chunks --seed 2026 --side 4 --repeat 1 --mode columns` cold passes
+per build, alternating build-to-build in one session, over the same
+`--data-root`:
+
+| build | min | median | max | written rows |
+| --- | --- | --- | --- | --- |
+| `601f02a` (slice N) | 1,387.41 | 1,403.86 | 1,465.82 | 636,822 |
+| this build | 1,379.83 | 1,391.08 | 1,441.23 | 637,619 |
+
+ms per chunk; each build's own range spans 5.7% and 4.4%, the medians differ by
+−0.9% and the means by −0.84%, and the two ranges overlap almost completely. So
+the cold terrain cost of naming open sky is **not measurable at this resolution**,
+even though the same square writes 797 more rows, of which 489 are the two
+vegetation families and 308 are states no census family names (the reconciliation
+the slice-N note deferred, still open). One sample is disclosed rather than
+quietly dropped: an earlier `--repeat 7 --mode all` run of this build printed
+1,488.76 ms/chunk for its first pass and a 1.75 h single-thread projection, which
+is outside the paired band above; the invocation shape differs from every
+published cold figure in this document, so neither number is used as a cost
+claim. Recomputed from this build's paired median, the same projection is
+1.63 h against the published 1.62 h. On the path where the placements actually
+happen, the published `-128..127` census square took 475 s single-threaded CPU at
+main, 478 s at slice N and 480.4 s here (+0.5% for this fix). Occupancy for the
+columns phase is 15,185 entries (+1 over slice N), the bounded cache budget is
+unchanged at 1,856 KiB, and peak RSS measured 17,600 KiB against slice N's 17,708.
+
+**The gap report grows by naming.** `record_unmodeled_modifiers` recognized
+`minecraft:count` and `minecraft:height_range` but stayed silent when their int
+provider had no runtime, so chains gated out by exactly those parameters
+disappeared from the report entirely. Two nested-pattern arms now record the
+modifier key *and* a `range:<provider>` key, which takes the ground-cover-scoped
+key list from 18 to 24: `placement:minecraft:count` 25,
+`range:minecraft:weighted_list` 22, `placement:minecraft:height_range` 2,
+`range:minecraft:clamped` 2, `range:minecraft:very_biased_to_bottom` 2 and
+`range:minecraft:biased_to_bottom` 1. The chain census is unchanged and re-asserted
+at exact values rather than lower bounds — 64 placed features target the 37
+`minecraft:simple_block` documents, 33 of them with a resolvable state provider,
+50 with every decoration modeled, 46 modelable end to end, 18 still gated. These
+key counts remain pack-wide document counts, not chain counts.
+`DecorationTarget`'s `writable` and `block_at` contract text was corrected in the
+same pass: `writable` no longer claims a neighbour's own pass paints its half of
+any straddling write, because the nine-chunk window is finite and an offset of up
+to ±16 (predicate) or ±32768 (provider) can ask for a column outside it, where the
+write is refused and lost and is recorded as a grid-aligned under-count.
+
+**What this slice licenses.** The pack's air filter is now a working gate over the
+whole column, so the vegetation families can be compared as distributions rather
+than as a zero artifact — and this commit shows that comparison failing by 2–7×,
+with the heightmap-anchor question named as the first testable step. Trees,
+structures and the noise-driven flower providers still need their own slices, and
+the T4 gate remains unmet.
 
 ## Risks
 

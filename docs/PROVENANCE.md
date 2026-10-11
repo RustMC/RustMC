@@ -1238,3 +1238,64 @@ rather than quoted from an earlier session: the terrain phases of the four-chunk
 cold sweep moved 1,375.55 → 1,380.54 ms per chunk (+0.36%) with identical written
 rows, and the census squares that do place ground cover moved 118.6 → 119.2 s for
 16,384 columns and 475 → 478 s for 65,536 columns (+0.51% and +0.63%).
+## Open-sky air named, ground-cover over-count measured (11 October 2026, slice O)
+
+This entry supersedes the last paragraph of the ground-cover entry above for the
+build it describes: the same published census square is 480.4 s single-threaded
+here, and the four-chunk cold sweep is reported below as a paired band rather
+than a single sample. The slice-N figures stay as the record of that commit.
+
+The change itself is three lines of behavior in `ChunkView::block_at` and rests
+on two sources, both local. The pack's own documents say how far the affected
+filter reaches: walking `data/minecraft/worldgen/placed_feature/*.json` of the
+operator-provisioned Java 26.3 pack with `python3`, read-only, gives 273 placed
+features, 84 of them using `minecraft:matching_block_tag`, carrying 92 predicate
+occurrences over three tags (`minecraft:air` 87, `minecraft:nylium` 3,
+`minecraft:cannot_support_kelp` 2), so 82 documents test air at least once; the
+air tests appear bare and with `offset: [0, 1, 0]`. No pack file is copied into
+this repository and no Mojang, Paper, Pumpkin or other-server code, binary or
+decompiled class was read. The second source is this repository's own column
+code: the invariant the fix now states ("a row the fill pass leaves unnamed is
+one the substance pass calls air") came out of reading `base_column_ids` and the
+`Substance::Air` arm, after a stronger and false claim ("unnamed means above the
+column top") was disproved by the test written for it. That is recorded here
+because the first draft of the shipped comment carried the wrong claim.
+
+Both new tests are production-path tests, and that distinction is the point. The
+fixture target in `feature.rs` answered air above its own synthetic surface from
+the beginning, which is how the previous commit passed 259 tests while placing
+almost nothing in generated terrain; `unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold`
+goes through `build_decorated_chunk` and `a_pack_air_filter_places_ground_cover_on_generated_terrain`
+through `column_ids` over generated columns, so the fixture/production divergence
+cannot hide again. The tag file those tests write is a three-line hand-written
+fixture mirroring the shape of `feature.rs`' existing tag fixtures, not data
+taken from the pack.
+
+Save-side denominators come from the owner's seed-2026 save read read-only
+through `vanilla_oracle census_compare`; no save file, region file or generated
+game data was modified, moved or copied by this slice. Four squares are reported,
+two of them new (`0..255` at spawn and `1024..1279` as a far control) and two run
+on both builds for the paired diff. The over-count they show — 2.06× to 5.20× on
+grasses and 4.72× to 7.74× on flowers, larger away from spawn — is published as
+an unexplained measurement, not smoothed into a parity claim: no mechanism is
+asserted for it here, and the three candidates named in
+`docs/research/vanilla-worldgen-feasibility.md` are the follow-up's agenda. In
+particular the `minecraft:heightmap` anchor question (highest non-air row, as
+this runtime computes it, versus the first free row above it) is deliberately
+left open and is to be settled by black-box observation of the heightmap arrays
+the owner's own save stores, per ADR-0014's knowledge-only rule; no external
+documentation of vanilla heightmap storage conventions was consulted and none of
+that question's possible answers is asserted in code by this slice.
+
+Cost is stated as a band because the effect being measured is smaller than one
+run's spread. `bench_vanilla_chunks --seed 2026 --side 4 --repeat 1 --mode
+columns --data-root <provisioned pack>` was run ten times per build, alternating
+between the base build at `601f02a` and this one in one session on the same host:
+1,387.41–1,465.82 ms per chunk (median 1,403.86) against 1,379.83–1,441.23
+(median 1,391.08), i.e. −0.9% on medians and −0.84% on means with the two ranges
+overlapping, so no cold-cost claim is made in either direction while the same
+square writes 797 more rows. One sample is named rather than dropped: an earlier
+`--repeat 7 --mode all` invocation of this build printed 1,488.76 ms per chunk
+for its first pass and a 1.75 h projection, which lies outside the paired band
+and comes from an invocation shape none of this document's published cold figures
+uses; neither number is claimed as this slice's cost.

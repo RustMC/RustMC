@@ -1034,7 +1034,20 @@ impl DecorationTarget for ChunkView<'_> {
         }
         let row = (y - self.generator.router.min_y) as usize;
         let at = self.chunk.index(x & 15, row, z & 15);
-        self.chunk.name(self.chunk.blocks[at])
+        // An unnamed row inside the decorated chunk is a row the fill pass left
+        // empty, and the only rows it leaves empty hold air: a solid or fluid
+        // row is named by the surface rules or the filler, a carved row is
+        // named the carver's `cave_air`, and everything else the column walk
+        // passed — the sky above the top and the air a density gap leaves
+        // inside the body — stays empty. Naming those rows here is what lets
+        // `matching_block_tag minecraft:air` pass on open sky instead of only
+        // on carved air; `is_air` already read an unnamed row as air, and the
+        // two answers cannot disagree across one position.
+        Some(
+            self.chunk
+                .name(self.chunk.blocks[at])
+                .unwrap_or("minecraft:air"),
+        )
     }
 
     fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
@@ -2193,6 +2206,51 @@ mod tests {
         (root, generator)
     }
 
+    /// The decorating pack plus one ground-cover ordinal in the shape the
+    /// overworld pack's vegetation steps use: a `minecraft:simple_block`
+    /// flower, put at the `MOTION_BLOCKING` row offset up by one and gated on
+    /// a `minecraft:matching_block_tag` test against `minecraft:air` — so the
+    /// candidate only stands where the column holds open sky.
+    fn covering_pack(root: &Path) {
+        decorating_pack(root);
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/cover.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:dandelion"}}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/cover.json"),
+            r#"{"feature": "testns:cover", "placement": [
+                {"type": "minecraft:count", "count": 8},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:offset", "x": 0, "y": 1, "z": 0},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:matching_block_tag", "tag": "minecraft:air"}},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &root.join("data/minecraft/tags/block/air.json"),
+            r#"{"values": ["minecraft:air"]}"#,
+        );
+        // The vein keeps its own ordinal, so one chunk runs both families and
+        // the two writes are told apart by their states.
+        write(
+            &worldgen.join("biome/flat.json"),
+            r#"{"carvers": ["testns:scarce"],
+                "features": [[], [], ["testns:cover"], [], [], [], [], [], ["testns:vein"], [], []]}"#,
+        );
+    }
+
+    fn covering_generator(label: &str) -> (PathBuf, VanillaGenerator) {
+        let root = scratch_root(label);
+        covering_pack(&root);
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("covering pack generator");
+        (root, generator)
+    }
+
     /// The decorating pack plus a second dimension whose placement table
     /// splits the world along x: `testns:low` west of x = 32, `testns:peak`
     /// east of it. Only `peak` lists a placed vein, and that vein carries no
@@ -2324,6 +2382,115 @@ mod tests {
         assert!(
             painted > 0,
             "the fixture must actually fire veins, or the assertions above are vacuous"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// What the decoration view's open-sky answer rests on, checked against a
+    /// production chunk rather than a fixture's own target: a row the fill pass
+    /// leaves unnamed holds air — the substance pass says so for every one of
+    /// them, for the sky above a column top and for the gap a density hole
+    /// leaves inside the body — and the view names each of them
+    /// `minecraft:air`, which is what `is_air` has always answered. A carved
+    /// row is not among them, because the carver stamps its cave air by name.
+    #[test]
+    fn unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold() {
+        let (root, generator) = decorating_generator("open-sky");
+        let min_y = generator.min_y();
+        let height = generator.router.height as usize;
+        let mut chunk = generator.build_decorated_chunk(0, 0);
+        let mut empty: Vec<(i32, i32, i32)> = Vec::new();
+        let mut filled: Vec<(i32, i32, i32, String)> = Vec::new();
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                for row in 0..height {
+                    let at = chunk.index(local_x, row, local_z);
+                    match chunk.name(chunk.blocks[at]) {
+                        Some(name) => {
+                            filled.push((local_x, min_y + row as i32, local_z, name.to_owned()))
+                        }
+                        None => empty.push((local_x, min_y + row as i32, local_z)),
+                    }
+                }
+            }
+        }
+        assert!(
+            !empty.is_empty() && !filled.is_empty(),
+            "the fixture must hold both sky and ground, or the checks below are vacuous"
+        );
+        for (x, y, z) in &empty {
+            assert_eq!(
+                generator.substance(*x, *y, *z),
+                Substance::Air,
+                "row ({x}, {y}, {z}) is unnamed but the substance pass does not call it air"
+            );
+        }
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: 0,
+            chunk_z: 0,
+            chunk: &mut chunk,
+        };
+        for (x, y, z) in &empty {
+            assert_eq!(
+                view.block_at(*x, *y, *z),
+                Some("minecraft:air"),
+                "an unnamed row at ({x}, {y}, {z}) must name the air it holds"
+            );
+            assert!(
+                view.is_air(*x, *y, *z),
+                "block_at and is_air disagree at ({x}, {y}, {z})"
+            );
+        }
+        // The fallback is a fallback, not a rewrite: every named row still
+        // answers its own name.
+        for (x, y, z, name) in &filled {
+            assert_eq!(
+                view.block_at(*x, *y, *z),
+                Some(name.as_str()),
+                "a named row at ({x}, {y}, {z}) lost its own name"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The regression the open-sky answer exists for. The feature module's own
+    /// target answered air above its synthetic surface from the first, so a
+    /// `matching_block_tag minecraft:air` filter passed every test written
+    /// against it while the production view answered `None` and the whole
+    /// vegetation family placed nothing in a real chunk. This runs the pass end
+    /// to end over generated terrain.
+    #[test]
+    fn a_pack_air_filter_places_ground_cover_on_generated_terrain() {
+        let (root, generator) = covering_generator("cover-open-sky");
+        let cover = "minecraft:dandelion";
+        let mut placed = 0usize;
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                let (x, z) = (local_x, local_z);
+                let base = generator.base_column_ids(x, z);
+                let top = base.iter().rposition(|name| name.is_some());
+                for (row, name) in generator.column_ids(x, z).iter().enumerate() {
+                    if name.as_deref() != Some(cover) {
+                        continue;
+                    }
+                    let top = top.expect("a column with cover has a surface under it");
+                    placed += 1;
+                    assert_eq!(
+                        row,
+                        top + 1,
+                        "cover at ({x}, {z}) row {row} is not the open-sky row one above surface {top}"
+                    );
+                    assert_eq!(
+                        base[row], None,
+                        "cover replaced a row the fill pass had already named at ({x}, {z}) row {row}"
+                    );
+                }
+            }
+        }
+        assert!(
+            placed > 0,
+            "the air-gated cover chain must place on open sky through the production view"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
