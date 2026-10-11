@@ -1275,11 +1275,16 @@ Save-side denominators come from the owner's seed-2026 save read read-only
 through `vanilla_oracle census_compare`; no save file, region file or generated
 game data was modified, moved or copied by this slice. Four squares are reported,
 two of them new (`0..255` at spawn and `1024..1279` as a far control) and two run
-on both builds for the paired diff. The over-count they show — 2.06× to 5.20× on
-grasses and 4.72× to 7.74× on flowers, larger away from spawn — is published as
-an unexplained measurement, not smoothed into a parity claim: no mechanism is
-asserted for it here, and the three candidates named in
-`docs/research/vanilla-worldgen-feasibility.md` are the follow-up's agenda. In
+on both builds for the paired diff. The over-count they show — grass ratios of
+2.06×, 2.31×, 5.11× and 5.20× and flower ratios of 2.00×, 2.34×, 4.72× and 7.74×
+across the four squares — is published as an unexplained measurement, not smoothed
+into a parity claim: no mechanism is asserted for it here, and the three candidates
+named in
+`docs/research/vanilla-worldgen-feasibility.md` are the follow-up's agenda. What the
+control square does establish is narrower than a trend: the far square over-counts
+by about the same factor as the spawn core does, so the excess is not a property of
+the owner's built-up spawn area, and no monotone relationship with distance is
+claimed. In
 particular the `minecraft:heightmap` anchor question (highest non-air row, as
 this runtime computes it, versus the first free row above it) is deliberately
 left open and is to be settled by black-box observation of the heightmap arrays

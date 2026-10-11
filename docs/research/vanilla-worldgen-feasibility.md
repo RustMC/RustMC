@@ -945,8 +945,14 @@ error is visible rather than averaged:
 | `1024..1279` | 65,536 | grasses | 788 | 4,101 | 5.20× |
 | `1024..1279` | 65,536 | flowers | 39 | 184 | 4.72× |
 
-The excess is *larger* away from the owner's spawn area, so farming the saved
-terrain does not account for it and this note does not offer that explanation.
+The far control over-counts by about the same factor as the spawn core does —
+5.20× at `1024..1279` against 5.11× at `0..63` — so farming the saved terrain is
+not needed to account for the excess, and no monotone trend with distance is
+claimed either: across the four squares the grass ratio runs 2.06×, 2.31×, 5.11×
+and 5.20× and the flower ratio 2.00×, 2.34×, 4.72× and 7.74×, and inside the
+published square the grass excess itself is 4.54× in `32..63`, 1.87× in `64..95`
+and 2.87× in `96..127`. What the control does establish is that the over-count is
+not a local property of the owner's built-up spawn area.
 `logs` (6,837 / 3,517 in the save) and `leaves` (51,475 / 36,512) stay at zero in
 both new squares, consistent with no tree feature being modeled. Three mechanisms
 could each produce an over-placement of this shape and none is tested here, so
