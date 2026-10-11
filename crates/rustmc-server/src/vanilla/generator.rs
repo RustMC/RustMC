@@ -1063,6 +1063,15 @@ impl DecorationTarget for ChunkView<'_> {
     fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
         self.generator.ocean_floor_height(x, z)
     }
+
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        // The decoration-time world-surface row is the top the fill pass
+        // already memoises for the column; asking it whether anything is
+        // there keeps a column the filler left empty from answering with the
+        // dimension floor, which is what the heightmap decoration drops on.
+        let top = self.generator.surface_height(x, z);
+        (self.generator.substance(x, top, z) != Substance::Air).then_some(top)
+    }
 }
 
 #[cfg(test)]

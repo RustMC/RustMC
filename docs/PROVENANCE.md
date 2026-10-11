@@ -1171,3 +1171,70 @@ rather than an operator-visible surface. Second, the `placement:` and `target:`
 prefixes are a naming convention, not a namespace check. Configured-type and
 `placement:` counts track documents rather than registry entries; `target:`
 counts track unsupported rule occurrences, including nested rules.
+
+## Ground-cover placement runtime (11 October 2026)
+
+Every `minecraft:simple_block` chain was gated, so the census's vegetation
+families read zero against the save's own counts. This slice adds the four
+shapes those chains ask for: the `minecraft:heightmap` decoration over the five
+map names the pack writes, the `minecraft:offset` decoration over its three
+per-axis ranges, the `minecraft:block_predicate_filter` decoration over
+`matching_block_tag`, `matching_blocks`, `any_of`, `all_of` and `not` with an
+offset inside ±16, and the `minecraft:simple_block` configured type with a
+directly named state or a `minecraft:weighted` list.
+
+The rules come out of the operator-provisioned Java 26.3 pack only — in 26.3 the
+configured features are `data/minecraft/worldgen/feature/*.json` (not a
+`configured_feature` directory), their decorations are
+`worldgen/placed_feature/*.json`, and a `block_state_provider` is its own
+registry directory. `worldgen/feature/grass.json` is
+`{"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"}}`,
+and `worldgen/placed_feature/flower_plains.json` shows the other three shapes in
+one chain: `heightmap: MOTION_BLOCKING`, an `offset` whose axes are
+`minecraft:trapezoid` ranges, and a `block_predicate_filter` on
+`minecraft:matching_block_tag` with tag `minecraft:air`. That last field is what
+makes the registry-reference gap a measured fact rather than an assumption:
+`to_place: "minecraft:flower_plain"` is not a block id, because
+`worldgen/block_state_provider/flower_plain.json` is a
+`minecraft:noise_threshold` provider document holding dandelion, poppy, the
+tulips and its own noise, seed `2345` and scale `0.005`. The three chains that
+reference it stay gated and name themselves `provider:minecraft:block_state_provider_reference`
+in the gap report; implementing that provider means reproducing a noise sampler
+from pack parameters, so it is left open rather than approximated.
+No Mojang, Paper, Pumpkin or other-server code, binary, or decompiled class was
+read for this change; the `noise_threshold` figures above are quoted from the
+pack's own document as the reason the reference is refused, and are not used by
+this runtime.
+
+Two semantics are reasoned from the column's contents rather than witnessed in
+the save, and both are stated here as reasoning. First, a pre-decoration column
+holds only filler solids, sea fluid and air — nothing motion-blocking that is not
+solid, and no leaf block, because no tree feature is modeled here — so the three
+surface-ish maps answer one highest-non-air row and the two ocean-floor maps
+answer the stored terrain row. Second, a `weighted` provider costs exactly one
+bounded draw over the summed weights, matching the draw discipline the count and
+height-range providers keep. Each is pinned by unit tests over synthetic targets
+(the surface-map and ocean-floor rows are required to answer *different* rows, so
+one shared implementation cannot pass) and neither is presented as vanilla-parity
+evidence.
+
+The measured effect, with denominators, is tabulated in
+`docs/research/vanilla-worldgen-feasibility.md` under slice N. It is a
+non-zero-vs-zero result, not a distribution result: over three fully generated
+seed-2026 squares (`missing_chunks=0`) grasses reach 2 of the save's 95, 26 of
+384 and 77 of 2,543 blocks, and flowers 1 of 95, while `logs` and `leaves` are
+still counted at zero by this runtime. Every other family line in each paired
+report is byte-identical between the base build and this one, so no ore,
+host-stone or raw-metal denominator moved. The 18 ground-cover keys the
+filtered report still lists — `block_predicate_filter` 72, `would_survive` 63,
+`surface_water_depth_filter` 26, `environment_scan` 12, `matching_fluids` 11,
+`count_on_every_layer` 8, `noise_threshold_count` 6 and eleven smaller ones — are
+each named there, and one of them gates any chain that would write the bulk of
+the save's grass, flower and canopy counts. No tree, structure or fluid feature
+is claimed by this slice.
+
+The cost is measured on the same machine in the same session as its own control,
+rather than quoted from an earlier session: the terrain phases of the four-chunk
+cold sweep moved 1,375.55 → 1,380.54 ms per chunk (+0.36%) with identical written
+rows, and the census squares that do place ground cover moved 118.6 → 119.2 s for
+16,384 columns and 475 → 478 s for 65,536 columns (+0.51% and +0.63%).

@@ -756,6 +756,87 @@ line counts chunk maps instead of columns, and its fixed-budget line now include
 the heightmap cache, which it had been leaving out — the committed 1,791 KiB total
 understated the per-generator state by the 160 KiB column memo.
 
+## T4 ground-cover placement runtime measured (11 October 2026, slice N)
+
+Slice M stored the decoration-time heightmap; nothing read it, because every
+`minecraft:simple_block` chain was still gated. This slice gives the ground-cover
+chains the four decorations they ask for — `minecraft:heightmap`,
+`minecraft:offset`, `minecraft:block_predicate_filter` and the `simple_block`
+configured type with its constant and `weighted` state providers — and measures
+what that unlocks. The pack documents these shapes are cited in
+`docs/PROVENANCE.md`; no third-party code was read for the rules.
+
+**The chain census, from the pack itself.** 64 placed features target a
+`minecraft:simple_block` configured feature, and 37 configured documents of that
+type exist, 33 of them with a state provider this runtime can resolve. After this
+slice 50 of the 64 chains have every decoration modeled and 46 are modelable end
+to end; the 4-chain difference is chains whose provider is a
+`block_state_provider` reference. The 18 still-gated chains each name their own
+reason: 6 by `minecraft:noise_threshold_count`, 4 by an unmodeled predicate nested
+inside a filter they do model (`would_survive`, `matching_fluids`, `replaceable`),
+4 by their state provider, 3 by `minecraft:count_on_every_layer`, and 1 by
+`minecraft:environment_scan`. Three of those 18 are nether canopy chains, which
+never fire in an overworld column anyway, so the overworld-relevant remainder is
+15 chains.
+
+**The measured blocks.** `census_compare` over fully generated seed-2026 squares
+(`missing_chunks=0` in every run, the save side identical in both binaries because
+only generation changed):
+
+| square | columns | family | save | base build | this build |
+| --- | --- | --- | --- | --- | --- |
+| `0..63` | 4,096 | grasses | 95 | 0 | 2 |
+| `0..127` | 16,384 | grasses | 384 | 0 | 26 |
+| `0..127` | 16,384 | flowers | 6 | 0 | 0 |
+| `0..127` | 16,384 | logs | 1,732 | 0 | 0 |
+| `0..127` | 16,384 | leaves | 14,742 | 0 | 0 |
+| `-128..127` (the published square) | 65,536 | grasses | 2,543 | 0 | 77 |
+| `-128..127` (the published square) | 65,536 | flowers | 95 | 0 | 1 |
+| `-128..127` (the published square) | 65,536 | logs | 6,795 | 0 | 0 |
+| `-128..127` (the published square) | 65,536 | leaves | 66,776 | 0 | 0 |
+
+The two reports differ by exactly that: the two vegetation family lines and their
+band lines, per square. Every ore, host-stone and raw-metal line is byte-identical
+between the base and this build, so the slice moved no census denominator it did
+not intend to move. The result is a non-zero-vs-zero result, not a distribution
+result: 77 of 2,543 grass blocks is 3.0% of the save's count in the published
+square and the single flower is 1.1% of its 95, while `logs` and `leaves` stay at
+zero because no tree feature is modeled. No per-position vegetation parity is
+claimed, and the older slice-K sentence above — "all counted at zero by RustMC",
+which was true of that build — is superseded by this table rather than rewritten.
+
+**The measured cost, against its own control on the same machine in the same
+session.** `bench_vanilla_chunks --seed 2026 --side 4 --repeat 3 --mode all` run
+once per binary:
+
+| phase | base cold ms/chunk | this cold ms/chunk | Δ |
+| --- | --- | --- | --- |
+| columns | 1,375.55 | 1,380.54 | +0.36% |
+| heights | 203.43 | 203.22 | −0.10% |
+| carve | 2.57 | 2.56 | −0.4% |
+| substance | 434.65 | 433.57 | −0.25% |
+
+Written rows are identical (636,822 / 4,096 / 31,052 / 615,830 units) and the
+cache budget is unchanged at 1,856 KiB; the columns phase's occupancy grew by 81
+entries (15,103 → 15,184, of which 49 are the surface rows the heightmap
+decoration now reads) and peak RSS by 492 KiB (17,216 → 17,708). The phase that
+actually places ground cover is the census square, whose cost is not in this
+table: `0..127` moved 118.6 → 119.2 s for 16,384 columns (+0.51%) and the
+published `-128..127` square moved 475 → 478 s for 65,536 columns (+0.63%).
+
+One measurement does not line up and is reported rather than smoothed over: the
+bench's non-air row tally is identical (636,822) although the same `0..63` square
+gains 2 grass blocks in the census, which would predict 636,824. The census and
+the bench call the same `column_ids` path. This note does not resolve why; the
+slice's cost claim does not depend on the direction of a 2-row count, but a
+follow-up should before any per-chunk write denominator is quoted as exact.
+
+**What this slice licenses.** T4's remaining scope is now named and bounded
+rather than open-ended: the ground-cover placement stage runs, packs its own
+blocks through 46 modelable chains, and leaves 18 chains and 18 keys documented
+by name. Trees, structures and the flower providers need their own slices, and
+the T4 gate (distribution-level agreement for vegetation) is **not** met yet.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

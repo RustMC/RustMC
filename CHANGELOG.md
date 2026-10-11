@@ -10,6 +10,7 @@
 - Prefer the forward edge within square chunk shells during movement and let stationary players use the configured worker pool for outer cold chunks, while keeping the same bounded maximum.
 - Use `rustc-hash` for bounded coordinate caches in the Overworld generator. A ten-run, cold four-chunk seed-2027 sample improved from a 1.134 s median to 1.062 s; packet bytes matched the prior build for 49 seed-2027 and nine seed-2026 chunks. Client loading speed remains unmeasured.
 - Fill the three-chunk square around the player before sending farther chunks in the Java preview, preventing early far results from appearing beside nearby gaps. Cold chunks can still take time to generate.
+- Added the placement stage's ground-cover runtime for the operator-provisioned 26.3 pack: the `heightmap`, `offset`, and `block_predicate_filter` decorations and the `simple_block` configured type with its constant and weighted providers, modelable in 46 of the pack's 64 ground-cover chains. Measured against the owner's seed-2026 save, this build's ground-cover count moves from zero to 77 of the save's 2,543 grass blocks and 1 of its 95 flowers over a fully generated 65,536-column square, at +0.36% cold terrain cost; tree canopy and structures remain absent and no per-position vegetation parity is claimed.
 
 ## Unreleased — Milestone 2 discovery
 

@@ -186,6 +186,192 @@ impl BlockTags {
     }
 }
 
+/// One entry of a `minecraft:weighted` block-state provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightedState {
+    pub state: String,
+    pub weight: i32,
+}
+
+/// The state a configured feature asks to write, as a `to_place` field
+/// writes it. The pack's ground-cover features name one block state; the
+/// flower and grass variants pick between several by weight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateProvider {
+    /// One fixed state: the pack's `{"id": ..., "properties": ...}` object,
+    /// or a bare state string.
+    Constant { state: String },
+    /// `minecraft:weighted` — one uniform draw over the summed weights picks
+    /// the entry, so the pick costs exactly one bounded draw.
+    Weighted { entries: Vec<WeightedState> },
+    /// A provider shape without a runtime here. Named so the gap report can
+    /// tell an unmodeled state apart from a feature that placed nothing.
+    Unsupported { kind: String },
+}
+
+impl StateProvider {
+    /// Whether a provider shape has a runtime here.
+    pub fn is_modelable(&self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+
+    /// The state to place, drawn from the decoration stream. A constant
+    /// costs nothing and a weighted pick costs one bounded draw, matching
+    /// the draw-count discipline the count and height providers keep.
+    pub fn sample(&self, random: &mut DecorationRandom) -> Option<&str> {
+        match self {
+            Self::Constant { state } => Some(state.as_str()),
+            Self::Weighted { entries } => {
+                let total: i32 = entries.iter().map(|entry| entry.weight).sum();
+                if total <= 0 {
+                    return None;
+                }
+                let mut pick = random.next_int_bounded(total);
+                for entry in entries {
+                    if pick < entry.weight {
+                        return Some(entry.state.as_str());
+                    }
+                    pick -= entry.weight;
+                }
+                None
+            }
+            // `is_modelable` gates this out before the feature runs.
+            Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+/// One block test the `minecraft:block_predicate_filter` decoration asks
+/// about. Its own codec names predicates differently from the ore target
+/// rules (`minecraft:matching_block_tag` for a tag rather than
+/// `minecraft:tag_match`, and a `predicates` list for a conjunction), so it
+/// is parsed and evaluated separately instead of sharing `RuleTest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockPredicate {
+    /// `minecraft:matching_block_tag` — the block at the position plus
+    /// `offset` belongs to the named tag.
+    BlockTag {
+        tag: String,
+        offset: (i32, i32, i32),
+    },
+    /// `minecraft:matching_blocks` — one of the listed blocks sits there.
+    Blocks {
+        blocks: Vec<String>,
+        offset: (i32, i32, i32),
+    },
+    /// `minecraft:any_of` — at least one nested test passes.
+    AnyOf(Vec<BlockPredicate>),
+    /// `minecraft:all_of` — every nested test passes.
+    AllOf(Vec<BlockPredicate>),
+    /// `minecraft:not` — the nested test fails.
+    Not(Box<BlockPredicate>),
+    /// A predicate this runtime does not model. The name is kept so the gap
+    /// report can say which one gated the chain, and the test never accepts
+    /// a position on its behalf.
+    Unsupported { kind: String },
+}
+
+impl BlockPredicate {
+    /// Whether this predicate and every nested one can be evaluated here.
+    pub fn is_modelable(&self) -> bool {
+        match self {
+            Self::Unsupported { .. } => false,
+            Self::AnyOf(rules) | Self::AllOf(rules) => rules.iter().all(Self::is_modelable),
+            Self::Not(rule) => rule.is_modelable(),
+            _ => true,
+        }
+    }
+
+    /// Evaluates the predicate against the terrain around one candidate
+    /// position. A shifted read that leaves the decorated chunk answers
+    /// "no block", which is the conservative reading: the neighbour's own
+    /// pass paints its half of the patch, exactly as for the ore path.
+    pub fn test(
+        &self,
+        target: &dyn DecorationTarget,
+        pos: DecorationPos,
+        tags: &BlockTags,
+    ) -> bool {
+        match self {
+            Self::BlockTag { tag, offset } => target
+                .block_at(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
+                .is_some_and(|block| tags.contains(tag, block)),
+            Self::Blocks { blocks, offset } => target
+                .block_at(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
+                .is_some_and(|block| blocks.iter().any(|candidate| candidate == block)),
+            Self::AnyOf(rules) => rules.iter().any(|rule| rule.test(target, pos, tags)),
+            Self::AllOf(rules) => rules.iter().all(|rule| rule.test(target, pos, tags)),
+            Self::Not(rule) => !rule.test(target, pos, tags),
+            Self::Unsupported { .. } => false,
+        }
+    }
+}
+
+/// A `Heightmap.Types` name the `minecraft:heightmap` decoration asks a
+/// column's surface row from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeightmapType {
+    /// `MOTION_BLOCKING` — the highest row that stops entity motion.
+    MotionBlocking,
+    /// `MOTION_BLOCKING_NO_LEAVES` — the same walk with leaves ignored.
+    MotionBlockingNoLeaves,
+    /// `WORLD_SURFACE_WG` — the highest non-air row of the decoration-time map.
+    WorldSurfaceWg,
+    /// `OCEAN_FLOOR` — the highest terrain row, the fluid above a sea floor
+    /// not counted.
+    OceanFloor,
+    /// `OCEAN_FLOOR_WG` — the same terrain row from the decoration-time map.
+    OceanFloorWg,
+    /// A map name without a runtime here, kept for the gap report.
+    Unsupported { kind: String },
+}
+
+impl HeightmapType {
+    /// Names the pack writes. An unrecognised name stays `Unsupported`
+    /// rather than being read as one of the five.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "MOTION_BLOCKING" => Self::MotionBlocking,
+            "MOTION_BLOCKING_NO_LEAVES" => Self::MotionBlockingNoLeaves,
+            "WORLD_SURFACE_WG" => Self::WorldSurfaceWg,
+            "OCEAN_FLOOR" => Self::OceanFloor,
+            "OCEAN_FLOOR_WG" => Self::OceanFloorWg,
+            other => Self::Unsupported {
+                kind: other.to_string(),
+            },
+        }
+    }
+
+    /// Whether a map name has a runtime here.
+    pub fn is_modelable(&self) -> bool {
+        !matches!(self, Self::Unsupported { .. })
+    }
+
+    /// The column row this map answers with.
+    ///
+    /// A pre-decoration column holds filler solids, sea fluid and air only:
+    /// nothing that stops motion is not solid, and no leaf block exists yet
+    /// because no tree feature is modeled here. The three surface-ish maps
+    /// therefore answer the same highest-non-air row, and the two ocean-floor
+    /// maps answer the terrain row the generator already stores.
+    fn row(&self, target: &dyn DecorationTarget, x: i32, z: i32) -> Option<i32> {
+        match self {
+            Self::MotionBlocking | Self::MotionBlockingNoLeaves | Self::WorldSurfaceWg => {
+                target.surface_height(x, z)
+            }
+            // The stored terrain row of a column that has no surface at all
+            // is the dimension floor, which is not a surface: the candidate
+            // drops for the same reason the world-surface maps drop it, so no
+            // modeled map type can decorate the void.
+            Self::OceanFloor | Self::OceanFloorWg => target
+                .surface_height(x, z)
+                .map(|_| target.ocean_floor_height(x, z)),
+            // Never reached: `is_modelable` gates the chain out first.
+            Self::Unsupported { .. } => None,
+        }
+    }
+}
+
 /// One ore target: what to test and what to write when it matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OreTarget {
@@ -204,6 +390,11 @@ pub enum ConfiguredFeature {
         targets: Vec<OreTarget>,
         discard_chance_on_air_exposure: f32,
     },
+    /// `minecraft:simple_block` — one state at one position, the pack's
+    /// ground-cover family: grass, flowers, mushrooms, bushes and fire.
+    SimpleBlock {
+        to_place: StateProvider,
+    },
     Unsupported {
         kind: String,
     },
@@ -212,12 +403,14 @@ pub enum ConfiguredFeature {
 impl ConfiguredFeature {
     /// Whether placement of this feature is modeled here. An ore whose
     /// targets contain a test this runtime cannot evaluate is not modeled,
-    /// even though the ore shape itself is.
+    /// even though the ore shape itself is; the same goes for a simple block
+    /// whose state provider has no runtime.
     pub fn is_supported(&self) -> bool {
         match self {
             Self::Ore { targets, .. } => {
                 targets.iter().all(|target| target.predicate.is_modelable())
             }
+            Self::SimpleBlock { to_place } => to_place.is_modelable(),
             Self::Unsupported { .. } => false,
         }
     }
@@ -360,6 +553,78 @@ impl RangeProvider {
     pub fn is_modelable(&self) -> bool {
         !matches!(self, Self::Unsupported { .. })
     }
+
+    /// Parses one axis of a `minecraft:offset` decoration. The pack writes an
+    /// offset's range as a plain numeric `min`/`max` (trapezoid) or
+    /// `min_inclusive`/`max_inclusive` (uniform) pair rather than the anchors
+    /// a height band resolves against the dimension, so both bounds become
+    /// absolute and the existing sample paths give the shift the same draw
+    /// count it has for a height: none for a constant, one for a uniform, two
+    /// for a triangle. A shape with no runtime here — a `plateau` the sampling
+    /// does not model, a `minecraft:clamped_normal`, a missing axis — stays
+    /// `Unsupported`, which gates the whole chain out and names it.
+    fn from_offset_value(value: &Value) -> Self {
+        let absolute = |number: Option<i64>| -> Option<VerticalAnchor> {
+            let number = number?;
+            let number = i32::try_from(number).ok()?;
+            (-32_768..=32_768)
+                .contains(&number)
+                .then_some(VerticalAnchor::Absolute(number))
+        };
+        let constant = |number: Option<i64>| -> Option<Self> {
+            let number = i32::try_from(number?).ok()?;
+            (-32_768..=32_768)
+                .contains(&number)
+                .then_some(Self::Constant(number))
+        };
+        let unsupported = |kind: &str| Self::Unsupported {
+            kind: kind.to_string(),
+        };
+        if value.as_i64().is_some() {
+            return constant(value.as_i64())
+                .unwrap_or_else(|| unsupported("minecraft:offset_too_wide"));
+        }
+        let Some(object) = value.as_object() else {
+            return unsupported("minecraft:missing_provider");
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("minecraft:missing_provider");
+        if kind == "minecraft:constant" {
+            return constant(object.get("value").and_then(Value::as_i64))
+                .unwrap_or_else(|| unsupported(kind));
+        }
+        let (min_key, max_key) = if kind == "minecraft:trapezoid" {
+            ("min", "max")
+        } else {
+            ("min_inclusive", "max_inclusive")
+        };
+        let (Some(min_inclusive), Some(max_inclusive)) = (
+            absolute(object.get(min_key).and_then(Value::as_i64)),
+            absolute(object.get(max_key).and_then(Value::as_i64)),
+        ) else {
+            return unsupported(kind);
+        };
+        if kind == "minecraft:trapezoid"
+            && object.get("plateau").and_then(Value::as_i64).unwrap_or(0) != 0
+        {
+            // A plateau flattens the triangle; the shared sampler models the
+            // symmetric one only, which is what the pack's offsets use.
+            return unsupported(kind);
+        }
+        match kind {
+            "minecraft:uniform" => Self::Uniform {
+                min_inclusive,
+                max_inclusive,
+            },
+            "minecraft:trapezoid" => Self::Trapezoid {
+                min_inclusive,
+                max_inclusive,
+            },
+            _ => unsupported(kind),
+        }
+    }
 }
 
 /// One decoration step of a placed feature.
@@ -373,6 +638,19 @@ pub enum PlacementModifier {
     InSquare,
     /// `minecraft:height_range` — the vertical band of the attempt.
     HeightRange { height: RangeProvider },
+    /// `minecraft:heightmap` — move the candidate to the surface row of the
+    /// named map for its column. Costs no draws.
+    Heightmap { heightmap: HeightmapType },
+    /// `minecraft:offset` — shift the candidate by three int providers, x, y
+    /// and z in that order.
+    Offset {
+        x: RangeProvider,
+        y: RangeProvider,
+        z: RangeProvider,
+    },
+    /// `minecraft:block_predicate_filter` — keep the candidate only where the
+    /// block around it answers the predicate. Costs no draws.
+    BlockPredicateFilter { predicate: BlockPredicate },
     /// `minecraft:biome` — keep the position only if the biome at it lists
     /// this feature.
     Biome,
@@ -394,13 +672,24 @@ impl PlacedFeature {
     /// this feature; the feature still holds its ordinal in its step, so
     /// the numbers the other features are seeded with do not move.
     pub fn is_modelable(&self) -> bool {
-        self.feature.is_supported()
-            && self.modifiers.iter().all(|modifier| match modifier {
-                PlacementModifier::Unsupported { .. } => false,
-                PlacementModifier::Count { count } => count.is_modelable(),
-                PlacementModifier::HeightRange { height } => height.is_modelable(),
-                _ => true,
-            })
+        self.feature.is_supported() && self.modifiers.iter().all(modifier_is_modelable)
+    }
+}
+
+/// Whether one decoration step has a runtime here. Split out of
+/// [`PlacedFeature::is_modelable`] so a measurement can ask *which* decoration
+/// of a gated chain gated it, and stay unable to disagree with the gate itself.
+fn modifier_is_modelable(modifier: &PlacementModifier) -> bool {
+    match modifier {
+        PlacementModifier::Unsupported { .. } => false,
+        PlacementModifier::Count { count } => count.is_modelable(),
+        PlacementModifier::HeightRange { height } => height.is_modelable(),
+        PlacementModifier::Heightmap { heightmap } => heightmap.is_modelable(),
+        PlacementModifier::Offset { x, y, z } => {
+            x.is_modelable() && y.is_modelable() && z.is_modelable()
+        }
+        PlacementModifier::BlockPredicateFilter { predicate } => predicate.is_modelable(),
+        _ => true,
     }
 }
 
@@ -553,6 +842,9 @@ impl FeatureData {
                     for target in targets {
                         record_unmodeled_rule(&mut data.unimplemented_features, &target.predicate);
                     }
+                }
+                ConfiguredFeature::SimpleBlock { to_place } => {
+                    record_unmodeled_provider(&mut data.unimplemented_features, to_place);
                 }
             }
             data.configured.insert(id, Rc::new(feature));
@@ -897,6 +1189,17 @@ pub(crate) fn parse_configured_feature(
         .and_then(Value::as_str)
         .unwrap_or("minecraft:missing_type")
         .to_string();
+    if kind == "minecraft:simple_block" {
+        // The pack writes the state provider at the top level, and the older
+        // `config` wrapper is accepted here too, as for an ore.
+        let body = match document.get("config") {
+            Some(config) if config.is_object() => config,
+            _ => document,
+        };
+        return Ok(ConfiguredFeature::SimpleBlock {
+            to_place: parse_state_provider(body.get("to_place")),
+        });
+    }
     if kind != "minecraft:ore" {
         return Ok(ConfiguredFeature::Unsupported { kind });
     }
@@ -983,15 +1286,73 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
 /// chain then yields nothing, so without this key a feature whose configured
 /// type *is* modeled — `minecraft:ore` — would be
 /// missing from the gap report entirely.
+///
+/// The three decorations this runtime models carry their own parameter, and
+/// a parameter without a runtime gates the chain out just as an unknown
+/// modifier type does. Those get the modifier-level key above *and* a key
+/// naming the parameter (`heightmap:<name>`, `offset:<name>`,
+/// `predicate:<name>`), so the report says which inner shape is missing
+/// rather than only which modifier was carrying it.
 fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &PlacedFeature) {
-    let mut seen: HashSet<&str> = HashSet::new();
-    for modifier in &placed.modifiers {
-        let PlacementModifier::Unsupported { kind } = modifier else {
-            continue;
-        };
-        if seen.insert(kind.as_str()) {
-            *counts.entry(format!("placement:{kind}")).or_insert(0) += 1;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut record = |key: String| {
+        if seen.insert(key.clone()) {
+            *counts.entry(key).or_insert(0) += 1;
         }
+    };
+    for modifier in &placed.modifiers {
+        match modifier {
+            PlacementModifier::Unsupported { kind } => record(format!("placement:{kind}")),
+            PlacementModifier::Heightmap {
+                heightmap: HeightmapType::Unsupported { kind },
+            } => {
+                record("placement:minecraft:heightmap".to_string());
+                record(format!("heightmap:{kind}"));
+            }
+            PlacementModifier::Offset { x, y, z } => {
+                for provider in [x, y, z] {
+                    if let RangeProvider::Unsupported { kind } = provider {
+                        record("placement:minecraft:offset".to_string());
+                        record(format!("offset:{kind}"));
+                    }
+                }
+            }
+            PlacementModifier::BlockPredicateFilter { predicate } => {
+                for kind in unmodeled_predicates(predicate) {
+                    record("placement:minecraft:block_predicate_filter".to_string());
+                    record(format!("predicate:{kind}"));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The unmodeled predicate types one `minecraft:block_predicate_filter` nests,
+/// in the order the document writes them.
+fn unmodeled_predicates(predicate: &BlockPredicate) -> Vec<&str> {
+    let mut kinds = Vec::new();
+    match predicate {
+        BlockPredicate::Unsupported { kind } => kinds.push(kind.as_str()),
+        BlockPredicate::AnyOf(rules) | BlockPredicate::AllOf(rules) => {
+            for nested in rules {
+                kinds.extend(unmodeled_predicates(nested));
+            }
+        }
+        BlockPredicate::Not(nested) => kinds.extend(unmodeled_predicates(nested)),
+        _ => {}
+    }
+    kinds
+}
+
+/// Counts the block-state provider shapes a modeled configured feature asks
+/// for without a runtime here, keyed `provider:<kind>`. Without it the
+/// configured type's own key would disappear from the report as soon as the
+/// type was modeled, and a `minecraft:simple_block` whose state comes from a
+/// provider this runtime does not resolve would look like no gap at all.
+fn record_unmodeled_provider(counts: &mut HashMap<String, usize>, provider: &StateProvider) {
+    if let StateProvider::Unsupported { kind } = provider {
+        *counts.entry(format!("provider:{kind}")).or_insert(0) += 1;
     }
 }
 
@@ -1081,6 +1442,217 @@ fn parse_rule_test(value: Option<&Value>) -> Result<RuleTest, WorldgenError> {
         other => Ok(RuleTest::Unsupported {
             kind: other.to_string(),
         }),
+    }
+}
+
+/// One block state the pack names directly: a bare id, or the
+/// `{"id": ..., "properties": {...}}` object the 26.3 documents write. The
+/// properties are rendered in the `id[k=v,...]` form the save palettes use,
+/// with the keys in sorted order so the name does not depend on the
+/// document's own ordering.
+fn parse_direct_state(value: &Value) -> Option<String> {
+    if let Some(name) = value.as_str() {
+        return Some(name.to_string());
+    }
+    let object = value.as_object()?;
+    state_from_object(object)
+}
+
+/// The `{"id": ..., "properties": {...}}` form of a directly named state.
+fn state_from_object(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let name = object.get("id").and_then(Value::as_str)?;
+    let properties = object.get("properties").and_then(Value::as_object);
+    let Some(properties) = properties.filter(|map| !map.is_empty()) else {
+        return Some(name.to_string());
+    };
+    let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let inner: Vec<String> = keys
+        .iter()
+        .filter_map(|key| Some(format!("{key}={}", properties[*key].as_str()?)))
+        .collect();
+    if inner.len() != keys.len() {
+        // A non-string property value has no agreed rendering here.
+        return None;
+    }
+    Some(format!("{name}[{}]", inner.join(",")))
+}
+
+/// Parses one `to_place` block-state provider. A state the pack names
+/// directly needs no runtime; a reference into the pack's
+/// `block_state_provider` registry, or a provider shape with no sampling code
+/// here, is named as a gap rather than guessed at.
+fn parse_state_provider(value: Option<&Value>) -> StateProvider {
+    let unsupported = |kind: &str| StateProvider::Unsupported {
+        kind: kind.to_string(),
+    };
+    match value {
+        None => unsupported("minecraft:missing_to_place"),
+        Some(Value::String(name)) if name.starts_with('#') => {
+            // A block-tag reference picks its state from the tag's members at
+            // placement; no runtime here reads that back.
+            unsupported("minecraft:block_tag")
+        }
+        // The 26.3 pack puts a *reference into its own
+        // `block_state_provider` registry* at this position, not a block
+        // name: every bare string it writes here
+        // (`minecraft:flower_plain`, `minecraft:flower_meadow`,
+        // `minecraft:flower_flower_forest`) is the id of a document under
+        // `worldgen/block_state_provider`, and none of them is a block.
+        // Reading one as a state would write a block that does not exist, so
+        // it stays a named gap. A string inside a `weighted` entry is the
+        // other codec field — a block state — and is a constant there.
+        Some(Value::String(_)) => unsupported("minecraft:block_state_provider_reference"),
+        Some(Value::Object(object)) => {
+            match object.get("type").and_then(Value::as_str) {
+                Some("minecraft:weighted") => {
+                    let entries: Vec<WeightedState> = object
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|entry| {
+                            let weight = entry.get("weight").and_then(Value::as_i64)?;
+                            Some(WeightedState {
+                                state: parse_direct_state(entry.get("data")?)?,
+                                weight: i32::try_from(weight).ok()?,
+                            })
+                        })
+                        .collect();
+                    let count = object
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default();
+                    // A partially parsed list would change which entry the
+                    // draw picks, so an entry this runtime cannot name gates
+                    // the whole provider instead.
+                    if entries.len() != count
+                        || entries.is_empty()
+                        || entries.len() > 64
+                        || !entries
+                            .iter()
+                            .all(|entry| (1..=1_000_000).contains(&entry.weight))
+                    {
+                        unsupported("minecraft:weighted")
+                    } else {
+                        StateProvider::Weighted { entries }
+                    }
+                }
+                Some(other) => unsupported(other),
+                // No `type`: the direct block-state form.
+                None => state_from_object(object).map_or_else(
+                    || unsupported("minecraft:missing_state"),
+                    |state| StateProvider::Constant { state },
+                ),
+            }
+        }
+        Some(_) => unsupported("minecraft:missing_to_place"),
+    }
+}
+
+/// A `minecraft:block_predicate_filter`'s position offset: three small
+/// integers, `[0, 0, 0]` when the document writes none. A wider shift reads
+/// beyond the region the decoration pass resolves, so it is refused.
+fn parse_block_offset(object: &serde_json::Map<String, Value>) -> Option<(i32, i32, i32)> {
+    let Some(value) = object.get("offset") else {
+        return Some((0, 0, 0));
+    };
+    let parts = value.as_array().filter(|parts| parts.len() == 3)?;
+    let mut axes = [0i32; 3];
+    for (index, part) in parts.iter().enumerate() {
+        let number = i32::try_from(part.as_i64()?).ok()?;
+        axes[index] = number;
+    }
+    axes.iter()
+        .all(|axis| (-16..=16).contains(axis))
+        .then_some((axes[0], axes[1], axes[2]))
+}
+
+/// Parses one placement block predicate. An unknown predicate type, a missing
+/// one, or an offset this runtime will not read becomes `Unsupported`, which
+/// gates the chain out of the run instead of letting an untested position
+/// through.
+fn parse_block_predicate(value: Option<&Value>) -> BlockPredicate {
+    let unsupported = |kind: &str| BlockPredicate::Unsupported {
+        kind: kind.to_string(),
+    };
+    let Some(Value::Object(object)) = value else {
+        return unsupported("minecraft:missing_predicate");
+    };
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("minecraft:missing_predicate");
+    let nested = |key: &str| -> Vec<BlockPredicate> {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .map(|entry| parse_block_predicate(Some(entry)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match kind {
+        "minecraft:matching_block_tag" => {
+            let Some(tag) = object.get("tag").and_then(Value::as_str) else {
+                return unsupported(kind);
+            };
+            match parse_block_offset(object) {
+                Some(offset) => BlockPredicate::BlockTag {
+                    tag: tag.to_string(),
+                    offset,
+                },
+                None => unsupported(kind),
+            }
+        }
+        "minecraft:matching_blocks" => {
+            let blocks: Vec<String> = match object.get("blocks") {
+                Some(Value::Array(list)) => list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect(),
+                Some(Value::String(single)) => vec![single.to_string()],
+                _ => Vec::new(),
+            };
+            let count = object
+                .get("blocks")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(1);
+            if blocks.is_empty()
+                || blocks.len() != count
+                || blocks.iter().any(|block| block.starts_with('#'))
+            {
+                return unsupported(kind);
+            }
+            match parse_block_offset(object) {
+                Some(offset) => BlockPredicate::Blocks { blocks, offset },
+                None => unsupported(kind),
+            }
+        }
+        // An empty conjunction would accept every position and an empty
+        // disjunction is a no-op, so neither is read as a filter at all.
+        "minecraft:any_of" | "minecraft:all_of" => {
+            let rules = nested("predicates");
+            if rules.is_empty() {
+                return unsupported(kind);
+            }
+            if kind == "minecraft:any_of" {
+                BlockPredicate::AnyOf(rules)
+            } else {
+                BlockPredicate::AllOf(rules)
+            }
+        }
+        "minecraft:not" => match object.get("predicate") {
+            Some(inner) => BlockPredicate::Not(Box::new(parse_block_predicate(Some(inner)))),
+            None => unsupported(kind),
+        },
+        other => unsupported(other),
     }
 }
 
@@ -1179,6 +1751,38 @@ fn parse_placement_modifier(
             })
         }
         "minecraft:biome" => Ok(PlacementModifier::Biome),
+        "minecraft:heightmap" => {
+            // An unmapped map name is kept as `HeightmapType::Unsupported`
+            // rather than failed here: the pack is read whole, and one
+            // dimension's exotic map must not stop the others loading.
+            let name = entry
+                .get("heightmap")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{id}: heightmap placement without a map name"))
+                })?;
+            Ok(PlacementModifier::Heightmap {
+                heightmap: HeightmapType::from_name(name),
+            })
+        }
+        "minecraft:offset" => {
+            let axis = |key: &str| {
+                entry.get(key).map_or_else(
+                    || RangeProvider::Unsupported {
+                        kind: "minecraft:missing_provider".to_string(),
+                    },
+                    RangeProvider::from_offset_value,
+                )
+            };
+            Ok(PlacementModifier::Offset {
+                x: axis("x"),
+                y: axis("y"),
+                z: axis("z"),
+            })
+        }
+        "minecraft:block_predicate_filter" => Ok(PlacementModifier::BlockPredicateFilter {
+            predicate: parse_block_predicate(entry.get("predicate")),
+        }),
         other => Ok(PlacementModifier::Unsupported {
             kind: other.to_string(),
         }),
@@ -1305,10 +1909,10 @@ pub struct DecorationPos {
 /// geometry independent of how the terrain was produced.
 ///
 /// Every position the pass writes is inside the implementation's own chunk.
-/// Reads reach one column beyond it: the six-neighbour air test, and the
-/// heightmap the ore anchor gate walks over its box's footprint, whose halo
-/// columns stay within the 3x3 chunk region the pass already resolves biomes
-/// over.
+/// Reads reach one column beyond it: the six-neighbour air test, the
+/// heightmap the ore anchor gate walks over its box's footprint, and the
+/// single column a `minecraft:heightmap` decoration resolves — halo columns
+/// stay within the 3x3 chunk region the pass already resolves biomes over.
 pub trait DecorationTarget {
     /// The dimension's lowest buildable row.
     fn min_y(&self) -> i32;
@@ -1336,6 +1940,12 @@ pub trait DecorationTarget {
     /// floor do not count. The ore anchor gate reads it for every column of
     /// its box's footprint, including the halo over the neighbour chunks.
     fn ocean_floor_height(&self, x: i32, z: i32) -> i32;
+    /// The absolute Y of the highest non-air row of the column, as the
+    /// decoration-time world-surface map reports it, or `None` when the
+    /// column holds no block at all. The `minecraft:heightmap` decoration
+    /// reads it for the one column of each candidate, so a column with no
+    /// surface drops the candidate rather than decorating the void.
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32>;
 }
 
 /// Java `Mth.SIN`: a 65536-entry table indexed by a fixed-point multiple of
@@ -1563,6 +2173,34 @@ fn place_ore(
     written
 }
 
+/// Places one `minecraft:simple_block` state, returning the number of blocks
+/// written.
+///
+/// The position has to be inside the decorated chunk before anything is drawn,
+/// the same confinement and the same stream discipline the vein path keeps:
+/// the neighbour's own pass paints its half of a patch that straddles the
+/// border. The state then comes from the provider — a weighted pick costs one
+/// bounded draw — and the block written only replaces air, which is what the
+/// pack's own `minecraft:air` tag says the chains gated on it expect.
+fn place_simple_block(
+    target: &mut dyn DecorationTarget,
+    random: &mut DecorationRandom,
+    to_place: &StateProvider,
+    pos: DecorationPos,
+) -> usize {
+    if !target.writable(pos.x, pos.y, pos.z) {
+        return 0;
+    }
+    let Some(state) = to_place.sample(random) else {
+        return 0;
+    };
+    if !target.is_air(pos.x, pos.y, pos.z) {
+        return 0;
+    }
+    target.set_block(pos.x, pos.y, pos.z, state);
+    1
+}
+
 impl FeatureData {
     /// Runs one generation step's modeled features for one chunk, drawing
     /// from the stream the step's ordinal gives that chunk, and returns the
@@ -1656,6 +2294,9 @@ impl FeatureData {
                     *discard_chance_on_air_exposure,
                     pos,
                 ),
+                ConfiguredFeature::SimpleBlock { to_place } => {
+                    place_simple_block(target, random, to_place, pos)
+                }
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
@@ -1685,6 +2326,42 @@ impl FeatureData {
                 let mut next = pos;
                 next.y = provider.sample(target.min_y(), target.height(), random);
                 self.run_chain(target, placed, index + 1, next, random)
+            }
+            PlacementModifier::Heightmap { heightmap } => {
+                // Resolving the map costs no draws. A column whose surface
+                // does not exist answers nothing, and the candidate is dropped
+                // rather than decorated into the void.
+                let Some(y) = heightmap.row(target, pos.x, pos.z) else {
+                    return 0;
+                };
+                let mut next = pos;
+                next.y = y;
+                self.run_chain(target, placed, index + 1, next, random)
+            }
+            PlacementModifier::Offset { x, y, z } => {
+                // The three axes are sampled in the order the document names
+                // them, and all three before the result is tested, so a shift
+                // that leaves the build volume costs its draws and drops the
+                // candidate instead of wrapping inside it.
+                let (min_y, height) = (target.min_y(), target.height());
+                let mut next = pos;
+                next.x += x.sample(min_y, height, random);
+                next.y += y.sample(min_y, height, random);
+                next.z += z.sample(min_y, height, random);
+                if next.y < min_y || next.y > min_y + height - 1 {
+                    return 0;
+                }
+                self.run_chain(target, placed, index + 1, next, random)
+            }
+            PlacementModifier::BlockPredicateFilter { predicate } => {
+                // The predicate reads the terrain around the candidate and
+                // costs no draws; an unmodeled shape inside it is gated out by
+                // `is_modelable` long before this point.
+                if predicate.test(target, pos, &self.tags) {
+                    self.run_chain(target, placed, index + 1, pos, random)
+                } else {
+                    0
+                }
             }
             PlacementModifier::Biome => {
                 // The filter asks the biome at the candidate position, not at
@@ -2024,7 +2701,8 @@ mod tests {
             "report-dedup",
             r#"[{"type": "minecraft:random_offset", "xz_spread": 7, "y_spread": 3},
                 {"type": "minecraft:random_offset", "xz_spread": 2, "y_spread": 1},
-                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:noise_threshold_count", "noise_level": -0.8,
+                    "below_noise": 1, "above_noise": 4},
                 {"type": "minecraft:biome"}]"#,
         );
         let data = FeatureData::load(&root).expect("loads");
@@ -2037,7 +2715,7 @@ mod tests {
         );
         assert_eq!(
             data.unimplemented_features
-                .get("placement:minecraft:heightmap"),
+                .get("placement:minecraft:noise_threshold_count"),
             Some(&1),
             "a second unmodeled kind in the same document gets its own key"
         );
@@ -2093,9 +2771,16 @@ mod tests {
             Some(&1)
         );
         assert_eq!(
+            data.unimplemented_features
+                .get("offset:minecraft:missing_provider"),
+            Some(&1),
+            "the offset is modeled, but the parameter inside it that is not gets \
+             its own key"
+        );
+        assert_eq!(
             data.unimplemented_features.len(),
-            3,
-            "the three namespaces stay separate: {:?}",
+            4,
+            "the four namespaces stay separate: {:?}",
             data.unimplemented_features
         );
         assert!(
@@ -2155,6 +2840,8 @@ mod tests {
         base: String,
         write_anywhere: bool,
         ground: i32,
+        surface: Option<i32>,
+        air_above: Option<i32>,
         written: HashMap<(i32, i32, i32), String>,
         biome: Option<String>,
     }
@@ -2169,6 +2856,8 @@ mod tests {
                 base: "minecraft:stone".to_string(),
                 write_anywhere: false,
                 ground: 127,
+                surface: Some(127),
+                air_above: None,
                 written: HashMap::new(),
                 biome: Some("minecraft:plains".to_string()),
             }
@@ -2194,6 +2883,36 @@ mod tests {
         /// for the anchor gate to read.
         fn with_ground(mut self, y: i32) -> Self {
             self.ground = y;
+            self
+        }
+
+        /// The block every filled row of the fixture reads as, for a host test
+        /// that has to name the terrain the cover sits on.
+        fn with_base(mut self, name: &str) -> Self {
+            self.base = name.to_string();
+            self
+        }
+
+        /// The row every column's decoration-time world-surface map reports,
+        /// for the `minecraft:heightmap` decoration to resolve. The fixture
+        /// terrain fills the build volume, so the default is its top row; a
+        /// target with no surface at all answers `None`.
+        fn with_surface(mut self, y: i32) -> Self {
+            self.surface = Some(y);
+            self
+        }
+
+        fn without_surface(mut self) -> Self {
+            self.surface = None;
+            self
+        }
+
+        /// Leave every row above `y` empty, so the fixture reads as terrain up
+        /// to `y` and air over it. Ground cover resolves its candidate onto the
+        /// surface row and then asks whether that row is free, which the
+        /// all-solid fixture could never answer.
+        fn with_air_above(mut self, y: i32) -> Self {
+            self.air_above = Some(y);
             self
         }
 
@@ -2238,6 +2957,9 @@ mod tests {
             if let Some(name) = self.written.get(&(x, y, z)) {
                 return Some(name);
             }
+            if self.air_above.is_some_and(|top| y > top) {
+                return Some("minecraft:air");
+            }
             (y >= self.min_y && y <= self.max_y()).then_some(self.base.as_str())
         }
 
@@ -2258,6 +2980,10 @@ mod tests {
 
         fn ocean_floor_height(&self, _x: i32, _z: i32) -> i32 {
             self.ground
+        }
+
+        fn surface_height(&self, _x: i32, _z: i32) -> Option<i32> {
+            self.surface
         }
     }
 
@@ -3308,6 +4034,883 @@ mod tests {
         data.set_biome_order(&["testns:two", "testns:one"]);
         assert_eq!(step_ids(&data, 0), ["testns:ore_a", "testns:ore_b"]);
         assert_eq!(data.region_ordinals(0, &only_one), vec![0]);
+    }
+
+    /// The ground-cover feature: one state written at the surviving position.
+    fn ground_cover(state: &str) -> Rc<ConfiguredFeature> {
+        Rc::new(ConfiguredFeature::SimpleBlock {
+            to_place: StateProvider::Constant {
+                state: state.to_string(),
+            },
+        })
+    }
+
+    /// The tag fixture a `minecraft:matching_block_tag` predicate reads: air is
+    /// a member, the fixture's base stone is not.
+    fn air_tags() -> BlockTags {
+        BlockTags {
+            entries: HashMap::from([(
+                "minecraft:air".to_string(),
+                vec!["minecraft:air".to_string()],
+            )]),
+        }
+    }
+
+    /// Runs one ground-cover chain over the plains biome of the fixture region.
+    fn cover_run(
+        feature: &Rc<ConfiguredFeature>,
+        modifiers: Vec<PlacementModifier>,
+        target: &mut TestTarget,
+    ) -> usize {
+        let data = registry(vec![wrapper("testns:cover", feature, modifiers)]);
+        data.decorate_step(target, 0, 0, 0, 2026, &region())
+    }
+
+    #[test]
+    fn the_heightmap_decoration_resolves_the_surface_row_of_its_map() {
+        // Terrain up to row 70, air over it, and an ocean-floor row the world
+        // surface does not report: the two map families have to answer their
+        // own row, not each other's.
+        let lift = || PlacementModifier::Offset {
+            x: RangeProvider::Constant(0),
+            y: RangeProvider::Constant(1),
+            z: RangeProvider::Constant(0),
+        };
+        for (name, expected) in [
+            (HeightmapType::MotionBlocking, 70),
+            (HeightmapType::MotionBlockingNoLeaves, 70),
+            (HeightmapType::WorldSurfaceWg, 70),
+            (HeightmapType::OceanFloor, 60),
+            (HeightmapType::OceanFloorWg, 60),
+        ] {
+            let surface = if expected == 70 { 70 } else { 80 };
+            let target = TestTarget::new()
+                .with_surface(surface)
+                .with_ground(60)
+                .with_air_above(59);
+            assert_eq!(
+                name.row(&target, 0, 0),
+                Some(expected),
+                "{name:?} resolves its own row"
+            );
+            let mut target = TestTarget::new()
+                .with_surface(surface)
+                .with_ground(60)
+                .with_air_above(59);
+            let written = cover_run(
+                &ground_cover("minecraft:short_grass"),
+                vec![
+                    PlacementModifier::Heightmap {
+                        heightmap: name.clone(),
+                    },
+                    lift(),
+                ],
+                &mut target,
+            );
+            assert_eq!(
+                target.written.get(&(0, expected + 1, 0)),
+                Some(&"minecraft:short_grass".to_string()),
+                "{name:?} lands its candidate one row above its own surface"
+            );
+            assert_eq!(written, 1, "{name:?} places exactly one block");
+        }
+    }
+
+    #[test]
+    fn a_heightmap_over_a_column_with_no_surface_drops_the_candidate() {
+        // The void must not be decorated: every modeled map type, the terrain
+        // rows included, drops the candidate when the column answers nothing.
+        for name in [
+            HeightmapType::MotionBlocking,
+            HeightmapType::MotionBlockingNoLeaves,
+            HeightmapType::WorldSurfaceWg,
+            HeightmapType::OceanFloor,
+            HeightmapType::OceanFloorWg,
+        ] {
+            let target = TestTarget::new().without_surface();
+            assert_eq!(name.row(&target, 0, 0), None, "{name:?} reads the void");
+            let mut target = TestTarget::new().without_surface().write_anywhere();
+            let written = cover_run(
+                &ground_cover("minecraft:short_grass"),
+                vec![PlacementModifier::Heightmap {
+                    heightmap: name.clone(),
+                }],
+                &mut target,
+            );
+            assert_eq!(written, 0, "{name:?} must drop, not decorate the void");
+            assert!(target.written.is_empty(), "{name:?} wrote into the void");
+        }
+    }
+
+    #[test]
+    fn an_unknown_heightmap_name_stays_a_named_gap() {
+        // A map name the pack invents is not silently read as one of the five.
+        assert!(matches!(
+            HeightmapType::from_name("MOTION_BLOCKING"),
+            HeightmapType::MotionBlocking
+        ));
+        let typo = HeightmapType::from_name("WORLD_SURFACE");
+        assert!(
+            !typo.is_modelable()
+                && matches!(typo, HeightmapType::Unsupported { kind } if kind == "WORLD_SURFACE"),
+            "an unmapped name keeps its own name"
+        );
+        let root = report_pack(
+            "report-heightmap-gap",
+            r#"[{"type": "minecraft:count", "count": 1},
+                {"type": "minecraft:heightmap", "heightmap": "WORLD_SURFACE"},
+                {"type": "minecraft:biome"}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert_eq!(
+            data.unimplemented_features.get("heightmap:WORLD_SURFACE"),
+            Some(&1),
+            "the parameter is named, not only its decoration"
+        );
+        assert_eq!(
+            data.unimplemented_features
+                .get("placement:minecraft:heightmap"),
+            Some(&1),
+            "and the decoration that carries it stays named too"
+        );
+        assert!(
+            !data.step(0).expect("step 0")[0].is_modelable(),
+            "so the chain is gated out of the run"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_offset_decoration_shifts_the_candidate_on_all_three_axes() {
+        let mut target = TestTarget::new()
+            .with_surface(70)
+            .with_air_above(70)
+            .write_anywhere();
+        let written = cover_run(
+            &ground_cover("minecraft:poppy"),
+            vec![
+                PlacementModifier::Heightmap {
+                    heightmap: HeightmapType::MotionBlocking,
+                },
+                PlacementModifier::Offset {
+                    x: RangeProvider::Constant(-3),
+                    y: RangeProvider::Constant(1),
+                    z: RangeProvider::Constant(5),
+                },
+            ],
+            &mut target,
+        );
+        assert_eq!(written, 1);
+        assert_eq!(
+            target.written.keys().collect::<Vec<_>>(),
+            vec![&(-3, 71, 5)],
+            "the shift is added to the resolved position, negatives included"
+        );
+    }
+
+    #[test]
+    fn an_offset_outside_the_build_volume_drops_the_candidate() {
+        // One chain, three candidate rows. The shift is applied first and the
+        // build volume tested after, so a candidate that leaves the volume
+        // drops instead of wrapping inside it. Every row of this fixture reads
+        // as air, so only the bound can be what rejects.
+        fn chain(dy: i32) -> PlacedFeature {
+            PlacedFeature {
+                id: "testns:cover".to_string(),
+                feature: ground_cover("minecraft:poppy"),
+                modifiers: vec![PlacementModifier::Offset {
+                    x: RangeProvider::Constant(0),
+                    y: RangeProvider::Constant(dy),
+                    z: RangeProvider::Constant(0),
+                }],
+            }
+        }
+        let run = |placed: &PlacedFeature, y: i32| {
+            let mut target = TestTarget::new().with_air_above(-1);
+            let mut random = DecorationRandom::new(2026);
+            let written = FeatureData::default().run_chain(
+                &mut target,
+                placed,
+                0,
+                DecorationPos { x: 0, y, z: 0 },
+                &mut random,
+            );
+            (written, target.blocks("minecraft:poppy"))
+        };
+        let downward = chain(-1);
+        let upward = chain(1);
+        assert_eq!(
+            run(&downward, 0),
+            (0, 0),
+            "a shift below the dimension floor drops the candidate"
+        );
+        assert_eq!(
+            run(&upward, 127),
+            (0, 0),
+            "and so does one past the ceiling"
+        );
+        assert_eq!(
+            run(&downward, 1),
+            (1, 1),
+            "the same negative shift inside the volume places"
+        );
+        // The drop happens after the shift drew: the bound is tested only once
+        // all three axes have been sampled, so the stream a chain spends does
+        // not depend on where its candidate landed.
+        let dropped = PlacedFeature {
+            id: "testns:cover".to_string(),
+            feature: ground_cover("minecraft:poppy"),
+            modifiers: vec![PlacementModifier::Offset {
+                x: RangeProvider::Uniform {
+                    min_inclusive: VerticalAnchor::Absolute(0),
+                    max_inclusive: VerticalAnchor::Absolute(1),
+                },
+                y: RangeProvider::Constant(1),
+                z: RangeProvider::Constant(0),
+            }],
+        };
+        let mut probe = DecorationRandom::new(2026);
+        let mut reference = DecorationRandom::new(2026);
+        reference.next_int_bounded(2);
+        let mut ceiling = TestTarget::new().with_air_above(-1);
+        assert_eq!(
+            FeatureData::default().run_chain(
+                &mut ceiling,
+                &dropped,
+                0,
+                DecorationPos { x: 0, y: 127, z: 0 },
+                &mut probe,
+            ),
+            0
+        );
+        assert_eq!(
+            signature(&probe),
+            signature(&reference),
+            "the dropped candidate still cost its one bounded draw"
+        );
+    }
+
+    #[test]
+    fn the_offset_provider_reads_the_shapes_the_pack_writes() {
+        // 26.3 writes an offset's trapezoid as `min`/`max`/`plateau`, unlike the
+        // `min_inclusive`/`max_inclusive` pair a height band uses; both a bare
+        // number and a constant object are constants.
+        assert_eq!(
+            RangeProvider::from_offset_value(&json!(7)),
+            RangeProvider::Constant(7)
+        );
+        assert_eq!(
+            RangeProvider::from_offset_value(&json!({"type": "minecraft:constant", "value": -2})),
+            RangeProvider::Constant(-2)
+        );
+        assert_eq!(
+            RangeProvider::from_offset_value(
+                &json!({"type": "minecraft:trapezoid", "min": -7, "max": 7, "plateau": 0})
+            ),
+            RangeProvider::Trapezoid {
+                min_inclusive: VerticalAnchor::Absolute(-7),
+                max_inclusive: VerticalAnchor::Absolute(7),
+            }
+        );
+        assert_eq!(
+            RangeProvider::from_offset_value(
+                &json!({"type": "minecraft:uniform", "min_inclusive": -3, "max_inclusive": 3})
+            ),
+            RangeProvider::Uniform {
+                min_inclusive: VerticalAnchor::Absolute(-3),
+                max_inclusive: VerticalAnchor::Absolute(3),
+            }
+        );
+        // Shapes with no runtime here, and an anchor that resolves against the
+        // dimension rather than shifting the candidate, are refused.
+        for value in [
+            json!({"type": "minecraft:trapezoid", "min": -7, "max": 7, "plateau": 2}),
+            json!({"type": "minecraft:clamped_normal", "deviation": 1.0,
+                "min_inclusive": -3, "max_inclusive": 3, "mean": 0}),
+            json!({"type": "minecraft:uniform", "min_inclusive": {"absolute": 10}}),
+            json!(true),
+        ] {
+            let provider = RangeProvider::from_offset_value(&value);
+            assert!(
+                matches!(&provider, RangeProvider::Unsupported { kind } if !kind.is_empty()),
+                "{value} has no offset runtime, got {provider:?}"
+            );
+        }
+        // A shift is a shift: it never borrows the dimension bounds.
+        let shift = RangeProvider::from_offset_value(
+            &json!({"type": "minecraft:uniform", "min_inclusive": -3, "max_inclusive": 3}),
+        );
+        let mut random = DecorationRandom::new(2026);
+        for _ in 0..64 {
+            let drawn = shift.sample(-64, 384, &mut random);
+            assert!((-3..=3).contains(&drawn), "offset drew {drawn}");
+        }
+    }
+
+    #[test]
+    fn the_block_predicate_filter_tests_the_block_under_its_offset() {
+        let tags = air_tags();
+        // One host column of grass block at row 70 in terrain that is
+        // otherwise stone, so a shifted read can land on the host or miss it.
+        let mut target = TestTarget::new()
+            .with_base("minecraft:stone")
+            .with_surface(70)
+            .with_air_above(70);
+        target.set_block(0, 70, 0, "minecraft:grass_block");
+        let blocks = |name: &str, offset: (i32, i32, i32)| BlockPredicate::Blocks {
+            blocks: vec![name.to_string()],
+            offset,
+        };
+        let pos = DecorationPos { x: 0, y: 71, z: 0 };
+        assert!(
+            blocks("minecraft:grass_block", (0, -1, 0)).test(&target, pos, &tags),
+            "the block one row down is the host the predicate names"
+        );
+        assert!(
+            !blocks("minecraft:grass_block", (0, 0, 0)).test(&target, pos, &tags),
+            "the candidate's own row is air, so it is not the host"
+        );
+        assert!(
+            !blocks("minecraft:grass_block", (0, -1, 1)).test(&target, pos, &tags),
+            "a neighbour column of the host is not the host"
+        );
+        assert!(
+            !blocks("minecraft:dirt", (0, -1, 0)).test(&target, pos, &tags),
+            "the same read asks a block the host is not"
+        );
+        // The same test through the runtime: a chain whose host is wrong places
+        // nothing at all.
+        let mut planted = TestTarget::new()
+            .with_base("minecraft:dirt")
+            .with_surface(70)
+            .with_air_above(70);
+        planted.set_block(0, 70, 0, "minecraft:dirt");
+        let mut blocked = TestTarget::new()
+            .with_base("minecraft:stone")
+            .with_surface(70)
+            .with_air_above(70);
+        blocked.set_block(0, 70, 0, "minecraft:stone");
+        let chain = |target: &mut TestTarget| {
+            cover_run(
+                &ground_cover("minecraft:poppy"),
+                vec![
+                    PlacementModifier::Heightmap {
+                        heightmap: HeightmapType::MotionBlocking,
+                    },
+                    PlacementModifier::Offset {
+                        x: RangeProvider::Constant(0),
+                        y: RangeProvider::Constant(1),
+                        z: RangeProvider::Constant(0),
+                    },
+                    PlacementModifier::BlockPredicateFilter {
+                        predicate: blocks("minecraft:dirt", (0, -1, 0)),
+                    },
+                ],
+                target,
+            )
+        };
+        assert_eq!(chain(&mut planted), 1, "a dirt host carries the cover");
+        assert_eq!(chain(&mut blocked), 0, "a stone host does not");
+        assert!(
+            blocked
+                .written
+                .values()
+                .all(|state| state != "minecraft:poppy"),
+            "and the rejected candidate wrote nothing anywhere"
+        );
+    }
+
+    #[test]
+    fn tag_and_composition_predicates_accept_and_reject_as_documented() {
+        let tags = air_tags();
+        let target = TestTarget::new().with_air_above(70);
+        let air = DecorationPos { x: 0, y: 71, z: 0 };
+        let solid = DecorationPos { x: 0, y: 70, z: 0 };
+        let tag = BlockPredicate::BlockTag {
+            tag: "minecraft:air".to_string(),
+            offset: (0, 0, 0),
+        };
+        assert!(tag.test(&target, air, &tags), "air is in the air tag");
+        assert!(!tag.test(&target, solid, &tags), "terrain is not");
+        let unknown_tag = BlockPredicate::BlockTag {
+            tag: "minecraft:not_declared".to_string(),
+            offset: (0, 0, 0),
+        };
+        assert!(
+            !unknown_tag.test(&target, air, &tags),
+            "an undeclared tag has no members, so nothing matches it"
+        );
+        let any = BlockPredicate::AnyOf(vec![tag.clone(), unknown_tag]);
+        let all = BlockPredicate::AllOf(vec![tag.clone(), tag.clone()]);
+        let not = BlockPredicate::Not(Box::new(BlockPredicate::Blocks {
+            blocks: vec!["minecraft:air".to_string()],
+            offset: (0, 0, 0),
+        }));
+        assert!(any.test(&target, air, &tags));
+        assert!(!any.test(&target, solid, &tags));
+        assert!(all.test(&target, air, &tags));
+        assert!(!all.test(&target, solid, &tags));
+        assert!(!not.test(&target, air, &tags), "air is not not-air");
+        assert!(not.test(&target, solid, &tags));
+        // A predicate with no runtime never lets a position through, whatever
+        // the terrain says, and its composition keeps the whole chain out.
+        let gap = BlockPredicate::Unsupported {
+            kind: "minecraft:would_survive".to_string(),
+        };
+        assert!(!gap.test(&target, air, &tags));
+        assert!(!gap.is_modelable());
+        assert!(
+            !BlockPredicate::AllOf(vec![tag.clone(), gap.clone()]).is_modelable(),
+            "an unsupported leaf inside a conjunction gates the conjunction"
+        );
+        assert!(
+            !BlockPredicate::Not(Box::new(gap.clone())).is_modelable(),
+            "and inside a negation"
+        );
+        assert!(
+            !BlockPredicate::AnyOf(vec![gap]).is_modelable(),
+            "and inside a disjunction"
+        );
+        assert!(
+            tag.is_modelable() && all.is_modelable() && not.is_modelable() && any.is_modelable()
+        );
+    }
+
+    #[test]
+    fn simple_block_places_only_where_air_is_and_only_in_its_chunk() {
+        let provider = StateProvider::Constant {
+            state: "minecraft:tall_grass[half=lower]".to_string(),
+        };
+        let mut random = DecorationRandom::new(2026);
+        // An empty row takes the state.
+        let mut host = TestTarget::new().with_air_above(70);
+        assert_eq!(
+            place_simple_block(
+                &mut host,
+                &mut random,
+                &provider,
+                DecorationPos { x: 4, y: 71, z: 4 },
+            ),
+            1
+        );
+        assert_eq!(host.blocks("minecraft:tall_grass[half=lower]"), 1);
+        // A row the terrain already fills refuses, and costs nothing.
+        let mut solid = TestTarget::new().with_air_above(70);
+        solid.set_block(4, 70, 4, "minecraft:stone");
+        assert_eq!(
+            place_simple_block(
+                &mut solid,
+                &mut random,
+                &provider,
+                DecorationPos { x: 4, y: 70, z: 4 },
+            ),
+            0
+        );
+        assert_eq!(
+            solid.blocks("minecraft:stone"),
+            1,
+            "the host block is not repainted"
+        );
+        // A position outside the decorated chunk is refused before anything is
+        // drawn, the same confinement the vein path keeps.
+        let mut neighbour = TestTarget::new().with_air_above(70);
+        let mut before = random.clone();
+        assert_eq!(
+            place_simple_block(
+                &mut neighbour,
+                &mut before,
+                &provider,
+                DecorationPos { x: 16, y: 71, z: 4 },
+            ),
+            0,
+            "row 16 of chunk 0 is the neighbour's own column to paint"
+        );
+        assert!(neighbour.written.is_empty());
+        assert_eq!(
+            signature(&before),
+            signature(&random),
+            "a refused position spends no draw"
+        );
+    }
+
+    #[test]
+    fn a_weighted_state_provider_costs_one_draw_and_names_its_entries() {
+        let provider = parse_state_provider(Some(&json!({
+            "type": "minecraft:weighted",
+            "entries": [
+                {"data": "minecraft:short_grass", "weight": 3},
+                {"data": {"id": "minecraft:fern", "properties": {}}, "weight": 1}
+            ]
+        })));
+        let StateProvider::Weighted { entries } = &provider else {
+            panic!("the pack shape is a weighted provider: {provider:?}");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.state.as_str(), e.weight))
+                .collect::<Vec<_>>(),
+            vec![("minecraft:short_grass", 3), ("minecraft:fern", 1)],
+            "an empty property map leaves the bare id"
+        );
+        // Exactly one bounded draw over the summed weights, and that draw is
+        // what decides the entry.
+        let mut sampled = DecorationRandom::new(2026);
+        let mut reference = DecorationRandom::new(2026);
+        let picked = provider.sample(&mut sampled).expect("picks");
+        let control = reference.next_int_bounded(4);
+        assert_eq!(
+            picked,
+            if control < 3 {
+                "minecraft:short_grass"
+            } else {
+                "minecraft:fern"
+            },
+            "the weights decide which entry the one draw picks"
+        );
+        assert_eq!(
+            signature(&sampled),
+            signature(&reference),
+            "the weighted pick costs one bounded draw and no more"
+        );
+        // Both entries are reachable across seeds, and nothing else is ever.
+        let mut grass = 0;
+        let mut fern = 0;
+        for seed in 0..256i64 {
+            let mut random = DecorationRandom::new(seed);
+            match provider.sample(&mut random) {
+                Some("minecraft:short_grass") => grass += 1,
+                Some("minecraft:fern") => fern += 1,
+                other => panic!("unexpected pick {other:?}"),
+            }
+        }
+        assert_eq!(grass + fern, 256, "only the two entries are ever picked");
+        assert!(
+            fern > 0 && grass > 0,
+            "both entries must be reachable: {grass} grass / {fern} fern"
+        );
+        // A provider whose entries cannot all be named is refused rather than
+        // partially read, because a dropped entry would move the pick.
+        for value in [
+            json!({"type": "minecraft:weighted", "entries": []}),
+            json!({"type": "minecraft:weighted", "entries": [
+                {"data": "minecraft:air", "weight": 0}]}),
+            json!({"type": "minecraft:weighted", "entries": [
+                {"data": {"id": "minecraft:x", "properties": {"n": 1}}, "weight": 1}]}),
+            json!({"type": "minecraft:weighted"}),
+        ] {
+            assert!(
+                !parse_state_provider(Some(&value)).is_modelable(),
+                "{value} must not read as a placeable state"
+            );
+        }
+    }
+
+    #[test]
+    fn the_state_provider_names_the_pack_shapes() {
+        // The three shapes the 26.3 features write directly.
+        assert_eq!(
+            parse_state_provider(Some(&json!("minecraft:poppy"))),
+            StateProvider::Unsupported {
+                kind: "minecraft:block_state_provider_reference".to_string()
+            },
+            "a bare string at this position is the pack's registry reference: \
+             `minecraft:flower_plain` and friends are documents under \
+             `worldgen/block_state_provider`, not blocks"
+        );
+        assert_eq!(
+            parse_state_provider(Some(&json!({"id": "minecraft:tall_grass",
+                "properties": {"half": "lower", "waterlogged": "false"}}))),
+            StateProvider::Constant {
+                state: "minecraft:tall_grass[half=lower,waterlogged=false]".to_string()
+            },
+            "properties render sorted, so the name does not track the document order"
+        );
+        assert_eq!(
+            parse_state_provider(Some(&json!({"id": "minecraft:brown_mushroom"}))),
+            StateProvider::Constant {
+                state: "minecraft:brown_mushroom".to_string()
+            }
+        );
+        // Everything else is a gap with a name, never a silent state.
+        assert_eq!(
+            parse_state_provider(Some(&json!({
+                "type": "minecraft:randomized_int", "property": "pickles",
+                "source": {"id": "minecraft:sea_pickle"},
+                "values": {"type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 4}}))),
+            StateProvider::Unsupported {
+                kind: "minecraft:randomized_int".to_string()
+            }
+        );
+        assert_eq!(
+            parse_state_provider(Some(&json!("#minecraft:small_flowers"))),
+            StateProvider::Unsupported {
+                kind: "minecraft:block_tag".to_string()
+            }
+        );
+        assert!(!parse_state_provider(None).is_modelable());
+        // And an unmodelable provider is not a supported configured feature.
+        assert!(
+            !ConfiguredFeature::SimpleBlock {
+                to_place: parse_state_provider(Some(&json!("minecraft:flower_plain")))
+            }
+            .is_supported()
+        );
+        assert!(
+            ConfiguredFeature::SimpleBlock {
+                to_place: parse_state_provider(Some(&json!({"id": "minecraft:poppy"})))
+            }
+            .is_supported()
+        );
+    }
+
+    #[test]
+    fn a_modeled_ground_cover_chain_leaves_the_gap_report_alone() {
+        // The chain `minecraft:patch_tall_grass` writes, reduced to one of each
+        // shape. Before this slice every one of these three decorations was a
+        // gap and the configured type was one; now none of them is.
+        let root = report_pack(
+            "report-cover-clean",
+            r#"[{"type": "minecraft:count", "count": 4},
+                {"type": "minecraft:rarity_filter", "chance": 5},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:biome"},
+                {"type": "minecraft:offset",
+                    "x": {"type": "minecraft:trapezoid", "min": -7, "max": 7, "plateau": 0},
+                    "y": {"type": "minecraft:trapezoid", "min": -3, "max": 3, "plateau": 0},
+                    "z": {"type": "minecraft:trapezoid", "min": -7, "max": 7, "plateau": 0}},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:matching_block_tag", "tag": "minecraft:air"}}]"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert!(
+            data.unimplemented_features.is_empty(),
+            "a ground-cover chain this runtime runs is not a gap: {:?}",
+            data.unimplemented_features
+        );
+        assert!(data.step(0).expect("step 0")[0].is_modelable());
+        fs::remove_dir_all(root).expect("cleanup");
+        // The same shapes written for an ore keep the report empty too: the
+        // configured type is what changed, not the decorations' own keys.
+        let cover = report_pack(
+            "report-cover-clean2",
+            r#"[{"type": "minecraft:heightmap", "heightmap": "WORLD_SURFACE_WG"}]"#,
+        );
+        let data = FeatureData::load(&cover).expect("loads");
+        assert!(
+            data.unimplemented_features.is_empty(),
+            "{:?}",
+            data.unimplemented_features
+        );
+        fs::remove_dir_all(cover).expect("cleanup");
+    }
+
+    #[test]
+    fn unmodeled_ground_cover_parameters_are_named_individually() {
+        // A predicate type the pack invented, an offset axis with no runtime,
+        // and a state provider this generator does not resolve: each keeps its
+        // own key so the report says what is missing, and none of them can
+        // place a block.
+        let root = scratch_root("report-cover-gaps");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/cover.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"type": "minecraft:randomized_int",
+                "property": "pickles", "source": {"id": "minecraft:sea_pickle"},
+                "values": {"type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 4}}}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/one.json"),
+            r#"{"feature": "testns:cover", "placement": [
+                {"type": "minecraft:heightmap", "heightmap": "OCEAN_FLOOR_WG"},
+                {"type": "minecraft:offset", "x": {"type": "minecraft:clamped_normal",
+                    "deviation": 1.0, "min_inclusive": -3, "max_inclusive": 3, "mean": 0},
+                    "y": 1, "z": 0},
+                {"type": "minecraft:block_predicate_filter", "predicate": {"type": "minecraft:all_of",
+                    "predicates": [
+                        {"type": "minecraft:matching_block_tag", "tag": "minecraft:air"},
+                        {"type": "minecraft:would_survive", "state": {"id": "minecraft:grass_block"}}]}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [["testns:one"]]}"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        for key in [
+            "provider:minecraft:randomized_int",
+            "placement:minecraft:offset",
+            "offset:minecraft:clamped_normal",
+            "placement:minecraft:block_predicate_filter",
+            "predicate:minecraft:would_survive",
+        ] {
+            assert_eq!(
+                data.unimplemented_features.get(key),
+                Some(&1),
+                "{key} stays a named gap: {:?}",
+                data.unimplemented_features
+            );
+        }
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("minecraft:simple_block"),
+            "the configured type is modeled now: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("heightmap:OCEAN_FLOOR_WG"),
+            "a map this runtime resolves adds nothing"
+        );
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("placement:minecraft:heightmap"),
+            "and neither does its decoration"
+        );
+        assert!(
+            !data.step(0).expect("step 0")[0].is_modelable(),
+            "one unmodeled parameter gates the whole chain"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Requires the operator-provisioned data pack. Measures the ground-cover
+    /// unlock this slice was for, over the pack's own documents rather than any
+    /// fixture: how many placed features target a `minecraft:simple_block`
+    /// configured feature, how many of those now answer `is_modelable`, and
+    /// which gap keys the run lost or kept. Also prints the provider and
+    /// predicate keys, which are the residual gaps. Run with
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_measures_the_ground_cover_unlock() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = FeatureData::load(&root).expect("the provisioned pack loads");
+        let mut targeting = 0usize;
+        let mut modelable = 0usize;
+        let mut supported_configured = 0usize;
+        let mut simple_block_docs = 0usize;
+        for feature in data.configured.values() {
+            if matches!(&**feature, ConfiguredFeature::SimpleBlock { .. }) {
+                simple_block_docs += 1;
+                if feature.is_supported() {
+                    supported_configured += 1;
+                }
+            }
+        }
+        let mut gated: Vec<(String, Vec<String>)> = Vec::new();
+        let mut decorations_modeled = 0usize;
+        for placed in data.placed.values() {
+            if matches!(&*placed.feature, ConfiguredFeature::SimpleBlock { .. }) {
+                targeting += 1;
+                if placed.modifiers.iter().all(modifier_is_modelable) {
+                    decorations_modeled += 1;
+                }
+                if placed.is_modelable() {
+                    modelable += 1;
+                    continue;
+                }
+                let names = placed
+                    .modifiers
+                    .iter()
+                    .filter(|modifier| !modifier_is_modelable(modifier))
+                    .map(|modifier| match modifier {
+                        PlacementModifier::Unsupported { kind } => kind.clone(),
+                        PlacementModifier::Heightmap { heightmap } => {
+                            format!("heightmap({heightmap:?})")
+                        }
+                        PlacementModifier::Offset { x, y, z } => {
+                            format!("offset({x:?},{y:?},{z:?})")
+                        }
+                        PlacementModifier::BlockPredicateFilter { predicate } => {
+                            format!("predicate({predicate:?})")
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                // A chain whose decorations are all modeled but which is still
+                // gated is gated by its own state provider.
+                let names = if names.is_empty() {
+                    vec!["state provider".to_string()]
+                } else {
+                    names
+                };
+                gated.push((placed.id.clone(), names));
+            }
+        }
+        let key = |name: &str| data.unimplemented_features.get(name).copied().unwrap_or(0);
+        println!(
+            "ground cover: {} simple_block configured documents, {} with a modeled state provider; \
+             {} placed features target them, {} with every decoration modeled, {} modelable overall",
+            simple_block_docs, supported_configured, targeting, decorations_modeled, modelable
+        );
+        println!(
+            "gap keys (placement:heightmap, placement:offset, placement:block_predicate_filter, \
+             minecraft:simple_block) = {}, {}, {}, {}",
+            key("placement:minecraft:heightmap"),
+            key("placement:minecraft:offset"),
+            key("placement:minecraft:block_predicate_filter"),
+            key("minecraft:simple_block"),
+        );
+        if !gated.is_empty() {
+            println!("  -- chains still gated --");
+            let mut gated = gated;
+            gated.sort();
+            for (id, names) in &gated {
+                println!("  {id} gated by {}", names.join(", "));
+            }
+        }
+        let mut entries: Vec<(&String, &usize)> = data.unimplemented_features.iter().collect();
+        entries.sort_unstable_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+        println!("  -- ground-cover keys still open --");
+        for (key, count) in &entries {
+            let inner = key.split_once(':').unwrap_or_default().1;
+            if key.starts_with("placement:")
+                || key.starts_with("provider:")
+                || key.starts_with("predicate:")
+                || key.starts_with("offset:")
+                || key.starts_with("heightmap:")
+                || inner == "minecraft:simple_block"
+            {
+                println!("  {key} {count}");
+            }
+        }
+        assert_eq!(
+            targeting, 64,
+            "the pack's measured simple_block chain census"
+        );
+        assert_eq!(
+            supported_configured, 33,
+            "37 configured documents less the three registry references and \
+             the one randomized-int provider"
+        );
+        assert!(
+            decorations_modeled >= 50,
+            "the three decorations plus the configured type were to unlock most of \
+             the {targeting} chains, got {decorations_modeled} with every decoration modeled"
+        );
+        assert!(
+            modelable >= 45,
+            "of those, {modelable} are modelable overall: the difference is the chains whose \
+             state provider this runtime still cannot resolve"
+        );
+        assert_eq!(
+            key("placement:minecraft:heightmap"),
+            0,
+            "every heightmap name the pack writes now has a runtime"
+        );
+        assert_eq!(
+            key("minecraft:simple_block"),
+            0,
+            "and the configured type is modeled"
+        );
     }
 
     /// Requires the operator-provisioned data pack. Prints the gap ledger the
