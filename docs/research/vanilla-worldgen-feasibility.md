@@ -895,6 +895,31 @@ What is true, and what the fix now rests on, is the weaker claim
 against `generator.substance`, and `block_at` and `is_air` cannot disagree at any
 position in the chunk.
 
+That committed test walks a fixture chunk — 16×16 columns by 128 rows, 32,768
+positions — so it does not by itself show the claim holds on the terrain the fix
+is for. The stronger check was run once, out of tree, against the provisioned
+26.3 pack: a temporary test that builds ten real decorated chunks through
+`build_decorated_chunk` and asks, for every row the fill pass left unnamed, what
+`generator.substance` calls it. The chunks were chosen to include negative and
+far coordinates as well as the origin — `(0,0)`, `(1,-2)`, `(-3,4)`, `(8,8)`,
+`(-9,-7)`, `(64,64)`, `(-64,63)`, `(80,-80)`, `(-1,-1)`, `(16,-16)` — over the
+pack's `−64 … 319` column height:
+
+    PROBE chunks=10 rows=983040 named=361677 carved_cave_air=11913 unnamed=609450 violations=0
+
+609,450 unnamed rows out of 983,040 — 62% of the volume, which is the sky and
+the density gaps — and **not one of them is solid or fluid to the substance
+pass**. The 11,913 rows counted separately are the carver's named
+`minecraft:cave_air`: before this fix those were the only rows an air filter
+could ever have matched, which is why the placement stage placed almost nothing.
+The check is recorded rather than committed because it costs 863.92 s in the
+debug test profile — two orders of magnitude beyond what this suite can carry —
+and because it reads the operator-provisioned pack, so it is a measurement of
+this data root rather than a property of the code. It was run by the lead in a
+scratch worktree, which was restored byte-identical to `2150952` afterwards
+(`git status --porcelain` empty, the file `cmp`-identical to the reviewed tree),
+and an independent verifier is re-running its own version of it.
+
 **Two production regressions, not fixture checks.** The feature module's own
 synthetic `DecorationTarget` answered air above its surface from the first, which
 is why `601f02a` passed 259 tests while placing nothing real: the divergence was

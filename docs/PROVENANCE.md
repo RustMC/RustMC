@@ -1241,9 +1241,14 @@ rows, and the census squares that do place ground cover moved 118.6 → 119.2 s 
 ## Open-sky air named, ground-cover over-count measured (11 October 2026, slice O)
 
 This entry supersedes the last paragraph of the ground-cover entry above for the
-build it describes: the same published census square is 480.4 s single-threaded
-here, and the four-chunk cold sweep is reported below as a paired band rather
-than a single sample. The slice-N figures stay as the record of that commit.
+build it describes, and corrects one figure it had itself published: the same
+census square measured 480.4 s for this build in a solo run whose `/tmp` artifact
+has since been collected, while the 475 s for `9abf311` and 478 s for `601f02a`
+came from one paired script that ran those two builds concurrently. A concurrent
+run and a solo run are not the same measurement, so this entry draws no cost
+comparison from any of the three. The four-chunk cold sweep reported below is
+this slice's cost statement, given as a paired band rather than a single sample.
+The slice-N figures stay as the record of that commit.
 
 The change itself is three lines of behavior in `ChunkView::block_at` and rests
 on two sources, both local. The pack's own documents say how far the affected
@@ -1304,3 +1309,20 @@ square writes 797 more rows. One sample is named rather than dropped: an earlier
 for its first pass and a 1.75 h projection, which lies outside the paired band
 and comes from an invocation shape none of this document's published cold figures
 uses; neither number is claimed as this slice's cost.
+
+The invariant's broader check is a recorded measurement, not a committed test. A
+temporary test in a scratch worktree built ten real decorated chunks from the
+operator-provisioned pack through `build_decorated_chunk` — `(0,0)`, `(1,-2)`,
+`(-3,4)`, `(8,8)`, `(-9,-7)`, `(64,64)`, `(-64,63)`, `(80,-80)`, `(-1,-1)` and
+`(16,-16)` — and asked `generator.substance` what every row the fill pass left
+unnamed was: 983,040 rows, of which 361,677 are named, 11,913 are named as the
+carver's `minecraft:cave_air`, and 609,450 are unnamed, with zero of the unnamed
+rows solid or fluid. It is not committed for two reasons: it costs 863.92 s in
+the debug test profile, which this suite cannot carry, and it reads the
+operator-provisioned data root, so what it establishes is a property of this pack
+and terrain seed 2026 observed once rather than a regression the suite guards. The
+committed test stays the pack-independent form — a fixture chunk's 32,768 rows.
+Neither the probe nor the committed test reads the owner's save; both go through
+the pack and the generator only. The scratch worktree was restored afterwards and
+verified clean at `2150952`, its patched file `cmp`-identical to the reviewed
+tree.
