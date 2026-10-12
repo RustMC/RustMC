@@ -920,15 +920,30 @@ and because it reads the operator-provisioned pack, so it is a measurement of
 this data root rather than a property of the code. It was run by the lead in a
 scratch worktree, which was restored byte-identical to `2150952` afterwards
 (`git status --porcelain` empty, the file `cmp`-identical to the reviewed tree),
-and an independent verifier then ran its own probe over chunks `(0,0)`, `(4,-3)`
-and `(-8,12)` of the same pack at the full `−64 … 319` height:
+and an independent verifier then ran its own probe of the same pack at the full
+`−64 … 319` height:
 
     SUMMARY unnamed_sky 117844 unnamed_body 3239 carved_unnamed 690 named 75525 fluid 1098 solid 74427 all_unnamed_columns 0 fallback_air 121083
     VIOLATIONS 0 []
 
+That block was first published here as covering chunks `(0,0)`, `(4,-3)` and
+`(-8,12)`. It covers two of them. A later verifier re-derived it chunk by chunk —
+each chunk being 16×16×384 = 98,304 rows, so three chunks would be 294,912 and the
+SUMMARY's 196,608 is exactly two — and measured `(0, 0)` at 43,618 named / 54,686
+unnamed / 0 carved-unnamed above the fill top, `(4, -3)` at 31,907 / 66,397 / 690
+and `(-8, 12)` at 34,780 / 63,524 / 239. 75,525 is 43,618 + 31,907 and 121,083 is
+54,686 + 66,397: the third chunk was probed and never counted. Its named rows also
+split three ways rather than two — 69,761 solid, 4,666 named air (the carver's
+`minecraft:cave_air`) and 1,098 fluid — so "74,427 solid" was solid plus named air
+lumped together, and `carved_unnamed_above_fill_top` is profile-dependent: 931 over
+the three chunks' *base* columns, 929 over their decorated ones, 690 for the
+decorated two. The invariant itself held in all of it, including that verifier's
+own three-chunk sweep (`VIOLATIONS 0` over 294,912 rows) and its exact
+re-derivation of the lead's ten-chunk probe (`rows=983040 named=361677
+cave_air=11913 unnamed=609450 violations=0`).
+
 121,083 unnamed rows — 117,844 sky and 3,239 interior density gaps — every one
-of them substance-Air, and the 75,525 named rows splitting into exactly 74,427
-solid plus 1,098 fluid: no named row lost its name, no fluid read as air, and no
+of them substance-Air: no named row lost its name, no fluid read as air, and no
 column was unnamed from end to end. The same verifier's second pass found the
 claim this slice's own comment got wrong:
 `carved_unnamed_above_fill_top 931 inside_body 0 non_air_substance 0`, one
@@ -943,7 +958,14 @@ own narrative. Those are corrected in a follow-up commit, and the "cannot
 disagree" claim is now scoped to positions inside the decorated chunk: at a
 fringe position the verifier measured
 `FRINGE (-1,118,0) writable false block_at None is_air true substance Air`, which
-is the two answers being different questions rather than one answer.
+is the two answers being different questions rather than one answer. The full
+sweep of that boundary — `x ∈ {−1, 16}` and `z ∈ {−1, 16}` at all 384 rows — found
+no out-of-chunk position where `writable` held or `block_at` answered anything, and
+found the fringe `is_air` following the terrain rather than the fallback: true at
+y = 319, **false at y = −64** where the substance is solid. The committed test now
+requires that equality at four out-of-chunk columns at both height ends instead of
+merely restating `writable`, because `block_at` refuses exactly where `writable`
+refuses and pinning both is one assertion written twice.
 
 **Two production regressions, not fixture checks.** The feature module's own
 synthetic `DecorationTarget` answered air above its surface from the first, which
@@ -1147,11 +1169,29 @@ working, not a defect — the assertions were written when nothing could fire
 outside carved air and so described everything they had ever observed. They are
 now stated in two halves: a row that already had a name may only be recolored to
 something a vein's target test accepts (unchanged), a row the fill pass left
-empty may only be *named* above that column's own highest named row (new), and no
-row may disappear. The new half is the one worth keeping as a guard, because a
-chain that placed onto a cave floor or into a density gap instead of the surface
-would fail it while the census, which counts families rather than positions,
-would not. Which commit broke it is measured rather than assumed: with its old
+empty may only be *named* within a band above that column's own highest named row
+(new), and no row may disappear. The new half is the one worth keeping as a guard,
+because a chain that placed onto a cave floor or into a density gap instead of the
+surface would fail it while the census, which counts families rather than
+positions, would not — and a verifier's mutation showed the first version of that
+half was too loose to guard anything: with only "above the fill top" required, a
+placement that also named a row 25 above its anchor passed the test, which the
+single old assertion caught by accident. The band is measured, not derived: across
+the four squares 166 rows are named onto empty space (103 `minecraft:short_grass`,
+38 `minecraft:fern`, 25 `minecraft:bush`) at distances 1 (74), 2 (55), 3 (26), 4
+(6), 5 (4) and 6 (1) above their column's highest named base row — the tail coming
+from later ordinals stacking cover on rows earlier ordinals just named — and the
+assertion allows 1..=17, headroom over a measured maximum rather than a cap this
+runtime actually imposes, because nothing in it bounds how far a placement offset
+can reach vertically. Re-running the same mutation against that bound fails with
+`(0, 1) row 144: a placement named empty row 208 outside the band above its
+column's highest named row Some(181)`. Both arms are known to be live rather than
+decorative:
+an independent verifier counted 22,013 rows through the recolor arm and 166 through
+the naming arm, and its own mutations of the tag gate were caught by the arm that
+applies (a vein bypassing its target test onto a named row failed with `wrote
+Some("minecraft:tuff") onto "minecraft:cave_air"`, one onto empty space failed the
+band). Which commit broke it is measured rather than assumed: with its old
 assertions the test passes on main content (`e8ee4d0`, whose `generator.rs` and
 `feature.rs` are byte-identical to `9abf311`) in 426.41 s and at `601f02a` in
 436.51 s, and fails at `2150952`'s code state — the shape you would expect, since

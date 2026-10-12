@@ -1273,14 +1273,27 @@ carver's own `minecraft:cave_air`; the carver's loop at `generator.rs:712` is
 it opens above a column's fill top stays unnamed. The reviewer's own scan counted
 `carved_unnamed_above_fill_top 931 inside_body 0 non_air_substance 0`, one
 instance printed as `(64,64,-48)` row 128 in a column whose fill top is 127, and
-its main probe over chunks `(0,0)`, `(4,-3)` and `(-8,12)` of the same pack
-reported `unnamed_sky 117844 unnamed_body 3239 carved_unnamed 690 named 75525
-fluid 1098 solid 74427 all_unnamed_columns 0 fallback_air 121083` with
-`VIOLATIONS 0 []` — the 75,525 named rows splitting into exactly 74,427 solid and
-1,098 fluid, and every one of the 121,083 unnamed rows substance-Air. That is a
-second, independent reproduction of the invariant on a different chunk set from
-the lead's ten, and like the lead's it reads only the provisioned pack and the
-generator, never the owner's save. Behaviour is unaffected, because the tag those
+its main probe reported `unnamed_sky 117844 unnamed_body 3239 carved_unnamed 690
+named 75525 fluid 1098 solid 74427 all_unnamed_columns 0 fallback_air 121083` with
+`VIOLATIONS 0 []`. A later verifier re-derived that block chunk by chunk and found
+two things my transcription had carried without noticing: the SUMMARY covers
+**two** of the three chunks it was labeled with — `(0, 0)` and `(4, -3)`, 196,608
+rows, not three chunks' 294,912 — and its `solid 74427` is not solid alone. At the
+full `−64 … 319` height each chunk is 16×16×384 = 98,304 rows, and the per-chunk
+measurements are `(0, 0)` 43,618 named / 54,686 unnamed / 0 carved-unnamed above
+the fill top, `(4, -3)` 31,907 / 66,397 / 690, `(-8, 12)` 34,780 / 63,524 / 239.
+So 75,525 = 43,618 + 31,907 and 121,083 = 54,686 + 66,397: `(-8, 12)` was probed
+and never counted. The 75,525 named rows split three ways, not two — 69,761 solid,
+4,666 named air (the carver's `minecraft:cave_air`) and 1,098 fluid — and the
+carved-above count depends on which columns you read: 931 over the three chunks'
+*base* columns, 929 over their decorated ones, 690 for the decorated two. The
+invariant itself held in every one of those readings, including the same
+verifier's own three-chunk sweep, which found `VIOLATIONS 0` over all 294,912 rows
+and re-derived the lead's ten-chunk probe exactly (`rows=983040 named=361677
+cave_air=11913 unnamed=609450 violations=0`). That is a second and third
+independent reproduction of the invariant on chunk sets different from the lead's
+ten, and like the lead's they read only the provisioned pack and the generator,
+never the owner's save. Behaviour is unaffected, because the tag those
 chains test is the pack's own three-value `minecraft:air` block tag — read
 read-only from `data/minecraft/tags/block/air.json` of the provisioned pack, whose
 `values` are exactly `minecraft:air`, `minecraft:void_air` and
@@ -1296,7 +1309,18 @@ sentence that `2150952` deleted from `writable` still standing in
 "cannot disagree" claim unscoped, where a fringe position answers `block_at None`
 while `is_air` answers from the terrain — measured by the reviewer as
 `(-1,118,0) writable false block_at None is_air true substance Air`. That boundary
-is now asserted in the committed test rather than only in prose.
+is now asserted rather than only stated, and one assertion more than my first
+version of it: at each of the four out-of-chunk columns around the fixture, at both
+the world's floor row and its top row, the committed test requires `is_air` to
+equal the substance pass's own answer there. The later verifier's sweep of
+`x ∈ {−1, 16}`, `z ∈ {−1, 16}` over all 384 rows found no out-of-chunk position
+where `writable` held or `block_at` answered anything, and recorded the fringe
+`is_air` as true at y = 319 and **false at y = −64**, where the terrain is solid —
+so the out-of-chunk fallback is *the terrain*, not air, which is what the scoped
+comment says and was not what the single pinned position demonstrated. What the
+test does not pin is a difference between `block_at` and `writable`: `block_at`
+refuses exactly where `writable` refuses (`generator.rs:1030` reads `writable`
+first), so asserting the two at one position is one assertion written twice.
 
 Both new tests are production-path tests, and that distinction is the point. The
 fixture target in `feature.rs` answered air above its own synthetic surface from
@@ -1329,6 +1353,44 @@ reads the owner's save. What the miss says about the gate list matters as much:
 lead's pack sweep and the independent verifier's run had executed the two named
 ground-cover smoke tests rather than the whole ignored set. Running all nine
 ignored `vanilla::` tests is now part of this slice's gate report.
+
+The corrected vein test's two arms were then checked by mutation rather than by
+reading, because an assertion that never fires is not a contract. An independent
+verifier counted them on the provisioned pack: 22,013 rows through the recolor arm,
+166 through the naming arm, and the naming arm's own `id.is_some()` condition held
+in 166 of 166 — the loop above it already skips a row where both sides are empty —
+so that half-condition was removed as a claim the code could not falsify. Its
+mutations of the tag gate were both caught (a vein bypassing its target test onto a
+named row failed with `wrote Some("minecraft:tuff") onto "minecraft:cave_air"`, one
+onto an empty row inside a body failed the naming arm). What was *not* caught was a
+placement naming a row 25 above its own anchor: "anywhere above the column's fill
+top" accepted it, and the single assertion it replaced rejected it. The lead re-ran
+that mutation after the band was added and it now fails with
+`(0, 1) row 144: a placement named empty row 208 outside the band above its
+column's highest named row Some(181)`. The band's numbers are the lead's own
+instrumented run of the same test — 166 naming rows, at distances 1 (74), 2 (55),
+3 (26), 4 (6), 5 (4) and 6 (1), all `minecraft:short_grass`, `minecraft:fern` or
+`minecraft:bush` — and the instrument build was reverted before committing, with
+`feature.rs` left byte-identical to the reviewed tree.
+
+The committed open-sky test covers two of the three unnamed families, and a later
+verifier established which two by counting them in the fixture: 27,904 unnamed rows
+split 26,624 sky above a column top and 1,280 interior density gaps, with
+`carved_any=0` and `carved_unnamed_above_fill_top=0`, because this fixture's carver
+is written with `"probability": 0.0` (`bounded_pack`, which `decorating_pack`
+calls). The carver is still *listed* by the fixture's dimension, so the carving
+path runs and stamps nothing — which is why the third family, a cave opened above
+the rows the fill pass reached, cannot appear here and is measured out of tree
+instead. A follow-up commit makes the test say so and asserts that both families it
+does have are present, so the "every unnamed row" wording cannot quietly mean "only
+the sky ones".
+
+Duration profiles are stated because the same test costs very different amounts in
+each: the vein pack test above measured 425.67 s (corrected form), 426.41 s and
+436.51 s in the debug test profile, while an independent verifier's release-profile
+run of the same single test finished in 28.41 s. A duration is only comparable with
+another of the same profile, and the ten-chunk invariant's 863.92 s is likewise a
+debug figure.
 
 Save-side denominators come from the owner's seed-2026 save read read-only
 through `vanilla_oracle census_compare`; no save file, region file or generated
@@ -1376,9 +1438,17 @@ cost claims, because repeated single-threaded runs of one binary on this host
 spread 4.4%–5.7%; what the triple supports is the bounded statement that the slice
 does not multiply the square's cost. An earlier attempt at the same measurement
 never ran a build: it refused to start for 40 minutes while waiting for the host to
-fall below load 3.0 on its 20 cores, which is why acceptance moved from the start
-condition to the sample. The raw artifacts, including the three census reports,
-are under `/tmp/sq-timing/` and are deliberately not committed.
+fall below load 3.0 on its 20 cores. The retry did not drop the start gate, as an
+earlier sentence here implied — `/tmp/sq-timing.sh` still refuses to launch a run
+while more than one other matching process is live or the 1-minute load reaches 8.0,
+now with a 90-try, 30-minute budget instead of waiting indefinitely — and it added
+the per-sample ratio gate on top, so a run counts only if its own `user`/`real`
+ratio clears 0.90. Both conditions, not one, describe that method. The raw
+artifacts, including the three census reports, are under `/tmp/sq-timing/` and are
+deliberately not committed. The third row is the binary built at `041d307`; a
+verifier checked `041d307..746e32e` hunk by hunk and found every non-comment line
+in that range sits inside `mod tests`, which is what makes the row readable against
+this head at all.
 
 The invariant's broader check is a recorded measurement, not a committed test. A
 temporary test in a scratch worktree built ten real decorated chunks from the
