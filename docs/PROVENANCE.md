@@ -1279,6 +1279,16 @@ is not a regression this branch introduced: the same early return was reproduced
 against the pre-change binary, so it is recorded here as a gap the guard left
 open rather than as a behaviour change against main.
 
+A further synthetic-region check found that a stored chunk root with an empty
+`sections` list was counted as a complete chunk by `biome_volume`, `census`,
+`census_compare`, and `census_names`, despite supplying no biome cells or block
+states. The readers now count that placeholder as missing, so a one-chunk
+square reports `coverage scored=0 expected=1 missing=1 unaccounted=0` and
+exits non-zero with or without `--allow-partial`. The regression constructs
+its own minimal uncompressed Anvil region and asserts that both the family
+census and name histogram score zero chunks; no owner save is copied into the
+test. Populated chunks continue through the same decoders and report layout.
+
 Two hardenings came out of the same review. `rustmc_tools::nbt` bounded every
 read by the size of the input but not the recursion: a crafted stream of list and
 compound headers descends once per six bytes and overflows the stack long before

@@ -1016,8 +1016,13 @@ pub fn compare_biome_volume(
                 report.missing_chunks += 1;
                 continue;
             };
+            let cells = biome_cells(&root, chunk_x, chunk_z)?;
+            if cells.is_empty() {
+                report.missing_chunks += 1;
+                continue;
+            }
             report.chunks += 1;
-            for cell in biome_cells(&root, chunk_x, chunk_z)? {
+            for cell in cells {
                 report.cells += 1;
                 let band = cell.y.div_euclid(32) * 32;
                 let entry = report.bands.entry(band).or_default();
@@ -1485,12 +1490,16 @@ impl Census {
         Ok(())
     }
 
-    fn record_chunk(&mut self, root: &Tag) -> Result<(), String> {
-        for section in chunk_sections(root)? {
+    fn record_chunk(&mut self, root: &Tag) -> Result<bool, String> {
+        let sections = chunk_sections(root)?;
+        if sections.is_empty() {
+            return Ok(false);
+        }
+        for section in sections {
             self.record_section(section)?;
         }
         self.chunks += 1;
-        Ok(())
+        Ok(true)
     }
 
     /// Fold one generated column (as produced by
@@ -1537,9 +1546,12 @@ pub fn census_name_histogram(
             let Some(root) = store.chunk_root(chunk_x, chunk_z)? else {
                 continue;
             };
-            for section in
-                chunk_sections(&root).map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?
-            {
+            let sections =
+                chunk_sections(&root).map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?;
+            if sections.is_empty() {
+                continue;
+            }
+            for section in sections {
                 for (name, count) in section_name_counts(section)? {
                     *names.entry(name).or_default() += count;
                 }
@@ -1564,9 +1576,14 @@ pub fn census_chunks(
         for chunk_x in min_cx..=max_cx {
             match store.chunk_root(chunk_x, chunk_z)? {
                 None => census.missing_chunks += 1,
-                Some(root) => census
-                    .record_chunk(&root)
-                    .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?,
+                Some(root) => {
+                    let scored = census
+                        .record_chunk(&root)
+                        .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?;
+                    if !scored {
+                        census.missing_chunks += 1;
+                    }
+                }
             }
         }
     }
@@ -2428,6 +2445,51 @@ mod tests {
             census.bands.get(&(CensusFamily::DeepslateDiamond, 96)),
             Some(&4096)
         );
+    }
+
+    #[test]
+    fn stored_placeholder_chunk_cannot_complete_a_census() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rustmc-empty-census-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let region_dir = dir.join("region");
+        std::fs::create_dir_all(&region_dir).expect("create synthetic region directory");
+
+        // One stored chunk with an empty sections list, encoded as raw NBT in
+        // a minimal Anvil region. It has a location entry but no block data.
+        let mut nbt = vec![10, 0, 0, 9, 0, 8];
+        nbt.extend_from_slice(b"sections");
+        nbt.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut region = vec![0u8; 3 * 4096];
+        region[0..4].copy_from_slice(&[0, 0, 2, 1]);
+        region[8192..8196].copy_from_slice(&((nbt.len() + 1) as u32).to_be_bytes());
+        region[8196] = 3; // uncompressed chunk NBT
+        region[8197..8197 + nbt.len()].copy_from_slice(&nbt);
+        std::fs::write(region_dir.join("r.0.0.mca"), region).expect("write synthetic region");
+
+        let mut store = RegionStore::new(&dir);
+        let census = census_chunks(&mut store, 0, 0, 0, 0).expect("census placeholder");
+        assert_eq!((census.chunks, census.missing_chunks), (0, 1));
+        let (named_chunks, names) =
+            census_name_histogram(&mut store, 0, 0, 0, 0).expect("name placeholder");
+        assert_eq!(named_chunks, 0);
+        assert!(names.is_empty());
+        let coverage = Coverage::new(census.chunks, 1, census.missing_chunks, ScoredSource::Save);
+        assert!(matches!(
+            coverage.outcome(false),
+            CoverageOutcome::PartialRejected { .. }
+        ));
+        assert!(matches!(
+            coverage.outcome(true),
+            CoverageOutcome::PartialRejected { .. }
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove synthetic region");
     }
 
     /// The published seed-2026 substance grid: 49 x 49 sampled columns, all
