@@ -1288,6 +1288,10 @@ exits non-zero with or without `--allow-partial`. The regression constructs
 its own minimal uncompressed Anvil region and asserts that both the family
 census and name histogram score zero chunks; no owner save is copied into the
 test. Populated chunks continue through the same decoders and report layout.
+The same review then supplied a malformed nonempty section with a block-state
+palette but no `Y` coordinate: the family census previously skipped it and
+counted its chunk as complete. The census now refuses `section without Y`
+instead of silently omitting those blocks; a synthetic test pins the error.
 
 Two hardenings came out of the same review. `rustmc_tools::nbt` bounded every
 read by the size of the input but not the recursion: a crafted stream of list and

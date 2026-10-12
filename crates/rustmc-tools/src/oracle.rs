@@ -1477,9 +1477,12 @@ pub struct Census {
 
 impl Census {
     fn record_section(&mut self, section: &Tag) -> Result<(), String> {
-        let Some(y_min) = section.get("Y").and_then(Tag::as_i32).map(|y| y * 16) else {
-            return Ok(());
-        };
+        let y_min = section
+            .get("Y")
+            .and_then(Tag::as_i32)
+            .ok_or("section without Y")?
+            .checked_mul(16)
+            .ok_or("section Y overflows block coordinates")?;
         let band = y_min.div_euclid(32) * 32;
         for (name, count) in section_name_counts(section)? {
             if let Some(family) = census_family(base_block_name(&name)) {
@@ -2490,6 +2493,21 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(dir).expect("remove synthetic region");
+    }
+
+    #[test]
+    fn census_rejects_a_section_without_a_y_coordinate() {
+        let section = compound(&[(
+            "block_states",
+            compound(&[("palette", Tag::List(vec![palette_entry("minecraft:stone")]))]),
+        )]);
+        let root = compound(&[("sections", Tag::List(vec![section]))]);
+        let mut census = Census::default();
+        assert_eq!(
+            census.record_chunk(&root),
+            Err("section without Y".to_owned())
+        );
+        assert_eq!(census.chunks, 0);
     }
 
     /// The published seed-2026 substance grid: 49 x 49 sampled columns, all
