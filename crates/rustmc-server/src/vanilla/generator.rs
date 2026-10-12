@@ -1607,9 +1607,12 @@ mod tests {
     /// veins evaluated. A vein may only replace a block its target test
     /// accepts, and every replaceable tag in the pack (`stone_ore_replaceables`,
     /// `deepslate_ore_replaceables`, `height_specific_ore_replaceables`) is a
-    /// subset of `base_stone_overworld`, so that one tag answers for the whole
-    /// placement stage: a row the pass changed must have held one of its
-    /// members before, and no row may appear or disappear.
+    /// subset of `base_stone_overworld`, so that one tag answers for the recolor
+    /// half of the placement stage: a row that already had a name and changed one
+    /// must have held a member of it before. The stage's other half — the ground
+    /// cover that replaced nothing — is bounded from the other side: a row the
+    /// fill pass left empty may only be named above this column's own fill top.
+    /// No row may disappear.
     ///
     /// The four 16×16 squares sit at fixed origins on a power-of-two grid,
     /// with one off-grid pair so at least one square straddles chunk borders
@@ -1639,6 +1642,7 @@ mod tests {
                 for z in origin_z..origin_z + 16 {
                     let base = generator.base_column_ids(x, z);
                     let ids = generator.column_ids(x, z);
+                    let base_top = base.iter().rposition(|name| name.is_some());
                     for (index, id) in ids.iter().enumerate() {
                         let y = min_y + index as i32;
                         let before = base[index].as_deref();
@@ -1671,22 +1675,31 @@ mod tests {
                         if before == id.as_deref() {
                             continue;
                         }
-                        // A row the pass did change: it can only change one its
-                        // target test accepts.
-                        assert!(
-                            before
-                                .is_some_and(|before| tags
-                                    .contains("minecraft:base_stone_overworld", before)),
-                            "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
-                        );
+                        // Two writers change rows here and their contracts
+                        // differ. A vein recolors a row only when its target
+                        // test accepts what was already there. The placement
+                        // stage also *names* rows the fill pass left empty,
+                        // which is the behavior this pass exists to have, so
+                        // such a write has to be open sky above this column's
+                        // own fill top rather than a hole inside its body.
+                        match before {
+                            Some(before) => assert!(
+                                tags.contains("minecraft:base_stone_overworld", before),
+                                "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
+                            ),
+                            None => assert!(
+                                id.is_some() && base_top.is_some_and(|top| index > top),
+                                "({x}, {z}) row {y}: a placement named row {index} of a column whose highest named row is {base_top:?}"
+                            ),
+                        }
                     }
                     assert_eq!(
                         ids.iter()
                             .zip(base.iter())
-                            .filter(|(after, before)| after.is_some() != before.is_some())
+                            .filter(|(after, before)| after.is_none() && before.is_some())
                             .count(),
                         0,
-                        "({x}, {z}): a vein cannot create or remove a row, only recolor one"
+                        "({x}, {z}): a decoration cannot remove a row, only recolor or name one"
                     );
                 }
             }
