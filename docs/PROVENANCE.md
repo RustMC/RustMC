@@ -1466,3 +1466,23 @@ Neither the probe nor the committed test reads the owner's save; both go through
 the pack and the generator only. The scratch worktree was restored afterwards and
 verified clean at `2150952`, its patched file `cmp`-identical to the reviewed
 tree.
+
+An independent review of this ground-cover slice found one post-carve height
+error: the fill pass's cached top is a pre-carve bound, so a carved-open top row
+does not imply the whole column is empty. The correction walks down to the
+highest non-air post-carve row. The operator-provisioned Java 26.3 pack and
+RustMC's generated column, consulted read-only, expose the regression at seed
+2026 `(64, -48)`: cached top y=63, carved air through y=55, and granite at
+y=54. A local pack-backed test pins that observation. The owner's save was read
+only through the oracle for distribution measurement. In the fully generated
+65,536-column `-128..127` square, the corrected build reports 5,973 grasses
+against 2,543 in the save and 223 flowers against 95; the pre-correction build
+reported 5,885 and 222. No other census line changed. This is a distribution
+regression in absolute count. Size-matched spawn and distant controls now report
+5,502/2,622 and 4,165/788 grasses, and 264/34 and 206/39 flowers (RustMC/save);
+both also changed only those vegetation lines. Across those controls and the
+published and small squares, grass ratios run 2.10×–5.29× and flower ratios
+2.00×–7.76×. The T4 gate stays open, and the count comparison does not
+establish exact-position parity. No third-party server binary,
+decompiled class, or other server implementation was used to derive the
+correction.

@@ -1210,6 +1210,57 @@ with the heightmap-anchor question named as the first testable step. Trees,
 structures and the noise-driven flower providers still need their own slices, and
 the T4 gate remains unmet.
 
+### Post-carve surface correction, 12 October 2026
+
+The `this build` columns in the tables above record the pre-correction PR head
+`b367559`. An independent
+review found that the decoration height lookup used the fill pass's cached top
+row, then returned no surface if a carver had opened that one row. The post-carve
+column can still have terrain below it. At seed 2026, local pack data at
+`(64, -48)` give a cached top of y=63, air at y=63..55, and granite at y=54;
+160 of 256 columns in that one sampled chunk have an opened cached top. The
+fraction describes that chunk only. The corrected lookup descends to the first
+post-carve non-air row and has a pack-backed regression at that coordinate.
+
+The same release `census_compare` command over the published `-128..127` square
+(65,536 columns, zero missing chunks) changed only ground cover against the
+earlier build: grasses 5,885 → 5,973 against 2,543 in the save, and flowers
+222 → 223 against 95. RustMC grass bands changed from 576/3,020/2,289 to
+610/3,056/2,307 at y=32/64/96; flower bands changed from 19/125/78 to
+23/122/78. All other report lines matched the earlier build byte for byte.
+The correction makes the distribution-level over-count slightly worse; it is
+not evidence of exact-position parity or completion of T4.
+
+The size-matched `0..255` spawn control (65,536 columns, zero missing chunks)
+also changes only ground cover: grasses 5,395 → 5,502 against the save's 2,622,
+and flowers 263 → 264 against 34. Its save-side counts and every other report
+line are unchanged. The old table above is retained as a versioned observation,
+not the corrected build's current count.
+
+The distant `1024..1279` control (65,536 columns, zero missing chunks) changes
+only the same families: grasses 4,101 → 4,165 against 788 saved, and flowers
+184 → 206 against 39. The `0..63` square remains 485 grasses against 95 saved
+and four flowers against two, with no line changed. Across those four squares,
+the corrected grass ratios range from 2.10× to 5.29× and flower ratios from
+2.00× to 7.76×. They are distribution-level errors, not a distance trend or
+a measure of exact-position agreement.
+
+Cost was remeasured as five alternating old/new release-build pairs with
+`bench_vanilla_chunks --seed 2026 --side 4 --repeat 1 --mode columns` and the
+same provisioned pack. Each run covers 16 chunks, 4,096 columns and writes
+637,619 rows on both builds. The pre-correction build's cold min/median/max
+were 1,461.54/1,570.23/1,700.67 ms per chunk (median process wall 25.15 s);
+the corrected build's were 1,435.92/1,470.87/1,674.31 ms per chunk (median
+wall 23.58 s). All ten process user/wall ratios exceeded 0.99. The ranges
+overlap widely, so this sample does not establish a speed benefit or cost
+regression. The correction adds no cache and leaves its fixed capacity intact.
+
+The release `vanilla_oracle substance` check over seed 2026 `-384..384`, stride
+16, against the same save and pack still covers 2,401 columns and 347,483
+positions, with 342,641 exact (98.61%). Its 40-line report retains md5
+`28f153fd93ebb5d299544a3447f195c1`; wall/user time was 12.47/12.33 s.
+That is a terrain/material check, not vegetation parity evidence.
+
 ## Risks
 
 - **Legal ambiguity** until EULA review: derived numeric constants are the

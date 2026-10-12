@@ -1081,12 +1081,19 @@ impl DecorationTarget for ChunkView<'_> {
     }
 
     fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
-        // The decoration-time world-surface row is the top the fill pass
-        // already memoises for the column; asking it whether anything is
-        // there keeps a column the filler left empty from answering with the
-        // dimension floor, which is what the heightmap decoration drops on.
-        let top = self.generator.surface_height(x, z);
-        (self.generator.substance(x, top, z) != Substance::Air).then_some(top)
+        // The fill pass memoises its top before carvers run. A carver can open
+        // that row while leaving terrain below it; the decoration heightmap
+        // must keep descending instead of dropping the whole column.
+        let mut y = self.generator.surface_height(x, z);
+        loop {
+            if self.generator.substance(x, y, z) != Substance::Air {
+                return Some(y);
+            }
+            if y == self.generator.router.min_y {
+                return None;
+            }
+            y -= 1;
+        }
     }
 }
 
@@ -1760,6 +1767,38 @@ mod tests {
                 "column ({x}, {z}) top row at y={top}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_decoration_height_descends_below_a_carved_top() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let (x, z) = (64, -48);
+        let fill_top = generator.surface_height(x, z);
+        assert_eq!(fill_top, 63);
+        assert_eq!(generator.substance(x, fill_top, z), Substance::Air);
+
+        // The independent column construction names cave air at the carved
+        // top and leaves the first post-carve non-air row below it.
+        let ids = generator.base_column_ids(x, z);
+        let highest_non_air = ids
+            .iter()
+            .rposition(|id| id.as_deref().is_some_and(|name| !AIR_IDS.contains(&name)))
+            .map(|row| generator.router.min_y + row as i32);
+        assert_eq!(highest_non_air, Some(54));
+
+        let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: x >> 4,
+            chunk_z: z >> 4,
+            chunk: &mut chunk,
+        };
+        assert_eq!(view.surface_height(x, z), highest_non_air);
     }
 
     /// Requires the operator-provisioned 26.3 worldgen data. On real terrain
