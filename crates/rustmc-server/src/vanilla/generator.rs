@@ -1610,8 +1610,9 @@ mod tests {
     /// subset of `base_stone_overworld`, so that one tag answers for the recolor
     /// half of the placement stage: a row that already had a name and changed one
     /// must have held a member of it before. The stage's other half — the ground
-    /// cover that replaced nothing — is bounded from the other side: a row the
-    /// fill pass left empty may only be named above this column's own fill top.
+    /// cover that replaced nothing — is bounded on both sides: a row the fill pass
+    /// left empty may only be named within a measured band above this column's own
+    /// highest named base row, never inside its body and never floating above it.
     /// No row may disappear.
     ///
     /// The four 16×16 squares sit at fixed origins on a power-of-two grid,
@@ -1680,16 +1681,36 @@ mod tests {
                         // test accepts what was already there. The placement
                         // stage also *names* rows the fill pass left empty,
                         // which is the behavior this pass exists to have, so
-                        // such a write has to be open sky above this column's
-                        // own fill top rather than a hole inside its body.
+                        // such a write has to sit just above this column's own
+                        // fill top rather than deep inside its body or floating
+                        // far above it.
+                        // The upper edge is measured, not derived: across the
+                        // four squares below, 166 rows are named onto empty
+                        // space and they sit at distances 1 (74 of them), 2 (55),
+                        // 3 (26), 4 (6), 5 (4) and 6 (1) above their column's
+                        // highest named base row — the tail coming from later
+                        // ordinals stacking cover on rows earlier ordinals have
+                        // just named. 17 leaves headroom over that maximum so the
+                        // bound stays a check on where a placement anchors rather
+                        // than a restatement of today's draw. Nothing in this
+                        // runtime caps how far a placement offset can reach
+                        // vertically, so this number is a regression bound and not
+                        // a Java parity claim; it exists because the single
+                        // assertion it replaced caught a placement naming a row 25
+                        // above its anchor, and an unbounded "anywhere above the
+                        // fill top" does not.
+                        const NAMED_ROW_MAX_ABOVE_SURFACE: i32 = 17;
                         match before {
                             Some(before) => assert!(
                                 tags.contains("minecraft:base_stone_overworld", before),
                                 "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
                             ),
                             None => assert!(
-                                id.is_some() && base_top.is_some_and(|top| index > top),
-                                "({x}, {z}) row {y}: a placement named row {index} of a column whose highest named row is {base_top:?}"
+                                base_top.is_some_and(|top| {
+                                    let above = index as i32 - top as i32;
+                                    (1..=NAMED_ROW_MAX_ABOVE_SURFACE).contains(&above)
+                                }),
+                                "({x}, {z}) row {y}: a placement named empty row {index} outside the band above its column's highest named row {base_top:?}"
                             ),
                         }
                     }
@@ -2405,12 +2426,17 @@ mod tests {
     /// What the decoration view's open-sky answer rests on, checked against a
     /// production chunk rather than a fixture's own target: a row the fill pass
     /// leaves unnamed holds air — the substance pass says so for every one of
-    /// them, whether it is sky above a column top, the gap a density hole leaves
-    /// inside the body, or a cave the carver opened above the rows the fill pass
-    /// reached — and the view names each of them `minecraft:air`, which is one of
-    /// the names `is_air` accepts. The agreement checked here is therefore
-    /// scoped to the decorated chunk: one column outside it, `block_at` refuses
-    /// and `is_air` answers from the terrain instead.
+    /// them — and the view names each of them `minecraft:air`, which is one of the
+    /// names `is_air` accepts. Two of the three unnamed families are exercised
+    /// here and one is not: this fixture's carver has probability 0.0, so it
+    /// stamps no mask and a cave the carver opened above the rows the fill pass
+    /// reached cannot appear in it. That third family is measured out of tree on
+    /// the provisioned pack and recorded in `docs/PROVENANCE.md`; what this test
+    /// does guarantee, by counting, is that both families the fixture *does* have
+    /// show up — sky above a column top, and the gap a density hole leaves inside
+    /// a body. The agreement checked here is scoped to the decorated chunk: one
+    /// column outside it, `block_at` refuses and `is_air` answers from the terrain
+    /// instead, which is asserted at the fringe below rather than only stated.
     #[test]
     fn unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold() {
         let (root, generator) = decorating_generator("open-sky");
@@ -2435,6 +2461,30 @@ mod tests {
         assert!(
             !empty.is_empty() && !filled.is_empty(),
             "the fixture must hold both sky and ground, or the checks below are vacuous"
+        );
+        // Both unnamed families this fixture can produce have to be present, or
+        // the loop below proves one case and claims two: an unnamed row above its
+        // column's highest named row is open sky, one below it is the gap a
+        // density hole left inside the body.
+        let mut column_top: HashMap<(i32, i32), i32> = HashMap::new();
+        for (x, y, z, _) in &filled {
+            let top = column_top.entry((*x, *z)).or_insert(*y);
+            if *y > *top {
+                *top = *y;
+            }
+        }
+        let (mut sky, mut interior, mut bare) = (0usize, 0usize, 0usize);
+        for (x, y, z) in &empty {
+            match column_top.get(&(*x, *z)) {
+                Some(top) if *y > *top => sky += 1,
+                Some(_) => interior += 1,
+                None => bare += 1,
+            }
+        }
+        assert!(
+            sky > 0 && interior > 0,
+            "the fixture must leave both sky and an interior density gap unnamed: \
+             sky={sky} interior={interior} bare={bare}"
         );
         for (x, y, z) in &empty {
             assert_eq!(
@@ -2473,17 +2523,32 @@ mod tests {
                 "a named row at ({x}, {y}, {z}) lost its own name"
             );
         }
-        // And the scope of the agreement above is pinned, not just stated: a
-        // column outside the decorated chunk is refused by `writable`, so
-        // `block_at` answers nothing there while `is_air` falls back to the
-        // terrain. This is the boundary the air filter's own pass never asks
-        // about, because it tests `writable` before it reads.
-        let fringe_y = min_y + height as i32 - 1;
-        assert!(
-            !view.writable(-1, fringe_y, 0),
-            "a neighbouring column must not be writable inside the decorated chunk's pass"
-        );
-        assert_eq!(view.block_at(-1, fringe_y, 0), None);
+        // And the scope of the agreement above is pinned, not just stated.
+        // `block_at` refuses exactly where `writable` refuses — `generator.rs`
+        // reads `writable` first — so those two are one assertion written twice,
+        // and the non-trivial half is that outside the decorated chunk `is_air`
+        // stops answering the fallback and answers the terrain instead: air above
+        // the world's top row, not necessarily air at its floor. That is why the
+        // agreement above is claimed only inside the decorated chunk.
+        let fringe_top = min_y + height as i32 - 1;
+        for (x, z) in [(-1, 0), (16, 0), (0, -1), (0, 16)] {
+            assert!(
+                !view.writable(x, fringe_top, z),
+                "a neighbouring column at ({x}, {z}) must not be writable inside this chunk's pass"
+            );
+            assert_eq!(
+                view.block_at(x, fringe_top, z),
+                None,
+                "({x}, {z}) row {fringe_top}: `block_at` answered outside the writable zone"
+            );
+            for y in [min_y, fringe_top] {
+                assert_eq!(
+                    view.is_air(x, y, z),
+                    generator.substance(x, y, z) == Substance::Air,
+                    "outside the decorated chunk `is_air` must answer the terrain substance at ({x}, {y}, {z})"
+                );
+            }
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 
