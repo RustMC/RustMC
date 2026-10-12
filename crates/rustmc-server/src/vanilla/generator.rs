@@ -1008,8 +1008,8 @@ impl VanillaGenerator {
 }
 
 /// The air families a decoration pass's neighbour test treats as air: the
-/// filler writes the named cave air at carved rows, and the pre-carve `None`
-/// entry stands for the air above the terrain.
+/// filler writes the named cave air at the carved rows it reaches, and open
+/// sky arrives as the `minecraft:air` this module names an unnamed row.
 const AIR_IDS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
 
 impl DecorationTarget for ChunkView<'_> {
@@ -1035,14 +1035,17 @@ impl DecorationTarget for ChunkView<'_> {
         let row = (y - self.generator.router.min_y) as usize;
         let at = self.chunk.index(x & 15, row, z & 15);
         // An unnamed row inside the decorated chunk is a row the fill pass left
-        // empty, and the only rows it leaves empty hold air: a solid or fluid
-        // row is named by the surface rules or the filler, a carved row is
-        // named the carver's `cave_air`, and everything else the column walk
-        // passed — the sky above the top and the air a density gap leaves
-        // inside the body — stays empty. Naming those rows here is what lets
-        // `matching_block_tag minecraft:air` pass on open sky instead of only
-        // on carved air; `is_air` already read an unnamed row as air, and the
-        // two answers cannot disagree across one position.
+        // empty, and every row it leaves empty holds air: the substance pass
+        // says so for each one, both for the sky above a column top and for the
+        // gap a density hole leaves inside the body. A carved row is not
+        // necessarily named either — the carver rewrites only the rows the fill
+        // pass reached, so a cave it opens above that top stays empty here too.
+        // Naming these rows is what lets `matching_block_tag minecraft:air` pass
+        // on open sky instead of only on carved air. `is_air` already read an
+        // unnamed row as air, so *inside* the decorated chunk the two answers
+        // cannot disagree; outside it `block_at` returns `None` while `is_air`
+        // falls back to the terrain substance, which is a different question and
+        // the reason the claim is scoped this way.
         Some(
             self.chunk
                 .name(self.chunk.blocks[at])
@@ -2389,10 +2392,12 @@ mod tests {
     /// What the decoration view's open-sky answer rests on, checked against a
     /// production chunk rather than a fixture's own target: a row the fill pass
     /// leaves unnamed holds air — the substance pass says so for every one of
-    /// them, for the sky above a column top and for the gap a density hole
-    /// leaves inside the body — and the view names each of them
-    /// `minecraft:air`, which is what `is_air` has always answered. A carved
-    /// row is not among them, because the carver stamps its cave air by name.
+    /// them, whether it is sky above a column top, the gap a density hole leaves
+    /// inside the body, or a cave the carver opened above the rows the fill pass
+    /// reached — and the view names each of them `minecraft:air`, which is one of
+    /// the names `is_air` accepts. The agreement checked here is therefore
+    /// scoped to the decorated chunk: one column outside it, `block_at` refuses
+    /// and `is_air` answers from the terrain instead.
     #[test]
     fn unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold() {
         let (root, generator) = decorating_generator("open-sky");
@@ -2437,9 +2442,13 @@ mod tests {
                 Some("minecraft:air"),
                 "an unnamed row at ({x}, {y}, {z}) must name the air it holds"
             );
+            // Not an independent cross-check: `is_air` now reads through
+            // `block_at`, so this asserts the one thing the two calls do not
+            // settle between them — that the name the fallback invents is a name
+            // the decoration pass treats as air.
             assert!(
                 view.is_air(*x, *y, *z),
-                "block_at and is_air disagree at ({x}, {y}, {z})"
+                "is_air does not treat the fallback name as air at ({x}, {y}, {z})"
             );
         }
         // The fallback is a fallback, not a rewrite: every named row still
@@ -2451,6 +2460,17 @@ mod tests {
                 "a named row at ({x}, {y}, {z}) lost its own name"
             );
         }
+        // And the scope of the agreement above is pinned, not just stated: a
+        // column outside the decorated chunk is refused by `writable`, so
+        // `block_at` answers nothing there while `is_air` falls back to the
+        // terrain. This is the boundary the air filter's own pass never asks
+        // about, because it tests `writable` before it reads.
+        let fringe_y = min_y + height as i32 - 1;
+        assert!(
+            !view.writable(-1, fringe_y, 0),
+            "a neighbouring column must not be writable inside the decorated chunk's pass"
+        );
+        assert_eq!(view.block_at(-1, fringe_y, 0), None);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

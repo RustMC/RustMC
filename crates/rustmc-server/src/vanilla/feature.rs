@@ -284,8 +284,11 @@ impl BlockPredicate {
 
     /// Evaluates the predicate against the terrain around one candidate
     /// position. A shifted read that leaves the decorated chunk answers
-    /// "no block", which is the conservative reading: the neighbour's own
-    /// pass paints its half of the patch, exactly as for the ore path.
+    /// "no block", so a positive gate fails there and a negated gate passes:
+    /// this pass cannot see the neighbour's veins. Within the nine-chunk
+    /// window the neighbour's own pass does draw its half of a straddling
+    /// patch from its own anchor, but a predicate offset reaches past that
+    /// window — see [`DecorationTarget::writable`] for how far.
     pub fn test(
         &self,
         target: &dyn DecorationTarget,
@@ -1943,11 +1946,12 @@ pub trait DecorationTarget {
     fn writable(&self, x: i32, y: i32, z: i32) -> bool;
     /// The block name at the position. Inside the decorated chunk this is
     /// always a name: a row the fill pass left empty holds air and answers
-    /// `minecraft:air`, which is the same answer [`Self::is_air`] gives, while
-    /// a carved row answers the carver's own `minecraft:cave_air`. `None`
-    /// means the position is outside the chunk the view writes. Earlier
-    /// decorations in this pass have already painted here: a later vein may
-    /// replace stone a blob turned to granite.
+    /// `minecraft:air`, the same answer [`Self::is_air`] gives. A carved row
+    /// answers the carver's own `minecraft:cave_air` where the carver reached
+    /// it; above the fill top it wrote nothing, so such a row is empty and
+    /// takes the air answer. `None` means the position is outside the chunk the
+    /// view writes. Earlier decorations in this pass have already painted here:
+    /// a later vein may replace stone a blob turned to granite.
     fn block_at(&self, x: i32, y: i32, z: i32) -> Option<&str>;
     /// Whether the position holds air, for the air-exposure test. Reads
     /// beyond the writable zone still have an answer, because the six
@@ -2199,9 +2203,10 @@ fn place_ore(
 /// written.
 ///
 /// The position has to be inside the decorated chunk before anything is drawn,
-/// the same confinement and the same stream discipline the vein path keeps:
-/// the neighbour's own pass paints its half of a patch that straddles the
-/// border. The state then comes from the provider — a weighted pick costs one
+/// the same confinement the vein path keeps: a write outside it is refused and
+/// lost here, and reaches the map only through the neighbouring chunk's own
+/// pass, which draws its own anchor rather than completing this one's patch.
+/// The state then comes from the provider — a weighted pick costs one
 /// bounded draw — and the block written only replaces air, which is what the
 /// pack's own `minecraft:air` tag says the chains gated on it expect.
 fn place_simple_block(
