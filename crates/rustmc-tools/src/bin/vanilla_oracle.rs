@@ -95,6 +95,20 @@ const SEED_MODES: [&str; 7] = [
     "column",
 ];
 
+/// Maximum positional count, including the mode and save path. `inspect`
+/// accepts any number of coordinate pairs and checks their pairing below.
+fn max_positionals(mode: &str) -> Option<usize> {
+    match mode {
+        "worksheet" | "census_names" => Some(5),
+        "compare" | "substance" => Some(9),
+        "block_compare" => Some(8),
+        "biome_volume" => Some(6),
+        "census" => Some(4),
+        "census_compare" | "column" => Some(7),
+        _ => None,
+    }
+}
+
 fn run(raw_args: &[String]) -> Result<(), String> {
     let allow_partial = raw_args.iter().any(|arg| arg == "--allow-partial");
     let args: Vec<String> = raw_args
@@ -113,6 +127,15 @@ fn run(raw_args: &[String]) -> Result<(), String> {
                 .to_string(),
         );
     };
+    if let Some(max) = max_positionals(mode)
+        && args.len() > max
+    {
+        return Err(format!(
+            "{mode} accepts at most {} positional arguments after the mode; unexpected argument {:?}",
+            max - 1,
+            args[max]
+        ));
+    }
     let world = Path::new(args.get(1).ok_or("missing <world-dir>")?);
     if SEED_MODES.contains(&mode) {
         attest_seed(world, parse_i64(args.get(2).ok_or("missing <seed>")?)?)?;
@@ -846,6 +869,25 @@ mod tests {
     use super::*;
 
     const SOURCE: &str = include_str!("vanilla_oracle.rs");
+
+    #[test]
+    fn extra_positionals_are_rejected_before_save_attestation() {
+        let args: Vec<String> = [
+            "column",
+            "missing-world",
+            "2026",
+            "0",
+            "0",
+            "vanilla",
+            "data-root",
+            "extra",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let error = run(&args).unwrap_err();
+        assert!(error.contains("unexpected argument \"extra\""), "{error}");
+    }
 
     /// The documented usage block is what an operator actually runs, so a mode
     /// that takes a seed there has to be attested here — and a mode that does

@@ -17,20 +17,23 @@ pub struct Region {
 }
 
 impl Region {
-    fn open(path: PathBuf, coords: (i32, i32)) -> Result<Self, String> {
-        let bytes =
-            std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    fn open(path: PathBuf, coords: (i32, i32)) -> Result<Option<Self>, String> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
         if bytes.len() < 8192 {
             return Err(format!(
                 "{} is smaller than a region header",
                 path.display()
             ));
         }
-        Ok(Self {
+        Ok(Some(Self {
             coords,
             bytes,
             path,
-        })
+        }))
     }
 
     fn be_i32(&self, byte_offset: usize) -> i32 {
@@ -158,7 +161,7 @@ impl RegionStore {
             let mut opened = None;
             for layout in paths {
                 let path = self.region_path(coords, layout);
-                if let Ok(region) = Region::open(path, coords) {
+                if let Some(region) = Region::open(path, coords)? {
                     self.layout = Some(layout);
                     opened = Some(region);
                     break;
@@ -251,6 +254,19 @@ mod tests {
         store_with_region(&dir, region);
         let mut store = RegionStore::new(&dir);
         assert!(store.chunk_root(3, 5).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_truncated_region_is_an_error_not_missing_coverage() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustmc-oracle-truncated-region-{}",
+            std::process::id()
+        ));
+        store_with_region(&dir, vec![0u8; 8]);
+        let mut store = RegionStore::new(&dir);
+        let error = store.chunk_root(3, 5).unwrap_err();
+        assert!(error.contains("r.0.0.mca is smaller than a region header"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
