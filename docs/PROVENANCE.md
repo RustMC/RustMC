@@ -1315,3 +1315,35 @@ with nothing behind it: two tests in the binary now read the tool's own usage
 block, require the modes that document a `<seed>` to be exactly the attested
 modes, and require every mode the usage error offers to have a dispatch arm, so a
 future seed-taking mode cannot be documented and left unattested.
+
+### 14 October 2026: block-tag reference decoding for 26.3 data
+
+The operator-provisioned official Java 26.3 pack contains 300 block-tag JSON
+files and 278 string entries beginning with `#`; an independent read-only JSON
+inventory found that all 278 targets exist in that pack. The public data shape
+is a literal block identifier such as `minecraft:stone` or a reference such as
+`#minecraft:blocks_motion`. RustMC's tag loader previously inserted the latter
+as if it were a block name. This change resolves string and object `id` tag
+references transitively, stops cycles with a per-tag visited set, rejects a
+missing required reference, and skips a missing optional reference. It keeps
+support for the loader's earlier object `tag` form. Synthetic tests cover
+literals, nesting, cycles, optional and required missing references, and the
+case where an optional duplicate must not hide a required missing reference.
+The ignored operator-pack test is opt-in through `RUSTMC_VANILLA_DATA` and
+checks that `blocks_motion_in_heightmap` contains stone and oak leaves, while
+its no-leaves counterpart contains stone but not oak leaves; neither contains
+short grass. The local pack itself, owner saves, and generated data are not
+committed. No third-party server implementation was consulted for this change.
+
+A fresh detached release build of merged main `7fdfa4b` and a separate release
+build of the candidate each ran `vanilla_oracle census_compare <save> 2026 0 31
+vanilla <data-root>` on the same owner save. Both scored 4/4 stored chunks and
+1,024 generated columns, with byte-identical standard output and coverage on
+standard error; this sample shows no ore or vegetation census change on main.
+One sequential process run each took 9.10 s wall / 9.05 s user before and
+8.75 s wall / 8.70 s user after. Those single measurements are diagnostic
+run times, not evidence of a speed improvement or a bound for other squares.
+The tag loader is bounded by the provisioned pack's tag graph but does not
+validate literal block IDs against the runtime registry. Ground-cover and
+heightmap semantics in the separate draft PR are not measured by this mainline
+A/B and require their own final-tip oracle and client checks.
