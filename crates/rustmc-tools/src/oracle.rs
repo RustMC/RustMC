@@ -551,6 +551,162 @@ pub fn percent(matches: usize, columns: usize) -> f64 {
     }
 }
 
+/// Which generator the scored RustMC-side answers came from. Recorded in every
+/// coverage line so a zero can never be read as a parity result: `preview` and
+/// `experimental` are RustMC's own terrain models, not the vanilla pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoredSource {
+    /// The data-driven vanilla density and surface pipeline.
+    Vanilla,
+    /// `Terrain::Preview`, the placeholder terrain model.
+    Preview,
+    /// `Terrain::Experimental`, the experimental terrain model.
+    Experimental,
+    /// Save-side accounting only: no RustMC answer is scored in this mode.
+    Save,
+}
+
+impl ScoredSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vanilla => "vanilla",
+            Self::Preview => "preview-not-vanilla-generator",
+            Self::Experimental => "experimental-not-vanilla-generator",
+            Self::Save => "save-only",
+        }
+    }
+}
+
+/// Denominator accounting for one oracle run, printed as one machine-readable
+/// line by every scoring mode. The denominators are save-driven, so a wrong
+/// world directory or a partially generated save shrinks the population instead
+/// of raising an error: `expected` records the grid or chunk square the mode
+/// asked for, `missing` the units the save could not supply, and `unaccounted`
+/// any unit that is neither scored nor explained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coverage {
+    pub scored: usize,
+    pub expected: usize,
+    pub missing: usize,
+    pub unaccounted: usize,
+    pub source: ScoredSource,
+}
+
+impl Coverage {
+    /// Builds the account, deriving `unaccounted` from the other three so no
+    /// mode can forget to state the residual.
+    pub fn new(scored: usize, expected: usize, missing: usize, source: ScoredSource) -> Self {
+        Self {
+            scored,
+            expected,
+            missing,
+            unaccounted: expected.saturating_sub(scored).saturating_sub(missing),
+            source,
+        }
+    }
+
+    /// Every requested unit is scored and none is unexplained.
+    pub fn is_complete(self) -> bool {
+        self.scored == self.expected && self.missing == 0 && self.unaccounted == 0
+    }
+
+    /// The machine-readable line, identical whatever follows from it.
+    pub fn line(self) -> String {
+        format!(
+            "coverage scored={} expected={} missing={} unaccounted={} source={}",
+            self.scored,
+            self.expected,
+            self.missing,
+            self.unaccounted,
+            self.source.name()
+        )
+    }
+
+    /// The diagnosis, shared by both verdicts so the accepted warning and the
+    /// rejected error describe the same shortfall in the same words.
+    fn shortfall_reason(self) -> String {
+        format!(
+            "incomplete measurement: scored={} of expected={} with missing={} unaccounted={} (source={})",
+            self.scored,
+            self.expected,
+            self.missing,
+            self.unaccounted,
+            self.source.name()
+        )
+    }
+
+    /// Why this run is not comparable with a full-coverage baseline, and the
+    /// flag that would have accepted it.
+    fn shortfall(self) -> String {
+        format!(
+            "{}; a partial population is not comparable with a published baseline, and this mode exits non-zero unless the run is complete (rerun with --allow-partial to accept a partial measurement)",
+            self.shortfall_reason()
+        )
+    }
+
+    /// The one shortfall `--allow-partial` does not rescue: nothing at all was
+    /// scored, so there is no partial measurement to read.
+    fn empty(self) -> String {
+        format!(
+            "nothing was scored: expected={} with missing={} unaccounted={} (source={}); the save holds none of the units this run asked for, and --allow-partial accepts a partially populated save, not an empty measurement",
+            self.expected,
+            self.missing,
+            self.unaccounted,
+            self.source.name()
+        )
+    }
+
+    /// The lines to print and the exit status: `allow_partial` downgrades a
+    /// shortfall to a warning and never changes the coverage line — except a
+    /// run that scored nothing, which fails whatever the flag says, because
+    /// zeros over an empty sample are the failure this guard exists to catch.
+    pub fn outcome(self, allow_partial: bool) -> CoverageOutcome {
+        if self.is_complete() {
+            return CoverageOutcome::Complete { line: self.line() };
+        }
+        if allow_partial && self.scored > 0 {
+            return CoverageOutcome::PartialAccepted {
+                line: self.line(),
+                warning: format!(
+                    "{}; accepted because --allow-partial is present, so this output is not comparable with a published baseline",
+                    self.shortfall_reason()
+                ),
+            };
+        }
+        let message = if self.scored == 0 {
+            self.empty()
+        } else {
+            self.shortfall()
+        };
+        CoverageOutcome::PartialRejected {
+            line: self.line(),
+            message,
+        }
+    }
+}
+
+/// What a mode does with one coverage report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageOutcome {
+    /// Full coverage: print the line and keep the exit status.
+    Complete { line: String },
+    /// Shortfall tolerated by `--allow-partial`: print the line and a warning.
+    PartialAccepted { line: String, warning: String },
+    /// Shortfall: print the line, then fail with this message.
+    PartialRejected { line: String, message: String },
+}
+
+impl CoverageOutcome {
+    /// The machine-readable line, which every variant prints unchanged.
+    pub fn line(&self) -> &str {
+        match self {
+            Self::Complete { line }
+            | Self::PartialAccepted { line, .. }
+            | Self::PartialRejected { line, .. } => line,
+        }
+    }
+}
+
 /// Absolute Y of the top terrain block from the stored heightmaps, or
 /// `Ok(None)` when the column is not filled yet.
 ///
@@ -860,8 +1016,13 @@ pub fn compare_biome_volume(
                 report.missing_chunks += 1;
                 continue;
             };
+            let cells = biome_cells(&root, chunk_x, chunk_z)?;
+            if cells.is_empty() {
+                report.missing_chunks += 1;
+                continue;
+            }
             report.chunks += 1;
-            for cell in biome_cells(&root, chunk_x, chunk_z)? {
+            for cell in cells {
                 report.cells += 1;
                 let band = cell.y.div_euclid(32) * 32;
                 let entry = report.bands.entry(band).or_default();
@@ -1316,9 +1477,12 @@ pub struct Census {
 
 impl Census {
     fn record_section(&mut self, section: &Tag) -> Result<(), String> {
-        let Some(y_min) = section.get("Y").and_then(Tag::as_i32).map(|y| y * 16) else {
-            return Ok(());
-        };
+        let y_min = section
+            .get("Y")
+            .and_then(Tag::as_i32)
+            .ok_or("section without Y")?
+            .checked_mul(16)
+            .ok_or("section Y overflows block coordinates")?;
         let band = y_min.div_euclid(32) * 32;
         for (name, count) in section_name_counts(section)? {
             if let Some(family) = census_family(base_block_name(&name)) {
@@ -1329,12 +1493,16 @@ impl Census {
         Ok(())
     }
 
-    fn record_chunk(&mut self, root: &Tag) -> Result<(), String> {
-        for section in chunk_sections(root)? {
+    fn record_chunk(&mut self, root: &Tag) -> Result<bool, String> {
+        let sections = chunk_sections(root)?;
+        if sections.is_empty() {
+            return Ok(false);
+        }
+        for section in sections {
             self.record_section(section)?;
         }
         self.chunks += 1;
-        Ok(())
+        Ok(true)
     }
 
     /// Fold one generated column (as produced by
@@ -1381,9 +1549,12 @@ pub fn census_name_histogram(
             let Some(root) = store.chunk_root(chunk_x, chunk_z)? else {
                 continue;
             };
-            for section in
-                chunk_sections(&root).map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?
-            {
+            let sections =
+                chunk_sections(&root).map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?;
+            if sections.is_empty() {
+                continue;
+            }
+            for section in sections {
                 for (name, count) in section_name_counts(section)? {
                     *names.entry(name).or_default() += count;
                 }
@@ -1408,9 +1579,14 @@ pub fn census_chunks(
         for chunk_x in min_cx..=max_cx {
             match store.chunk_root(chunk_x, chunk_z)? {
                 None => census.missing_chunks += 1,
-                Some(root) => census
-                    .record_chunk(&root)
-                    .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?,
+                Some(root) => {
+                    let scored = census
+                        .record_chunk(&root)
+                        .map_err(|e| format!("chunk ({chunk_x}, {chunk_z}): {e}"))?;
+                    if !scored {
+                        census.missing_chunks += 1;
+                    }
+                }
             }
         }
     }
@@ -2272,5 +2448,156 @@ mod tests {
             census.bands.get(&(CensusFamily::DeepslateDiamond, 96)),
             Some(&4096)
         );
+    }
+
+    #[test]
+    fn stored_placeholder_chunk_cannot_complete_a_census() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rustmc-empty-census-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let region_dir = dir.join("region");
+        std::fs::create_dir_all(&region_dir).expect("create synthetic region directory");
+
+        // One stored chunk with an empty sections list, encoded as raw NBT in
+        // a minimal Anvil region. It has a location entry but no block data.
+        let mut nbt = vec![10, 0, 0, 9, 0, 8];
+        nbt.extend_from_slice(b"sections");
+        nbt.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut region = vec![0u8; 3 * 4096];
+        region[0..4].copy_from_slice(&[0, 0, 2, 1]);
+        region[8192..8196].copy_from_slice(&((nbt.len() + 1) as u32).to_be_bytes());
+        region[8196] = 3; // uncompressed chunk NBT
+        region[8197..8197 + nbt.len()].copy_from_slice(&nbt);
+        std::fs::write(region_dir.join("r.0.0.mca"), region).expect("write synthetic region");
+
+        let mut store = RegionStore::new(&dir);
+        let census = census_chunks(&mut store, 0, 0, 0, 0).expect("census placeholder");
+        assert_eq!((census.chunks, census.missing_chunks), (0, 1));
+        let (named_chunks, names) =
+            census_name_histogram(&mut store, 0, 0, 0, 0).expect("name placeholder");
+        assert_eq!(named_chunks, 0);
+        assert!(names.is_empty());
+        let coverage = Coverage::new(census.chunks, 1, census.missing_chunks, ScoredSource::Save);
+        assert!(matches!(
+            coverage.outcome(false),
+            CoverageOutcome::PartialRejected { .. }
+        ));
+        assert!(matches!(
+            coverage.outcome(true),
+            CoverageOutcome::PartialRejected { .. }
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove synthetic region");
+    }
+
+    #[test]
+    fn census_rejects_a_section_without_a_y_coordinate() {
+        let section = compound(&[(
+            "block_states",
+            compound(&[("palette", Tag::List(vec![palette_entry("minecraft:stone")]))]),
+        )]);
+        let root = compound(&[("sections", Tag::List(vec![section]))]);
+        let mut census = Census::default();
+        assert_eq!(
+            census.record_chunk(&root),
+            Err("section without Y".to_owned())
+        );
+        assert_eq!(census.chunks, 0);
+    }
+
+    /// The published seed-2026 substance grid: 49 x 49 sampled columns, all
+    /// present. Anything else is a shortfall by construction.
+    #[test]
+    fn full_coverage_is_complete_and_shortfalls_are_not() {
+        let full = Coverage::new(2401, 2401, 0, ScoredSource::Vanilla);
+        assert!(full.is_complete());
+        assert_eq!(full.unaccounted, 0);
+        // The partial run recorded on the wrong world directory: 208 missing
+        // chunks plus 153 ungenerated columns over the same 2401 grid.
+        let partial = Coverage::new(2040, 2401, 208 + 153, ScoredSource::Vanilla);
+        assert!(!partial.is_complete());
+        assert_eq!(partial.unaccounted, 0);
+        // Units that vanished without being scored or explained.
+        let unaccounted = Coverage::new(2040, 2401, 0, ScoredSource::Vanilla);
+        assert_eq!(unaccounted.unaccounted, 361);
+        assert!(!unaccounted.is_complete());
+        // A score above the requested grid cannot pass either.
+        let over = Coverage::new(2402, 2401, 0, ScoredSource::Vanilla);
+        assert!(!over.is_complete());
+    }
+
+    #[test]
+    fn coverage_line_names_the_scored_source() {
+        assert!(
+            Coverage::new(0, 2401, 0, ScoredSource::Preview)
+                .line()
+                .contains("source=preview-not-vanilla-generator")
+        );
+        assert!(
+            Coverage::new(0, 2401, 0, ScoredSource::Experimental)
+                .line()
+                .contains("source=experimental-not-vanilla-generator")
+        );
+        assert_eq!(
+            Coverage::new(1, 1, 0, ScoredSource::Vanilla).line(),
+            "coverage scored=1 expected=1 missing=0 unaccounted=0 source=vanilla"
+        );
+    }
+
+    #[test]
+    fn allow_partial_changes_the_exit_status_not_the_printed_line() {
+        let partial = Coverage::new(2040, 2401, 361, ScoredSource::Vanilla);
+        let rejected = partial.outcome(false);
+        let accepted = partial.outcome(true);
+        assert_eq!(rejected.line(), accepted.line());
+        assert_eq!(rejected.line(), partial.line());
+        assert!(matches!(rejected, CoverageOutcome::PartialRejected { .. }));
+        assert!(matches!(accepted, CoverageOutcome::PartialAccepted { .. }));
+        if let CoverageOutcome::PartialRejected { message, .. } = &rejected {
+            assert!(message.contains("--allow-partial"), "{message}");
+            assert!(message.contains("scored=2040"), "{message}");
+        }
+        if let CoverageOutcome::PartialAccepted { warning, .. } = &accepted {
+            assert!(warning.contains("--allow-partial is present"), "{warning}");
+            assert!(
+                !warning.contains("rerun with --allow-partial"),
+                "{warning} must not offer a flag the operator already gave"
+            );
+        }
+        let full = Coverage::new(2401, 2401, 0, ScoredSource::Vanilla);
+        assert!(matches!(
+            full.outcome(false),
+            CoverageOutcome::Complete { .. }
+        ));
+        assert!(matches!(
+            full.outcome(true),
+            CoverageOutcome::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_partial_never_rescues_a_run_that_scored_nothing() {
+        let empty = Coverage::new(0, 1, 1, ScoredSource::Vanilla);
+        for allow_partial in [false, true] {
+            let CoverageOutcome::PartialRejected { line, message } = empty.outcome(allow_partial)
+            else {
+                panic!("an empty measurement must fail even with --allow-partial");
+            };
+            assert_eq!(line, empty.line());
+            assert!(message.contains("nothing was scored"), "{message}");
+            assert!(
+                !message.contains("rerun with --allow-partial"),
+                "{message} must not offer a flag that will not help"
+            );
+        }
+        assert!(matches!(
+            Coverage::new(2040, 2401, 361, ScoredSource::Vanilla).outcome(true),
+            CoverageOutcome::PartialAccepted { .. }
+        ));
     }
 }

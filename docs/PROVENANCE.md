@@ -942,7 +942,11 @@ fixed. Evidence that it holds fixed: `ocean_floor_height` equals
 column of the four new tests and of the new operator-data smoke, including after
 whole-chunk fills overwrite lazily stored rows and after a sweep rotates every
 original map out of the cache; the 3D `substance` report is byte-identical between
-the builds (md5 28f153fd93ebb5d299544a3447f195c1); the `-128..127` family census
+the builds (md5 28f153fd93ebb5d299544a3447f195c1, reproducible as
+`vanilla_oracle substance <seed-2026 save> 2026 -384 384 16 vanilla <data-root>`
+— 40 standard-output lines, `columns=2401`, 347,483 positions, 342,641 exact at
+98.61%, re-measured to the same md5 on 11 October 2026 with the attestation guard
+in place, in 12.1 s of single-threaded release CPU); the `-128..127` family census
 report is byte-identical, all 24 placed families and `coal_ore` 37,951 included,
 which is the feature stream and the gate's decisions; and the three
 `block_compare` grids re-measure to the same lines and the same numerators —
@@ -1171,3 +1175,143 @@ rather than an operator-visible surface. Second, the `placement:` and `target:`
 prefixes are a naming convention, not a namespace check. Configured-type and
 `placement:` counts track documents rather than registry entries; `target:`
 counts track unsupported rule occurrences, including nested rules.
+
+## Oracle measurement attestation and denominators (11 October 2026)
+
+Two measurement failures on one day produced plausible numbers instead of
+errors, so the oracle now refuses to answer a question it cannot actually
+answer. A save directory was passed as the seed-2026 reference while it was a
+different world (seed `1792166558050215585`, bzip2-compressed chunks), and a
+second run compared against a still-populating save and reported 71.49% over
+2,040 of 2,401 columns as if it were the committed 98.61% baseline. Neither was
+flagged: the tool never read `level.dat`, and its denominators are save-driven,
+so a missing chunk shrinks the denominator instead of failing the run.
+
+`rustmc_tools::save` is now the single reader of a save's own version and world
+seed — `level.dat` plus `data/minecraft/world_gen_settings.dat`, the same
+storage layout `inspect_vanilla_save` already validated against the owner's
+26.3 saves — and every mode that takes a `<seed>` (`worksheet`, `compare`,
+`substance`, `block_compare`, `biome_volume`, `census_compare`, `column`)
+attests that argument against the stored value before measuring, exits non-zero
+naming both seeds and the path when they differ, and treats unreadable metadata
+as an error rather than a skipped check. `inspect` deliberately stays
+unattested: it is the tool you reach for when attestation fails. Every scoring
+mode then prints one machine-readable denominator line,
+`coverage scored=N expected=M missing=K unaccounted=U source=S`, and exits
+non-zero unless the run is complete — where `scored` and `expected` count the
+columns or chunks the mode asked the save for, not the positions inside them.
+`--allow-partial` downgrades only the exit status, for exploratory runs on a
+save that is still generating; it does not rescue a run that scored nothing.
+Measured on the seed-2026 save: `block_compare <save> 2026 60000 60003 8 <root>`
+asks for a square the save does not hold, prints
+`coverage scored=0 expected=1 missing=1 unaccounted=0 source=vanilla` and exits
+1 with `nothing was scored` whether or not the flag is present, while the same
+command over `0 … 15 … 8` prints `coverage scored=4 expected=4 missing=0` and
+exits 0. Letting the empty case pass under `--allow-partial` was this guard's own
+first defect, found by running it rather than by reading it; a unit test now
+pins both halves. `preview` and `experimental` terrain tokens keep their zero
+exit and label their source, because those modes legitimately answer no
+per-position substance at all — a zero there is labelled, never implied.
+
+The denominator line goes to standard error, not standard output: the 3D
+`substance` report is pinned in this file by md5 and the M3 `block_compare`
+grids line-for-line, so a measurement-integrity change must not become a change
+to the published measurement. Verified against the pre-change binary, built from
+`e8ee4d0` whose tree is identical to the merged main this branch carries,
+standard output is byte-identical and the exit statuses match for these exact
+commands on the seed-2026 save: `census <save> 0 15`;
+`column <save> 2026 0 0 vanilla <root>` (183 lines);
+`substance <save> 2026 0 0 1 vanilla <root>`; and
+`block_compare <save> 2026 0 15 8 <root>`. The argument slots are load-bearing
+for the claim itself: an earlier run put the data root in `column`'s terrain slot,
+so both binaries failed identically and the "byte-identical stdout" it recorded
+was two empty files proving nothing. Against a mismatched seed argument,
+`substance <save> 2027 0 0 1 vanilla <root>` used to emit a 37-line report and
+exit 0; it now prints nothing and exits 1 naming both seeds.
+
+A real partial square shows the middle case: `block_compare <save> 2026 0 4080
+255 <root>` reaches past what the owner's save holds and reports
+`coverage scored=35 expected=289 missing=254 unaccounted=0 source=vanilla`
+(`missing_chunks=247`, `ungenerated_columns=7`), exiting 1 without the flag and 0
+with it, printing the same coverage line either way.
+
+What attestation does *not* cover, stated so it is not assumed: it compares the
+stored world seed, and it pins the game version rather than reporting it — the
+shared reader refuses any save whose stored `Version.Name` is not `26.3`, the
+rule `inspect_vanilla_save` already applied — but it does not compare the
+dimension or the active data packs: the seed-2027 save reports
+`was_modded=true` with `fabric-convention-tags-v2` enabled, so a matching seed
+still requires the operator to know which packs generated the terrain. The bzip2
+(compression type 4) region limitation is unchanged: this repository's reader
+decodes zlib and uncompressed chunks only, and now says so rather than silently
+reporting fewer columns. On the wrong-world run, the seed attestation now fires
+first and names the stored seed `1792166558050215585`, while the seedless
+`census` mode on the same directory still exits 1 with
+`unsupported chunk compression type 4 in (0, 0)` — so a mismatched save is
+identified before the codec reaches a chunk, and a bzip2 save is still refused
+loudly in its own right. A third layout fact is recorded here because it wasted
+an operator-looking check during this slice: these 26.3 single-player saves hold
+the overworld chunks under
+`dimensions/minecraft/overworld/region/` — 27 region files there in the seed-2026
+save — and there is no top-level `region/` directory at all, so a "the save has no
+chunks" conclusion drawn from `ls <save>/region` is a path error, not an empty
+world. The count is easy to over-report: `find <save> -name '*.mca'` returns 175
+files for that save, but only 107 of them are region directories (27 under
+`overworld/region`, 50 under `the_end/region`, 30 under `the_nether/region`) and
+the other 68 are sibling `entities/` and `poi/` stores, so 27 is the number of
+region files whose chunks this oracle can compare. That split was re-counted here
+because an earlier draft of this paragraph published the 175 as overworld region
+files. No Mojang or third-party server code was read for this change; the
+attested fields and this layout are structure observed in the owner's own saves.
+
+Independent review of this branch then found a hole in the guard's own coverage:
+`biome_volume` returned `no generated chunks found in the sampled range` from its
+empty-square path *before* printing any denominator, so a seeded scoring mode
+could still exit 1 with a zero-byte standard output and no denominator at all —
+the exact shape the guard exists to close. Measured on the seed-2026 save,
+`biome_volume <save> 2026 60000 60003 <root>` asks for a chunk square the save
+does not hold and printed nothing before the change; it now prints
+`coverage scored=0 expected=16 missing=16 unaccounted=0 source=vanilla` on
+standard error and exits 1 naming the empty measurement, identically with
+`--allow-partial`, while `biome_volume <save> 2026 0 3 <root>` still exits 0 with
+656 bytes of report and `coverage scored=16 expected=16 missing=0`. The ordering
+is not a regression this branch introduced: the same early return was reproduced
+against the pre-change binary, so it is recorded here as a gap the guard left
+open rather than as a behaviour change against main.
+
+A further synthetic-region check found that a stored chunk root with an empty
+`sections` list was counted as a complete chunk by `biome_volume`, `census`,
+`census_compare`, and `census_names`, despite supplying no biome cells or block
+states. The readers now count that placeholder as missing, so a one-chunk
+square reports `coverage scored=0 expected=1 missing=1 unaccounted=0` and
+exits non-zero with or without `--allow-partial`. The regression constructs
+its own minimal uncompressed Anvil region and asserts that both the family
+census and name histogram score zero chunks; no owner save is copied into the
+test. Populated chunks continue through the same decoders and report layout.
+The same review then supplied a malformed nonempty section with a block-state
+palette but no `Y` coordinate: the family census previously skipped it and
+counted its chunk as complete. The census now refuses `section without Y`
+instead of silently omitting those blocks; a synthetic test pins the error.
+
+Two hardenings came out of the same review. `rustmc_tools::nbt` bounded every
+read by the size of the input but not the recursion: a crafted stream of list and
+compound headers descends once per six bytes and overflows the stack long before
+it runs out of input, so `payload`, `compound` and `anonymous` now carry a depth
+and refuse anything past `MAX_DEPTH = 64` levels with
+`NBT nesting exceeds 64 levels` instead of crashing the tool. That ceiling is
+reasoned, not measured — 26.3 chunk and `level.dat` storage nests a handful of
+levels, and the new tests pin that a 62-deep list chain parses while the next
+level is refused. Under the bound the release binary re-ran, on the owner's own
+saves: `substance <save> 2026 -384 384 16 vanilla <root>` (2,401 columns, 40
+lines, the pinned md5 unchanged), `census <save> 0 63` (16 chunks, exit 0),
+`inspect <save> 0 0` (both metadata files, exit 0) and
+`compare <save> 2027 -384 384 16 vanilla <root>` (exit 0, `scored=2401
+expected=2401`). Those cover every chunk of both published squares plus the save
+metadata, so the bound rejects no real data here; it does not re-verify the
+`column`, `block_compare 0 15 8` or the hour-long seed-2027 `block_compare`
+recipes recorded above, which all read through the same `parse_root` path and
+passed on the previous head. `SEED_MODES` was a list
+with nothing behind it: two tests in the binary now read the tool's own usage
+block, require the modes that document a `<seed>` to be exactly the attested
+modes, and require every mode the usage error offers to have a dispatch arm, so a
+future seed-taking mode cannot be documented and left unattested.
