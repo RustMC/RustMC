@@ -150,15 +150,21 @@ fn run(raw_args: &[String]) -> Result<(), String> {
                 "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome,rustmc_top_block"
             );
             let (source, origin) = build_source(seed, args.get(3), args.get(4))?;
+            let mut scored = 0;
+            let mut missing = 0;
             for (x, z, result) in oracle::read_columns(&mut store, &points)? {
                 let (sy, tb, bi) = match result? {
-                    None => return Err(format!("worksheet point ({x}, {z}) is not in the save")),
+                    None => {
+                        missing += 1;
+                        continue;
+                    }
                     Some(c) => (
                         c.surface_y,
                         c.top_block.unwrap_or_else(|| "<unreadable>".into()),
                         c.biome.unwrap_or_else(|| "<unreadable>".into()),
                     ),
                 };
+                scored += 1;
                 println!(
                     "{x},{z},{sy},{tb},{bi},{},{},{}",
                     source.column_height(x, z),
@@ -167,7 +173,7 @@ fn run(raw_args: &[String]) -> Result<(), String> {
                 );
             }
             report_coverage(
-                Coverage::new(points.len(), points.len(), 0, origin),
+                Coverage::new(scored, points.len(), missing, origin),
                 allow_partial,
             )?;
         }
@@ -689,13 +695,19 @@ fn run(raw_args: &[String]) -> Result<(), String> {
             let settings = terrain
                 .split_once(':')
                 .map_or("minecraft:overworld", |(_, id)| id);
-            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
-                .map_err(|error| error.to_string())?;
             let (Ok(x32), Ok(z32)) = (i32::try_from(x), i32::try_from(z)) else {
                 return Err("coordinate too large".to_string());
             };
-            let profile = oracle::read_profile(&mut store, x, z)?
-                .ok_or_else(|| format!("column ({x}, {z}) is not in the save"))?;
+            let profile = oracle::read_profile(&mut store, x, z)?;
+            let Some(profile) = profile else {
+                return report_coverage(
+                    Coverage::new(0, 1, 1, ScoredSource::Vanilla),
+                    allow_partial,
+                )
+                .map_err(|reason| format!("column ({x}, {z}) is not in the save: {reason}"));
+            };
+            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
+                .map_err(|error| error.to_string())?;
             println!("y,vanilla,rustmc,rustmc_density");
             for (offset, vanilla) in profile.categories.iter().copied().enumerate() {
                 let y = profile.min_y + offset as i32;
