@@ -1008,8 +1008,8 @@ impl VanillaGenerator {
 }
 
 /// The air families a decoration pass's neighbour test treats as air: the
-/// filler writes the named cave air at carved rows, and the pre-carve `None`
-/// entry stands for the air above the terrain.
+/// filler writes the named cave air at the carved rows it reaches, and open
+/// sky arrives as the `minecraft:air` this module names an unnamed row.
 const AIR_IDS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
 
 impl DecorationTarget for ChunkView<'_> {
@@ -1034,7 +1034,23 @@ impl DecorationTarget for ChunkView<'_> {
         }
         let row = (y - self.generator.router.min_y) as usize;
         let at = self.chunk.index(x & 15, row, z & 15);
-        self.chunk.name(self.chunk.blocks[at])
+        // An unnamed row inside the decorated chunk is a row the fill pass left
+        // empty, and every row it leaves empty holds air: the substance pass
+        // says so for each one, both for the sky above a column top and for the
+        // gap a density hole leaves inside the body. A carved row is not
+        // necessarily named either — the carver rewrites only the rows the fill
+        // pass reached, so a cave it opens above that top stays empty here too.
+        // Naming these rows is what lets `matching_block_tag minecraft:air` pass
+        // on open sky instead of only on carved air. `is_air` already read an
+        // unnamed row as air, so *inside* the decorated chunk the two answers
+        // cannot disagree; outside it `block_at` returns `None` while `is_air`
+        // falls back to the terrain substance, which is a different question and
+        // the reason the claim is scoped this way.
+        Some(
+            self.chunk
+                .name(self.chunk.blocks[at])
+                .unwrap_or("minecraft:air"),
+        )
     }
 
     fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
@@ -1062,6 +1078,22 @@ impl DecorationTarget for ChunkView<'_> {
 
     fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
         self.generator.ocean_floor_height(x, z)
+    }
+
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        // The fill pass memoises its top before carvers run. A carver can open
+        // that row while leaving terrain below it; the decoration heightmap
+        // must keep descending instead of dropping the whole column.
+        let mut y = self.generator.surface_height(x, z);
+        loop {
+            if self.generator.substance(x, y, z) != Substance::Air {
+                return Some(y);
+            }
+            if y == self.generator.router.min_y {
+                return None;
+            }
+            y -= 1;
+        }
     }
 }
 
@@ -1582,9 +1614,13 @@ mod tests {
     /// veins evaluated. A vein may only replace a block its target test
     /// accepts, and every replaceable tag in the pack (`stone_ore_replaceables`,
     /// `deepslate_ore_replaceables`, `height_specific_ore_replaceables`) is a
-    /// subset of `base_stone_overworld`, so that one tag answers for the whole
-    /// placement stage: a row the pass changed must have held one of its
-    /// members before, and no row may appear or disappear.
+    /// subset of `base_stone_overworld`, so that one tag answers for the recolor
+    /// half of the placement stage: a row that already had a name and changed one
+    /// must have held a member of it before. The stage's other half — the ground
+    /// cover that replaced nothing — is bounded on both sides: a row the fill pass
+    /// left empty may only be named within a measured band above this column's own
+    /// highest named base row, never inside its body and never floating above it.
+    /// No row may disappear.
     ///
     /// The four 16×16 squares sit at fixed origins on a power-of-two grid,
     /// with one off-grid pair so at least one square straddles chunk borders
@@ -1614,6 +1650,7 @@ mod tests {
                 for z in origin_z..origin_z + 16 {
                     let base = generator.base_column_ids(x, z);
                     let ids = generator.column_ids(x, z);
+                    let base_top = base.iter().rposition(|name| name.is_some());
                     for (index, id) in ids.iter().enumerate() {
                         let y = min_y + index as i32;
                         let before = base[index].as_deref();
@@ -1646,22 +1683,51 @@ mod tests {
                         if before == id.as_deref() {
                             continue;
                         }
-                        // A row the pass did change: it can only change one its
-                        // target test accepts.
-                        assert!(
-                            before
-                                .is_some_and(|before| tags
-                                    .contains("minecraft:base_stone_overworld", before)),
-                            "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
-                        );
+                        // Two writers change rows here and their contracts
+                        // differ. A vein recolors a row only when its target
+                        // test accepts what was already there. The placement
+                        // stage also *names* rows the fill pass left empty,
+                        // which is the behavior this pass exists to have, so
+                        // such a write has to sit just above this column's own
+                        // fill top rather than deep inside its body or floating
+                        // far above it.
+                        // The upper edge is measured, not derived: across the
+                        // four squares below, 166 rows are named onto empty
+                        // space and they sit at distances 1 (74 of them), 2 (55),
+                        // 3 (26), 4 (6), 5 (4) and 6 (1) above their column's
+                        // highest named base row — the tail coming from later
+                        // ordinals stacking cover on rows earlier ordinals have
+                        // just named. 17 leaves headroom over that maximum so the
+                        // bound stays a check on where a placement anchors rather
+                        // than a restatement of today's draw. Nothing in this
+                        // runtime caps how far a placement offset can reach
+                        // vertically, so this number is a regression bound and not
+                        // a Java parity claim; it exists because the single
+                        // assertion it replaced caught a placement naming a row 25
+                        // above its anchor, and an unbounded "anywhere above the
+                        // fill top" does not.
+                        const NAMED_ROW_MAX_ABOVE_SURFACE: i32 = 17;
+                        match before {
+                            Some(before) => assert!(
+                                tags.contains("minecraft:base_stone_overworld", before),
+                                "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
+                            ),
+                            None => assert!(
+                                base_top.is_some_and(|top| {
+                                    let above = index as i32 - top as i32;
+                                    (1..=NAMED_ROW_MAX_ABOVE_SURFACE).contains(&above)
+                                }),
+                                "({x}, {z}) row {y}: a placement named empty row {index} outside the band above its column's highest named row {base_top:?}"
+                            ),
+                        }
                     }
                     assert_eq!(
                         ids.iter()
                             .zip(base.iter())
-                            .filter(|(after, before)| after.is_some() != before.is_some())
+                            .filter(|(after, before)| after.is_none() && before.is_some())
                             .count(),
                         0,
-                        "({x}, {z}): a vein cannot create or remove a row, only recolor one"
+                        "({x}, {z}): a decoration cannot remove a row, only recolor or name one"
                     );
                 }
             }
@@ -1701,6 +1767,38 @@ mod tests {
                 "column ({x}, {z}) top row at y={top}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn smoke_decoration_height_descends_below_a_carved_top() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+        let (x, z) = (64, -48);
+        let fill_top = generator.surface_height(x, z);
+        assert_eq!(fill_top, 63);
+        assert_eq!(generator.substance(x, fill_top, z), Substance::Air);
+
+        // The independent column construction names cave air at the carved
+        // top and leaves the first post-carve non-air row below it.
+        let ids = generator.base_column_ids(x, z);
+        let highest_non_air = ids
+            .iter()
+            .rposition(|id| id.as_deref().is_some_and(|name| !AIR_IDS.contains(&name)))
+            .map(|row| generator.router.min_y + row as i32);
+        assert_eq!(highest_non_air, Some(54));
+
+        let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: x >> 4,
+            chunk_z: z >> 4,
+            chunk: &mut chunk,
+        };
+        assert_eq!(view.surface_height(x, z), highest_non_air);
     }
 
     /// Requires the operator-provisioned 26.3 worldgen data. On real terrain
@@ -2184,6 +2282,51 @@ mod tests {
         (root, generator)
     }
 
+    /// The decorating pack plus one ground-cover ordinal in the shape the
+    /// overworld pack's vegetation steps use: a `minecraft:simple_block`
+    /// flower, put at the `MOTION_BLOCKING` row offset up by one and gated on
+    /// a `minecraft:matching_block_tag` test against `minecraft:air` — so the
+    /// candidate only stands where the column holds open sky.
+    fn covering_pack(root: &Path) {
+        decorating_pack(root);
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/cover.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:dandelion"}}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/cover.json"),
+            r#"{"feature": "testns:cover", "placement": [
+                {"type": "minecraft:count", "count": 8},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:offset", "x": 0, "y": 1, "z": 0},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:matching_block_tag", "tag": "minecraft:air"}},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &root.join("data/minecraft/tags/block/air.json"),
+            r#"{"values": ["minecraft:air"]}"#,
+        );
+        // The vein keeps its own ordinal, so one chunk runs both families and
+        // the two writes are told apart by their states.
+        write(
+            &worldgen.join("biome/flat.json"),
+            r#"{"carvers": ["testns:scarce"],
+                "features": [[], [], ["testns:cover"], [], [], [], [], [], ["testns:vein"], [], []]}"#,
+        );
+    }
+
+    fn covering_generator(label: &str) -> (PathBuf, VanillaGenerator) {
+        let root = scratch_root(label);
+        covering_pack(&root);
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("covering pack generator");
+        (root, generator)
+    }
+
     /// The decorating pack plus a second dimension whose placement table
     /// splits the world along x: `testns:low` west of x = 32, `testns:peak`
     /// east of it. Only `peak` lists a placed vein, and that vein carries no
@@ -2315,6 +2458,176 @@ mod tests {
         assert!(
             painted > 0,
             "the fixture must actually fire veins, or the assertions above are vacuous"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// What the decoration view's open-sky answer rests on, checked against a
+    /// production chunk rather than a fixture's own target: a row the fill pass
+    /// leaves unnamed holds air — the substance pass says so for every one of
+    /// them — and the view names each of them `minecraft:air`, which is one of the
+    /// names `is_air` accepts. Two of the three unnamed families are exercised
+    /// here and one is not: this fixture's carver has probability 0.0, so it
+    /// stamps no mask and a cave the carver opened above the rows the fill pass
+    /// reached cannot appear in it. That third family is measured out of tree on
+    /// the provisioned pack and recorded in `docs/PROVENANCE.md`; what this test
+    /// does guarantee, by counting, is that both families the fixture *does* have
+    /// show up — sky above a column top, and the gap a density hole leaves inside
+    /// a body. The agreement checked here is scoped to the decorated chunk: one
+    /// column outside it, `block_at` refuses and `is_air` answers from the terrain
+    /// instead, which is asserted at the fringe below rather than only stated.
+    #[test]
+    fn unnamed_rows_of_a_decorated_chunk_answer_the_air_they_hold() {
+        let (root, generator) = decorating_generator("open-sky");
+        let min_y = generator.min_y();
+        let height = generator.router.height as usize;
+        let mut chunk = generator.build_decorated_chunk(0, 0);
+        let mut empty: Vec<(i32, i32, i32)> = Vec::new();
+        let mut filled: Vec<(i32, i32, i32, String)> = Vec::new();
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                for row in 0..height {
+                    let at = chunk.index(local_x, row, local_z);
+                    match chunk.name(chunk.blocks[at]) {
+                        Some(name) => {
+                            filled.push((local_x, min_y + row as i32, local_z, name.to_owned()))
+                        }
+                        None => empty.push((local_x, min_y + row as i32, local_z)),
+                    }
+                }
+            }
+        }
+        assert!(
+            !empty.is_empty() && !filled.is_empty(),
+            "the fixture must hold both sky and ground, or the checks below are vacuous"
+        );
+        // Both unnamed families this fixture can produce have to be present, or
+        // the loop below proves one case and claims two: an unnamed row above its
+        // column's highest named row is open sky, one below it is the gap a
+        // density hole left inside the body.
+        let mut column_top: HashMap<(i32, i32), i32> = HashMap::new();
+        for (x, y, z, _) in &filled {
+            let top = column_top.entry((*x, *z)).or_insert(*y);
+            if *y > *top {
+                *top = *y;
+            }
+        }
+        let (mut sky, mut interior, mut bare) = (0usize, 0usize, 0usize);
+        for (x, y, z) in &empty {
+            match column_top.get(&(*x, *z)) {
+                Some(top) if *y > *top => sky += 1,
+                Some(_) => interior += 1,
+                None => bare += 1,
+            }
+        }
+        assert!(
+            sky > 0 && interior > 0,
+            "the fixture must leave both sky and an interior density gap unnamed: \
+             sky={sky} interior={interior} bare={bare}"
+        );
+        for (x, y, z) in &empty {
+            assert_eq!(
+                generator.substance(*x, *y, *z),
+                Substance::Air,
+                "row ({x}, {y}, {z}) is unnamed but the substance pass does not call it air"
+            );
+        }
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: 0,
+            chunk_z: 0,
+            chunk: &mut chunk,
+        };
+        for (x, y, z) in &empty {
+            assert_eq!(
+                view.block_at(*x, *y, *z),
+                Some("minecraft:air"),
+                "an unnamed row at ({x}, {y}, {z}) must name the air it holds"
+            );
+            // Not an independent cross-check: `is_air` now reads through
+            // `block_at`, so this asserts the one thing the two calls do not
+            // settle between them — that the name the fallback invents is a name
+            // the decoration pass treats as air.
+            assert!(
+                view.is_air(*x, *y, *z),
+                "is_air does not treat the fallback name as air at ({x}, {y}, {z})"
+            );
+        }
+        // The fallback is a fallback, not a rewrite: every named row still
+        // answers its own name.
+        for (x, y, z, name) in &filled {
+            assert_eq!(
+                view.block_at(*x, *y, *z),
+                Some(name.as_str()),
+                "a named row at ({x}, {y}, {z}) lost its own name"
+            );
+        }
+        // And the scope of the agreement above is pinned, not just stated.
+        // `block_at` refuses exactly where `writable` refuses — `generator.rs`
+        // reads `writable` first — so those two are one assertion written twice,
+        // and the non-trivial half is that outside the decorated chunk `is_air`
+        // stops answering the fallback and answers the terrain instead: air above
+        // the world's top row, not necessarily air at its floor. That is why the
+        // agreement above is claimed only inside the decorated chunk.
+        let fringe_top = min_y + height as i32 - 1;
+        for (x, z) in [(-1, 0), (16, 0), (0, -1), (0, 16)] {
+            assert!(
+                !view.writable(x, fringe_top, z),
+                "a neighbouring column at ({x}, {z}) must not be writable inside this chunk's pass"
+            );
+            assert_eq!(
+                view.block_at(x, fringe_top, z),
+                None,
+                "({x}, {z}) row {fringe_top}: `block_at` answered outside the writable zone"
+            );
+            for y in [min_y, fringe_top] {
+                assert_eq!(
+                    view.is_air(x, y, z),
+                    generator.substance(x, y, z) == Substance::Air,
+                    "outside the decorated chunk `is_air` must answer the terrain substance at ({x}, {y}, {z})"
+                );
+            }
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The regression the open-sky answer exists for. The feature module's own
+    /// target answered air above its synthetic surface from the first, so a
+    /// `matching_block_tag minecraft:air` filter passed every test written
+    /// against it while the production view answered `None` and the whole
+    /// vegetation family placed nothing in a real chunk. This runs the pass end
+    /// to end over generated terrain.
+    #[test]
+    fn a_pack_air_filter_places_ground_cover_on_generated_terrain() {
+        let (root, generator) = covering_generator("cover-open-sky");
+        let cover = "minecraft:dandelion";
+        let mut placed = 0usize;
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                let (x, z) = (local_x, local_z);
+                let base = generator.base_column_ids(x, z);
+                let top = base.iter().rposition(|name| name.is_some());
+                for (row, name) in generator.column_ids(x, z).iter().enumerate() {
+                    if name.as_deref() != Some(cover) {
+                        continue;
+                    }
+                    let top = top.expect("a column with cover has a surface under it");
+                    placed += 1;
+                    assert_eq!(
+                        row,
+                        top + 1,
+                        "cover at ({x}, {z}) row {row} is not the open-sky row one above surface {top}"
+                    );
+                    assert_eq!(
+                        base[row], None,
+                        "cover replaced a row the fill pass had already named at ({x}, {z}) row {row}"
+                    );
+                }
+            }
+        }
+        assert!(
+            placed > 0,
+            "the air-gated cover chain must place on open sky through the production view"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
