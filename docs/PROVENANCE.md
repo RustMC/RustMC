@@ -1416,6 +1416,14 @@ the owner's own save stores, per ADR-0014's knowledge-only rule; no external
 documentation of vanilla heightmap storage conventions was consulted and none of
 that question's possible answers is asserted in code by this slice.
 
+This follow-up reads the current decorated column for its
+highest non-air row and invalidates that cached answer after a write. This fixes
+the local read-after-write defect for that row without establishing vanilla
+heightmap parity. The placement runtime still shares this row among
+`WORLD_SURFACE_WG`, `MOTION_BLOCKING`, and `MOTION_BLOCKING_NO_LEAVES`; plants and
+leaves can make those maps differ after decoration. `OCEAN_FLOOR[_WG]` still
+uses the terrain map and does not track decoration writes.
+
 Cost is stated as a band because the effect being measured is smaller than one
 run's spread. `bench_vanilla_chunks --seed 2026 --side 4 --repeat 1 --mode
 columns --data-root <provisioned pack>` was run ten times per build, alternating

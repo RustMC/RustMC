@@ -119,6 +119,8 @@ struct ChunkView<'a> {
     chunk_x: i32,
     chunk_z: i32,
     chunk: &'a mut DecoratedChunk,
+    /// One cached world-surface answer per column, invalidated by writes.
+    surface_heights: RefCell<[Option<Option<i32>>; 256]>,
 }
 
 /// The biomes present somewhere in one chunk's whole 4x4x4-cell volume,
@@ -590,6 +592,7 @@ impl VanillaGenerator {
                     chunk_x,
                     chunk_z,
                     chunk: &mut chunk,
+                    surface_heights: RefCell::new([None; 256]),
                 };
                 for &step in &steps {
                     features.decorate_step(
@@ -1070,6 +1073,8 @@ impl DecorationTarget for ChunkView<'_> {
     fn set_block(&mut self, x: i32, y: i32, z: i32, name: &str) {
         let row = (y - self.generator.router.min_y) as usize;
         self.chunk.set(x & 15, row, z & 15, name);
+        let slot = ((x & 15) * 16 + (z & 15)) as usize;
+        self.surface_heights.get_mut()[slot] = None;
     }
 
     fn biome_at(&self, _x: i32, y: i32, z: i32) -> Option<String> {
@@ -1081,9 +1086,30 @@ impl DecorationTarget for ChunkView<'_> {
     }
 
     fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
-        // The fill pass memoises its top before carvers run. A carver can open
-        // that row while leaving terrain below it; the decoration heightmap
-        // must keep descending instead of dropping the whole column.
+        if (x >> 4, z >> 4) == (self.chunk_x, self.chunk_z) {
+            let slot = ((x & 15) * 16 + (z & 15)) as usize;
+            if let Some(height) = self.surface_heights.borrow()[slot] {
+                return height;
+            }
+            // The chunk already contains the fill pass, carvers and every
+            // earlier decoration write. Scan the named rows once per write to
+            // this column; a later feature must see the raised or removed top.
+            let height = (0..self.generator.router.height as usize)
+                .rev()
+                .find(|&row| {
+                    let at = self.chunk.index(x & 15, row, z & 15);
+                    self.chunk
+                        .name(self.chunk.blocks[at])
+                        .is_some_and(|name| !AIR_IDS.contains(&name))
+                })
+                .map(|row| self.generator.router.min_y + row as i32);
+            self.surface_heights.borrow_mut()[slot] = Some(height);
+            return height;
+        }
+        // A candidate from a neighbouring anchor can ask for a column outside
+        // this writable chunk. That chunk has no shared decoration state here.
+        // The fill pass memoises its original top before carvers run; descend
+        // past carved air rather than treating the whole column as void.
         let mut y = self.generator.surface_height(x, z);
         loop {
             if self.generator.substance(x, y, z) != Substance::Air {
@@ -1792,13 +1818,53 @@ mod tests {
         assert_eq!(highest_non_air, Some(54));
 
         let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        for (row, name) in ids.into_iter().enumerate() {
+            let at = chunk.index(x & 15, row, z & 15);
+            let slot = chunk.intern(name);
+            chunk.blocks[at] = slot;
+        }
         let view = ChunkView {
             generator: &generator,
             chunk_x: x >> 4,
             chunk_z: z >> 4,
             chunk: &mut chunk,
+            surface_heights: RefCell::new([None; 256]),
         };
         assert_eq!(view.surface_height(x, z), highest_non_air);
+    }
+
+    #[test]
+    fn decoration_surface_height_sees_earlier_writes() {
+        let root = scratch_root("decoration-heightmap-writes");
+        bounded_pack(&root);
+        let generator =
+            VanillaGenerator::new(&root, 2026, "testns:bounded").expect("fixture generator");
+        let (x, z) = (6, -2);
+        let ids = generator.base_column_ids(x, z);
+        let top = ids
+            .iter()
+            .rposition(|id| id.as_deref().is_some_and(|name| !AIR_IDS.contains(&name)))
+            .expect("fixture has solid terrain") as i32;
+        assert!(top < generator.max_y);
+        let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        for (row, name) in ids.into_iter().enumerate() {
+            let at = chunk.index(x & 15, row, z & 15);
+            let slot = chunk.intern(name);
+            chunk.blocks[at] = slot;
+        }
+        let mut view = ChunkView {
+            generator: &generator,
+            chunk_x: x >> 4,
+            chunk_z: z >> 4,
+            chunk: &mut chunk,
+            surface_heights: RefCell::new([None; 256]),
+        };
+        assert_eq!(view.surface_height(x, z), Some(top));
+        view.set_block(x, top + 1, z, "minecraft:stone");
+        assert_eq!(view.surface_height(x, z), Some(top + 1));
+        view.set_block(x, top + 1, z, "minecraft:air");
+        assert_eq!(view.surface_height(x, z), Some(top));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Requires the operator-provisioned 26.3 worldgen data. On real terrain
@@ -2537,6 +2603,7 @@ mod tests {
             chunk_x: 0,
             chunk_z: 0,
             chunk: &mut chunk,
+            surface_heights: RefCell::new([None; 256]),
         };
         for (x, y, z) in &empty {
             assert_eq!(

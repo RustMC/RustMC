@@ -352,11 +352,11 @@ impl HeightmapType {
 
     /// The column row this map answers with.
     ///
-    /// A pre-decoration column holds filler solids, sea fluid and air only:
-    /// nothing that stops motion is not solid, and no leaf block exists yet
-    /// because no tree feature is modeled here. The three surface-ish maps
-    /// therefore answer the same highest-non-air row, and the two ocean-floor
-    /// maps answer the terrain row the generator already stores.
+    /// The three surface-ish maps currently share the highest-non-air row.
+    /// This is exact for the pre-decoration filler used here, but after a
+    /// feature writes plants or leaves it is only an approximation for the
+    /// motion maps: their block predicates are different. The ocean-floor
+    /// maps continue to answer the stored terrain row.
     fn row(&self, target: &dyn DecorationTarget, x: i32, z: i32) -> Option<i32> {
         match self {
             Self::MotionBlocking | Self::MotionBlockingNoLeaves | Self::WorldSurfaceWg => {
