@@ -1347,3 +1347,41 @@ The tag loader is bounded by the provisioned pack's tag graph but does not
 validate literal block IDs against the runtime registry. Ground-cover and
 heightmap semantics in the separate draft PR are not measured by this mainline
 A/B and require their own final-tip oracle and client checks.
+
+### 14 October 2026: vegetation census families and a false log match
+
+This is a measurement correction, not new vegetation generation. The block
+names come from the owner's Java 26.3 saved block-state histogram and the
+operator-provisioned 26.3 game data; a separate name-level grouping of the
+save's `census_names` output checked the class totals without using
+`census_family`. No save or game-data file is tracked. The `flowers` row name
+is retained with corrected small-flower membership; the old definition also
+included `pitcher_plant` and used `with_rose` instead of `wither_rose`. Its
+historical 2,401-chunk sample has no exact square recorded here, so its 1,598
+count is a legacy
+measurement, not a value under the corrected definition. Neither number is a
+count of all flowers. New `wildflowers`, `bushes` (bush and
+firefly bush) and `tall_flowers` rows count stored block rows, so both halves
+of a tall plant count where present. `pitcher_plant` is in the tall group, and
+the misspelled `with_rose` match was corrected to `wither_rose`. Generic
+`*_stem` was too broad for logs: only the crimson and warped wood stems,
+including stripped variants, now join `*_log` and `*hyphae` there; crop,
+mushroom and big-dripleaf stems no longer do.
+
+On the seed-2026 save's `0..255` square, both old and new release census tools
+scored **256/256 chunks**. Logs move **6,837 → 6,653**, exactly the 184
+`big_dripleaf_stem` rows in the name histogram. Existing `grasses=2,622` and
+`flowers=34` are unchanged. New rows are `wildflowers=1,453`,
+`bushes=39` (33 bush + 6 firefly bush), and `tall_flowers=112` (80 rose bush
++ 32 lilac). On `-128..127`, **256/256 chunks** were stored: logs remain
+6,795, grasses 2,543, selected small flowers 95, and the new rows are
+wildflowers 1,008, bushes 101, tall flowers 112. The name histogram agrees
+for those new families too. For `0..255`, removing only the corrected log
+line and added family lines leaves all 26 other report lines and the
+`coverage scored=256 expected=256 missing=0` line byte-identical. One
+sequential release run per build took 0.15 s wall / 0.14 s user on merged
+main `5c23390` and 0.17 s wall / 0.16 s user on this candidate. These very
+short single runs do not show a speed change. The separate ground-cover draft
+has not been used to claim vegetation parity from these save-only numbers,
+and a four-family census is
+still only a selected slice of 26.3 vegetation.
