@@ -32,7 +32,11 @@ use crate::vanilla::aquifer::{
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
 use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
-use crate::vanilla::feature::{DecorationTarget, FeatureData};
+use std::sync::OnceLock;
+
+use crate::vanilla::feature::{
+    BlockTags, DecorationTarget, FeatureData, HeightmapKind, matches_heightmap,
+};
 use crate::vanilla::random::LegacyRandom;
 use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
 use crate::vanilla::worldgen::{NoiseRouter, WorldgenData, WorldgenError};
@@ -119,8 +123,8 @@ struct ChunkView<'a> {
     chunk_x: i32,
     chunk_z: i32,
     chunk: &'a mut DecoratedChunk,
-    /// One cached world-surface answer per column, invalidated by writes.
-    surface_heights: RefCell<[Option<Option<i32>>; 256]>,
+    /// Four cached heightmap answers per column, invalidated by writes.
+    heightmaps: RefCell<[[Option<Option<i32>>; 256]; 4]>,
 }
 
 /// The biomes present somewhere in one chunk's whole 4x4x4-cell volume,
@@ -592,7 +596,7 @@ impl VanillaGenerator {
                     chunk_x,
                     chunk_z,
                     chunk: &mut chunk,
-                    surface_heights: RefCell::new([None; 256]),
+                    heightmaps: RefCell::new([[None; 256]; 4]),
                 };
                 for &step in &steps {
                     features.decorate_step(
@@ -745,6 +749,15 @@ impl VanillaGenerator {
         }
         self.record_ocean_floor(x, z, floor);
         ids
+    }
+
+    /// The block tags loaded for this generator's data pack, or empty if none.
+    pub fn tags(&self) -> &BlockTags {
+        static EMPTY: OnceLock<BlockTags> = OnceLock::new();
+        self.features
+            .as_ref()
+            .map(FeatureData::tags)
+            .unwrap_or_else(|| EMPTY.get_or_init(BlockTags::default))
     }
 
     /// Absolute Y of the top written block: terrain, or the aquifer/sea
@@ -1074,7 +1087,10 @@ impl DecorationTarget for ChunkView<'_> {
         let row = (y - self.generator.router.min_y) as usize;
         self.chunk.set(x & 15, row, z & 15, name);
         let slot = ((x & 15) * 16 + (z & 15)) as usize;
-        self.surface_heights.get_mut()[slot] = None;
+        let caches = self.heightmaps.get_mut();
+        for kind_cache in caches.iter_mut() {
+            kind_cache[slot] = None;
+        }
     }
 
     fn biome_at(&self, _x: i32, y: i32, z: i32) -> Option<String> {
@@ -1085,41 +1101,48 @@ impl DecorationTarget for ChunkView<'_> {
         self.generator.ocean_floor_height(x, z)
     }
 
-    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+    fn heightmap(&self, kind: HeightmapKind, x: i32, z: i32) -> Option<i32> {
         if (x >> 4, z >> 4) == (self.chunk_x, self.chunk_z) {
             let slot = ((x & 15) * 16 + (z & 15)) as usize;
-            if let Some(height) = self.surface_heights.borrow()[slot] {
+            let kind_idx = kind.index();
+            if let Some(height) = self.heightmaps.borrow()[kind_idx][slot] {
                 return height;
             }
-            // The chunk already contains the fill pass, carvers and every
-            // earlier decoration write. Scan the named rows once per write to
-            // this column; a later feature must see the raised or removed top.
+            let tags = self.generator.tags();
             let height = (0..self.generator.router.height as usize)
                 .rev()
                 .find(|&row| {
                     let at = self.chunk.index(x & 15, row, z & 15);
                     self.chunk
                         .name(self.chunk.blocks[at])
-                        .is_some_and(|name| !AIR_IDS.contains(&name))
+                        .is_some_and(|name| matches_heightmap(kind, name, tags))
                 })
                 .map(|row| self.generator.router.min_y + row as i32);
-            self.surface_heights.borrow_mut()[slot] = Some(height);
+            self.heightmaps.borrow_mut()[kind_idx][slot] = Some(height);
             return height;
         }
-        // A candidate from a neighbouring anchor can ask for a column outside
-        // this writable chunk. That chunk has no shared decoration state here.
-        // The fill pass memoises its original top before carvers run; descend
-        // past carved air rather than treating the whole column as void.
-        let mut y = self.generator.surface_height(x, z);
-        loop {
-            if self.generator.substance(x, y, z) != Substance::Air {
-                return Some(y);
+        let surface = {
+            let mut y = self.generator.surface_height(x, z);
+            loop {
+                if self.generator.substance(x, y, z) != Substance::Air {
+                    break Some(y);
+                }
+                if y == self.generator.router.min_y {
+                    break None;
+                }
+                y -= 1;
             }
-            if y == self.generator.router.min_y {
-                return None;
-            }
-            y -= 1;
+        };
+        match kind {
+            HeightmapKind::WorldSurfaceWg
+            | HeightmapKind::MotionBlocking
+            | HeightmapKind::MotionBlockingNoLeaves => surface,
+            HeightmapKind::OceanFloorWg => surface.map(|_| self.generator.ocean_floor_height(x, z)),
         }
+    }
+
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        self.heightmap(HeightmapKind::WorldSurfaceWg, x, z)
     }
 }
 
@@ -1828,7 +1851,7 @@ mod tests {
             chunk_x: x >> 4,
             chunk_z: z >> 4,
             chunk: &mut chunk,
-            surface_heights: RefCell::new([None; 256]),
+            heightmaps: RefCell::new([[None; 256]; 4]),
         };
         assert_eq!(view.surface_height(x, z), highest_non_air);
     }
@@ -1857,7 +1880,7 @@ mod tests {
             chunk_x: x >> 4,
             chunk_z: z >> 4,
             chunk: &mut chunk,
-            surface_heights: RefCell::new([None; 256]),
+            heightmaps: RefCell::new([[None; 256]; 4]),
         };
         assert_eq!(view.surface_height(x, z), Some(top));
         view.set_block(x, top + 1, z, "minecraft:stone");
@@ -2376,6 +2399,10 @@ mod tests {
             &root.join("data/minecraft/tags/block/air.json"),
             r#"{"values": ["minecraft:air"]}"#,
         );
+        write(
+            &root.join("data/minecraft/tags/block/blocks_motion_in_heightmap.json"),
+            r#"{"values": ["minecraft:stone", "minecraft:dirt"]}"#,
+        );
         // The vein keeps its own ordinal, so one chunk runs both families and
         // the two writes are told apart by their states.
         write(
@@ -2603,7 +2630,7 @@ mod tests {
             chunk_x: 0,
             chunk_z: 0,
             chunk: &mut chunk,
-            surface_heights: RefCell::new([None; 256]),
+            heightmaps: RefCell::new([[None; 256]; 4]),
         };
         for (x, y, z) in &empty {
             assert_eq!(

@@ -87,6 +87,11 @@ impl RuleTest {
     }
 }
 
+/// Strips property suffixes (e.g. `[waterlogged=true]`) to yield the base block identifier.
+pub(crate) fn base_block_id(state: &str) -> &str {
+    state.split_once('[').map(|(base, _)| base).unwrap_or(state)
+}
+
 /// The block tags of the provisioned pack, keyed by namespaced id.
 #[derive(Debug, Default, Clone)]
 pub struct BlockTags {
@@ -196,6 +201,7 @@ impl BlockTags {
 
     /// Whether `block` is a member of `tag`.
     pub fn contains(&self, tag: &str, block: &str) -> bool {
+        let block = base_block_id(block);
         self.entries
             .get(tag)
             .is_some_and(|members| members.iter().any(|member| member == block))
@@ -327,7 +333,12 @@ impl BlockPredicate {
                 .is_some_and(|block| tags.contains(tag, block)),
             Self::Blocks { blocks, offset } => target
                 .block_at(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
-                .is_some_and(|block| blocks.iter().any(|candidate| candidate == block)),
+                .is_some_and(|block| {
+                    let block = base_block_id(block);
+                    blocks
+                        .iter()
+                        .any(|candidate| base_block_id(candidate) == block)
+                }),
             Self::AnyOf(rules) => rules.iter().any(|rule| rule.test(target, pos, tags)),
             Self::AllOf(rules) => rules.iter().all(|rule| rule.test(target, pos, tags)),
             Self::Not(rule) => !rule.test(target, pos, tags),
@@ -377,26 +388,98 @@ impl HeightmapType {
     }
 
     /// The column row this map answers with.
-    ///
-    /// The three surface-ish maps currently share the highest-non-air row.
-    /// This is exact for the pre-decoration filler used here, but after a
-    /// feature writes plants or leaves it is only an approximation for the
-    /// motion maps: their block predicates are different. The ocean-floor
-    /// maps continue to answer the stored terrain row.
     fn row(&self, target: &dyn DecorationTarget, x: i32, z: i32) -> Option<i32> {
         match self {
-            Self::MotionBlocking | Self::MotionBlockingNoLeaves | Self::WorldSurfaceWg => {
-                target.surface_height(x, z)
+            Self::MotionBlocking => target.heightmap(HeightmapKind::MotionBlocking, x, z),
+            Self::MotionBlockingNoLeaves => {
+                target.heightmap(HeightmapKind::MotionBlockingNoLeaves, x, z)
             }
+            Self::WorldSurfaceWg => target.heightmap(HeightmapKind::WorldSurfaceWg, x, z),
+            Self::OceanFloorWg => target.heightmap(HeightmapKind::OceanFloorWg, x, z),
             // The stored terrain row of a column that has no surface at all
             // is the dimension floor, which is not a surface: the candidate
             // drops for the same reason the world-surface maps drop it, so no
             // modeled map type can decorate the void.
-            Self::OceanFloor | Self::OceanFloorWg => target
-                .surface_height(x, z)
+            Self::OceanFloor => target
+                .heightmap(HeightmapKind::WorldSurfaceWg, x, z)
                 .map(|_| target.ocean_floor_height(x, z)),
             // Never reached: `is_modelable` gates the chain out first.
             Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+/// The four heightmap kinds used during feature decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeightmapKind {
+    /// Highest non-`minecraft:air` block.
+    WorldSurfaceWg,
+    /// Highest block matching `minecraft:blocks_motion_in_heightmap` tag.
+    OceanFloorWg,
+    /// Highest block matching `minecraft:blocks_motion_in_heightmap` tag OR fluid.
+    MotionBlocking,
+    /// Highest block matching `minecraft:blocks_motion_in_heightmap_no_leaves` tag OR fluid.
+    MotionBlockingNoLeaves,
+}
+
+impl HeightmapKind {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::WorldSurfaceWg => 0,
+            Self::OceanFloorWg => 1,
+            Self::MotionBlocking => 2,
+            Self::MotionBlockingNoLeaves => 3,
+        }
+    }
+}
+
+pub(crate) const AIR_IDS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
+
+/// Whether `state` represents a fluid or waterlogged block state.
+pub(crate) fn is_fluid_state(state: &str) -> bool {
+    let base = base_block_id(state);
+    match base {
+        "minecraft:water"
+        | "water"
+        | "minecraft:lava"
+        | "lava"
+        | "minecraft:bubble_column"
+        | "bubble_column"
+        | "minecraft:seagrass"
+        | "seagrass"
+        | "minecraft:tall_seagrass"
+        | "tall_seagrass"
+        | "minecraft:kelp"
+        | "kelp"
+        | "minecraft:kelp_plant"
+        | "kelp_plant" => true,
+        _ => {
+            if let Some((_, props)) = state.split_once('[') {
+                let props = props.trim_end_matches(']');
+                props
+                    .split(',')
+                    .any(|prop| prop.trim() == "waterlogged=true")
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Whether a block state matches the criteria for a decoration heightmap.
+pub fn matches_heightmap(kind: HeightmapKind, state: &str, tags: &BlockTags) -> bool {
+    let base = base_block_id(state);
+    match kind {
+        HeightmapKind::WorldSurfaceWg => {
+            base != "minecraft:air" && base != "air" && !AIR_IDS.contains(&base)
+        }
+        HeightmapKind::OceanFloorWg => tags.contains("minecraft:blocks_motion_in_heightmap", state),
+        HeightmapKind::MotionBlocking => {
+            tags.contains("minecraft:blocks_motion_in_heightmap", state) || is_fluid_state(state)
+        }
+        HeightmapKind::MotionBlockingNoLeaves => {
+            tags.contains("minecraft:blocks_motion_in_heightmap_no_leaves", state)
+                || is_fluid_state(state)
         }
     }
 }
@@ -1997,7 +2080,12 @@ pub trait DecorationTarget {
     /// column holds no block at all. The `minecraft:heightmap` decoration
     /// reads it for the one column of each candidate, so a column with no
     /// surface drops the candidate rather than decorating the void.
-    fn surface_height(&self, x: i32, z: i32) -> Option<i32>;
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        self.heightmap(HeightmapKind::WorldSurfaceWg, x, z)
+    }
+    /// The column row a decoration-time heightmap answers with, or `None`
+    /// when the column holds no matching block.
+    fn heightmap(&self, kind: HeightmapKind, x: i32, z: i32) -> Option<i32>;
 }
 
 /// Java `Mth.SIN`: a 65536-entry table indexed by a fixed-point multiple of
@@ -3115,6 +3203,15 @@ mod tests {
 
         fn surface_height(&self, _x: i32, _z: i32) -> Option<i32> {
             self.surface
+        }
+
+        fn heightmap(&self, kind: HeightmapKind, _x: i32, _z: i32) -> Option<i32> {
+            match kind {
+                HeightmapKind::OceanFloorWg => self.surface.map(|_| self.ground),
+                HeightmapKind::WorldSurfaceWg
+                | HeightmapKind::MotionBlocking
+                | HeightmapKind::MotionBlockingNoLeaves => self.surface,
+            }
         }
     }
 
