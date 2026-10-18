@@ -9,7 +9,7 @@ const TREE_CELL: i64 = 8;
 const TREE_REACH: i64 = 3;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Block {
     Air,
     Bedrock,
@@ -77,12 +77,39 @@ pub struct Chunk {
     blocks: Vec<Block>,
 }
 impl Chunk {
+    pub fn new_empty(x: i32, z: i32) -> Self {
+        Self {
+            x,
+            z,
+            blocks: vec![Block::Air; CHUNK_SIDE * CHUNK_SIDE * WORLD_HEIGHT],
+        }
+    }
+
+    pub fn blocks_raw(&self) -> &[Block] {
+        &self.blocks
+    }
+
     pub fn block(&self, x: usize, y: usize, z: usize) -> Option<Block> {
         if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
             return None;
         }
         Some(self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x])
     }
+
+    pub(crate) fn set_block_raw(
+        &mut self,
+        x: usize,
+        y: usize,
+        z: usize,
+        block: Block,
+    ) -> Option<Block> {
+        if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
+            return None;
+        }
+        let index = (y * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+        Some(std::mem::replace(&mut self.blocks[index], block))
+    }
+
     fn set(&mut self, x: i64, y: i64, z: i64, block: Block) {
         if y < 0 || y >= WORLD_HEIGHT as i64 {
             return;
