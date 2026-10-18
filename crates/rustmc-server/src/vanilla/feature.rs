@@ -146,21 +146,47 @@ impl BlockTags {
             let mut seen: HashSet<String> = HashSet::new();
             let mut queue: Vec<Value> = raw.get(&id).cloned().unwrap_or_default();
             while let Some(value) = queue.pop() {
-                let (name, reference) = match &value {
-                    Value::String(name) => (name.as_str(), None),
-                    Value::Object(object) => (
-                        object.get("id").and_then(Value::as_str).unwrap_or(""),
-                        object.get("tag").and_then(Value::as_str),
-                    ),
+                let (name, reference, required) = match &value {
+                    Value::String(value) => match value.strip_prefix('#') {
+                        Some(tag) => (None, Some(tag), true),
+                        None => (Some(value.as_str()), None, true),
+                    },
+                    Value::Object(object) => {
+                        let required = object
+                            .get("required")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
+                        if let Some(tag) = object.get("tag").and_then(Value::as_str) {
+                            (None, Some(tag.trim_start_matches('#')), required)
+                        } else if let Some(value) = object.get("id").and_then(Value::as_str) {
+                            match value.strip_prefix('#') {
+                                Some(tag) => (None, Some(tag), required),
+                                None => (Some(value), None, required),
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
                     _ => continue,
                 };
-                if !name.is_empty() && !members.iter().any(|member| member == name) {
+                if let Some(name) = name.filter(|name| !name.is_empty())
+                    && !members.iter().any(|member| member == name)
+                {
                     members.push(name.to_string());
                 }
-                if let Some(tag) = reference.filter(|tag| seen.insert(tag.to_string()))
-                    && let Some(values) = raw.get(tag)
-                {
-                    queue.extend(values.iter().cloned());
+                if let Some(tag) = reference {
+                    match raw.get(tag) {
+                        Some(values) if seen.insert(tag.to_string()) => {
+                            queue.extend(values.iter().cloned());
+                        }
+                        Some(_) => {}
+                        None if required => {
+                            return Err(WorldgenError::Invalid(format!(
+                                "block tag {id} references missing required tag {tag}"
+                            )));
+                        }
+                        None => {}
+                    }
                 }
             }
             tags.entries.insert(id, members);
@@ -3784,11 +3810,11 @@ mod tests {
         // Filed away, so its id keeps the directory.
         write(
             &root.join("data/testns/tags/block/deep/deep_stone.json"),
-            r#"{"values": ["minecraft:cobblestone", {"tag": "testns:base_stone"}]}"#,
+            r##"{"values": ["minecraft:cobblestone", "#testns:base_stone"]}"##,
         );
         write(
             &root.join("data/testns/tags/block/base_stone.json"),
-            r#"{"values": [{"id": "minecraft:stone", "required": true}, {"tag": "testns:deep/deep_stone"}]}"#,
+            r##"{"values": [{"id": "minecraft:stone", "required": true}, {"id": "#testns:deep/deep_stone"}, {"id": "#testns:optional", "required": false}]}"##,
         );
         let tags = BlockTags::load(&root).expect("loads");
         assert!(tags.contains("minecraft:base_stone_overworld", "minecraft:stone"));
@@ -3805,6 +3831,10 @@ mod tests {
             tags.contains("testns:deep/deep_stone", "minecraft:stone"),
             "and so does the reference that reaches back through the cycle"
         );
+        assert!(
+            !tags.contains("testns:deep/deep_stone", "#testns:base_stone"),
+            "a tag reference is not a literal block id"
+        );
         assert_eq!(tags.len(), 3, "one entry per path under the category");
 
         let empty = scratch_root("no-tags");
@@ -3814,6 +3844,57 @@ mod tests {
         );
         fs::remove_dir_all(root).expect("cleanup");
         fs::remove_dir_all(empty).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_required_tag_reference_is_an_error() {
+        let root = scratch_root("missing-required-tag");
+        write(
+            &root.join("data/testns/tags/block/parent.json"),
+            r##"{"values": ["#testns:absent"]}"##,
+        );
+        let error = BlockTags::load(&root).unwrap_err().to_string();
+        assert!(error.contains("testns:parent references missing required tag testns:absent"));
+        write(
+            &root.join("data/testns/tags/block/parent.json"),
+            r##"{"values": [{"id":"#testns:absent","required":true}, {"id":"#testns:absent","required":false}]}"##,
+        );
+        let error = BlockTags::load(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("testns:parent references missing required tag testns:absent"),
+            "an optional duplicate must not hide a required reference"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_motion_heightmap_tags_resolve_string_references() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = BlockTags::load(&root).expect("the provisioned block tags load");
+        assert!(tags.contains("minecraft:blocks_motion_in_heightmap", "minecraft:stone"));
+        assert!(tags.contains(
+            "minecraft:blocks_motion_in_heightmap",
+            "minecraft:oak_leaves"
+        ));
+        assert!(tags.contains(
+            "minecraft:blocks_motion_in_heightmap_no_leaves",
+            "minecraft:stone"
+        ));
+        assert!(!tags.contains(
+            "minecraft:blocks_motion_in_heightmap_no_leaves",
+            "minecraft:oak_leaves"
+        ));
+        assert!(!tags.contains(
+            "minecraft:blocks_motion_in_heightmap",
+            "minecraft:short_grass"
+        ));
+        assert!(!tags.contains(
+            "minecraft:blocks_motion_in_heightmap_no_leaves",
+            "minecraft:short_grass"
+        ));
     }
 
     /// A hand-built decorating pack: two ores and an unmodeled tree, placed

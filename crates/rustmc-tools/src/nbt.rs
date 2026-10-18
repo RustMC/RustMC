@@ -55,6 +55,11 @@ impl Tag {
     }
 }
 
+/// Lists and compounds recurse, and every read is bounded by the input size
+/// but the nesting is not: a crafted stream of list headers recurses once per
+/// six bytes and overflows the stack long before the input runs out.
+const MAX_DEPTH: usize = 64;
+
 pub fn parse_root(bytes: &[u8]) -> Result<Tag, String> {
     let mut cur = Reader::new(bytes);
     let kind = cur.u8()?;
@@ -62,7 +67,7 @@ pub fn parse_root(bytes: &[u8]) -> Result<Tag, String> {
         return Err(format!("root tag must be compound, found type {kind}"));
     }
     cur.skip_string()?;
-    Ok(Tag::Compound(cur.compound()?))
+    Ok(Tag::Compound(cur.compound(1)?))
 }
 
 struct Reader<'a> {
@@ -114,7 +119,10 @@ impl<'a> Reader<'a> {
         self.take(len)?;
         Ok(())
     }
-    fn payload(&mut self, kind: u8) -> Result<Tag, String> {
+    fn payload(&mut self, kind: u8, depth: usize) -> Result<Tag, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!("NBT nesting exceeds {MAX_DEPTH} levels"));
+        }
         Ok(match kind {
             1 => Tag::Byte(self.i8()?),
             2 => Tag::Short(self.i16()?),
@@ -136,11 +144,11 @@ impl<'a> Reader<'a> {
                 }
                 let mut items = Vec::with_capacity(len.min(1 << 16));
                 for _ in 0..len {
-                    items.push(self.anonymous(inner)?);
+                    items.push(self.anonymous(inner, depth + 1)?);
                 }
                 Tag::List(items)
             }
-            10 => Tag::Compound(self.compound()?),
+            10 => Tag::Compound(self.compound(depth)?),
             11 => {
                 let len = self.checked_len("int array")?;
                 Tag::IntArray((0..len).map(|_| self.i32()).collect::<Result<_, _>>()?)
@@ -159,10 +167,10 @@ impl<'a> Reader<'a> {
     fn i8(&mut self) -> Result<i8, String> {
         Ok(self.u8()? as i8)
     }
-    fn anonymous(&mut self, kind: u8) -> Result<Tag, String> {
-        self.payload(kind)
+    fn anonymous(&mut self, kind: u8, depth: usize) -> Result<Tag, String> {
+        self.payload(kind, depth)
     }
-    fn compound(&mut self) -> Result<BTreeMap<String, Tag>, String> {
+    fn compound(&mut self, depth: usize) -> Result<BTreeMap<String, Tag>, String> {
         let mut map = BTreeMap::new();
         loop {
             let kind = self.u8()?;
@@ -170,7 +178,7 @@ impl<'a> Reader<'a> {
                 return Ok(map);
             }
             let name = self.string()?;
-            map.insert(name, self.payload(kind)?);
+            map.insert(name, self.payload(kind, depth + 1)?);
         }
     }
 }
@@ -308,5 +316,26 @@ mod tests {
         write_root(&compound(&[("x", Tag::Int(1))]), &mut bytes);
         bytes.truncate(bytes.len() - 2);
         assert!(parse_root(&bytes).is_err());
+    }
+
+    #[test]
+    fn nesting_beyond_the_bound_is_a_named_error_not_a_stack_overflow() {
+        fn nested(levels: usize) -> Tag {
+            let mut tag = Tag::Int(7);
+            for _ in 0..levels {
+                tag = Tag::List(vec![tag]);
+            }
+            tag
+        }
+        // The root compound is depth 1 and its entries are depth 2, so a chain
+        // of `levels` lists bottoms out its payload at depth `levels + 2`.
+        let mut fits = Vec::new();
+        write_root(&compound(&[("v", nested(MAX_DEPTH - 2))]), &mut fits);
+        assert!(parse_root(&fits).is_ok());
+
+        let mut one_deeper = Vec::new();
+        write_root(&compound(&[("v", nested(MAX_DEPTH - 1))]), &mut one_deeper);
+        let error = parse_root(&one_deeper).unwrap_err();
+        assert!(error.contains("nesting exceeds"), "{error}");
     }
 }

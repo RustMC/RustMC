@@ -12,8 +12,47 @@
 //! vanilla_oracle biome_volume <world-dir> <seed> <min-chunk> <max-chunk> [data-root]
 //! vanilla_oracle census <world-dir> <min> <max>
 //! vanilla_oracle census_names <world-dir> <min> <max> [cap]
+//! vanilla_oracle census_compare <world-dir> <seed> <min> <max> [vanilla[:settings-id]] [data-root]
 //! vanilla_oracle column <world-dir> <seed> <x> <z> [vanilla[:settings-id] [data-root]]
 //! ```
+//!
+//! `--allow-partial` may be given in any mode above; it is the only flag.
+//!
+//! Measurement guards. Every mode that takes a `<seed>` first reads that
+//! save's own seed from `level.dat` plus `data/minecraft/world_gen_settings.dat`
+//! (see `rustmc_tools::save`) and exits non-zero when the argument differs,
+//! naming both values: the oracle can only measure the save it is pointed at,
+//! and an unreadable `level.dat` is an error rather than a skipped check. That
+//! reader also carries the version pin it inherited from `inspect_vanilla_save`:
+//! a save whose stored `Version.Name` is not `26.3` is refused outright, so a
+//! version is never measured silently. What the attestation does *not* compare
+//! is the dimension and the active data packs.
+//!
+//! Every scoring mode then prints exactly one machine-readable denominator
+//! line, `coverage scored=N expected=M missing=K unaccounted=U source=S`, on
+//! standard error next to the report it qualifies, and exits non-zero unless
+//! the run is complete (`scored == expected`, `missing == 0`,
+//! `unaccounted == 0`). It goes to stderr deliberately: the report itself stays
+//! byte-for-byte the published measurement, so the recorded `substance` md5 and
+//! the line-for-line `block_compare` comparisons in `docs/PROVENANCE.md` remain
+//! reproducible. `expected` is
+//! the sample grid or chunk square the mode asked the save for, `missing` the
+//! units the save could not supply (absent chunks, ungenerated columns,
+//! declined or out-of-domain columns), `unaccounted` anything else unexplained,
+//! and `source` names the generator that produced the RustMC-side answers:
+//! `vanilla`, `preview-not-vanilla-generator`,
+//! `experimental-not-vanilla-generator`, or `save-only` when nothing is scored
+//! against us. The `preview` and `experimental` terrain tokens legitimately
+//! answer no per-position substance at all, so their zero is labelled instead
+//! of being comparable; their exit status is unchanged.
+//!
+//! `--allow-partial` downgrades only the non-zero exit: the coverage line is
+//! printed identically, followed by a `warning:` line, both on stderr. It exists
+//! for exploratory runs on a save that is still generating, and its output is
+//! not comparable with a published baseline. One shortfall it does not rescue: a
+//! run that scored *nothing* — the save holds none of the units asked for — exits
+//! non-zero with or without the flag, because zeros over an empty sample are
+//! exactly the error-shaped result this guard exists to catch.
 //!
 //! The world directory is a single-player save root (contains region/).
 //! Nothing from the save is copied into the repository; only aggregate
@@ -29,8 +68,9 @@ use std::path::{Path, PathBuf};
 use rustmc_server::vanilla::aquifer::Substance;
 use rustmc_server::vanilla::generator::VanillaGenerator;
 use rustmc_server::world::{Generator, Terrain};
-use rustmc_tools::oracle::{self, ColumnSource};
+use rustmc_tools::oracle::{self, ColumnSource, Coverage, CoverageOutcome, ScoredSource};
 use rustmc_tools::region::RegionStore;
+use rustmc_tools::save;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,14 +83,63 @@ fn main() {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+/// Modes whose second positional argument is the world seed. Each of them is
+/// attested against the save's stored seed before any measurement runs.
+const SEED_MODES: [&str; 7] = [
+    "worksheet",
+    "compare",
+    "substance",
+    "block_compare",
+    "biome_volume",
+    "census_compare",
+    "column",
+];
+
+/// Maximum positional count, including the mode and save path. `inspect`
+/// accepts any number of coordinate pairs and checks their pairing below.
+fn max_positionals(mode: &str) -> Option<usize> {
+    match mode {
+        "worksheet" | "census_names" => Some(5),
+        "compare" | "substance" => Some(9),
+        "block_compare" => Some(8),
+        "biome_volume" => Some(6),
+        "census" => Some(4),
+        "census_compare" | "column" => Some(7),
+        _ => None,
+    }
+}
+
+fn run(raw_args: &[String]) -> Result<(), String> {
+    let allow_partial = raw_args.iter().any(|arg| arg == "--allow-partial");
+    let args: Vec<String> = raw_args
+        .iter()
+        .filter(|arg| *arg != "--allow-partial")
+        .cloned()
+        .collect();
+    if let Some(flag) = args.iter().find(|arg| arg.starts_with("--")) {
+        return Err(format!(
+            "unknown flag {flag}; the only flag this tool accepts is --allow-partial"
+        ));
+    }
     let Some(mode) = args.first().map(String::as_str) else {
         return Err(
-            "usage: vanilla_oracle inspect|worksheet|compare|substance|biome_volume|column <world-dir> ..."
+            "usage: vanilla_oracle inspect|worksheet|compare|substance|block_compare|biome_volume|census|census_compare|census_names|column <world-dir> ..."
                 .to_string(),
         );
     };
+    if let Some(max) = max_positionals(mode)
+        && args.len() > max
+    {
+        return Err(format!(
+            "{mode} accepts at most {} positional arguments after the mode; unexpected argument {:?}",
+            max - 1,
+            args[max]
+        ));
+    }
     let world = Path::new(args.get(1).ok_or("missing <world-dir>")?);
+    if SEED_MODES.contains(&mode) {
+        attest_seed(world, parse_i64(args.get(2).ok_or("missing <seed>")?)?)?;
+    }
     let mut store = RegionStore::new(world);
     match mode {
         "inspect" => {
@@ -83,16 +172,22 @@ fn run(args: &[String]) -> Result<(), String> {
             println!(
                 "x,z,vanilla_surface_y,vanilla_top_block,vanilla_biome,rustmc_height,rustmc_biome,rustmc_top_block"
             );
-            let source = build_source(seed, args.get(3), args.get(4))?;
+            let (source, origin) = build_source(seed, args.get(3), args.get(4))?;
+            let mut scored = 0;
+            let mut missing = 0;
             for (x, z, result) in oracle::read_columns(&mut store, &points)? {
                 let (sy, tb, bi) = match result? {
-                    None => return Err(format!("worksheet point ({x}, {z}) is not in the save")),
+                    None => {
+                        missing += 1;
+                        continue;
+                    }
                     Some(c) => (
                         c.surface_y,
                         c.top_block.unwrap_or_else(|| "<unreadable>".into()),
                         c.biome.unwrap_or_else(|| "<unreadable>".into()),
                     ),
                 };
+                scored += 1;
                 println!(
                     "{x},{z},{sy},{tb},{bi},{},{},{}",
                     source.column_height(x, z),
@@ -100,6 +195,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     source.column_top_block(x, z)
                 );
             }
+            report_coverage(
+                Coverage::new(scored, points.len(), missing, origin),
+                allow_partial,
+            )?;
         }
         "compare" => {
             let seed = parse_i64(args.get(2).ok_or("missing <seed>")?)?;
@@ -110,7 +209,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("min must not exceed max".to_string());
             }
             let (columns, gaps) = oracle::sample_columns(&mut store, min, max, min, max, stride)?;
-            let source = build_source(seed, args.get(6), args.get(7))?;
+            let (source, origin) = build_source(seed, args.get(6), args.get(7))?;
             let cap = args
                 .get(8)
                 .map(|v| parse_i64(v).map(|n| n.max(0) as usize))
@@ -121,6 +220,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 "columns={} missing_chunks={} ungenerated_columns={}",
                 report.columns, gaps.missing_chunks, gaps.ungenerated_columns
             );
+            report_coverage(
+                Coverage::new(
+                    report.columns,
+                    grid_square(min, max, stride)?,
+                    gaps.total(),
+                    origin,
+                ),
+                allow_partial,
+            )?;
             println!(
                 "height_exact={} ({:.2}%) biome={} ({:.2}%)",
                 report.height_matches,
@@ -163,7 +271,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("min must not exceed max".to_string());
             }
             let (profiles, gaps) = oracle::sample_profiles(&mut store, min, max, min, max, stride)?;
-            let source = build_source(seed, args.get(6), args.get(7))?;
+            let (source, origin) = build_source(seed, args.get(6), args.get(7))?;
             let cap = args
                 .get(8)
                 .map(|v| parse_i64(v).map(|n| n.max(0) as usize))
@@ -174,6 +282,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 "columns={} missing_chunks={} ungenerated_columns={}",
                 report.columns, gaps.missing_chunks, gaps.ungenerated_columns
             );
+            report_coverage(
+                Coverage::new(
+                    report.columns,
+                    grid_square(min, max, stride)?,
+                    gaps.total(),
+                    origin,
+                ),
+                allow_partial,
+            )?;
             println!(
                 "substance_positions={} exact={} ({:.2}%)",
                 report.positions,
@@ -268,16 +385,7 @@ fn run(args: &[String]) -> Result<(), String> {
             // M3 ground truth: the requested sample size and every grid
             // point that could not be scored are printed before any
             // percentage, so the denominator is never implied.
-            let per_axis = (max - min)
-                .checked_div(stride)
-                .and_then(|n| n.checked_add(1))
-                .ok_or("invalid sample grid")?;
-            let grid_points = usize::try_from(
-                per_axis
-                    .checked_mul(per_axis)
-                    .ok_or("invalid sample grid")?,
-            )
-            .map_err(|_| "sample grid too large".to_string())?;
+            let grid_points = grid_square(min, max, stride)?;
             let unaccounted = grid_points
                 .saturating_sub(report.columns)
                 .saturating_sub(gaps.total())
@@ -294,6 +402,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 unaccounted,
                 report.out_of_range_rows
             );
+            report_coverage(
+                Coverage {
+                    scored: report.columns,
+                    expected: grid_points,
+                    missing: gaps.total() + report.declined_columns + report.out_of_domain_columns,
+                    unaccounted,
+                    source: ScoredSource::Vanilla,
+                },
+                allow_partial,
+            )?;
             println!(
                 "base_block_positions={} exact={} ({:.2}%) air_family_normalised_exact={} ({:.2}%)",
                 report.positions,
@@ -372,7 +490,24 @@ fn run(args: &[String]) -> Result<(), String> {
                 VanillaGenerator::new(&resolve_data_root(args.get(5)), seed, "minecraft:overworld")
                     .map_err(|error| error.to_string())?;
             let report = oracle::compare_biome_volume(&mut store, &generator, min, max)?;
+            let expected = chunk_square_of(min, max)?;
             if report.chunks == 0 {
+                // The one arm that used to answer an empty square with an error
+                // and no denominator at all, which is exactly the failure this
+                // guard exists to prevent. `chunk_square_of` guarantees at least
+                // one unit, so a square scoring nothing can never be complete and
+                // the guard refuses it with or without `--allow-partial`; the
+                // refusal after it is what keeps a loosened guard from printing
+                // a `nan%` report over an empty save.
+                report_coverage(
+                    Coverage::new(
+                        report.chunks,
+                        expected,
+                        report.missing_chunks,
+                        ScoredSource::Vanilla,
+                    ),
+                    allow_partial,
+                )?;
                 return Err("no generated chunks found in the sampled range".to_owned());
             }
             println!(
@@ -384,6 +519,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 oracle::percent(report.matches, report.cells),
                 report.unresolved
             );
+            report_coverage(
+                Coverage::new(
+                    report.chunks,
+                    expected,
+                    report.missing_chunks,
+                    ScoredSource::Vanilla,
+                ),
+                allow_partial,
+            )?;
             for (band, (cells, matches)) in report.bands {
                 println!(
                     "band_y={band} cells={cells} exact={matches} ({:.2}%)",
@@ -413,6 +557,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 "chunks={} missing_chunks={}",
                 census.chunks, census.missing_chunks
             );
+            report_coverage(
+                Coverage::new(
+                    census.chunks,
+                    chunk_square(min, max)?,
+                    census.missing_chunks,
+                    ScoredSource::Save,
+                ),
+                allow_partial,
+            )?;
             for family in oracle::CensusFamily::all() {
                 let total = census.totals.get(&family).copied().unwrap_or(0);
                 if total == 0 {
@@ -469,6 +622,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 save.missing_chunks,
                 (max - min + 1) * (max - min + 1)
             );
+            report_coverage(
+                Coverage::new(
+                    save.chunks,
+                    chunk_square(min, max)?,
+                    save.missing_chunks,
+                    ScoredSource::Vanilla,
+                ),
+                allow_partial,
+            )?;
             for family in oracle::CensusFamily::all() {
                 let save_total = save.totals.get(&family).copied().unwrap_or(0);
                 let ours_total = ours.totals.get(&family).copied().unwrap_or(0);
@@ -518,6 +680,16 @@ fn run(args: &[String]) -> Result<(), String> {
             let (chunks, names) =
                 oracle::census_name_histogram(&mut store, min_cx, max_cx, min_cx, max_cx)?;
             println!("chunks={chunks}");
+            let expected = chunk_square_of(min_cx, max_cx)?;
+            report_coverage(
+                Coverage::new(
+                    chunks,
+                    expected,
+                    expected.saturating_sub(chunks),
+                    ScoredSource::Save,
+                ),
+                allow_partial,
+            )?;
             let mut pairs: Vec<_> = names.iter().collect();
             pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             let cap = args
@@ -546,13 +718,19 @@ fn run(args: &[String]) -> Result<(), String> {
             let settings = terrain
                 .split_once(':')
                 .map_or("minecraft:overworld", |(_, id)| id);
-            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
-                .map_err(|error| error.to_string())?;
             let (Ok(x32), Ok(z32)) = (i32::try_from(x), i32::try_from(z)) else {
                 return Err("coordinate too large".to_string());
             };
-            let profile = oracle::read_profile(&mut store, x, z)?
-                .ok_or_else(|| format!("column ({x}, {z}) is not in the save"))?;
+            let profile = oracle::read_profile(&mut store, x, z)?;
+            let Some(profile) = profile else {
+                return report_coverage(
+                    Coverage::new(0, 1, 1, ScoredSource::Vanilla),
+                    allow_partial,
+                )
+                .map_err(|reason| format!("column ({x}, {z}) is not in the save: {reason}"));
+            };
+            let generator = VanillaGenerator::new(&resolve_data_root(args.get(6)), seed, settings)
+                .map_err(|error| error.to_string())?;
             println!("y,vanilla,rustmc,rustmc_density");
             for (offset, vanilla) in profile.categories.iter().copied().enumerate() {
                 let y = profile.min_y + offset as i32;
@@ -564,38 +742,103 @@ fn run(args: &[String]) -> Result<(), String> {
                 };
                 println!("{y},{},{},{density}", vanilla.name(), rustmc.name());
             }
+            report_coverage(Coverage::new(1, 1, 0, ScoredSource::Vanilla), allow_partial)?;
         }
         other => return Err(format!("unknown mode {other:?}")),
     }
     Ok(())
 }
 
-/// Builds the RustMC-side column source. `vanilla` mode takes an optional
-/// `:settings-id` suffix (default the overworld) and reads the datapack
-/// root from the trailing argument, `$RUSTMC_VANILLA_DATA`, or the
+/// Compares the command-line `<seed>` with the seed the save stores, so a
+/// measurement can never be attributed to the wrong world. Both an unreadable
+/// save and a mismatch are errors.
+fn attest_seed(world: &Path, argument: i64) -> Result<(), String> {
+    let stored = save::seed(world)?;
+    save::attest_seed(stored, argument).map_err(|error| format!("{error} ({})", world.display()))
+}
+
+/// Prints one mode's coverage line and applies its verdict. The line goes to
+/// standard error so a mode's own report stays byte-identical to the
+/// measurements already recorded in `docs/PROVENANCE.md`.
+fn report_coverage(coverage: Coverage, allow_partial: bool) -> Result<(), String> {
+    match coverage.outcome(allow_partial) {
+        CoverageOutcome::Complete { line } => {
+            eprintln!("{line}");
+            Ok(())
+        }
+        CoverageOutcome::PartialAccepted { line, warning } => {
+            eprintln!("{line}");
+            eprintln!("warning: {warning}");
+            Ok(())
+        }
+        CoverageOutcome::PartialRejected { line, message } => {
+            eprintln!("{line}");
+            Err(message)
+        }
+    }
+}
+
+/// Grid points a strided sample of the inclusive block square asks for.
+fn grid_square(min: i64, max: i64, stride: i64) -> Result<usize, String> {
+    let per_axis = (max - min)
+        .checked_div(stride)
+        .and_then(|n| n.checked_add(1))
+        .ok_or("invalid sample grid")?;
+    usize::try_from(
+        per_axis
+            .checked_mul(per_axis)
+            .ok_or("invalid sample grid")?,
+    )
+    .map_err(|_| "sample grid too large".to_string())
+}
+
+/// Chunk square covering the inclusive block range.
+fn chunk_square(min: i64, max: i64) -> Result<usize, String> {
+    let to_chunk = |v: i64| -> Result<i32, String> {
+        i32::try_from(v.div_euclid(16)).map_err(|_| "coordinate too large".to_string())
+    };
+    chunk_square_of(to_chunk(min)?, to_chunk(max)?)
+}
+
+/// Chunk square over an inclusive chunk range.
+fn chunk_square_of(min: i32, max: i32) -> Result<usize, String> {
+    if min > max {
+        return Err("min must not exceed max".to_string());
+    }
+    let side = i64::from(max) - i64::from(min) + 1;
+    usize::try_from(side * side).map_err(|_| "chunk square too large".to_string())
+}
+
+/// Builds the RustMC-side column source and reports which terrain model it
+/// actually is, so the coverage line can label the number. `vanilla` mode takes
+/// an optional `:settings-id` suffix (default the overworld) and reads the
+/// datapack root from the trailing argument, `$RUSTMC_VANILLA_DATA`, or the
 /// project-local default.
 fn build_source(
     seed: i64,
     terrain: Option<&String>,
     data_root: Option<&String>,
-) -> Result<Box<dyn ColumnSource>, String> {
+) -> Result<(Box<dyn ColumnSource>, ScoredSource), String> {
     let value = terrain.map(String::as_str);
     match value {
-        None | Some("preview") => Ok(Box::new(Generator::with_terrain(
-            seed as u64,
-            Terrain::Preview,
-        ))),
-        Some("experimental") => Ok(Box::new(Generator::with_terrain(
-            seed as u64,
-            Terrain::Experimental,
-        ))),
+        None | Some("preview") => Ok((
+            Box::new(Generator::with_terrain(seed as u64, Terrain::Preview)),
+            ScoredSource::Preview,
+        )),
+        Some("experimental") => Ok((
+            Box::new(Generator::with_terrain(seed as u64, Terrain::Experimental)),
+            ScoredSource::Experimental,
+        )),
         Some(t) if t == "vanilla" || t.starts_with("vanilla:") => {
             let settings = t
                 .split_once(':')
                 .map_or("minecraft:overworld", |(_, id)| id);
-            Ok(Box::new(
-                VanillaGenerator::new(&resolve_data_root(data_root), seed, settings)
-                    .map_err(|error| error.to_string())?,
+            Ok((
+                Box::new(
+                    VanillaGenerator::new(&resolve_data_root(data_root), seed, settings)
+                        .map_err(|error| error.to_string())?,
+                ),
+                ScoredSource::Vanilla,
             ))
         }
         Some(other) => Err(format!(
@@ -619,4 +862,113 @@ fn parse_i64(value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
         .map_err(|_| format!("invalid integer: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = include_str!("vanilla_oracle.rs");
+
+    #[test]
+    fn extra_positionals_are_rejected_before_save_attestation() {
+        let args: Vec<String> = [
+            "column",
+            "missing-world",
+            "2026",
+            "0",
+            "0",
+            "vanilla",
+            "data-root",
+            "extra",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let error = run(&args).unwrap_err();
+        assert!(error.contains("unexpected argument \"extra\""), "{error}");
+    }
+
+    /// The documented usage block is what an operator actually runs, so a mode
+    /// that takes a seed there has to be attested here — and a mode that does
+    /// not must not be listed, or `run` would demand a seed argument the docs
+    /// never mention.
+    #[test]
+    fn seed_modes_match_the_documented_usage_lines() {
+        let mut documented: Vec<&str> = Vec::new();
+        let mut unseeded: Vec<&str> = Vec::new();
+        for line in SOURCE.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("//! vanilla_oracle ") else {
+                continue;
+            };
+            let mut tokens = rest.split_whitespace();
+            let (Some(mode), Some("<world-dir>")) = (tokens.next(), tokens.next()) else {
+                continue;
+            };
+            if tokens.next() == Some("<seed>") {
+                documented.push(mode);
+            } else {
+                unseeded.push(mode);
+            }
+        }
+        assert!(
+            !documented.is_empty(),
+            "no usage line documents a seed argument at all"
+        );
+        for mode in &documented {
+            assert!(
+                SEED_MODES.contains(mode),
+                "usage documents `{mode} <world-dir> <seed>` but {mode} is missing from SEED_MODES, so its seed is never attested"
+            );
+        }
+        for mode in SEED_MODES {
+            assert!(
+                documented.contains(&mode),
+                "{mode} is attested but no usage line gives it a seed"
+            );
+            assert!(
+                SOURCE.contains(&format!("\"{mode}\" =>")),
+                "{mode} is in SEED_MODES but has no match arm"
+            );
+        }
+        assert_eq!(
+            documented.len(),
+            SEED_MODES.len(),
+            "SEED_MODES and the usage block disagree about which modes take a seed"
+        );
+        for mode in &unseeded {
+            assert!(
+                !SEED_MODES.contains(mode),
+                "{mode} takes no seed per the usage block"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_error_lists_every_dispatched_mode() {
+        let help = SOURCE
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("\"usage: vanilla_oracle "))
+            .expect("the missing-mode usage error is present");
+        let listed: Vec<&str> = help
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .collect();
+        for mode in &listed {
+            assert!(
+                SOURCE.contains(&format!("\"{mode}\" =>")),
+                "the usage error offers {mode} but nothing dispatches it"
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            SOURCE
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//! vanilla_oracle "))
+                .count(),
+            "the usage error and the documented usage block cover different mode sets"
+        );
+    }
 }
