@@ -17,7 +17,7 @@
 //! order and the union are reproduced here from the pack's own data; see
 //! `docs/PROVENANCE.md` session 13 for the rules and their derivation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -212,6 +212,181 @@ impl BlockTags {
     }
 }
 
+/// A block state: its namespaced identifier and sorted key-value properties.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlockState {
+    pub id: String,
+    pub properties: BTreeMap<String, String>,
+}
+
+impl BlockState {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            properties: BTreeMap::new(),
+        }
+    }
+
+    /// Parses a block state from a string in either bare form (`minecraft:stone`)
+    /// or property form (`minecraft:sea_pickle[pickles=2,waterlogged=false]`).
+    pub fn parse_string(s: &str) -> Self {
+        let s = s.trim();
+        if let Some(bracket_start) = s.find('[') {
+            let id = s[..bracket_start].trim().to_string();
+            let mut properties = BTreeMap::new();
+            let rest = &s[bracket_start + 1..];
+            let props_str = rest.strip_suffix(']').unwrap_or(rest);
+            for part in props_str.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = part.split_once('=') {
+                    properties.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+            Self { id, properties }
+        } else {
+            Self {
+                id: s.to_string(),
+                properties: BTreeMap::new(),
+            }
+        }
+    }
+
+    /// Renders the block state to string format `id[k1=v1,k2=v2]`, with
+    /// properties sorted by key, or bare `id` if there are no properties.
+    pub fn to_state_string(&self) -> String {
+        if self.properties.is_empty() {
+            self.id.clone()
+        } else {
+            let props: Vec<String> = self
+                .properties
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            format!("{}[{}]", self.id, props.join(","))
+        }
+    }
+
+    /// Parses from a JSON string or object (`{"id": ..., "properties": {...}}` or `{"Name": ...}`).
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(s) => Some(Self::parse_string(s)),
+            Value::Object(object) => {
+                let id = object
+                    .get("id")
+                    .or_else(|| object.get("Name"))
+                    .and_then(Value::as_str)?;
+                let mut properties = BTreeMap::new();
+                if let Some(props_obj) = object.get("properties").and_then(Value::as_object) {
+                    for (k, v) in props_obj {
+                        let val_str = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Bool(b) => b.to_string(),
+                            Value::Number(n) => n.to_string(),
+                            _ => return None,
+                        };
+                        properties.insert(k.clone(), val_str);
+                    }
+                }
+                Some(Self {
+                    id: id.to_string(),
+                    properties,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_state_string())
+    }
+}
+
+/// A weighted block state entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightedState {
+    pub state: BlockState,
+    pub weight: i32,
+}
+
+/// A block-state provider: samples a block state from the decoration stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StateProvider {
+    /// `minecraft:simple_state_provider` or a direct block state.
+    Simple { state: BlockState },
+    /// Constant state alias.
+    Constant { state: BlockState },
+    /// `minecraft:weighted` or `minecraft:weighted_state_provider`.
+    Weighted { entries: Vec<WeightedState> },
+    /// `minecraft:randomized_int` and legacy `minecraft:randomized_int_state_provider`.
+    RandomizedInt {
+        source: Box<StateProvider>,
+        property: String,
+        values: RangeProvider,
+    },
+    /// A provider shape without a runtime here.
+    Unsupported { kind: String },
+}
+
+impl StateProvider {
+    /// Whether this provider shape and any nested providers have a runtime here.
+    pub fn is_modelable(&self) -> bool {
+        match self {
+            Self::Unsupported { .. } => false,
+            Self::Simple { .. } | Self::Constant { .. } => true,
+            Self::Weighted { entries } => {
+                !entries.is_empty() && entries.iter().all(|entry| entry.weight > 0)
+            }
+            Self::RandomizedInt { source, values, .. } => {
+                source.is_modelable() && values.is_modelable()
+            }
+        }
+    }
+
+    /// The state to place, drawn from the decoration stream.
+    pub fn sample(&self, random: &mut DecorationRandom) -> Option<BlockState> {
+        match self {
+            Self::Simple { state } | Self::Constant { state } => Some(state.clone()),
+            Self::Weighted { entries } => {
+                let total: i32 = entries.iter().map(|entry| entry.weight).sum();
+                if total <= 0 {
+                    return None;
+                }
+                let mut pick = random.next_int_bounded(total);
+                for entry in entries {
+                    if pick < entry.weight {
+                        return Some(entry.state.clone());
+                    }
+                    pick -= entry.weight;
+                }
+                None
+            }
+            Self::RandomizedInt {
+                source,
+                property,
+                values,
+            } => {
+                let mut state = source.sample(random)?;
+                let sampled_int = values.sample(0, 0, random);
+                state
+                    .properties
+                    .insert(property.clone(), sampled_int.to_string());
+                Some(state)
+            }
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Samples and renders the state as a string.
+    pub fn sample_string(&self, random: &mut DecorationRandom) -> Option<String> {
+        self.sample(random).map(|s| s.to_state_string())
+    }
+}
+
 /// One ore target: what to test and what to write when it matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OreTarget {
@@ -230,6 +405,10 @@ pub enum ConfiguredFeature {
         targets: Vec<OreTarget>,
         discard_chance_on_air_exposure: f32,
     },
+    /// `minecraft:simple_random_selector` — uniform random selection among child features.
+    SimpleRandomSelector {
+        features: Vec<Rc<PlacedFeature>>,
+    },
     Unsupported {
         kind: String,
     },
@@ -243,6 +422,9 @@ impl ConfiguredFeature {
         match self {
             Self::Ore { targets, .. } => {
                 targets.iter().all(|target| target.predicate.is_modelable())
+            }
+            Self::SimpleRandomSelector { features } => {
+                !features.is_empty() && features.iter().all(|feature| feature.is_modelable())
             }
             Self::Unsupported { .. } => false,
         }
@@ -332,8 +514,14 @@ impl RangeProvider {
         }
         let object = value.as_object()?;
         let anchored = |kind: &str| -> Option<Self> {
-            let min_inclusive = VerticalAnchor::from_value(object.get("min_inclusive")?)?;
-            let max_inclusive = VerticalAnchor::from_value(object.get("max_inclusive")?)?;
+            let min_val = object
+                .get("min_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("min_inclusive")))?;
+            let max_val = object
+                .get("max_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("max_inclusive")))?;
+            let min_inclusive = VerticalAnchor::from_value(min_val)?;
+            let max_inclusive = VerticalAnchor::from_value(max_val)?;
             // A count provider is a plain numeric range; only the height
             // decoration accepts anchors that resolve against the dimension.
             if !anchors_allowed
@@ -342,7 +530,7 @@ impl RangeProvider {
             {
                 return None;
             }
-            Some(if kind == "minecraft:uniform" {
+            Some(if kind.contains("uniform") {
                 Self::Uniform {
                     min_inclusive,
                     max_inclusive,
@@ -355,7 +543,7 @@ impl RangeProvider {
             })
         };
         match object.get("type").and_then(Value::as_str) {
-            Some("minecraft:constant") => {
+            Some("minecraft:constant" | "constant") => {
                 let value = object.get("value")?;
                 if anchors_allowed && let Some(anchor) = VerticalAnchor::from_value(value) {
                     // A constant anchor is a degenerate range; the height
@@ -371,14 +559,14 @@ impl RangeProvider {
                 }
                 Some(Self::Constant(n))
             }
-            Some(kind @ ("minecraft:uniform" | "minecraft:trapezoid")) => anchored(kind),
+            Some(
+                kind @ ("minecraft:uniform" | "uniform" | "minecraft:trapezoid" | "trapezoid"),
+            ) => anchored(kind),
             Some(other) => Some(Self::Unsupported {
                 kind: other.to_string(),
             }),
-            // No `type` key: an inline anchor pair, which only the height
-            // decoration accepts.
-            None if anchors_allowed => anchored("minecraft:uniform"),
-            None => None,
+            // No `type` key: an inline anchor or min/max pair.
+            None => anchored("minecraft:uniform"),
         }
     }
 
@@ -412,6 +600,14 @@ pub struct PlacedFeature {
     pub id: String,
     pub feature: Rc<ConfiguredFeature>,
     pub modifiers: Vec<PlacementModifier>,
+}
+
+impl PartialEq for PlacedFeature {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.modifiers == other.modifiers
+            && (Rc::ptr_eq(&self.feature, &other.feature) || self.feature == other.feature)
+    }
 }
 
 impl PlacedFeature {
@@ -580,6 +776,11 @@ impl FeatureData {
                         record_unmodeled_rule(&mut data.unimplemented_features, &target.predicate);
                     }
                 }
+                ConfiguredFeature::SimpleRandomSelector { features } => {
+                    for child in features {
+                        record_unmodeled_modifiers(&mut data.unimplemented_features, child);
+                    }
+                }
             }
             data.configured.insert(id, Rc::new(feature));
         }
@@ -587,6 +788,24 @@ impl FeatureData {
             let feature = parse_placed_feature(&id, &document, &data.configured)?;
             record_unmodeled_modifiers(&mut data.unimplemented_features, &feature);
             data.placed.insert(id, Rc::new(feature));
+        }
+        let configured_snapshot = data.configured.clone();
+        for configured_feature in data.configured.values_mut() {
+            if let ConfiguredFeature::SimpleRandomSelector { features } =
+                Rc::make_mut(configured_feature)
+            {
+                for placed in features.iter_mut() {
+                    if let Some(resolved) = data.placed.get(&placed.id) {
+                        *placed = Rc::clone(resolved);
+                    } else if let Some(cf) = configured_snapshot.get(&placed.id) {
+                        *placed = Rc::new(PlacedFeature {
+                            id: placed.id.clone(),
+                            feature: Rc::clone(cf),
+                            modifiers: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
         let placed_ids: Vec<String> = data.placed.keys().cloned().collect();
         let configured_ids: Vec<String> = data.configured.keys().cloned().collect();
@@ -923,16 +1142,29 @@ pub(crate) fn parse_configured_feature(
         .and_then(Value::as_str)
         .unwrap_or("minecraft:missing_type")
         .to_string();
-    if kind != "minecraft:ore" {
-        return Ok(ConfiguredFeature::Unsupported { kind });
-    }
-    // The 26.3 pack writes ore parameters at the top level; the older
-    // `config` wrapper is accepted too so a hand-built fixture reads the
-    // same as the pack.
     let body = match document.get("config") {
         Some(config) if config.is_object() => config,
         _ => document,
     };
+    if kind == "minecraft:simple_random_selector" || kind == "simple_random_selector" {
+        let features_array = body
+            .get("features")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                WorldgenError::Invalid(
+                    "simple_random_selector feature without features".to_string(),
+                )
+            })?;
+        let mut features = Vec::new();
+        for (index, entry) in features_array.iter().enumerate() {
+            let placed = parse_selector_feature_entry(entry, index)?;
+            features.push(Rc::new(placed));
+        }
+        return Ok(ConfiguredFeature::SimpleRandomSelector { features });
+    }
+    if kind != "minecraft:ore" {
+        return Ok(ConfiguredFeature::Unsupported { kind });
+    }
     let size = body
         .get("size")
         .and_then(Value::as_i64)
@@ -976,6 +1208,185 @@ pub(crate) fn parse_configured_feature(
         targets,
         discard_chance_on_air_exposure,
     })
+}
+
+fn parse_selector_feature_entry(
+    entry: &Value,
+    index: usize,
+) -> Result<PlacedFeature, WorldgenError> {
+    match entry {
+        Value::String(name) => Ok(PlacedFeature {
+            id: name.clone(),
+            feature: Rc::new(ConfiguredFeature::Unsupported { kind: name.clone() }),
+            modifiers: Vec::new(),
+        }),
+        Value::Object(object) => {
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_else(|| format!("inline#{index}"));
+            let feature = if let Some(feature_val) = object.get("feature") {
+                if let Some(name) = feature_val.as_str() {
+                    Rc::new(ConfiguredFeature::Unsupported {
+                        kind: name.to_string(),
+                    })
+                } else if feature_val.is_object() {
+                    Rc::new(parse_configured_feature(feature_val)?)
+                } else {
+                    return Err(WorldgenError::Invalid(format!(
+                        "{id}: inline placed feature has invalid feature field"
+                    )));
+                }
+            } else if object.contains_key("type") {
+                Rc::new(parse_configured_feature(entry)?)
+            } else {
+                return Err(WorldgenError::Invalid(format!(
+                    "{id}: inline placed feature without feature definition"
+                )));
+            };
+            let modifiers = object
+                .get("placement")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .map(|(m_idx, m_entry)| parse_placement_modifier(&id, m_idx, m_entry))
+                .collect::<Result<Vec<_>, _>>()?;
+            let attempt_budget = modifiers.iter().try_fold(1u32, |product, modifier| {
+                if let PlacementModifier::Count { count } = modifier {
+                    match count.range(0, 0) {
+                        Some((_, max)) => product.checked_mul(max.max(0) as u32),
+                        None => Some(product),
+                    }
+                } else {
+                    Some(product)
+                }
+            });
+            if !matches!(attempt_budget, Some(0..=4096)) {
+                return Err(WorldgenError::Invalid(format!(
+                    "{id}: count modifiers exceed the 4096-attempt placement budget"
+                )));
+            }
+            Ok(PlacedFeature {
+                id,
+                feature,
+                modifiers,
+            })
+        }
+        _ => Err(WorldgenError::Invalid(format!(
+            "simple_random_selector features[{index}] must be a string or object"
+        ))),
+    }
+}
+
+/// Parses one `to_place` block-state provider.
+#[allow(dead_code)]
+pub(crate) fn parse_state_provider(value: Option<&Value>) -> StateProvider {
+    let unsupported = |kind: &str| StateProvider::Unsupported {
+        kind: kind.to_string(),
+    };
+    let Some(value) = value else {
+        return unsupported("minecraft:missing_to_place");
+    };
+    match value {
+        Value::String(s) => {
+            if s.starts_with('#') {
+                unsupported("minecraft:block_tag")
+            } else if s.contains('[') {
+                StateProvider::Simple {
+                    state: BlockState::parse_string(s),
+                }
+            } else {
+                unsupported("minecraft:block_state_provider_reference")
+            }
+        }
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+            match kind {
+                Some(
+                    "minecraft:randomized_int"
+                    | "minecraft:randomized_int_state_provider"
+                    | "randomized_int"
+                    | "randomized_int_state_provider",
+                ) => {
+                    let source = Box::new(parse_state_provider(object.get("source")));
+                    let property = object
+                        .get("property")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let values = object
+                        .get("values")
+                        .and_then(|v| RangeProvider::from_value(v, false))
+                        .unwrap_or_else(|| RangeProvider::Unsupported {
+                            kind: "missing_values".to_string(),
+                        });
+                    StateProvider::RandomizedInt {
+                        source,
+                        property,
+                        values,
+                    }
+                }
+                Some("minecraft:simple_state_provider" | "simple_state_provider") => {
+                    let state = object
+                        .get("state")
+                        .and_then(BlockState::from_value)
+                        .unwrap_or_else(|| BlockState::new("minecraft:air"));
+                    StateProvider::Simple { state }
+                }
+                Some(
+                    "minecraft:weighted"
+                    | "minecraft:weighted_state_provider"
+                    | "weighted"
+                    | "weighted_state_provider",
+                ) => {
+                    let entries: Vec<WeightedState> = object
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|entry| {
+                            let weight = entry.get("weight").and_then(Value::as_i64)?;
+                            let data = entry.get("data")?;
+                            let state = BlockState::from_value(data)?;
+                            Some(WeightedState {
+                                state,
+                                weight: i32::try_from(weight).ok()?,
+                            })
+                        })
+                        .collect();
+                    let count = object
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default();
+                    if entries.len() != count
+                        || entries.is_empty()
+                        || entries.len() > 64
+                        || !entries
+                            .iter()
+                            .all(|entry| (1..=1_000_000).contains(&entry.weight))
+                    {
+                        unsupported("minecraft:weighted")
+                    } else {
+                        StateProvider::Weighted { entries }
+                    }
+                }
+                Some(other) => unsupported(other),
+                None => {
+                    if let Some(state) = BlockState::from_value(value) {
+                        StateProvider::Simple { state }
+                    } else {
+                        unsupported("minecraft:missing_state")
+                    }
+                }
+            }
+        }
+        _ => unsupported("minecraft:missing_to_place"),
+    }
 }
 
 /// Counts the rule-test kinds a target uses without a runtime here, so the
@@ -1682,6 +2093,14 @@ impl FeatureData {
                     *discard_chance_on_air_exposure,
                     pos,
                 ),
+                ConfiguredFeature::SimpleRandomSelector { features } => {
+                    if features.is_empty() {
+                        return 0;
+                    }
+                    let pick = random.next_int_bounded(features.len() as i32) as usize;
+                    let selected = &features[pick];
+                    self.run_chain(target, selected, 0, pos, random)
+                }
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
@@ -3425,5 +3844,262 @@ mod tests {
         for (key, count) in entries {
             println!("  {key} {count}");
         }
+    }
+
+    #[test]
+    fn test_randomized_int_state_provider_samples_properties_uniformly() {
+        // Test parsing modern minecraft:randomized_int with structured source and uniform range
+        let modern_json = json!({
+            "type": "minecraft:randomized_int",
+            "source": {
+                "id": "minecraft:sea_pickle",
+                "properties": {
+                    "waterlogged": "false"
+                }
+            },
+            "property": "pickles",
+            "values": {
+                "type": "minecraft:uniform",
+                "min_inclusive": 1,
+                "max_inclusive": 4
+            }
+        });
+        let modern_provider = parse_state_provider(Some(&modern_json));
+        assert!(modern_provider.is_modelable());
+
+        // Test parsing legacy minecraft:randomized_int_state_provider
+        let legacy_json = json!({
+            "type": "minecraft:randomized_int_state_provider",
+            "source": {
+                "id": "minecraft:sea_pickle"
+            },
+            "property": "pickles",
+            "values": {
+                "type": "minecraft:uniform",
+                "min_inclusive": 1,
+                "max_inclusive": 4
+            }
+        });
+        let legacy_provider = parse_state_provider(Some(&legacy_json));
+        assert!(legacy_provider.is_modelable());
+
+        // Test sampling uniformity across draws
+        let mut random = DecorationRandom::new(2026);
+        let mut pickle_counts = HashMap::new();
+        let total_samples = 10_000;
+        for _ in 0..total_samples {
+            let state = modern_provider
+                .sample(&mut random)
+                .expect("sampling must succeed");
+            assert_eq!(state.id, "minecraft:sea_pickle");
+            assert_eq!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("false")
+            );
+            let val = state
+                .properties
+                .get("pickles")
+                .expect("property 'pickles' must be set")
+                .clone();
+            *pickle_counts.entry(val).or_insert(0usize) += 1;
+
+            let s = state.to_state_string();
+            assert!(
+                s == "minecraft:sea_pickle[pickles=1,waterlogged=false]"
+                    || s == "minecraft:sea_pickle[pickles=2,waterlogged=false]"
+                    || s == "minecraft:sea_pickle[pickles=3,waterlogged=false]"
+                    || s == "minecraft:sea_pickle[pickles=4,waterlogged=false]",
+                "unexpected formatted state: {s}"
+            );
+        }
+
+        // Must cover all 4 values {1, 2, 3, 4}
+        assert_eq!(pickle_counts.len(), 4);
+        for i in 1..=4 {
+            let count = pickle_counts
+                .get(&i.to_string())
+                .copied()
+                .unwrap_or_default();
+            // Expected is 2500 for uniform over 4 outcomes; 2100..=2900 bounds statistical deviation
+            assert!(
+                (2100..=2900).contains(&count),
+                "count for pickles={i} was {count}, expected roughly 2500"
+            );
+        }
+
+        // Test parsing and stringification of BlockState
+        let parsed = BlockState::parse_string("minecraft:sea_pickle[waterlogged=true,pickles=3]");
+        assert_eq!(parsed.id, "minecraft:sea_pickle");
+        assert_eq!(
+            parsed.properties.get("pickles").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            parsed.properties.get("waterlogged").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            parsed.to_state_string(),
+            "minecraft:sea_pickle[pickles=3,waterlogged=true]"
+        );
+
+        // Test unmodelable provider cases
+        let unmodelable_values = json!({
+            "type": "minecraft:randomized_int",
+            "source": { "id": "minecraft:sea_pickle" },
+            "property": "pickles",
+            "values": { "type": "minecraft:unsupported_range_type" }
+        });
+        assert!(!parse_state_provider(Some(&unmodelable_values)).is_modelable());
+
+        let unmodelable_source = json!({
+            "type": "minecraft:randomized_int",
+            "source": "minecraft:flower_plain",
+            "property": "pickles",
+            "values": { "type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 4 }
+        });
+        assert!(!parse_state_provider(Some(&unmodelable_source)).is_modelable());
+    }
+
+    #[test]
+    fn test_simple_random_selector_selects_and_runs_child_feature() {
+        // Child feature 1: replaces stone with granite
+        let granite_child = wrapper(
+            "testns:child_granite",
+            &stone_replacement("minecraft:granite", 16, 0.0),
+            vec![
+                PlacementModifier::Count {
+                    count: RangeProvider::Constant(1),
+                },
+                PlacementModifier::HeightRange {
+                    height: RangeProvider::Constant(64),
+                },
+            ],
+        );
+
+        // Child feature 2: replaces stone with diorite
+        let diorite_child = wrapper(
+            "testns:child_diorite",
+            &stone_replacement("minecraft:diorite", 16, 0.0),
+            vec![
+                PlacementModifier::Count {
+                    count: RangeProvider::Constant(1),
+                },
+                PlacementModifier::HeightRange {
+                    height: RangeProvider::Constant(64),
+                },
+            ],
+        );
+
+        let selector = Rc::new(ConfiguredFeature::SimpleRandomSelector {
+            features: vec![Rc::clone(&granite_child), Rc::clone(&diorite_child)],
+        });
+        assert!(selector.is_supported());
+
+        let placed_selector = wrapper(
+            "testns:selector_placed",
+            &selector,
+            vec![
+                PlacementModifier::Count {
+                    count: RangeProvider::Constant(1),
+                },
+                PlacementModifier::HeightRange {
+                    height: RangeProvider::Constant(64),
+                },
+            ],
+        );
+        assert!(placed_selector.is_modelable());
+
+        let data = registry(vec![Rc::clone(&placed_selector)]);
+
+        let mut granite_chosen = 0usize;
+        let mut diorite_chosen = 0usize;
+        for seed in 0..100i64 {
+            let mut target = TestTarget::new().write_anywhere();
+            let written = data.decorate_step(&mut target, 0, 0, 0, seed, &region());
+            assert!(
+                written > 0,
+                "simple random selector must run child and write blocks"
+            );
+            let granite_count = target.blocks("minecraft:granite");
+            let diorite_count = target.blocks("minecraft:diorite");
+            // Exactly one child feature must have placed blocks on each run
+            assert!(
+                (granite_count > 0 && diorite_count == 0)
+                    || (diorite_count > 0 && granite_count == 0),
+                "seed {seed}: exactly one of the child features must be selected (granite: {granite_count}, diorite: {diorite_count})"
+            );
+            if granite_count > 0 {
+                granite_chosen += 1;
+            } else {
+                diorite_chosen += 1;
+            }
+        }
+
+        // Both child features should be selected across 100 seeds
+        assert!(
+            granite_chosen > 30 && diorite_chosen > 30,
+            "both child features must be selected roughly evenly: granite={granite_chosen}, diorite={diorite_chosen}"
+        );
+
+        // Test parsing JSON document with inline placed features
+        let doc = json!({
+            "type": "minecraft:simple_random_selector",
+            "features": [
+                {
+                    "feature": {
+                        "type": "minecraft:ore",
+                        "size": 16,
+                        "discard_chance_on_air_exposure": 0.0,
+                        "targets": [
+                            {
+                                "target": { "predicate_type": "minecraft:block_match", "block": "minecraft:stone" },
+                                "state": "minecraft:granite"
+                            }
+                        ]
+                    },
+                    "placement": []
+                },
+                {
+                    "feature": {
+                        "type": "minecraft:ore",
+                        "size": 16,
+                        "discard_chance_on_air_exposure": 0.0,
+                        "targets": [
+                            {
+                                "target": { "predicate_type": "minecraft:block_match", "block": "minecraft:stone" },
+                                "state": "minecraft:diorite"
+                            }
+                        ]
+                    },
+                    "placement": []
+                }
+            ]
+        });
+        let parsed = parse_configured_feature(&doc).expect("parses inline features");
+        assert!(parsed.is_supported());
+        if let ConfiguredFeature::SimpleRandomSelector { features } = &parsed {
+            assert_eq!(features.len(), 2);
+            assert!(features[0].is_modelable());
+            assert!(features[1].is_modelable());
+        } else {
+            panic!("expected SimpleRandomSelector");
+        }
+
+        // Test unmodelable and empty selector
+        let empty_selector = ConfiguredFeature::SimpleRandomSelector { features: vec![] };
+        assert!(!empty_selector.is_supported());
+
+        let unmodelable_child = Rc::new(PlacedFeature {
+            id: "test:unmodelable".to_string(),
+            feature: Rc::new(ConfiguredFeature::Unsupported {
+                kind: "missing".to_string(),
+            }),
+            modifiers: vec![],
+        });
+        let selector_with_unmodelable = ConfiguredFeature::SimpleRandomSelector {
+            features: vec![unmodelable_child],
+        };
+        assert!(!selector_with_unmodelable.is_supported());
     }
 }
