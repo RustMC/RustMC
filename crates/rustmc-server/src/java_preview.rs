@@ -221,9 +221,15 @@ const BATCH_END: u32 = 11;
 const MAX_CHUNKS_PER_BATCH: usize = 16;
 const MAX_BATCH_BYTES: usize = 768 * 1024;
 // Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves.
-const BLOCK_STATES: [u32; 19] = [
-    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759,
+const BLOCK_STATES: [u32; 24] = [
+    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759, 0,
+    0, 0, 0, 0,
 ];
+
+fn block_state_id(block_index: usize) -> u32 {
+    BLOCK_STATES.get(block_index).copied().unwrap_or(0)
+}
+
 const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
 const LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
@@ -781,13 +787,13 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         palette.dedup();
         if palette.len() == 1 {
             sections.push(0);
-            put_varint(BLOCK_STATES[values[0] as usize], &mut sections);
+            put_varint(block_state_id(values[0] as usize), &mut sections);
         } else {
             let bits = (usize::BITS - (palette.len() - 1).leading_zeros()).max(4) as usize;
             sections.push(bits as u8);
             put_varint(palette.len() as u32, &mut sections);
             for value in &palette {
-                put_varint(BLOCK_STATES[*value as usize], &mut sections);
+                put_varint(block_state_id(*value as usize), &mut sections);
             }
             let indices: Vec<u16> = values
                 .iter()

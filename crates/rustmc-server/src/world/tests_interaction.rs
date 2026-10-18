@@ -20,7 +20,7 @@
 //! nothing was copied or translated from another server; these probes are
 //! independently written checks against RustMC's own generator.
 
-use super::{Block, CHUNK_SIDE, Chunk, Generator, WORLD_HEIGHT};
+use super::{Block, CHUNK_SIDE, CellChange, Chunk, Generator, WORLD_HEIGHT};
 use std::collections::BTreeMap;
 
 /// Proposed player envelope in blocks, whole-cube approximation.
@@ -423,4 +423,390 @@ fn smoke_operator_save_layout_matches_the_chunk_coordinate_mapping() {
             stream[4]
         );
     }
+}
+
+#[test]
+fn breaking_supporting_block_collapses_resting_foliage_snow_and_carpet_at_y_plus_1() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // ShortGrass (foliage) resting on soil (Grass).
+    let (x1, y1, z1) = (2, 10, 3);
+    chunk.set_and_update(x1, y1, z1, Block::Grass).unwrap();
+    chunk
+        .set_and_update(x1, y1 + 1, z1, Block::ShortGrass)
+        .unwrap();
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::ShortGrass));
+
+    let changes1 = chunk.set_and_update(x1, y1, z1, Block::Air).unwrap();
+    assert_eq!(chunk.block(x1, y1, z1), Some(Block::Air));
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::Air));
+    assert!(changes1.contains(&CellChange {
+        x: x1,
+        y: y1,
+        z: z1,
+        block: Block::Air
+    }));
+    assert!(changes1.contains(&CellChange {
+        x: x1,
+        y: y1 + 1,
+        z: z1,
+        block: Block::Air
+    }));
+
+    // SnowLayer resting on solid block (Stone).
+    let (x2, y2, z2) = (5, 10, 5);
+    chunk.set_and_update(x2, y2, z2, Block::Stone).unwrap();
+    chunk
+        .set_and_update(x2, y2 + 1, z2, Block::SnowLayer)
+        .unwrap();
+    assert_eq!(chunk.block(x2, y2 + 1, z2), Some(Block::SnowLayer));
+
+    let changes2 = chunk.set_and_update(x2, y2, z2, Block::Air).unwrap();
+    assert_eq!(chunk.block(x2, y2, z2), Some(Block::Air));
+    assert_eq!(chunk.block(x2, y2 + 1, z2), Some(Block::Air));
+    assert!(changes2.contains(&CellChange {
+        x: x2,
+        y: y2,
+        z: z2,
+        block: Block::Air
+    }));
+    assert!(changes2.contains(&CellChange {
+        x: x2,
+        y: y2 + 1,
+        z: z2,
+        block: Block::Air
+    }));
+
+    // Carpet resting on solid block (Stone).
+    let (x3, y3, z3) = (8, 10, 8);
+    chunk.set_and_update(x3, y3, z3, Block::Stone).unwrap();
+    chunk.set_and_update(x3, y3 + 1, z3, Block::Carpet).unwrap();
+    assert_eq!(chunk.block(x3, y3 + 1, z3), Some(Block::Carpet));
+
+    let changes3 = chunk.set_and_update(x3, y3, z3, Block::Air).unwrap();
+    assert_eq!(chunk.block(x3, y3, z3), Some(Block::Air));
+    assert_eq!(chunk.block(x3, y3 + 1, z3), Some(Block::Air));
+    assert!(changes3.contains(&CellChange {
+        x: x3,
+        y: y3,
+        z: z3,
+        block: Block::Air
+    }));
+    assert!(changes3.contains(&CellChange {
+        x: x3,
+        y: y3 + 1,
+        z: z3,
+        block: Block::Air
+    }));
+}
+
+#[test]
+fn breaking_either_half_of_double_plant_destroys_the_other_half_deterministically() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // Case 1: Breaking the upper half destroys the lower half.
+    let (x1, y1, z1) = (3, 20, 3);
+    chunk.set_and_update(x1, y1, z1, Block::Grass).unwrap();
+    chunk
+        .set_and_update(x1, y1 + 1, z1, Block::TallGrassLower)
+        .unwrap();
+    chunk
+        .set_and_update(x1, y1 + 2, z1, Block::TallGrassUpper)
+        .unwrap();
+
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::TallGrassLower));
+    assert_eq!(chunk.block(x1, y1 + 2, z1), Some(Block::TallGrassUpper));
+
+    let changes_upper = chunk.set_and_update(x1, y1 + 2, z1, Block::Air).unwrap();
+    assert_eq!(chunk.block(x1, y1 + 2, z1), Some(Block::Air));
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::Air));
+    assert_eq!(chunk.block(x1, y1, z1), Some(Block::Grass));
+    assert!(changes_upper.contains(&CellChange {
+        x: x1,
+        y: y1 + 2,
+        z: z1,
+        block: Block::Air
+    }));
+    assert!(changes_upper.contains(&CellChange {
+        x: x1,
+        y: y1 + 1,
+        z: z1,
+        block: Block::Air
+    }));
+
+    // Case 2: Breaking the lower half destroys the upper half.
+    let (x2, y2, z2) = (6, 20, 6);
+    chunk.set_and_update(x2, y2, z2, Block::Grass).unwrap();
+    chunk
+        .set_and_update(x2, y2 + 1, z2, Block::TallGrassLower)
+        .unwrap();
+    chunk
+        .set_and_update(x2, y2 + 2, z2, Block::TallGrassUpper)
+        .unwrap();
+
+    assert_eq!(chunk.block(x2, y2 + 1, z2), Some(Block::TallGrassLower));
+    assert_eq!(chunk.block(x2, y2 + 2, z2), Some(Block::TallGrassUpper));
+
+    let changes_lower = chunk.set_and_update(x2, y2 + 1, z2, Block::Air).unwrap();
+    assert_eq!(chunk.block(x2, y2 + 1, z2), Some(Block::Air));
+    assert_eq!(chunk.block(x2, y2 + 2, z2), Some(Block::Air));
+    assert_eq!(chunk.block(x2, y2, z2), Some(Block::Grass));
+    assert!(changes_lower.contains(&CellChange {
+        x: x2,
+        y: y2 + 1,
+        z: z2,
+        block: Block::Air
+    }));
+    assert!(changes_lower.contains(&CellChange {
+        x: x2,
+        y: y2 + 2,
+        z: z2,
+        block: Block::Air
+    }));
+}
+
+#[test]
+fn replacing_soil_with_non_soil_solid_breaks_plants_but_preserves_snow_layer_and_carpet() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // ShortGrass on Dirt: replacing Dirt with Stone breaks ShortGrass.
+    let (x1, y1, z1) = (1, 15, 1);
+    chunk.set_and_update(x1, y1, z1, Block::Dirt).unwrap();
+    chunk
+        .set_and_update(x1, y1 + 1, z1, Block::ShortGrass)
+        .unwrap();
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::ShortGrass));
+
+    let changes_plant = chunk.set_and_update(x1, y1, z1, Block::Stone).unwrap();
+    assert_eq!(chunk.block(x1, y1, z1), Some(Block::Stone));
+    assert_eq!(chunk.block(x1, y1 + 1, z1), Some(Block::Air));
+    assert!(changes_plant.contains(&CellChange {
+        x: x1,
+        y: y1 + 1,
+        z: z1,
+        block: Block::Air
+    }));
+
+    // TallGrass on Grass: replacing Grass with Stone breaks both halves.
+    let (x2, y2, z2) = (3, 15, 3);
+    chunk.set_and_update(x2, y2, z2, Block::Grass).unwrap();
+    chunk
+        .set_and_update(x2, y2 + 1, z2, Block::TallGrassLower)
+        .unwrap();
+    chunk
+        .set_and_update(x2, y2 + 2, z2, Block::TallGrassUpper)
+        .unwrap();
+
+    let changes_double = chunk.set_and_update(x2, y2, z2, Block::Stone).unwrap();
+    assert_eq!(chunk.block(x2, y2, z2), Some(Block::Stone));
+    assert_eq!(chunk.block(x2, y2 + 1, z2), Some(Block::Air));
+    assert_eq!(chunk.block(x2, y2 + 2, z2), Some(Block::Air));
+    assert!(changes_double.contains(&CellChange {
+        x: x2,
+        y: y2 + 1,
+        z: z2,
+        block: Block::Air
+    }));
+    assert!(changes_double.contains(&CellChange {
+        x: x2,
+        y: y2 + 2,
+        z: z2,
+        block: Block::Air
+    }));
+
+    // SnowLayer on Grass: replacing Grass with Stone preserves SnowLayer.
+    let (x3, y3, z3) = (5, 15, 5);
+    chunk.set_and_update(x3, y3, z3, Block::Grass).unwrap();
+    chunk
+        .set_and_update(x3, y3 + 1, z3, Block::SnowLayer)
+        .unwrap();
+    assert_eq!(chunk.block(x3, y3 + 1, z3), Some(Block::SnowLayer));
+
+    let changes_snow = chunk.set_and_update(x3, y3, z3, Block::Stone).unwrap();
+    assert_eq!(chunk.block(x3, y3, z3), Some(Block::Stone));
+    assert_eq!(chunk.block(x3, y3 + 1, z3), Some(Block::SnowLayer));
+    assert_eq!(
+        changes_snow,
+        vec![CellChange {
+            x: x3,
+            y: y3,
+            z: z3,
+            block: Block::Stone
+        }]
+    );
+
+    // Carpet on Dirt: replacing Dirt with Stone preserves Carpet.
+    let (x4, y4, z4) = (7, 15, 7);
+    chunk.set_and_update(x4, y4, z4, Block::Dirt).unwrap();
+    chunk.set_and_update(x4, y4 + 1, z4, Block::Carpet).unwrap();
+    assert_eq!(chunk.block(x4, y4 + 1, z4), Some(Block::Carpet));
+
+    let changes_carpet = chunk.set_and_update(x4, y4, z4, Block::Stone).unwrap();
+    assert_eq!(chunk.block(x4, y4, z4), Some(Block::Stone));
+    assert_eq!(chunk.block(x4, y4 + 1, z4), Some(Block::Carpet));
+    assert_eq!(
+        changes_carpet,
+        vec![CellChange {
+            x: x4,
+            y: y4,
+            z: z4,
+            block: Block::Stone
+        }]
+    );
+}
+
+#[test]
+fn unsupported_placement_and_out_of_bounds_coordinates_are_rejected_without_mutation() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // 1. Out-of-bounds coordinates must return None without mutation.
+    assert!(
+        chunk
+            .set_and_update(CHUNK_SIDE, 10, 0, Block::Stone)
+            .is_none()
+    );
+    assert!(
+        chunk
+            .set_and_update(0, WORLD_HEIGHT, 0, Block::Stone)
+            .is_none()
+    );
+    assert!(
+        chunk
+            .set_and_update(0, 10, CHUNK_SIDE, Block::Stone)
+            .is_none()
+    );
+    assert!(chunk.set_and_update(100, 200, 300, Block::Dirt).is_none());
+
+    // 2. Unsupported placement must return None without mutation.
+    // ShortGrass on Air:
+    assert!(chunk.set_and_update(0, 10, 0, Block::ShortGrass).is_none());
+    assert_eq!(chunk.block(0, 10, 0), Some(Block::Air));
+
+    // ShortGrass on Stone (Stone is not soil):
+    chunk.set_and_update(1, 10, 1, Block::Stone).unwrap();
+    assert!(chunk.set_and_update(1, 11, 1, Block::ShortGrass).is_none());
+    assert_eq!(chunk.block(1, 11, 1), Some(Block::Air));
+
+    // ShortGrass at y = 0:
+    assert!(chunk.set_and_update(2, 0, 2, Block::ShortGrass).is_none());
+    assert_eq!(chunk.block(2, 0, 2), Some(Block::Air));
+
+    // Carpet on Air:
+    assert!(chunk.set_and_update(3, 10, 3, Block::Carpet).is_none());
+    assert_eq!(chunk.block(3, 10, 3), Some(Block::Air));
+
+    // Carpet on ShortGrass (ShortGrass does not provide top support):
+    chunk.set_and_update(4, 10, 4, Block::Grass).unwrap();
+    chunk.set_and_update(4, 11, 4, Block::ShortGrass).unwrap();
+    assert!(chunk.set_and_update(4, 12, 4, Block::Carpet).is_none());
+    assert_eq!(chunk.block(4, 12, 4), Some(Block::Air));
+
+    // SnowLayer on Air:
+    assert!(chunk.set_and_update(5, 10, 5, Block::SnowLayer).is_none());
+    assert_eq!(chunk.block(5, 10, 5), Some(Block::Air));
+
+    // TallGrassUpper on Grass (must be placed on TallGrassLower):
+    chunk.set_and_update(6, 10, 6, Block::Grass).unwrap();
+    assert!(
+        chunk
+            .set_and_update(6, 11, 6, Block::TallGrassUpper)
+            .is_none()
+    );
+    assert_eq!(chunk.block(6, 11, 6), Some(Block::Air));
+
+    // TallGrassLower at WORLD_HEIGHT - 1 (no space for upper half):
+    chunk
+        .set_and_update(7, WORLD_HEIGHT - 2, 7, Block::Grass)
+        .unwrap();
+    assert!(
+        chunk
+            .set_and_update(7, WORLD_HEIGHT - 1, 7, Block::TallGrassLower)
+            .is_none()
+    );
+    assert_eq!(chunk.block(7, WORLD_HEIGHT - 1, 7), Some(Block::Air));
+}
+
+#[test]
+fn survival_pass_is_bounded_and_stops_at_first_self_supporting_block_above() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // Set up a vertical column:
+    // y = 10: Grass (soil supporting ShortGrass at 11)
+    // y = 11: ShortGrass (dependent on 10)
+    // y = 12: Stone (self-supporting block that stops the survival pass!)
+    // y = 13: Carpet (dependent on Stone at 12)
+    chunk.set_and_update(4, 10, 4, Block::Grass).unwrap();
+    chunk.set_and_update(4, 11, 4, Block::ShortGrass).unwrap();
+    chunk.set_block(4, 12, 4, Block::Stone);
+    chunk.set_and_update(4, 13, 4, Block::Carpet).unwrap();
+
+    assert_eq!(chunk.block(4, 10, 4), Some(Block::Grass));
+    assert_eq!(chunk.block(4, 11, 4), Some(Block::ShortGrass));
+    assert_eq!(chunk.block(4, 12, 4), Some(Block::Stone));
+    assert_eq!(chunk.block(4, 13, 4), Some(Block::Carpet));
+
+    // Break Grass at y = 10:
+    let changes = chunk.set_and_update(4, 10, 4, Block::Air).unwrap();
+
+    // Grass at 10 broke to Air.
+    assert_eq!(chunk.block(4, 10, 4), Some(Block::Air));
+    // ShortGrass at 11 collapsed to Air.
+    assert_eq!(chunk.block(4, 11, 4), Some(Block::Air));
+    // Stone at 12 is self-supporting, so it survived and stopped the pass.
+    assert_eq!(chunk.block(4, 12, 4), Some(Block::Stone));
+    // Carpet at 13 was never reached and continues to rest on Stone at 12.
+    assert_eq!(chunk.block(4, 13, 4), Some(Block::Carpet));
+
+    assert_eq!(
+        changes,
+        vec![
+            CellChange {
+                x: 4,
+                y: 10,
+                z: 4,
+                block: Block::Air
+            },
+            CellChange {
+                x: 4,
+                y: 11,
+                z: 4,
+                block: Block::Air
+            },
+        ]
+    );
+
+    // Also verify that the survival pass stops when Air is hit.
+    // Set up:
+    // y = 20: Grass
+    // y = 21: ShortGrass
+    // y = 22: Air
+    // y = 23: SnowLayer
+    chunk.set_and_update(8, 20, 8, Block::Grass).unwrap();
+    chunk.set_and_update(8, 21, 8, Block::ShortGrass).unwrap();
+    chunk.set_block(8, 22, 8, Block::Air);
+    chunk.set_block(8, 23, 8, Block::SnowLayer);
+
+    let changes_air = chunk.set_and_update(8, 20, 8, Block::Air).unwrap();
+    assert_eq!(chunk.block(8, 20, 8), Some(Block::Air));
+    assert_eq!(chunk.block(8, 21, 8), Some(Block::Air));
+    assert_eq!(chunk.block(8, 22, 8), Some(Block::Air));
+    // SnowLayer at 23 was not touched because pass stopped at Air at 22.
+    assert_eq!(chunk.block(8, 23, 8), Some(Block::SnowLayer));
+    assert_eq!(
+        changes_air,
+        vec![
+            CellChange {
+                x: 8,
+                y: 20,
+                z: 8,
+                block: Block::Air
+            },
+            CellChange {
+                x: 8,
+                y: 21,
+                z: 8,
+                block: Block::Air
+            },
+        ]
+    );
 }
