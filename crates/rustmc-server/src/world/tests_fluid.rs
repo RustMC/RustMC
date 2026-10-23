@@ -291,3 +291,73 @@ fn test_block_state_parsing_and_formatting() {
     assert!(FluidState::from_block_state("minecraft:stone").is_none());
     assert!(FluidState::from_block_state("minecraft:water[level=9]").is_none());
 }
+
+#[test]
+fn test_in_memory_fluid_world_state_transitions() {
+    let mut world = InMemoryFluidWorld::new();
+    let pos = BlockPos::new(1, 0, 0);
+
+    // Set solid stone at pos
+    world.set_block(pos, "minecraft:stone");
+    assert!(world.is_solid(pos));
+
+    // Transition block from solid to air -> solid flag must become false
+    world.set_block(pos, "minecraft:air");
+    assert!(
+        !world.is_solid(pos),
+        "setting block to air must clear solid flag"
+    );
+
+    // Floor below pos and source neighbor
+    world.set_solid(BlockPos::new(0, -1, 0), true);
+    world.set_solid(BlockPos::new(1, -1, 0), true);
+
+    // Water source at (0, 0, 0) should now spread into pos
+    world.set_fluid(BlockPos::new(0, 0, 0), FluidState::source(FluidType::Water));
+    let spread = compute_fluid_spread(&world, pos);
+    assert_eq!(
+        spread,
+        Some(FluidState::new(FluidType::Water, 1, false)),
+        "water should spread into cell after solid block was cleared to air"
+    );
+}
+
+#[test]
+fn test_horizontal_fluid_collision_empty_cell_cobblestone() {
+    let mut world = InMemoryFluidWorld::new();
+    let empty_pos = BlockPos::new(0, 0, 0);
+    let water_source_pos = BlockPos::new(-1, 0, 0);
+    let lava_source_pos = BlockPos::new(1, 0, 0);
+
+    // Floor underneath to allow horizontal spread
+    world.set_solid(BlockPos::new(-1, -1, 0), true);
+    world.set_solid(BlockPos::new(0, -1, 0), true);
+    world.set_solid(BlockPos::new(1, -1, 0), true);
+
+    world.set_fluid(water_source_pos, FluidState::source(FluidType::Water));
+    world.set_fluid(lava_source_pos, FluidState::source(FluidType::Lava));
+
+    // Empty cell at (0, 0, 0) receives simultaneous water and lava horizontal arrival
+    assert_eq!(
+        FluidSimulator::check_collision(&world, empty_pos),
+        Some("minecraft:cobblestone"),
+        "simultaneous water and lava arrival must solidify into cobblestone"
+    );
+
+    assert_eq!(
+        FluidSimulator::step_cell(&world, empty_pos),
+        FlowOutcome::Solidify("minecraft:cobblestone")
+    );
+
+    // Step world simulation at empty cell
+    world.step(&[empty_pos]);
+    assert_eq!(
+        world.get_block_id(empty_pos),
+        "minecraft:cobblestone",
+        "stepping empty cell with colliding water and lava must set block to cobblestone"
+    );
+    assert!(
+        world.is_solid(empty_pos),
+        "solidified cobblestone must be marked solid"
+    );
+}

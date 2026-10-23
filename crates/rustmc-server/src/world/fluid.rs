@@ -3,6 +3,23 @@
 //! Provides fluid types (`Water`, `Lava`), block-state parsing and formatting,
 //! inward slope drop search, infinite water source generation, fluid-fluid
 //! collision resolution, and spread computation over a [`FluidWorldView`].
+//!
+//! # Scope & In-Memory Simulation
+//!
+//! This module provides an in-memory simulation model (`FluidSimulator`, `InMemoryFluidWorld`)
+//! for testing and verifying fluid dynamics algorithms. It is currently scoped as a standalone
+//! simulation component until wired to authoritative multi-chunk world state in future integration milestones.
+//!
+//! # Vanilla Specification & Source Citations
+//!
+//! - **Level Property**: Follows Java 26.3 `net.minecraft.world.level.block.LiquidBlock` where
+//!   `BlockStateProperties.LEVEL` is an integer property `0..=7` (source to decayed spread) and `1..=8`
+//!   in block state mapping (`net.minecraft.world.level.material.FlowingFluid`).
+//! - **Falling Property**: Follows Java 26.3 `net.minecraft.world.level.material.FlowingFluid` where
+//!   `BlockStateProperties.FALLING` is a boolean property indicating fluid flowing vertically downward.
+//! - **Fluid Collisions**: Water touching lava source blocks creates `minecraft:obsidian`;
+//!   water touching flowing lava creates `minecraft:cobblestone`; lava flowing on top of water creates `minecraft:stone`.
+//!   Simultaneous horizontal arrival of water and lava at an empty cell creates `minecraft:cobblestone`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -376,6 +393,7 @@ pub fn preferred_flow_directions(
 /// 1. Water touches lava source (`level == 0`) -> converts to `minecraft:obsidian`.
 /// 2. Water touches flowing lava (`level > 0`) -> converts to `minecraft:cobblestone`.
 /// 3. Lava flows vertically on top of water -> converts to `minecraft:stone`.
+/// 4. Water and lava simultaneously arrive horizontally at an empty cell -> converts to `minecraft:cobblestone`.
 pub fn check_fluid_collision(world: &dyn FluidWorldView, pos: BlockPos) -> Option<&'static str> {
     let current = world.get_fluid(pos);
 
@@ -408,6 +426,33 @@ pub fn check_fluid_collision(world: &dyn FluidWorldView, pos: BlockPos) -> Optio
                 // Water touches flowing lava -> cobblestone
                 return Some(BLOCK_COBBLESTONE);
             }
+        }
+    }
+
+    // Rule 4: Horizontal collision on an empty cell where both water and lava arrive simultaneously:
+    if current.is_none() && !world.is_solid(pos) {
+        let mut has_water_arrival = false;
+        let mut has_lava_arrival = false;
+
+        for &neighbor in &pos.horizontal_neighbors() {
+            if let Some(fluid) = world.get_fluid(neighbor) {
+                if world.is_solid(neighbor.down()) {
+                    let preferred = preferred_flow_directions(world, neighbor, fluid.type_);
+                    if preferred.contains(&pos) {
+                        let new_level = fluid.level + fluid.type_.flow_decay();
+                        if new_level <= fluid.type_.max_level() {
+                            match fluid.type_ {
+                                FluidType::Water => has_water_arrival = true,
+                                FluidType::Lava => has_lava_arrival = true,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_water_arrival && has_lava_arrival {
+            return Some(BLOCK_COBBLESTONE);
         }
     }
 
@@ -577,6 +622,11 @@ impl InMemoryFluidWorld {
         self.blocks.insert(pos, id.clone());
         if id != BLOCK_AIR && id != BLOCK_WATER && id != BLOCK_LAVA {
             self.solids.insert(pos, true);
+        } else {
+            self.solids.insert(pos, false);
+            if id == BLOCK_AIR {
+                self.fluids.remove(&pos);
+            }
         }
     }
 
