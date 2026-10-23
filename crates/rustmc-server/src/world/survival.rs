@@ -144,16 +144,21 @@ impl PlayerSurvival {
     /// Adds exhaustion points. When exhaustion reaches or exceeds 4.0, reduces saturation
     /// (or food level if saturation is 0.0) and wraps the remaining exhaustion.
     pub fn add_exhaustion(&mut self, amount: f32) {
-        if amount <= 0.0 || amount.is_nan() {
+        if amount <= 0.0 || !amount.is_finite() {
             return;
         }
         self.exhaustion += amount;
-        while self.exhaustion >= MAX_EXHAUSTION {
-            self.exhaustion -= MAX_EXHAUSTION;
+        let points = (self.exhaustion / MAX_EXHAUSTION).floor() as u32;
+        if points > 0 {
+            self.exhaustion -= points as f32 * MAX_EXHAUSTION;
+            let mut remaining_points = points;
             if self.saturation > 0.0 {
-                self.saturation = (self.saturation - 1.0).max(0.0);
-            } else {
-                self.food_level = self.food_level.saturating_sub(1);
+                let sat_deduct = (self.saturation.ceil() as u32).min(remaining_points);
+                self.saturation = (self.saturation - sat_deduct as f32).max(0.0);
+                remaining_points -= sat_deduct;
+            }
+            if remaining_points > 0 {
+                self.food_level = self.food_level.saturating_sub(remaining_points);
             }
         }
         self.exhaustion = self.exhaustion.clamp(0.0, MAX_EXHAUSTION);

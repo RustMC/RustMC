@@ -403,3 +403,28 @@ fn test_apply_damage_and_heal_clamping() {
     let dealt = player.apply_damage(DamageSource::Fire, 5.0);
     assert_eq!(dealt, 0.0);
 }
+
+#[test]
+fn test_add_exhaustion_non_finite_and_overflow_protection() {
+    let mut player = PlayerSurvival {
+        saturation: 5.0,
+        food_level: 20,
+        ..Default::default()
+    };
+
+    // Non-finite values are ignored safely without looping or panicking
+    player.add_exhaustion(f32::NAN);
+    assert_eq!(player.exhaustion, 0.0);
+    player.add_exhaustion(f32::INFINITY);
+    assert_eq!(player.exhaustion, 0.0);
+    player.add_exhaustion(-f32::INFINITY);
+    assert_eq!(player.exhaustion, 0.0);
+    player.add_exhaustion(-10.0);
+    assert_eq!(player.exhaustion, 0.0);
+
+    // Large finite exhaustion computes in O(1) without looping
+    player.add_exhaustion(100.0); // 25 exhaustion events: 5 saturation + 20 food level depleted
+    assert_eq!(player.saturation, 0.0);
+    assert_eq!(player.food_level, 0);
+    assert!(player.exhaustion <= 4.0);
+}
