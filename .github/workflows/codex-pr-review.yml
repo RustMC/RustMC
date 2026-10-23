@@ -1,0 +1,95 @@
+name: Codex PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: codex-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # The API credential is only exposed for RustMC branches and the owner's fork.
+    # Do not check out or execute the PR head in this privileged event.
+    if: >-
+      github.event.pull_request.user.login == 'neonjava' &&
+      (github.event.pull_request.head.repo.full_name == 'neonjava/Rust-MC' ||
+       github.event.pull_request.head.repo.full_name == 'RustMC/RustMC')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.metadata.outputs.head_sha }}
+      final_message: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Check credential and collect PR diff
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo 'Configure the OPENAI_API_KEY Actions secret before enabling Codex review.' >&2
+            exit 1
+          fi
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > pr.diff
+          CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [[ "$CURRENT_HEAD" != "$HEAD_SHA" ]]; then
+            echo 'PR head changed while collecting the diff; a newer run will review it.' >&2
+            exit 1
+          fi
+          if [[ ! -s pr.diff ]] || [[ $(wc -c < pr.diff) -gt 262144 ]]; then
+            echo 'PR diff is empty or exceeds the 256 KiB review limit.' >&2
+            exit 1
+          fi
+          printf 'PR #%s\nHead SHA: %s\n' "$PR_NUMBER" "$HEAD_SHA" > pr-metadata.txt
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      # Keep Codex last in this job. It sees only trusted base code and a diff
+      # treated as untrusted data; it cannot modify the checkout or reach the network.
+      - name: Review current diff
+        id: codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/review.md
+          permission-profile: ':read-only'
+          safety-strategy: drop-sudo
+
+  post_feedback:
+    needs: review
+    if: needs.review.result == 'success' && needs.review.outputs.final_message != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Post only on the reviewed head
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          REVIEWED_HEAD: ${{ needs.review.outputs.head_sha }}
+          CODEX_REVIEW: ${{ needs.review.outputs.final_message }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const pull_number = context.issue.number;
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number});
+            if (pr.head.sha !== process.env.REVIEWED_HEAD) {
+              core.notice('Skipping stale Codex review after a newer push.');
+              return;
+            }
+            const body = `Codex review of \`${pr.head.sha.slice(0, 12)}\`\n\n${process.env.CODEX_REVIEW}`;
+            await github.rest.issues.createComment({owner, repo, issue_number: pull_number, body: body.slice(0, 60000)});
