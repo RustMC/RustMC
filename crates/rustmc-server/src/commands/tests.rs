@@ -721,3 +721,72 @@ fn test_permission_checks() {
     // Console (level 4) is permitted
     assert!(dispatcher.execute(&console, "/seed").is_success());
 }
+
+#[test]
+fn test_tp_local_coordinates_with_rotation() {
+    let mut dispatcher = CommandDispatcher::new();
+
+    // Facing South (yaw = 0.0, pitch = 0.0): forward is +Z
+    dispatcher
+        .add_player(PlayerTarget::new("SouthFacing", (0.0, 64.0, 0.0)).with_rotation(0.0, 0.0));
+    let sender_south =
+        CommandSender::player_with_rotation("SouthFacing", (0.0, 64.0, 0.0), 2, 0.0, 0.0);
+    let res = dispatcher.execute(&sender_south, "/tp ^ ^ ^10");
+    assert!(res.is_success());
+    let pos = dispatcher.get_player("SouthFacing").unwrap().pos;
+    assert!((pos.0 - 0.0).abs() < 1e-4);
+    assert!((pos.1 - 64.0).abs() < 1e-4);
+    assert!((pos.2 - 10.0).abs() < 1e-4);
+
+    // Facing West (yaw = 90.0, pitch = 0.0): forward is -X
+    dispatcher
+        .add_player(PlayerTarget::new("WestFacing", (0.0, 64.0, 0.0)).with_rotation(90.0, 0.0));
+    let sender_west =
+        CommandSender::player_with_rotation("WestFacing", (0.0, 64.0, 0.0), 2, 90.0, 0.0);
+    let res = dispatcher.execute(&sender_west, "/tp ^ ^ ^10");
+    assert!(res.is_success());
+    let pos = dispatcher.get_player("WestFacing").unwrap().pos;
+    assert!((pos.0 - (-10.0)).abs() < 1e-4);
+    assert!((pos.1 - 64.0).abs() < 1e-4);
+    assert!((pos.2 - 0.0).abs() < 1e-4);
+
+    // Looking Up (yaw = 0.0, pitch = -90.0): forward is +Y
+    dispatcher
+        .add_player(PlayerTarget::new("UpFacing", (0.0, 64.0, 0.0)).with_rotation(0.0, -90.0));
+    let sender_up =
+        CommandSender::player_with_rotation("UpFacing", (0.0, 64.0, 0.0), 2, 0.0, -90.0);
+    let res = dispatcher.execute(&sender_up, "/tp ^ ^ ^5");
+    assert!(res.is_success());
+    let pos = dispatcher.get_player("UpFacing").unwrap().pos;
+    assert!((pos.0 - 0.0).abs() < 1e-4);
+    assert!((pos.1 - 69.0).abs() < 1e-4);
+    assert!((pos.2 - 0.0).abs() < 1e-4);
+
+    // Local coordinates executed by console without target rotation must fail cleanly
+    let res_console = dispatcher.execute(&CommandSender::console(), "/tp ^ ^ ^5");
+    assert!(res_console.is_error());
+}
+
+#[test]
+fn test_tp_multi_target_transactional_rollback() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("PlayerA", (0.0, 100.0, 0.0)));
+    dispatcher.add_player(PlayerTarget::new("PlayerB", (29_999_990.0, 100.0, 0.0)));
+
+    // PlayerA's relative destination would be valid (X=20 <= 30,000,000),
+    // but PlayerB's relative destination would exceed world boundaries (X=30,000,010 > 30,000,000).
+    let res = dispatcher.execute(&CommandSender::console(), "/tp @a ~20 ~ ~");
+    assert!(res.is_error());
+
+    // Transactional rollback guarantee: PlayerA MUST NOT have moved!
+    assert_eq!(
+        dispatcher.get_player("PlayerA").unwrap().pos,
+        (0.0, 100.0, 0.0),
+        "PlayerA position must be rolled back on mixed-validity failure"
+    );
+    assert_eq!(
+        dispatcher.get_player("PlayerB").unwrap().pos,
+        (29_999_990.0, 100.0, 0.0),
+        "PlayerB position must remain untouched"
+    );
+}

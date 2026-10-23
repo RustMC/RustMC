@@ -160,13 +160,83 @@ impl Coordinates3 {
         Self::new(x, y, z)
     }
 
+    /// Resolve all 3 coordinate components against an origin point `(x, y, z)`
+    /// and optional player rotation `(yaw, pitch)` in degrees.
+    ///
+    /// For local coordinates (`^left ^up ^forward`), computes the local basis
+    /// vectors from rotation using standard vanilla trigonometry:
+    /// - Forward: (-sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch))
+    /// - Left: (cos(yaw), 0, sin(yaw))
+    /// - Up: (-sin(pitch) * sin(yaw), cos(pitch), sin(pitch) * cos(yaw))
+    ///
+    /// If local coordinates are resolved without rotation (e.g. console sender),
+    /// returns an error.
+    pub fn resolve_with_rotation(
+        &self,
+        origin: (f64, f64, f64),
+        rotation: Option<(f32, f32)>,
+    ) -> Result<(f64, f64, f64), CommandError> {
+        if self.is_local() {
+            let (yaw, pitch) = rotation.ok_or_else(|| {
+                CommandError::ConsoleNotAllowed(
+                    "Local coordinates (^) require a sender or target with rotation".to_string(),
+                )
+            })?;
+
+            let left = match self.x {
+                Coordinate::Local(v) => v,
+                _ => 0.0,
+            };
+            let up = match self.y {
+                Coordinate::Local(v) => v,
+                _ => 0.0,
+            };
+            let forward = match self.z {
+                Coordinate::Local(v) => v,
+                _ => 0.0,
+            };
+
+            let rad_yaw = (yaw as f64).to_radians();
+            let rad_pitch = (pitch as f64).to_radians();
+
+            let cos_yaw = rad_yaw.cos();
+            let sin_yaw = rad_yaw.sin();
+            let cos_pitch = rad_pitch.cos();
+            let sin_pitch = rad_pitch.sin();
+
+            // Forward unit vector
+            let fx = -sin_yaw * cos_pitch;
+            let fy = -sin_pitch;
+            let fz = cos_yaw * cos_pitch;
+
+            // Left unit vector (horizontal perpendicular to forward)
+            let lx = cos_yaw;
+            let ly = 0.0;
+            let lz = sin_yaw;
+
+            // Up unit vector (F x L)
+            let ux = -sin_pitch * sin_yaw;
+            let uy = cos_pitch;
+            let uz = sin_pitch * cos_yaw;
+
+            let dest_x = origin.0 + left * lx + up * ux + forward * fx;
+            let dest_y = origin.1 + left * ly + up * uy + forward * fy;
+            let dest_z = origin.2 + left * lz + up * uz + forward * fz;
+
+            Ok((dest_x, dest_y, dest_z))
+        } else {
+            Ok((
+                self.x.resolve(origin.0),
+                self.y.resolve(origin.1),
+                self.z.resolve(origin.2),
+            ))
+        }
+    }
+
     /// Resolve all 3 coordinate components against an origin point `(x, y, z)`.
     pub fn resolve(&self, origin: (f64, f64, f64)) -> (f64, f64, f64) {
-        (
-            self.x.resolve(origin.0),
-            self.y.resolve(origin.1),
-            self.z.resolve(origin.2),
-        )
+        self.resolve_with_rotation(origin, Some((0.0, 0.0)))
+            .unwrap_or(origin)
     }
 
     /// Whether this coordinate triple uses local coordinates.
@@ -332,6 +402,8 @@ pub enum CommandSender {
         name: String,
         pos: (f64, f64, f64),
         permission_level: u8,
+        yaw: f32,
+        pitch: f32,
     },
 }
 
@@ -347,6 +419,25 @@ impl CommandSender {
             name: name.into(),
             pos,
             permission_level,
+            yaw: 0.0,
+            pitch: 0.0,
+        }
+    }
+
+    /// Create a player command sender with explicit yaw and pitch rotation in degrees.
+    pub fn player_with_rotation(
+        name: impl Into<String>,
+        pos: (f64, f64, f64),
+        permission_level: u8,
+        yaw: f32,
+        pitch: f32,
+    ) -> Self {
+        Self::Player {
+            name: name.into(),
+            pos,
+            permission_level,
+            yaw,
+            pitch,
         }
     }
 
@@ -363,6 +454,14 @@ impl CommandSender {
         match self {
             Self::Console => None,
             Self::Player { pos, .. } => Some(*pos),
+        }
+    }
+
+    /// Rotation `(yaw, pitch)` of the sender in degrees, if available.
+    pub fn rotation(&self) -> Option<(f32, f32)> {
+        match self {
+            Self::Console => None,
+            Self::Player { yaw, pitch, .. } => Some((*yaw, *pitch)),
         }
     }
 
@@ -451,6 +550,8 @@ impl std::error::Error for CommandError {}
 pub struct PlayerTarget {
     pub name: String,
     pub pos: (f64, f64, f64),
+    pub yaw: f32,
+    pub pitch: f32,
     pub gamemode: GameMode,
     pub is_alive: bool,
     pub inventory: HashMap<String, u32>,
@@ -461,10 +562,18 @@ impl PlayerTarget {
         Self {
             name: name.into(),
             pos,
+            yaw: 0.0,
+            pitch: 0.0,
             gamemode: GameMode::Survival,
             is_alive: true,
             inventory: HashMap::new(),
         }
+    }
+
+    pub fn with_rotation(mut self, yaw: f32, pitch: f32) -> Self {
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self
     }
 
     pub fn with_gamemode(mut self, gamemode: GameMode) -> Self {
@@ -956,7 +1065,7 @@ fn handle_tp(
                 }
             };
             let coords = Coordinates3::parse(args[0], args[1], args[2])?;
-            let dest_pos = coords.resolve(sender_pos);
+            let dest_pos = coords.resolve_with_rotation(sender_pos, sender.rotation())?;
             validate_coordinate_bounds(dest_pos)?;
 
             if let Some(player) = dispatcher.players.get_mut(&sender_name) {
@@ -984,16 +1093,25 @@ fn handle_tp(
             }
             let coords = Coordinates3::parse(args[1], args[2], args[3])?;
 
-            let mut last_pos = (0.0, 0.0, 0.0);
+            // Transactional update: compute and validate destinations for ALL targets before applying mutations.
+            // If any destination is invalid, abort immediately without mutating ANY player.
+            let mut pending_updates: Vec<(String, (f64, f64, f64))> =
+                Vec::with_capacity(targets.len());
             for name in &targets {
-                let current_pos = dispatcher
-                    .players
-                    .get(name)
-                    .map(|p| p.pos)
-                    .unwrap_or((0.0, 0.0, 0.0));
-                let dest_pos = coords.resolve(current_pos);
+                let (current_pos, rot) = match dispatcher.players.get(name) {
+                    Some(p) => (p.pos, Some((p.yaw, p.pitch))),
+                    None => ((0.0, 0.0, 0.0), sender.rotation()),
+                };
+                let dest_pos =
+                    coords.resolve_with_rotation(current_pos, rot.or_else(|| sender.rotation()))?;
                 validate_coordinate_bounds(dest_pos)?;
-                if let Some(player) = dispatcher.players.get_mut(name) {
+                pending_updates.push((name.clone(), dest_pos));
+            }
+
+            // Commit all pre-validated mutations
+            let mut last_pos = (0.0, 0.0, 0.0);
+            for (name, dest_pos) in pending_updates {
+                if let Some(player) = dispatcher.players.get_mut(&name) {
                     player.pos = dest_pos;
                 }
                 last_pos = dest_pos;
