@@ -67,10 +67,17 @@ impl RuleTest {
     /// `block` is `None` for a position that holds no block at all.
     pub fn test(&self, block: Option<&str>, y: i32, tags: &BlockTags) -> bool {
         match self {
-            Self::Tag { tag } => block.is_some_and(|block| tags.contains(tag, block)),
-            Self::Block { block: want } => block == Some(want.as_str()),
+            Self::Tag { tag } => {
+                let current = block.unwrap_or("minecraft:air");
+                tags.contains(tag, current)
+            }
+            Self::Block { block: want } => {
+                let current = block.unwrap_or("minecraft:air");
+                current == want.as_str()
+            }
             Self::Blocks { blocks } => {
-                block.is_some_and(|block| blocks.iter().any(|candidate| candidate == block))
+                let current = block.unwrap_or("minecraft:air");
+                blocks.iter().any(|candidate| candidate == current)
             }
             Self::Height {
                 min_inclusive,
@@ -230,6 +237,17 @@ pub enum ConfiguredFeature {
         targets: Vec<OreTarget>,
         discard_chance_on_air_exposure: f32,
     },
+    /// `minecraft:random_patch` — scatter child placements in a horizontal and vertical radius.
+    RandomPatch {
+        tries: i32,
+        xz_spread: i32,
+        y_spread: i32,
+        feature: Box<PlacedFeature>,
+    },
+    /// `minecraft:flower` — simple flower placement with a block state.
+    Flower {
+        state: String,
+    },
     Unsupported {
         kind: String,
     },
@@ -244,6 +262,8 @@ impl ConfiguredFeature {
             Self::Ore { targets, .. } => {
                 targets.iter().all(|target| target.predicate.is_modelable())
             }
+            Self::RandomPatch { feature, .. } => feature.is_modelable(),
+            Self::Flower { .. } => true,
             Self::Unsupported { .. } => false,
         }
     }
@@ -402,12 +422,17 @@ pub enum PlacementModifier {
     /// `minecraft:biome` — keep the position only if the biome at it lists
     /// this feature.
     Biome,
+    /// `minecraft:block_predicate_filter` — test the block at position + offset.
+    BlockPredicateFilter {
+        predicate: RuleTest,
+        offset: [i32; 3],
+    },
     /// A decoration without a runtime here. Named, never skipped silently.
     Unsupported { kind: String },
 }
 
 /// A placed feature: one configured feature plus its ordered decorations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlacedFeature {
     pub id: String,
     pub feature: Rc<ConfiguredFeature>,
@@ -425,6 +450,9 @@ impl PlacedFeature {
                 PlacementModifier::Unsupported { .. } => false,
                 PlacementModifier::Count { count } => count.is_modelable(),
                 PlacementModifier::HeightRange { height } => height.is_modelable(),
+                PlacementModifier::BlockPredicateFilter { predicate, .. } => {
+                    predicate.is_modelable()
+                }
                 _ => true,
             })
     }
@@ -571,16 +599,7 @@ impl FeatureData {
         biome_docs.sort_by(|left, right| left.0.cmp(&right.0));
         for (id, document) in configured_docs {
             let feature = parse_configured_feature(&document)?;
-            match &feature {
-                ConfiguredFeature::Unsupported { kind } => {
-                    *data.unimplemented_features.entry(kind.clone()).or_insert(0) += 1;
-                }
-                ConfiguredFeature::Ore { targets, .. } => {
-                    for target in targets {
-                        record_unmodeled_rule(&mut data.unimplemented_features, &target.predicate);
-                    }
-                }
-            }
+            record_unmodeled_configured(&mut data.unimplemented_features, &feature);
             data.configured.insert(id, Rc::new(feature));
         }
         for (id, document) in placed_docs {
@@ -913,6 +932,109 @@ fn depth_first_visit(
     }
 }
 
+/// Parses one block state or state provider JSON value into a block name string.
+fn parse_block_state_provider(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let obj = value.as_object()?;
+    if let Some(name) = obj.get("Name").and_then(Value::as_str) {
+        return Some(name.to_string());
+    }
+    if let Some(name) = obj.get("name").and_then(Value::as_str) {
+        return Some(name.to_string());
+    }
+    if let Some(parsed) = obj.get("state").and_then(parse_block_state_provider) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = obj.get("to_place").and_then(parse_block_state_provider) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = obj
+        .get("state_provider")
+        .and_then(parse_block_state_provider)
+    {
+        return Some(parsed);
+    }
+    if let Some(block) = obj.get("block").and_then(Value::as_str) {
+        return Some(block.to_string());
+    }
+    None
+}
+
+/// Parses a list of placement modifiers with attempt budget validation.
+fn parse_modifiers_list(
+    value: Option<&Value>,
+    id: &str,
+) -> Result<Vec<PlacementModifier>, WorldgenError> {
+    let list = value
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let modifiers = list
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_placement_modifier(id, index, entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attempt_budget = modifiers.iter().try_fold(1u32, |product, modifier| {
+        if let PlacementModifier::Count { count } = modifier {
+            match count.range(0, 0) {
+                Some((_, max)) => product.checked_mul(max.max(0) as u32),
+                None => Some(product),
+            }
+        } else {
+            Some(product)
+        }
+    });
+    if !matches!(attempt_budget, Some(0..=4096)) {
+        return Err(WorldgenError::Invalid(format!(
+            "{id}: count modifiers exceed the 4096-attempt placement budget"
+        )));
+    }
+    Ok(modifiers)
+}
+
+/// Parses an inline placed feature inside a random patch.
+fn parse_inline_placed_feature(value: &Value) -> Result<PlacedFeature, WorldgenError> {
+    if let Some(name) = value.as_str() {
+        return Ok(PlacedFeature {
+            id: name.to_string(),
+            feature: Rc::new(ConfiguredFeature::Unsupported {
+                kind: name.to_string(),
+            }),
+            modifiers: Vec::new(),
+        });
+    }
+    let Some(object) = value.as_object() else {
+        return Err(WorldgenError::Invalid(
+            "random_patch feature must be an object or string".to_string(),
+        ));
+    };
+    if let Some(inner) = object.get("feature") {
+        let feature = if let Some(name) = inner.as_str() {
+            Rc::new(ConfiguredFeature::Unsupported {
+                kind: name.to_string(),
+            })
+        } else {
+            Rc::new(parse_configured_feature(inner)?)
+        };
+        let modifiers = parse_modifiers_list(object.get("placement"), "inline_patch")?;
+        Ok(PlacedFeature {
+            id: "inline_patch".to_string(),
+            feature,
+            modifiers,
+        })
+    } else {
+        let feature = Rc::new(parse_configured_feature(value)?);
+        let modifiers = parse_modifiers_list(object.get("placement"), "inline_patch")?;
+        Ok(PlacedFeature {
+            id: "inline_patch".to_string(),
+            feature,
+            modifiers,
+        })
+    }
+}
+
 /// Parses one configured feature document. Types without a runtime here
 /// keep only their name.
 pub(crate) fn parse_configured_feature(
@@ -923,59 +1045,110 @@ pub(crate) fn parse_configured_feature(
         .and_then(Value::as_str)
         .unwrap_or("minecraft:missing_type")
         .to_string();
-    if kind != "minecraft:ore" {
-        return Ok(ConfiguredFeature::Unsupported { kind });
-    }
-    // The 26.3 pack writes ore parameters at the top level; the older
-    // `config` wrapper is accepted too so a hand-built fixture reads the
-    // same as the pack.
+
     let body = match document.get("config") {
         Some(config) if config.is_object() => config,
         _ => document,
     };
-    let size = body
-        .get("size")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| WorldgenError::Invalid("ore feature without a size".to_string()))?;
-    // The supported ore placer builds a cubic scratch box and compares all
-    // vein points pairwise. Reject operator-pack values that exceed the
-    // bounded runtime this implementation can provide.
-    if !(1..=128).contains(&size) {
-        return Err(WorldgenError::Invalid(format!(
-            "ore feature size must be in 1..=128, got {size}"
-        )));
+
+    match kind.as_str() {
+        "minecraft:ore" => {
+            let size = body
+                .get("size")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| WorldgenError::Invalid("ore feature without a size".to_string()))?;
+            if !(1..=128).contains(&size) {
+                return Err(WorldgenError::Invalid(format!(
+                    "ore feature size must be in 1..=128, got {size}"
+                )));
+            }
+            let size = i32::try_from(size).expect("checked ore size");
+            let discard_chance_on_air_exposure = body
+                .get("discard_chance_on_air_exposure")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            let mut targets = Vec::new();
+            for entry in body
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                let state = entry.get("state").and_then(Value::as_str).ok_or_else(|| {
+                    WorldgenError::Invalid("ore target without a state".to_string())
+                })?;
+                targets.push(OreTarget {
+                    predicate: parse_rule_test(entry.get("target"))?,
+                    state: state.to_string(),
+                });
+            }
+            if targets.is_empty() {
+                return Err(WorldgenError::Invalid(
+                    "ore feature without targets".to_string(),
+                ));
+            }
+            Ok(ConfiguredFeature::Ore {
+                size,
+                targets,
+                discard_chance_on_air_exposure,
+            })
+        }
+        "minecraft:random_patch" => {
+            let tries = body
+                .get("tries")
+                .and_then(Value::as_i64)
+                .map(|v| (v as i32).clamp(1, 256))
+                .unwrap_or(96);
+            let xz_spread = body
+                .get("xz_spread")
+                .and_then(Value::as_i64)
+                .map(|v| (v as i32).clamp(0, 32))
+                .unwrap_or(7);
+            let y_spread = body
+                .get("y_spread")
+                .and_then(Value::as_i64)
+                .map(|v| (v as i32).clamp(0, 32))
+                .unwrap_or(3);
+            let feature_val = body.get("feature").ok_or_else(|| {
+                WorldgenError::Invalid("random_patch feature missing".to_string())
+            })?;
+            let child_placed = parse_inline_placed_feature(feature_val)?;
+            Ok(ConfiguredFeature::RandomPatch {
+                tries,
+                xz_spread,
+                y_spread,
+                feature: Box::new(child_placed),
+            })
+        }
+        "minecraft:flower" | "minecraft:simple_block" => {
+            let state = parse_block_state_provider(body).ok_or_else(|| {
+                WorldgenError::Invalid(
+                    "flower feature without a state or state_provider".to_string(),
+                )
+            })?;
+            Ok(ConfiguredFeature::Flower { state })
+        }
+        _ => Ok(ConfiguredFeature::Unsupported { kind }),
     }
-    let size = i32::try_from(size).expect("checked ore size");
-    let discard_chance_on_air_exposure = body
-        .get("discard_chance_on_air_exposure")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0) as f32;
-    let mut targets = Vec::new();
-    for entry in body
-        .get("targets")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-    {
-        let state = entry
-            .get("state")
-            .and_then(Value::as_str)
-            .ok_or_else(|| WorldgenError::Invalid("ore target without a state".to_string()))?;
-        targets.push(OreTarget {
-            predicate: parse_rule_test(entry.get("target"))?,
-            state: state.to_string(),
-        });
+}
+
+/// Counts unmodeled configured features and their inner components for the startup gap report.
+fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &ConfiguredFeature) {
+    match feature {
+        ConfiguredFeature::Unsupported { kind } => {
+            *counts.entry(kind.clone()).or_insert(0) += 1;
+        }
+        ConfiguredFeature::Ore { targets, .. } => {
+            for target in targets {
+                record_unmodeled_rule(counts, &target.predicate);
+            }
+        }
+        ConfiguredFeature::RandomPatch { feature: child, .. } => {
+            record_unmodeled_modifiers(counts, child);
+            record_unmodeled_configured(counts, &child.feature);
+        }
+        ConfiguredFeature::Flower { .. } => {}
     }
-    if targets.is_empty() {
-        return Err(WorldgenError::Invalid(
-            "ore feature without targets".to_string(),
-        ));
-    }
-    Ok(ConfiguredFeature::Ore {
-        size,
-        targets,
-        discard_chance_on_air_exposure,
-    })
 }
 
 /// Counts the rule-test kinds a target uses without a runtime here, so the
@@ -1012,11 +1185,16 @@ fn record_unmodeled_rule(counts: &mut HashMap<String, usize>, rule: &RuleTest) {
 fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &PlacedFeature) {
     let mut seen: HashSet<&str> = HashSet::new();
     for modifier in &placed.modifiers {
-        let PlacementModifier::Unsupported { kind } = modifier else {
-            continue;
-        };
-        if seen.insert(kind.as_str()) {
-            *counts.entry(format!("placement:{kind}")).or_insert(0) += 1;
+        match modifier {
+            PlacementModifier::Unsupported { kind } => {
+                if seen.insert(kind.as_str()) {
+                    *counts.entry(format!("placement:{kind}")).or_insert(0) += 1;
+                }
+            }
+            PlacementModifier::BlockPredicateFilter { predicate, .. } => {
+                record_unmodeled_rule(counts, predicate);
+            }
+            _ => {}
         }
     }
 }
@@ -1126,30 +1304,7 @@ pub(crate) fn parse_placed_feature(
             "{id}: references unknown configured feature {feature_id}"
         ))
     })?;
-    let modifiers = document
-        .get("placement")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| parse_placement_modifier(id, index, entry))
-        .collect::<Result<Vec<_>, _>>()?;
-    let attempt_budget = modifiers.iter().try_fold(1u32, |product, modifier| {
-        if let PlacementModifier::Count { count } = modifier {
-            match count.range(0, 0) {
-                Some((_, max)) => product.checked_mul(max.max(0) as u32),
-                None => Some(product),
-            }
-        } else {
-            Some(product)
-        }
-    });
-    if !matches!(attempt_budget, Some(0..=4096)) {
-        return Err(WorldgenError::Invalid(format!(
-            "{id}: count modifiers exceed the 4096-attempt placement budget"
-        )));
-    }
+    let modifiers = parse_modifiers_list(document.get("placement"), id)?;
     Ok(PlacedFeature {
         id: id.to_string(),
         feature,
@@ -1205,6 +1360,26 @@ fn parse_placement_modifier(
             })
         }
         "minecraft:biome" => Ok(PlacementModifier::Biome),
+        "minecraft:block_predicate_filter" => {
+            let predicate_val = entry.get("predicate");
+            let predicate = parse_rule_test(predicate_val)?;
+            let offset = predicate_val
+                .and_then(|p| p.get("offset"))
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    if arr.len() == 3 {
+                        Some([
+                            arr[0].as_i64()? as i32,
+                            arr[1].as_i64()? as i32,
+                            arr[2].as_i64()? as i32,
+                        ])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or([0, 0, 0]);
+            Ok(PlacementModifier::BlockPredicateFilter { predicate, offset })
+        }
         other => Ok(PlacementModifier::Unsupported {
             kind: other.to_string(),
         }),
@@ -1658,7 +1833,7 @@ impl FeatureData {
     /// Walks one placed feature's decoration list. Each modifier either
     /// filters the candidate out, rewrites it, or multiplies it; the walk is
     /// the documented order, and the draws happen in that order too.
-    fn run_chain(
+    pub(crate) fn run_chain(
         &self,
         target: &mut dyn DecorationTarget,
         placed: &PlacedFeature,
@@ -1682,6 +1857,34 @@ impl FeatureData {
                     *discard_chance_on_air_exposure,
                     pos,
                 ),
+                ConfiguredFeature::RandomPatch {
+                    tries,
+                    xz_spread,
+                    y_spread,
+                    feature: child,
+                } => {
+                    let mut written = 0;
+                    for _ in 0..*tries {
+                        let dx = random.next_int_bounded(xz_spread * 2 + 1) - xz_spread;
+                        let dz = random.next_int_bounded(xz_spread * 2 + 1) - xz_spread;
+                        let dy = random.next_int_bounded(y_spread * 2 + 1) - y_spread;
+                        let target_pos = DecorationPos {
+                            x: pos.x + dx,
+                            y: pos.y + dy,
+                            z: pos.z + dz,
+                        };
+                        written += self.run_chain(target, child, 0, target_pos, random);
+                    }
+                    written
+                }
+                ConfiguredFeature::Flower { state } => {
+                    if target.writable(pos.x, pos.y, pos.z) {
+                        target.set_block(pos.x, pos.y, pos.z, state);
+                        1
+                    } else {
+                        0
+                    }
+                }
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
@@ -1719,6 +1922,17 @@ impl FeatureData {
                     .biome_at(pos.x, pos.y, pos.z)
                     .is_some_and(|biome| self.biome_lists(&biome, &placed.id));
                 if allowed {
+                    self.run_chain(target, placed, index + 1, pos, random)
+                } else {
+                    0
+                }
+            }
+            PlacementModifier::BlockPredicateFilter { predicate, offset } => {
+                let check_x = pos.x + offset[0];
+                let check_y = pos.y + offset[1];
+                let check_z = pos.z + offset[2];
+                let current = target.block_at(check_x, check_y, check_z);
+                if predicate.test(current, check_y, &self.tags) {
                     self.run_chain(target, placed, index + 1, pos, random)
                 } else {
                     0
@@ -3389,6 +3603,355 @@ mod tests {
         data.set_biome_order(&["testns:two", "testns:one"]);
         assert_eq!(step_ids(&data, 0), ["testns:ore_a", "testns:ore_b"]);
         assert_eq!(data.region_ordinals(0, &only_one), vec![0]);
+    }
+
+    #[test]
+    fn parses_official_data_pack_random_patch_and_flower_schemas() {
+        // Official 26.3 / modern data pack schema: random_patch with nested simple_block and block_predicate_filter
+        let patch_json = json!({
+            "type": "minecraft:random_patch",
+            "config": {
+                "tries": 96,
+                "xz_spread": 7,
+                "y_spread": 3,
+                "feature": {
+                    "feature": {
+                        "type": "minecraft:simple_block",
+                        "config": {
+                            "to_place": {
+                                "type": "minecraft:simple_state_provider",
+                                "state": {
+                                    "Name": "minecraft:dandelion"
+                                }
+                            }
+                        }
+                    },
+                    "placement": [
+                        {
+                            "type": "minecraft:block_predicate_filter",
+                            "predicate": {
+                                "type": "minecraft:matching_blocks",
+                                "blocks": "minecraft:air"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let feature = parse_configured_feature(&patch_json).expect("parses official random_patch");
+        let ConfiguredFeature::RandomPatch {
+            tries,
+            xz_spread,
+            y_spread,
+            feature: child,
+        } = &feature
+        else {
+            panic!("expected RandomPatch variant, got {feature:?}");
+        };
+        assert_eq!(*tries, 96);
+        assert_eq!(*xz_spread, 7);
+        assert_eq!(*y_spread, 3);
+        assert!(feature.is_supported());
+        assert_eq!(
+            *child.feature,
+            ConfiguredFeature::Flower {
+                state: "minecraft:dandelion".to_string()
+            }
+        );
+        assert_eq!(child.modifiers.len(), 1);
+
+        // 26.3 flattened top-level schema
+        let patch_flat_json = json!({
+            "type": "minecraft:random_patch",
+            "tries": 64,
+            "xz_spread": 5,
+            "y_spread": 2,
+            "feature": {
+                "feature": {
+                    "type": "minecraft:flower",
+                    "state": {
+                        "Name": "minecraft:poppy"
+                    }
+                },
+                "placement": []
+            }
+        });
+        let flat_feature =
+            parse_configured_feature(&patch_flat_json).expect("parses flat random_patch");
+        let ConfiguredFeature::RandomPatch {
+            tries,
+            xz_spread,
+            y_spread,
+            feature: child_flat,
+        } = &flat_feature
+        else {
+            panic!("expected RandomPatch variant");
+        };
+        assert_eq!(*tries, 64);
+        assert_eq!(*xz_spread, 5);
+        assert_eq!(*y_spread, 2);
+        assert_eq!(
+            *child_flat.feature,
+            ConfiguredFeature::Flower {
+                state: "minecraft:poppy".to_string()
+            }
+        );
+
+        // Direct flower schemas (with state_provider or block state)
+        let flower_doc1 = json!({
+            "type": "minecraft:flower",
+            "config": {
+                "state_provider": {
+                    "type": "minecraft:simple_state_provider",
+                    "state": {
+                        "Name": "minecraft:allium"
+                    }
+                }
+            }
+        });
+        let flower1 =
+            parse_configured_feature(&flower_doc1).expect("parses flower with state_provider");
+        assert_eq!(
+            flower1,
+            ConfiguredFeature::Flower {
+                state: "minecraft:allium".to_string()
+            }
+        );
+        assert!(flower1.is_supported());
+
+        let flower_doc2 = json!({
+            "type": "minecraft:flower",
+            "state": "minecraft:cornflower"
+        });
+        let flower2 =
+            parse_configured_feature(&flower_doc2).expect("parses flower with direct state");
+        assert_eq!(
+            flower2,
+            ConfiguredFeature::Flower {
+                state: "minecraft:cornflower".to_string()
+            }
+        );
+
+        // Clamping and default parameters
+        let defaults_doc = json!({
+            "type": "minecraft:random_patch",
+            "feature": {
+                "type": "minecraft:flower",
+                "state": "minecraft:blue_orchid"
+            }
+        });
+        let defaults_feature =
+            parse_configured_feature(&defaults_doc).expect("parses default random_patch");
+        let ConfiguredFeature::RandomPatch {
+            tries,
+            xz_spread,
+            y_spread,
+            ..
+        } = &defaults_feature
+        else {
+            panic!("expected RandomPatch");
+        };
+        assert_eq!(*tries, 96, "default tries is 96");
+        assert_eq!(*xz_spread, 7, "default xz_spread is 7");
+        assert_eq!(*y_spread, 3, "default y_spread is 3");
+
+        let clamped_doc = json!({
+            "type": "minecraft:random_patch",
+            "tries": 1000,
+            "xz_spread": 100,
+            "y_spread": -5,
+            "feature": {
+                "type": "minecraft:flower",
+                "state": "minecraft:blue_orchid"
+            }
+        });
+        let clamped_feature =
+            parse_configured_feature(&clamped_doc).expect("parses clamped random_patch");
+        let ConfiguredFeature::RandomPatch {
+            tries,
+            xz_spread,
+            y_spread,
+            ..
+        } = &clamped_feature
+        else {
+            panic!("expected RandomPatch");
+        };
+        assert_eq!(*tries, 256, "tries clamped to 256");
+        assert_eq!(*xz_spread, 32, "xz_spread clamped to 32");
+        assert_eq!(*y_spread, 0, "y_spread clamped to 0");
+    }
+
+    #[test]
+    fn random_patch_placement_places_flowers_within_bounded_offsets() {
+        let xz_spread = 6;
+        let y_spread = 2;
+        let origin = DecorationPos {
+            x: 80,
+            y: 64,
+            z: 80,
+        };
+        let patch = ConfiguredFeature::RandomPatch {
+            tries: 40,
+            xz_spread,
+            y_spread,
+            feature: Box::new(PlacedFeature {
+                id: "inline_patch".to_string(),
+                feature: Rc::new(ConfiguredFeature::Flower {
+                    state: "minecraft:poppy".to_string(),
+                }),
+                modifiers: Vec::new(),
+            }),
+        };
+        let placed = PlacedFeature {
+            id: "test:patch_poppy".to_string(),
+            feature: Rc::new(patch),
+            modifiers: Vec::new(),
+        };
+
+        let mut target = TestTarget::new().write_anywhere();
+        let mut random = DecorationRandom::new(42);
+        let data = FeatureData::default();
+
+        let written = data.run_chain(&mut target, &placed, 0, origin, &mut random);
+        assert!(written > 0, "random patch placed at least one flower");
+        assert_eq!(target.blocks("minecraft:poppy"), target.written.len());
+
+        // Every placed block must lie strictly within [pos ± spread]
+        for (&(x, y, z), state) in &target.written {
+            assert_eq!(state, "minecraft:poppy");
+            let dx = (x - origin.x).abs();
+            let dy = (y - origin.y).abs();
+            let dz = (z - origin.z).abs();
+            assert!(
+                dx <= xz_spread,
+                "x offset {dx} exceeds xz_spread {xz_spread} at {x}"
+            );
+            assert!(
+                dz <= xz_spread,
+                "z offset {dz} exceeds xz_spread {xz_spread} at {z}"
+            );
+            assert!(
+                dy <= y_spread,
+                "y offset {dy} exceeds y_spread {y_spread} at {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn gap_ledger_reports_random_patch_without_false_unmodeled_drop() {
+        let root = scratch_root("gap-random-patch");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/patch_flowers.json"),
+            r#"{
+                "type": "minecraft:random_patch",
+                "config": {
+                    "tries": 64,
+                    "xz_spread": 7,
+                    "y_spread": 3,
+                    "feature": {
+                        "feature": {
+                            "type": "minecraft:flower",
+                            "state": "minecraft:dandelion"
+                        },
+                        "placement": [
+                            {
+                                "type": "minecraft:block_predicate_filter",
+                                "predicate": {
+                                    "type": "minecraft:matching_blocks",
+                                    "blocks": ["minecraft:air"]
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        );
+        write(
+            &worldgen.join("placed_feature/patch_flowers.json"),
+            r#"{"feature": "testns:patch_flowers", "placement": [
+                {"type": "minecraft:count", "count": 2},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [["testns:patch_flowers"]]}"#,
+        );
+
+        let data = FeatureData::load(&root).expect("loads");
+        // Must NOT report minecraft:random_patch or minecraft:flower as unmodeled
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("minecraft:random_patch"),
+            "random_patch is modeled and must not be reported as gap: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            !data.unimplemented_features.contains_key("minecraft:flower"),
+            "flower is modeled and must not be reported as gap: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            data.unimplemented_features.is_empty(),
+            "a fully modeled random_patch chain creates zero gap entries: {:?}",
+            data.unimplemented_features
+        );
+        assert!(
+            data.step(0).expect("step 0")[0].is_modelable(),
+            "the placed random patch feature is modelable"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn gap_ledger_reports_unmodeled_subfeature_inside_random_patch() {
+        let root = scratch_root("gap-patch-unmodeled-child");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/patch_tree.json"),
+            r#"{
+                "type": "minecraft:random_patch",
+                "tries": 32,
+                "xz_spread": 4,
+                "y_spread": 2,
+                "feature": {
+                    "feature": {
+                        "type": "minecraft:tree"
+                    },
+                    "placement": []
+                }
+            }"#,
+        );
+        write(
+            &worldgen.join("placed_feature/patch_tree.json"),
+            r#"{"feature": "testns:patch_tree", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [["testns:patch_tree"]]}"#,
+        );
+
+        let data = FeatureData::load(&root).expect("loads");
+        assert_eq!(
+            data.unimplemented_features.get("minecraft:tree"),
+            Some(&1),
+            "unmodeled child feature inside random_patch is reported"
+        );
+        assert!(
+            !data
+                .unimplemented_features
+                .contains_key("minecraft:random_patch"),
+            "random_patch container itself is modeled"
+        );
+        assert_eq!(data.unimplemented_features.len(), 1);
+        assert!(
+            !data.step(0).expect("step 0")[0].is_modelable(),
+            "feature with unmodeled child is gated out"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Requires the operator-provisioned data pack. Prints the gap ledger the
