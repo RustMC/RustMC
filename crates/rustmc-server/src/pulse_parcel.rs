@@ -47,9 +47,13 @@ impl CellCoord {
     /// Owning chunk coordinate `(chunk_x, chunk_z)`.
     pub fn chunk_coord(&self) -> (i32, i32) {
         let side = CHUNK_SIDE as i64;
+        let cx = self.x.div_euclid(side);
+        let cz = self.z.div_euclid(side);
         (
-            self.x.div_euclid(side) as i32,
-            self.z.div_euclid(side) as i32,
+            cx.try_into()
+                .unwrap_or(if cx < 0 { i32::MIN } else { i32::MAX }),
+            cz.try_into()
+                .unwrap_or(if cz < 0 { i32::MIN } else { i32::MAX }),
         )
     }
 
@@ -447,12 +451,18 @@ pub enum PulseEvent {
 
 /// Integer block cells whose interior the half-open interval `[lo, hi)` crosses.
 pub fn crossed_cells(lo: f64, hi: f64) -> Vec<i64> {
+    if !lo.is_finite() || !hi.is_finite() {
+        return Vec::new();
+    }
     let first = lo.floor();
     let last = if (hi - hi.floor()).abs() < 1e-9 {
         hi.floor() - 1.0
     } else {
         hi.floor()
     };
+    if first > last {
+        return Vec::new();
+    }
     (first as i64..=last as i64).collect()
 }
 
@@ -702,7 +712,14 @@ impl ReferenceExecutor {
                         chunk.block(lx, y, lz)
                     };
 
-                    if to_y < 0.0 || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64 {
+                    if !to_x.is_finite()
+                        || !to_y.is_finite()
+                        || !to_z.is_finite()
+                        || to_x.abs() > 30_000_000.0
+                        || to_z.abs() > 30_000_000.0
+                        || to_y < 0.0
+                        || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
+                    {
                         self.event_log.push(PulseEvent::IntentRejected {
                             pulse_id: input.pulse_id,
                             player_id,
@@ -747,19 +764,19 @@ impl ReferenceExecutor {
                         to_y.floor() as i64,
                         to_z.floor() as i64,
                     );
-                    if let Some(target_parcel) = self.layout.parcel_for_cell(target_cell) {
-                        if target_parcel != player.parcel_id {
-                            let old_parcel = player.parcel_id;
-                            player.parcel_id = target_parcel;
-                            player.epoch += 1;
-                            self.event_log.push(PulseEvent::PlayerMigrated {
-                                pulse_id: input.pulse_id,
-                                player_id,
-                                from_parcel: old_parcel,
-                                to_parcel: target_parcel,
-                                epoch: player.epoch,
-                            });
-                        }
+                    if let Some(target_parcel) = self.layout.parcel_for_cell(target_cell)
+                        && target_parcel != player.parcel_id
+                    {
+                        let old_parcel = player.parcel_id;
+                        player.parcel_id = target_parcel;
+                        player.epoch += 1;
+                        self.event_log.push(PulseEvent::PlayerMigrated {
+                            pulse_id: input.pulse_id,
+                            player_id,
+                            from_parcel: old_parcel,
+                            to_parcel: target_parcel,
+                            epoch: player.epoch,
+                        });
                     }
 
                     self.event_log.push(PulseEvent::IntentCommitted {
@@ -997,6 +1014,16 @@ impl BoundaryCoordinator {
 
         match &admitted.intent {
             IntentKind::Move { to_x, to_y, to_z } => {
+                if !to_x.is_finite()
+                    || !to_y.is_finite()
+                    || !to_z.is_finite()
+                    || to_x.abs() > 30_000_000.0
+                    || to_z.abs() > 30_000_000.0
+                    || *to_y < 0.0
+                    || *to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
+                {
+                    return false;
+                }
                 let target_cell = CellCoord::new(
                     to_x.floor() as i64,
                     to_y.floor() as i64,
@@ -1163,10 +1190,10 @@ impl ParcelExecutor {
         for (pid, parcel) in &mut self.parcels {
             let mut remove_coords = Vec::new();
             for &coord in parcel.chunks.keys() {
-                if let Some(target_pid) = new_layout.parcel_for_chunk(coord) {
-                    if target_pid != *pid {
-                        remove_coords.push(coord);
-                    }
+                if let Some(target_pid) = new_layout.parcel_for_chunk(coord)
+                    && target_pid != *pid
+                {
+                    remove_coords.push(coord);
                 }
             }
             for coord in remove_coords {
@@ -1192,10 +1219,10 @@ impl ParcelExecutor {
                     player.y.floor() as i64,
                     player.z.floor() as i64,
                 );
-                if let Some(target_pid) = new_layout.parcel_for_cell(cell) {
-                    if target_pid != *pid {
-                        remove_players.push((pl_id, target_pid));
-                    }
+                if let Some(target_pid) = new_layout.parcel_for_cell(cell)
+                    && target_pid != *pid
+                {
+                    remove_players.push((pl_id, target_pid));
                 }
             }
             for (pl_id, target_pid) in remove_players {
@@ -1300,7 +1327,14 @@ impl ParcelExecutor {
             IntentKind::Move { to_x, to_y, to_z } => {
                 let get_block = |cell: CellCoord| parcel.get_block(cell);
 
-                if to_y < 0.0 || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64 {
+                if !to_x.is_finite()
+                    || !to_y.is_finite()
+                    || !to_z.is_finite()
+                    || to_x.abs() > 30_000_000.0
+                    || to_z.abs() > 30_000_000.0
+                    || to_y < 0.0
+                    || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
+                {
                     event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1536,7 +1570,14 @@ impl ParcelExecutor {
 
         match admitted.intent {
             IntentKind::Move { to_x, to_y, to_z } => {
-                if to_y < 0.0 || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64 {
+                if !to_x.is_finite()
+                    || !to_y.is_finite()
+                    || !to_z.is_finite()
+                    || to_x.abs() > 30_000_000.0
+                    || to_z.abs() > 30_000_000.0
+                    || to_y < 0.0
+                    || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
+                {
                     self.event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -2423,5 +2464,68 @@ mod tests {
             parcel_exec.get_block(CellCoord::new(18, 64, 8)),
             Some(Block::Air)
         );
+    }
+
+    #[test]
+    fn test_nonfinite_and_overflow_move_intents_rejected_identically() {
+        let chunk0 = create_test_chunk(0, 0);
+        let mut layout = PartitionLayout::new();
+        layout.assign_chunk((0, 0), ParcelId(0));
+
+        let mut ref_exec = ReferenceExecutor::new(layout.clone());
+        ref_exec.insert_chunk(chunk0.clone());
+        ref_exec.insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)));
+
+        let mut parcel_exec = ParcelExecutor::new(layout.clone());
+        parcel_exec.insert_chunk(chunk0);
+        parcel_exec.insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)));
+
+        let nonfinite_cases = [
+            (f64::NAN, 64.0, 8.0),
+            (8.0, f64::NAN, 8.0),
+            (8.0, 64.0, f64::NAN),
+            (f64::INFINITY, 64.0, 8.0),
+            (-f64::INFINITY, 64.0, 8.0),
+            (8.0, f64::INFINITY, 8.0),
+            (8.0, -10.0, 8.0),
+            (8.0, 300.0, 8.0),
+            (35_000_000.0, 64.0, 8.0),
+            (-35_000_000.0, 64.0, 8.0),
+            (8.0, 64.0, 35_000_000.0),
+        ];
+
+        for (seq, (x, y, z)) in (1u64..).zip(nonfinite_cases) {
+            let pulse = PulseInput::new(PulseId(seq)).with_intents(vec![AdmittedIntent::new(
+                1,
+                PlayerId(1),
+                seq,
+                IntentKind::Move {
+                    to_x: x,
+                    to_y: y,
+                    to_z: z,
+                },
+            )]);
+
+            ref_exec.step(pulse.clone());
+            parcel_exec.step(pulse);
+
+            assert_execution_equivalent(&ref_exec, &parcel_exec);
+
+            let rejected = ref_exec.event_log.iter().any(|e| {
+                matches!(
+                    e,
+                    PulseEvent::IntentRejected {
+                        pulse_id: PulseId(p),
+                        sequence: s,
+                        reason: RejectionReason::OutOfBounds,
+                        ..
+                    } if *p == seq && *s == seq
+                )
+            });
+            assert!(
+                rejected,
+                "case ({x}, {y}, {z}) should reject with OutOfBounds"
+            );
+        }
     }
 }
