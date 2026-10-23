@@ -1,6 +1,6 @@
 use super::interaction::{
-    BlockInteractionEngine, DiggingAction, DiggingSession, DiggingStatus, Direction,
-    InteractionRejectReason, InteractionResult, UseItemOnAction,
+    BlockInteractionEngine, DiggingAction, DiggingStatus, Direction, InteractionRejectReason,
+    InteractionResult, UseItemOnAction,
 };
 
 #[test]

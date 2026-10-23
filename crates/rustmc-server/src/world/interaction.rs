@@ -239,47 +239,47 @@ impl BlockInteractionEngine {
             return true;
         };
         let stripped = id.strip_prefix("minecraft:").unwrap_or(id);
-        match stripped {
+        !matches!(
+            stripped,
             "air"
-            | "cave_air"
-            | "void_air"
-            | "water"
-            | "lava"
-            | "short_grass"
-            | "grass"
-            | "tall_grass"
-            | "fern"
-            | "large_fern"
-            | "dandelion"
-            | "poppy"
-            | "blue_orchid"
-            | "allium"
-            | "azure_bluet"
-            | "red_tulip"
-            | "orange_tulip"
-            | "white_tulip"
-            | "pink_tulip"
-            | "oxeye_daisy"
-            | "cornflower"
-            | "lily_of_the_valley"
-            | "wither_rose"
-            | "sunflower"
-            | "torch"
-            | "wall_torch"
-            | "redstone_torch"
-            | "redstone_wall_torch"
-            | "redstone_wire"
-            | "lever"
-            | "stone_button"
-            | "oak_button"
-            | "tripwire"
-            | "tripwire_hook"
-            | "rail"
-            | "powered_rail"
-            | "detector_rail"
-            | "activator_rail" => false,
-            _ => true,
-        }
+                | "cave_air"
+                | "void_air"
+                | "water"
+                | "lava"
+                | "short_grass"
+                | "grass"
+                | "tall_grass"
+                | "fern"
+                | "large_fern"
+                | "dandelion"
+                | "poppy"
+                | "blue_orchid"
+                | "allium"
+                | "azure_bluet"
+                | "red_tulip"
+                | "orange_tulip"
+                | "white_tulip"
+                | "pink_tulip"
+                | "oxeye_daisy"
+                | "cornflower"
+                | "lily_of_the_valley"
+                | "wither_rose"
+                | "sunflower"
+                | "torch"
+                | "wall_torch"
+                | "redstone_torch"
+                | "redstone_wall_torch"
+                | "redstone_wire"
+                | "lever"
+                | "stone_button"
+                | "oak_button"
+                | "tripwire"
+                | "tripwire_hook"
+                | "rail"
+                | "powered_rail"
+                | "detector_rail"
+                | "activator_rail"
+        )
     }
 
     /// Validates a digging action authoritative intent without tracking session state.
@@ -398,16 +398,7 @@ impl BlockInteractionEngine {
                         },
                         None,
                     )
-                } else if is_creative {
-                    (
-                        InteractionResult::Accepted {
-                            placed: None,
-                            broken: Some(action.pos),
-                            sequence: action.sequence,
-                        },
-                        None,
-                    )
-                } else if allow_untracked {
+                } else if is_creative || allow_untracked {
                     (
                         InteractionResult::Accepted {
                             placed: None,
