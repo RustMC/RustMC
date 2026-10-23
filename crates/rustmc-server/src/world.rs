@@ -705,10 +705,7 @@ pub(crate) mod tests {
         assert_eq!(inv.total_item_count(), 20);
         assert_eq!(
             inv.held_item(),
-            Some(&ItemStack {
-                item: "minecraft:iron_ingot".to_string(),
-                count: 20
-            })
+            Some(&ItemStack::new("minecraft:iron_ingot", 20).unwrap())
         );
 
         // 3. Stacking into existing slot
@@ -720,39 +717,27 @@ pub(crate) mod tests {
         assert_eq!(inv.total_item_count(), 50);
         assert_eq!(
             inv.get_slot(0),
-            Some(&ItemStack {
-                item: "minecraft:iron_ingot".to_string(),
-                count: 50
-            })
+            Some(&ItemStack::new("minecraft:iron_ingot", 50).unwrap())
         );
 
         // 4. Consume held items partially
         let consumed = inv.consume_held(15).expect("partial consumption");
         assert_eq!(
             consumed,
-            ItemStack {
-                item: "minecraft:iron_ingot".to_string(),
-                count: 15
-            }
+            ItemStack::new("minecraft:iron_ingot", 15).unwrap()
         );
         assert_eq!(inv.revision(), 3);
         assert_eq!(inv.total_item_count(), 35);
         assert_eq!(
             inv.get_slot(0),
-            Some(&ItemStack {
-                item: "minecraft:iron_ingot".to_string(),
-                count: 35
-            })
+            Some(&ItemStack::new("minecraft:iron_ingot", 35).unwrap())
         );
 
         // 5. Consume remaining held items completely (clearing slot to None)
         let consumed = inv.consume_held(35).expect("complete consumption");
         assert_eq!(
             consumed,
-            ItemStack {
-                item: "minecraft:iron_ingot".to_string(),
-                count: 35
-            }
+            ItemStack::new("minecraft:iron_ingot", 35).unwrap()
         );
         assert_eq!(inv.revision(), 4);
         assert_eq!(inv.total_item_count(), 0);
@@ -787,10 +772,7 @@ pub(crate) mod tests {
         assert_eq!(inv.revision(), 5);
         assert_eq!(
             inv.held_item(),
-            Some(&ItemStack {
-                item: "minecraft:gold_ingot".to_string(),
-                count: 5
-            })
+            Some(&ItemStack::new("minecraft:gold_ingot", 5).unwrap())
         );
         assert_eq!(inv.total_item_count(), 5);
 
@@ -810,10 +792,7 @@ pub(crate) mod tests {
         inv.grant_item("minecraft:bread".to_string(), 8).unwrap();
         assert_eq!(
             inv.get_slot(1),
-            Some(&ItemStack {
-                item: "minecraft:bread".to_string(),
-                count: 8
-            })
+            Some(&ItemStack::new("minecraft:bread", 8).unwrap())
         );
 
         // Select slot 1 and consume 3 bread
@@ -821,17 +800,11 @@ pub(crate) mod tests {
         let consumed_bread = inv.consume_held(3).unwrap();
         assert_eq!(
             consumed_bread,
-            ItemStack {
-                item: "minecraft:bread".to_string(),
-                count: 3
-            }
+            ItemStack::new("minecraft:bread", 3).unwrap()
         );
         assert_eq!(
             inv.get_slot(1),
-            Some(&ItemStack {
-                item: "minecraft:bread".to_string(),
-                count: 5
-            })
+            Some(&ItemStack::new("minecraft:bread", 5).unwrap())
         );
 
         // 9. Stacking past MAX_STACK_SIZE (spill into next slots)
@@ -844,17 +817,11 @@ pub(crate) mod tests {
         assert_eq!(rem, 0);
         assert_eq!(
             inv.get_slot(0),
-            Some(&ItemStack {
-                item: "minecraft:gold_ingot".to_string(),
-                count: 64
-            })
+            Some(&ItemStack::new("minecraft:gold_ingot", 64).unwrap())
         );
         assert_eq!(
             inv.get_slot(2),
-            Some(&ItemStack {
-                item: "minecraft:gold_ingot".to_string(),
-                count: 1
-            })
+            Some(&ItemStack::new("minecraft:gold_ingot", 1).unwrap())
         );
 
         // 10. Full inventory rejection
@@ -903,10 +870,7 @@ pub(crate) mod tests {
         assert_eq!(partial_inv.revision(), partial_rev + 1);
         assert_eq!(
             partial_inv.get_slot(35),
-            Some(&ItemStack {
-                item: "minecraft:cobblestone".to_string(),
-                count: 64
-            })
+            Some(&ItemStack::new("minecraft:cobblestone", 64).unwrap())
         );
         // Count conservation: (35 * 64 + 60) + (10 - 6) = 36 * 64
         assert_eq!(partial_inv.total_item_count(), 36 * 64);

@@ -36,8 +36,8 @@ pub const TOTAL_SLOTS: std::ops::RangeInclusive<u8> = 0..=35;
 /// A counted stack of items with max stack size bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemStack {
-    pub item: String,
-    pub count: u8,
+    item: String,
+    count: u8,
 }
 
 impl ItemStack {
@@ -52,6 +52,16 @@ impl ItemStack {
             return Err(InventoryError::InvalidCount(count));
         }
         Ok(Self { item, count })
+    }
+
+    /// The item identifier.
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    /// The item stack count, guaranteed to be within `1..=MAX_STACK_SIZE`.
+    pub fn count(&self) -> u8 {
+        self.count
     }
 }
 
@@ -172,16 +182,6 @@ impl PlayerInventory {
     pub fn get_slot(&self, slot: u8) -> Option<&ItemStack> {
         if (slot as usize) < TOTAL_SLOT_COUNT {
             self.slots[slot as usize].as_ref()
-        } else {
-            None
-        }
-    }
-
-    /// Gets a mutable reference to the item stack in the given slot, or `None` if empty
-    /// or if `slot` is out of bounds (`slot >= 36`).
-    pub fn get_slot_mut(&mut self, slot: u8) -> Option<&mut ItemStack> {
-        if (slot as usize) < TOTAL_SLOT_COUNT {
-            self.slots[slot as usize].as_mut()
         } else {
             None
         }
@@ -378,8 +378,8 @@ mod tests {
             Err(InventoryError::InvalidCount(65))
         );
         let valid = ItemStack::new("minecraft:dirt", 64).unwrap();
-        assert_eq!(valid.item, "minecraft:dirt");
-        assert_eq!(valid.count, 64);
+        assert_eq!(valid.item(), "minecraft:dirt");
+        assert_eq!(valid.count(), 64);
     }
 
     #[test]
@@ -402,16 +402,26 @@ mod tests {
     }
 
     #[test]
-    fn inventory_mutable_slot_access() {
+    fn inventory_transactional_invariants_cannot_be_bypassed() {
         let mut inv = PlayerInventory::default();
         assert_eq!(inv, PlayerInventory::new());
+        let initial_rev = inv.revision();
 
+        // 1. Invalid slot rejected without modifying revision
+        assert_eq!(
+            inv.set_slot(36, Some(ItemStack::new("minecraft:apple", 2).unwrap())),
+            Err(InventoryError::InvalidSlot(36))
+        );
+        assert_eq!(inv.revision(), initial_rev);
+
+        // 2. Valid set_slot increments revision
         inv.set_slot(5, Some(ItemStack::new("minecraft:apple", 2).unwrap()))
             .unwrap();
-        if let Some(stack) = inv.get_slot_mut(5) {
-            stack.count += 1;
-        }
-        assert_eq!(inv.get_slot(5).unwrap().count, 3);
-        assert!(inv.get_slot_mut(36).is_none());
+        assert_eq!(inv.revision(), initial_rev + 1);
+        assert_eq!(inv.get_slot(5).unwrap().count(), 2);
+        assert_eq!(inv.get_slot(5).unwrap().item(), "minecraft:apple");
+
+        // 3. Transactions are strictly checked; no direct mutable slot reference
+        assert!(inv.get_slot(36).is_none());
     }
 }
