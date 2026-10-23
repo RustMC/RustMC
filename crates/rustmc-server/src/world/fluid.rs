@@ -435,16 +435,16 @@ pub fn check_fluid_collision(world: &dyn FluidWorldView, pos: BlockPos) -> Optio
         let mut has_lava_arrival = false;
 
         for &neighbor in &pos.horizontal_neighbors() {
-            if let Some(fluid) = world.get_fluid(neighbor) {
-                if world.is_solid(neighbor.down()) {
-                    let preferred = preferred_flow_directions(world, neighbor, fluid.type_);
-                    if preferred.contains(&pos) {
-                        let new_level = fluid.level + fluid.type_.flow_decay();
-                        if new_level <= fluid.type_.max_level() {
-                            match fluid.type_ {
-                                FluidType::Water => has_water_arrival = true,
-                                FluidType::Lava => has_lava_arrival = true,
-                            }
+            if let Some(fluid) = world.get_fluid(neighbor)
+                && world.is_solid(neighbor.down())
+            {
+                let preferred = preferred_flow_directions(world, neighbor, fluid.type_);
+                if preferred.contains(&pos) {
+                    let new_level = fluid.level + fluid.type_.flow_decay();
+                    if new_level <= fluid.type_.max_level() {
+                        match fluid.type_ {
+                            FluidType::Water => has_water_arrival = true,
+                            FluidType::Lava => has_lava_arrival = true,
                         }
                     }
                 }
