@@ -310,3 +310,79 @@ fn test_seed_mismatch_rejection() {
         other => panic!("expected WorldError::SeedMismatch, got {other:?}"),
     }
 }
+
+#[test]
+fn test_mid_journal_corruption_rejected() {
+    let test_dir = TestDir::new("mid-journal-corruption");
+    let generator = Generator::new(2026);
+
+    {
+        let mut world = World::open(test_dir.path(), generator).expect("open world");
+        assert!(world.set_block(0, 60, 0, Block::Dirt));
+        world.commit_tick().expect("commit tick 0");
+        assert!(world.set_block(1, 60, 1, Block::Stone));
+        world.commit_tick().expect("commit tick 1");
+    }
+
+    // Corrupt bytes in the 1st record payload, while 2nd record remains in file
+    let log_path = test_dir.path().join("journal.log");
+    let mut bytes = std::fs::read(&log_path).expect("read log");
+    // Offset 32 is start of first record; offset 50 is inside first record's coordinate payload
+    bytes[50] ^= 0xff;
+    std::fs::write(&log_path, &bytes).expect("write corrupted log");
+
+    // Opening world must fail loudly on mid-journal corruption, rather than truncating
+    let result = World::open(test_dir.path(), generator);
+    match result {
+        Err(WorldError::Corrupted(msg)) => {
+            assert!(
+                msg.contains("checksum mismatch"),
+                "expected checksum mismatch message, got {msg}"
+            );
+        }
+        other => panic!("expected WorldError::Corrupted, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_non_monotonic_sequence_rejected() {
+    let test_dir = TestDir::new("non-monotonic-sequence");
+    let generator = Generator::new(2026);
+
+    {
+        let mut world = World::open(test_dir.path(), generator).expect("open world");
+        assert!(world.set_block(0, 60, 0, Block::Dirt));
+        world.commit_tick().expect("commit tick 0");
+    }
+
+    // Manually forge a record with tick sequence ID regressing backwards
+    let log_path = test_dir.path().join("journal.log");
+    let mut bytes = std::fs::read(&log_path).expect("read log");
+
+    // Create a forged record with tick = 0 (when recovered_tick is 1)
+    let mut record = Vec::new();
+    record.extend_from_slice(&0u64.to_be_bytes()); // tick 0 < recovered_tick 1
+    record.extend_from_slice(&1u32.to_be_bytes()); // count 1
+    record.extend_from_slice(&10i64.to_be_bytes()); // x
+    record.extend_from_slice(&60i64.to_be_bytes()); // y
+    record.extend_from_slice(&10i64.to_be_bytes()); // z
+    record.push(Block::Sand as u8); // block
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&record);
+    let crc = hasher.finalize();
+    record.extend_from_slice(&crc.to_be_bytes());
+
+    bytes.extend_from_slice(&record);
+    std::fs::write(&log_path, &bytes).expect("write non-monotonic log");
+
+    let result = World::open(test_dir.path(), generator);
+    match result {
+        Err(WorldError::Corrupted(msg)) => {
+            assert!(
+                msg.contains("non-monotonic sequence ID"),
+                "expected non-monotonic sequence ID message, got {msg}"
+            );
+        }
+        other => panic!("expected WorldError::Corrupted, got {other:?}"),
+    }
+}

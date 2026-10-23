@@ -14,6 +14,17 @@ pub const HEADER_SIZE: usize = 32;
 /// committed mutations map, and the recovered tick sequence ID.
 pub type JournalRecovery = (WorldJournal, BTreeMap<(i64, i64, i64), Block>, u64);
 
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+    let _ = dir;
+    Ok(())
+}
+
 /// Manages `journal.log` and `checkpoint.bin` with CRC32 checksums,
 /// crash recovery, and atomic checkpoint compaction.
 #[derive(Debug)]
@@ -152,29 +163,52 @@ impl WorldJournal {
                 let mut valid_offset = HEADER_SIZE as u64;
 
                 loop {
+                    let remaining = file_len.saturating_sub(valid_offset);
+                    if remaining < 12 {
+                        // Incomplete record header at EOF (truncated trailing write)
+                        break;
+                    }
+
                     let mut record_hdr = [0u8; 12];
                     match f.read_exact(&mut record_hdr) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            // Incomplete record header at EOF (truncated trailing write)
                             break;
                         }
                         Err(e) => return Err(WorldError::Io(e)),
                     }
 
                     let tick = u64::from_be_bytes(record_hdr[0..8].try_into().unwrap());
+                    if tick < recovered_tick {
+                        return Err(WorldError::Corrupted(format!(
+                            "non-monotonic sequence ID {tick} < {recovered_tick} at offset {valid_offset}"
+                        )));
+                    }
+
                     let count = u32::from_be_bytes(record_hdr[8..12].try_into().unwrap()) as usize;
                     if count > 100_000 {
-                        // Unreasonable mutation count indicates corrupted record header
-                        break;
+                        let needed = 12u64
+                            .saturating_add((count as u64).saturating_mul(25))
+                            .saturating_add(4);
+                        if remaining < needed {
+                            // Incomplete/torn header at EOF
+                            break;
+                        }
+                        return Err(WorldError::Corrupted(format!(
+                            "unreasonable mutation count {count} at offset {valid_offset}"
+                        )));
                     }
 
                     let body_len = count * 25 + 4;
+                    if remaining < 12 + body_len as u64 {
+                        // Incomplete record payload at EOF (truncated trailing write)
+                        break;
+                    }
+
                     let mut body = vec![0u8; body_len];
                     match f.read_exact(&mut body) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            // Incomplete record payload at EOF (truncated trailing write)
                             break;
                         }
                         Err(e) => return Err(WorldError::Io(e)),
@@ -187,13 +221,21 @@ impl WorldJournal {
                     let stored_crc =
                         u32::from_be_bytes(body[count * 25..count * 25 + 4].try_into().unwrap());
                     if computed_crc != stored_crc {
-                        // Checksum failure indicates torn or corrupted trailing record
-                        break;
+                        let record_end = valid_offset + 12 + body_len as u64;
+                        if record_end == file_len {
+                            // Checksum failure on the trailing record at the very end of file
+                            // (torn write during power loss)
+                            break;
+                        } else {
+                            // Checksum mismatch inside the journal prior to EOF
+                            return Err(WorldError::Corrupted(format!(
+                                "checksum mismatch at offset {valid_offset}: computed {computed_crc:#x}, stored {stored_crc:#x}"
+                            )));
+                        }
                     }
 
                     let mut record_muts = Vec::with_capacity(count);
                     let mut offset = 0;
-                    let mut valid_blocks = true;
                     for _ in 0..count {
                         let x = i64::from_be_bytes(body[offset..offset + 8].try_into().unwrap());
                         let y =
@@ -205,13 +247,10 @@ impl WorldJournal {
                         if let Some(block) = Block::from_u8(block_byte) {
                             record_muts.push((x, y, z, block));
                         } else {
-                            valid_blocks = false;
-                            break;
+                            return Err(WorldError::Corrupted(format!(
+                                "invalid block ID {block_byte} at offset {valid_offset}"
+                            )));
                         }
-                    }
-
-                    if !valid_blocks {
-                        break;
                     }
 
                     for (x, y, z, block) in record_muts {
@@ -279,6 +318,7 @@ impl WorldJournal {
         self.log_file.seek(SeekFrom::End(0))?;
         self.log_file.write_all(&record)?;
         self.log_file.flush()?;
+        self.log_file.sync_data()?;
         Ok(())
     }
 
@@ -328,12 +368,14 @@ impl WorldJournal {
         }
 
         let checkpoint_path = self.dir.join("checkpoint.bin");
-        std::fs::rename(&tmp_path, checkpoint_path)?;
+        std::fs::rename(&tmp_path, &checkpoint_path)?;
+        sync_dir(&self.dir)?;
 
         // Reset journal.log with current_tick as start sequence.
         write_log_header(&mut self.log_file, self.seed, self.terrain, current_tick)?;
         self.log_file.flush()?;
         self.log_file.sync_data()?;
+        sync_dir(&self.dir)?;
 
         Ok(())
     }
@@ -371,6 +413,8 @@ fn write_log_header(
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header)?;
     file.set_len(HEADER_SIZE as u64)?;
+    file.flush()?;
+    file.sync_data()?;
     file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
     Ok(())
 }
