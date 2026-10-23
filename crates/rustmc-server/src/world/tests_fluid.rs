@@ -297,6 +297,13 @@ fn test_in_memory_fluid_world_state_transitions() {
     let mut world = InMemoryFluidWorld::new();
     let pos = BlockPos::new(1, 0, 0);
 
+    // Solid floor at y = -1
+    for x in -5..=5 {
+        for z in -5..=5 {
+            world.set_solid(BlockPos::new(x, -1, z), true);
+        }
+    }
+
     // Set solid stone at pos
     world.set_block(pos, "minecraft:stone");
     assert!(world.is_solid(pos));
@@ -307,10 +314,6 @@ fn test_in_memory_fluid_world_state_transitions() {
         !world.is_solid(pos),
         "setting block to air must clear solid flag"
     );
-
-    // Floor below pos and source neighbor
-    world.set_solid(BlockPos::new(0, -1, 0), true);
-    world.set_solid(BlockPos::new(1, -1, 0), true);
 
     // Water source at (0, 0, 0) should now spread into pos
     world.set_fluid(BlockPos::new(0, 0, 0), FluidState::source(FluidType::Water));
@@ -329,10 +332,12 @@ fn test_horizontal_fluid_collision_empty_cell_cobblestone() {
     let water_source_pos = BlockPos::new(-1, 0, 0);
     let lava_source_pos = BlockPos::new(1, 0, 0);
 
-    // Floor underneath to allow horizontal spread
-    world.set_solid(BlockPos::new(-1, -1, 0), true);
-    world.set_solid(BlockPos::new(0, -1, 0), true);
-    world.set_solid(BlockPos::new(1, -1, 0), true);
+    // Solid floor at y = -1 to allow uniform horizontal spread
+    for x in -5..=5 {
+        for z in -5..=5 {
+            world.set_solid(BlockPos::new(x, -1, z), true);
+        }
+    }
 
     world.set_fluid(water_source_pos, FluidState::source(FluidType::Water));
     world.set_fluid(lava_source_pos, FluidState::source(FluidType::Lava));
