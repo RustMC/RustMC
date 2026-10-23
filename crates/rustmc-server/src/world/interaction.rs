@@ -1,8 +1,15 @@
 //! Authoritative block interaction engine and validation types.
 //!
-//! Handles server-side validation of block digging and placement intents
-//! according to Minecraft protocol rules and spatial constraints (reach,
-//! world bounds, player hitbox collision).
+//! Handles server-side validation of block digging progression and placement intents
+//! according to Minecraft protocol rules and spatial constraints (reach, world bounds,
+//! tick-based digging progression, and block-type aware player hitbox collision).
+//!
+//! # Scope & Progression
+//!
+//! This module provides authoritative validation for digging and placement actions.
+//! Survival digging progression enforces start-to-finish tick duration checks and
+//! rejects unbreakable blocks (e.g. bedrock). Placement checks account for non-collidable
+//! blocks (e.g. torches, flowers) to avoid invalid collision rejections.
 
 /// 3D cardinal and vertical directions for block faces and neighbor offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,6 +99,24 @@ pub struct UseItemOnAction {
     pub sequence: i32,
 }
 
+/// Tracks an ongoing digging action for a player session in survival mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiggingSession {
+    pub pos: (i32, i32, i32),
+    pub start_tick: u64,
+    pub required_ticks: u32,
+}
+
+impl DiggingSession {
+    pub const fn new(pos: (i32, i32, i32), start_tick: u64, required_ticks: u32) -> Self {
+        Self {
+            pos,
+            start_tick,
+            required_ticks,
+        }
+    }
+}
+
 /// Rejection reason when an authoritative block interaction cannot be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionRejectReason {
@@ -100,6 +125,7 @@ pub enum InteractionRejectReason {
     InsidePlayer,
     TargetNotReplaceable,
     Malformed,
+    PrematureFinish,
 }
 
 /// Result of authoritative interaction validation.
@@ -176,13 +202,115 @@ impl BlockInteractionEngine {
         dx * dx + dy * dy + dz * dz
     }
 
-    /// Validates a digging action authoritative intent.
+    /// Returns the hardness value for known standard blocks.
+    /// Unbreakable blocks like bedrock return a negative value (< 0.0).
+    pub fn get_block_hardness(block_id: Option<&str>) -> f32 {
+        let Some(id) = block_id else {
+            return 1.0;
+        };
+        let stripped = id.strip_prefix("minecraft:").unwrap_or(id);
+        match stripped {
+            "bedrock" | "barrier" | "end_portal_frame" => -1.0,
+            "air" | "cave_air" | "void_air" => 0.0,
+            "short_grass" | "grass" | "fern" | "dead_bush" | "dandelion" | "poppy" => 0.0,
+            "dirt" | "coarse_dirt" | "grass_block" => 0.5,
+            "stone" | "cobblestone" => 1.5,
+            "iron_ore" | "coal_ore" | "copper_ore" => 3.0,
+            "obsidian" => 50.0,
+            _ => 1.0,
+        }
+    }
+
+    /// Computes minimum required ticks to break a block given block hardness.
+    /// In vanilla, break time in ticks without tool multiplier is `(hardness * 30.0)` for blocks requiring tools,
+    /// or `(hardness * 15.0)` when harvestable. Instant breaks (hardness == 0.0) take 0 ticks.
+    pub fn required_break_ticks(hardness: f32) -> u32 {
+        if hardness <= 0.0 {
+            0
+        } else {
+            (hardness * 30.0).ceil() as u32
+        }
+    }
+
+    /// Checks whether a block type is collidable (has a physical collision box that blocks entities).
+    /// Non-collidable blocks include air, fluids, plants, flowers, torches, redstone, etc.
+    pub fn is_block_collidable(block_id: Option<&str>) -> bool {
+        let Some(id) = block_id else {
+            return true;
+        };
+        let stripped = id.strip_prefix("minecraft:").unwrap_or(id);
+        match stripped {
+            "air"
+            | "cave_air"
+            | "void_air"
+            | "water"
+            | "lava"
+            | "short_grass"
+            | "grass"
+            | "tall_grass"
+            | "fern"
+            | "large_fern"
+            | "dandelion"
+            | "poppy"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "red_tulip"
+            | "orange_tulip"
+            | "white_tulip"
+            | "pink_tulip"
+            | "oxeye_daisy"
+            | "cornflower"
+            | "lily_of_the_valley"
+            | "wither_rose"
+            | "sunflower"
+            | "torch"
+            | "wall_torch"
+            | "redstone_torch"
+            | "redstone_wall_torch"
+            | "redstone_wire"
+            | "lever"
+            | "stone_button"
+            | "oak_button"
+            | "tripwire"
+            | "tripwire_hook"
+            | "rail"
+            | "powered_rail"
+            | "detector_rail"
+            | "activator_rail" => false,
+            _ => true,
+        }
+    }
+
+    /// Validates a digging action authoritative intent without tracking session state.
     pub fn validate_digging(
         player_eye: (f64, f64, f64),
         is_creative: bool,
         action: &DiggingAction,
         current_block: Option<&str>,
     ) -> InteractionResult {
+        let (result, _) = Self::validate_digging_stateful(
+            player_eye,
+            is_creative,
+            action,
+            current_block,
+            0,
+            None,
+            true,
+        );
+        result
+    }
+
+    /// Validates a digging action with stateful session and tick-duration tracking.
+    pub fn validate_digging_stateful(
+        player_eye: (f64, f64, f64),
+        is_creative: bool,
+        action: &DiggingAction,
+        current_block: Option<&str>,
+        current_tick: u64,
+        session: Option<&DiggingSession>,
+        allow_untracked: bool,
+    ) -> (InteractionResult, Option<DiggingSession>) {
         if player_eye.0.is_nan()
             || player_eye.1.is_nan()
             || player_eye.2.is_nan()
@@ -190,59 +318,134 @@ impl BlockInteractionEngine {
             || player_eye.1.is_infinite()
             || player_eye.2.is_infinite()
         {
-            return InteractionResult::Rejected {
-                reason: InteractionRejectReason::Malformed,
-                sequence: action.sequence,
-            };
+            return (
+                InteractionResult::Rejected {
+                    reason: InteractionRejectReason::Malformed,
+                    sequence: action.sequence,
+                },
+                None,
+            );
         }
 
         if !Self::is_within_bounds(action.pos) {
-            return InteractionResult::Rejected {
-                reason: InteractionRejectReason::OutOfBounds,
-                sequence: action.sequence,
-            };
+            return (
+                InteractionResult::Rejected {
+                    reason: InteractionRejectReason::OutOfBounds,
+                    sequence: action.sequence,
+                },
+                None,
+            );
         }
 
         let dist_sq = Self::reach_distance_squared(player_eye, action.pos);
         if dist_sq > Self::MAX_REACH_DISTANCE_SQUARED {
-            return InteractionResult::Rejected {
-                reason: InteractionRejectReason::TooFar,
-                sequence: action.sequence,
-            };
+            return (
+                InteractionResult::Rejected {
+                    reason: InteractionRejectReason::TooFar,
+                    sequence: action.sequence,
+                },
+                None,
+            );
         }
 
+        let hardness = Self::get_block_hardness(current_block);
+
         match action.status {
-            DiggingStatus::Cancelled => InteractionResult::Accepted {
-                placed: None,
-                broken: None,
-                sequence: action.sequence,
-            },
+            DiggingStatus::Cancelled => (
+                InteractionResult::Accepted {
+                    placed: None,
+                    broken: None,
+                    sequence: action.sequence,
+                },
+                None,
+            ),
             DiggingStatus::Started => {
-                if is_creative {
-                    InteractionResult::Accepted {
-                        placed: None,
-                        broken: Some(action.pos),
-                        sequence: action.sequence,
-                    }
+                if !is_creative && hardness < 0.0 {
+                    (
+                        InteractionResult::Rejected {
+                            reason: InteractionRejectReason::TargetNotReplaceable,
+                            sequence: action.sequence,
+                        },
+                        None,
+                    )
+                } else if is_creative {
+                    (
+                        InteractionResult::Accepted {
+                            placed: None,
+                            broken: Some(action.pos),
+                            sequence: action.sequence,
+                        },
+                        None,
+                    )
                 } else {
-                    InteractionResult::Accepted {
-                        placed: None,
-                        broken: None,
-                        sequence: action.sequence,
-                    }
+                    let req_ticks = Self::required_break_ticks(hardness);
+                    (
+                        InteractionResult::Accepted {
+                            placed: None,
+                            broken: None,
+                            sequence: action.sequence,
+                        },
+                        Some(DiggingSession::new(action.pos, current_tick, req_ticks)),
+                    )
                 }
             }
             DiggingStatus::Finished => {
-                if !is_creative && matches!(current_block, Some("minecraft:bedrock" | "bedrock")) {
-                    InteractionResult::Rejected {
-                        reason: InteractionRejectReason::TargetNotReplaceable,
-                        sequence: action.sequence,
-                    }
+                if !is_creative && hardness < 0.0 {
+                    (
+                        InteractionResult::Rejected {
+                            reason: InteractionRejectReason::TargetNotReplaceable,
+                            sequence: action.sequence,
+                        },
+                        None,
+                    )
+                } else if is_creative {
+                    (
+                        InteractionResult::Accepted {
+                            placed: None,
+                            broken: Some(action.pos),
+                            sequence: action.sequence,
+                        },
+                        None,
+                    )
+                } else if allow_untracked {
+                    (
+                        InteractionResult::Accepted {
+                            placed: None,
+                            broken: Some(action.pos),
+                            sequence: action.sequence,
+                        },
+                        None,
+                    )
                 } else {
-                    InteractionResult::Accepted {
-                        placed: None,
-                        broken: Some(action.pos),
-                        sequence: action.sequence,
+                    match session {
+                        Some(s) if s.pos == action.pos => {
+                            let elapsed = current_tick.saturating_sub(s.start_tick);
+                            if elapsed >= s.required_ticks as u64 {
+                                (
+                                    InteractionResult::Accepted {
+                                        placed: None,
+                                        broken: Some(action.pos),
+                                        sequence: action.sequence,
+                                    },
+                                    None,
+                                )
+                            } else {
+                                (
+                                    InteractionResult::Rejected {
+                                        reason: InteractionRejectReason::PrematureFinish,
+                                        sequence: action.sequence,
+                                    },
+                                    Some(*s),
+                                )
+                            }
+                        }
+                        _ => (
+                            InteractionResult::Rejected {
+                                reason: InteractionRejectReason::PrematureFinish,
+                                sequence: action.sequence,
+                            },
+                            None,
+                        ),
                     }
                 }
             }
@@ -257,6 +460,27 @@ impl BlockInteractionEngine {
         action: &UseItemOnAction,
         target_is_replaceable: bool,
         candidate_is_empty: bool,
+    ) -> InteractionResult {
+        Self::validate_block_placement_with_block(
+            player_pos,
+            player_eye,
+            player_box,
+            action,
+            target_is_replaceable,
+            candidate_is_empty,
+            None,
+        )
+    }
+
+    /// Validates a block placement authoritative intent with block-type collision awareness.
+    pub fn validate_block_placement_with_block(
+        player_pos: (f64, f64, f64),
+        player_eye: (f64, f64, f64),
+        player_box: ((f64, f64, f64), (f64, f64, f64)),
+        action: &UseItemOnAction,
+        target_is_replaceable: bool,
+        candidate_is_empty: bool,
+        placed_block_id: Option<&str>,
     ) -> InteractionResult {
         if player_pos.0.is_nan()
             || player_pos.1.is_nan()
@@ -332,31 +556,34 @@ impl BlockInteractionEngine {
             };
         }
 
-        // AABB collision test between placed block [min, max] and player hitbox
-        let block_min = (
-            placed_pos.0 as f64,
-            placed_pos.1 as f64,
-            placed_pos.2 as f64,
-        );
-        let block_max = (
-            placed_pos.0 as f64 + 1.0,
-            placed_pos.1 as f64 + 1.0,
-            placed_pos.2 as f64 + 1.0,
-        );
-        let (p_min, p_max) = player_box;
+        // AABB collision test between placed block [min, max] and player hitbox,
+        // applicable only if the block has physical collision geometry.
+        if Self::is_block_collidable(placed_block_id) {
+            let block_min = (
+                placed_pos.0 as f64,
+                placed_pos.1 as f64,
+                placed_pos.2 as f64,
+            );
+            let block_max = (
+                placed_pos.0 as f64 + 1.0,
+                placed_pos.1 as f64 + 1.0,
+                placed_pos.2 as f64 + 1.0,
+            );
+            let (p_min, p_max) = player_box;
 
-        let collides = block_min.0 < p_max.0
-            && block_max.0 > p_min.0
-            && block_min.1 < p_max.1
-            && block_max.1 > p_min.1
-            && block_min.2 < p_max.2
-            && block_max.2 > p_min.2;
+            let collides = block_min.0 < p_max.0
+                && block_max.0 > p_min.0
+                && block_min.1 < p_max.1
+                && block_max.1 > p_min.1
+                && block_min.2 < p_max.2
+                && block_max.2 > p_min.2;
 
-        if collides {
-            return InteractionResult::Rejected {
-                reason: InteractionRejectReason::InsidePlayer,
-                sequence: action.sequence,
-            };
+            if collides {
+                return InteractionResult::Rejected {
+                    reason: InteractionRejectReason::InsidePlayer,
+                    sequence: action.sequence,
+                };
+            }
         }
 
         InteractionResult::Accepted {

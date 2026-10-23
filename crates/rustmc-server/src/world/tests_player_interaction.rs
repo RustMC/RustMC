@@ -1,6 +1,6 @@
 use super::interaction::{
-    BlockInteractionEngine, DiggingAction, DiggingStatus, Direction, InteractionRejectReason,
-    InteractionResult, UseItemOnAction,
+    BlockInteractionEngine, DiggingAction, DiggingSession, DiggingStatus, Direction,
+    InteractionRejectReason, InteractionResult, UseItemOnAction,
 };
 
 #[test]
@@ -609,6 +609,180 @@ fn test_out_of_bounds_interaction_rejected() {
             placed: Some((0, -63, 0)),
             broken: None,
             sequence: 56,
+        }
+    );
+}
+
+#[test]
+fn test_stateful_survival_digging_progression() {
+    let eye = (10.5, 66.0, 10.5);
+    let target = (10, 64, 10);
+
+    let start_action = DiggingAction {
+        status: DiggingStatus::Started,
+        pos: target,
+        face: Direction::Up,
+        sequence: 100,
+    };
+
+    let finish_action = DiggingAction {
+        status: DiggingStatus::Finished,
+        pos: target,
+        face: Direction::Up,
+        sequence: 101,
+    };
+
+    // 1. Survival player starts digging stone (hardness 1.5 -> 45 ticks)
+    let (res_start, session) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false, // survival
+        &start_action,
+        Some("minecraft:stone"),
+        1000, // current tick
+        None,
+        false, // do not allow untracked
+    );
+    assert_eq!(
+        res_start,
+        InteractionResult::Accepted {
+            placed: None,
+            broken: None,
+            sequence: 100,
+        }
+    );
+    assert!(session.is_some());
+    let active_session = session.unwrap();
+    assert_eq!(active_session.pos, target);
+    assert_eq!(active_session.start_tick, 1000);
+    assert_eq!(active_session.required_ticks, 45);
+
+    // 2. Client finishes prematurely at tick 1020 (only 20 ticks elapsed < 45) -> Rejected
+    let (res_early, retained_session) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &finish_action,
+        Some("minecraft:stone"),
+        1020,
+        Some(&active_session),
+        false,
+    );
+    assert_eq!(
+        res_early,
+        InteractionResult::Rejected {
+            reason: InteractionRejectReason::PrematureFinish,
+            sequence: 101,
+        }
+    );
+    assert_eq!(retained_session, Some(active_session));
+
+    // 3. Client finishes after sufficient ticks at tick 1045 (45 ticks elapsed) -> Accepted break
+    let (res_valid, completed_session) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &finish_action,
+        Some("minecraft:stone"),
+        1045,
+        Some(&active_session),
+        false,
+    );
+    assert_eq!(
+        res_valid,
+        InteractionResult::Accepted {
+            placed: None,
+            broken: Some(target),
+            sequence: 101,
+        }
+    );
+    assert!(completed_session.is_none());
+
+    // 4. Client attempts Finished without an active session -> Rejected
+    let (res_no_session, _) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &finish_action,
+        Some("minecraft:stone"),
+        1045,
+        None,
+        false,
+    );
+    assert_eq!(
+        res_no_session,
+        InteractionResult::Rejected {
+            reason: InteractionRejectReason::PrematureFinish,
+            sequence: 101,
+        }
+    );
+}
+
+#[test]
+fn test_non_collidable_block_placement_inside_player() {
+    let player_pos = (10.0, 64.0, 10.0);
+    let eye = (10.0, 65.62, 10.0);
+    // Player hitbox spanning [9.7..10.3, 64.0..65.8, 9.7..10.3]
+    let player_box = ((9.7, 64.0, 9.7), (10.3, 65.8, 10.3));
+
+    // Placing against floor at (10, 63, 10) face UP -> candidate placed block is at (10, 64, 10)
+    // which intersects the player hitbox!
+    let place_action = UseItemOnAction {
+        pos: (10, 63, 10),
+        face: Direction::Up,
+        cursor: (0.5, 1.0, 0.5),
+        inside_block: false,
+        sequence: 200,
+    };
+
+    // Case 1: Solid block (e.g. stone) placed inside player hitbox must be rejected
+    let res_stone = BlockInteractionEngine::validate_block_placement_with_block(
+        player_pos,
+        eye,
+        player_box,
+        &place_action,
+        false,
+        true,
+        Some("minecraft:stone"),
+    );
+    assert_eq!(
+        res_stone,
+        InteractionResult::Rejected {
+            reason: InteractionRejectReason::InsidePlayer,
+            sequence: 200,
+        }
+    );
+
+    // Case 2: Non-collidable block (e.g. torch, short_grass) placed inside player hitbox must be ACCEPTED
+    let res_torch = BlockInteractionEngine::validate_block_placement_with_block(
+        player_pos,
+        eye,
+        player_box,
+        &place_action,
+        false,
+        true,
+        Some("minecraft:torch"),
+    );
+    assert_eq!(
+        res_torch,
+        InteractionResult::Accepted {
+            placed: Some((10, 64, 10)),
+            broken: None,
+            sequence: 200,
+        }
+    );
+
+    let res_grass = BlockInteractionEngine::validate_block_placement_with_block(
+        player_pos,
+        eye,
+        player_box,
+        &place_action,
+        false,
+        true,
+        Some("minecraft:short_grass"),
+    );
+    assert_eq!(
+        res_grass,
+        InteractionResult::Accepted {
+            placed: Some((10, 64, 10)),
+            broken: None,
+            sequence: 200,
         }
     );
 }
