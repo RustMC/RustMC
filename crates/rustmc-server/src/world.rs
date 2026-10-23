@@ -232,6 +232,20 @@ impl Chunk {
         self.blocks[index] = block;
         changes.push(CellChange { x, y, z, block });
 
+        // Atomic double plant placement: placing TallGrassLower atomically places TallGrassUpper at y + 1.
+        if block == Block::TallGrassLower && y + 1 < WORLD_HEIGHT {
+            let upper_index = ((y + 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            if self.blocks[upper_index] != Block::TallGrassUpper {
+                self.blocks[upper_index] = Block::TallGrassUpper;
+                changes.push(CellChange {
+                    x,
+                    y: y + 1,
+                    z,
+                    block: Block::TallGrassUpper,
+                });
+            }
+        }
+
         // Step A: downward coupled-half check at y - 1 (breaks lower half if upper half broken).
         if y > 0 {
             let prev_y = y - 1;

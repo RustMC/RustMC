@@ -220,10 +220,11 @@ const BATCH_START: u32 = 12;
 const BATCH_END: u32 = 11;
 const MAX_CHUNKS_PER_BATCH: usize = 16;
 const MAX_BATCH_BYTES: usize = 768 * 1024;
-// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves.
+// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves,
+// wood variants, sand/sandstone, snow blocks, short grass, snow layer, white carpet, tall grass halves.
 const BLOCK_STATES: [u32; 24] = [
-    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759, 0,
-    0, 0, 0, 0,
+    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759,
+    2363, 8589, 14743, 14771, 14770,
 ];
 
 fn block_state_id(block_index: usize) -> u32 {
@@ -1284,5 +1285,14 @@ mod tests {
             !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
             "generation should continue while awaiting the client"
         );
+    }
+
+    #[test]
+    fn preview_block_state_ids_match_chunk_registry() {
+        assert_eq!(block_state_id(19), 2363); // ShortGrass
+        assert_eq!(block_state_id(20), 8589); // SnowLayer
+        assert_eq!(block_state_id(21), 14743); // Carpet
+        assert_eq!(block_state_id(22), 14771); // TallGrassLower
+        assert_eq!(block_state_id(23), 14770); // TallGrassUpper
     }
 }

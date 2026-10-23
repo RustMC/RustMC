@@ -810,3 +810,43 @@ fn survival_pass_is_bounded_and_stops_at_first_self_supporting_block_above() {
         ]
     );
 }
+
+#[test]
+fn atomic_double_plant_placement_and_rejection_when_blocked() {
+    let mut chunk = Chunk::empty(0, 0);
+
+    // Place Grass soil at (5, 10, 5)
+    chunk.set_and_update(5, 10, 5, Block::Grass).unwrap();
+
+    // 1. Placing TallGrassLower at (5, 11, 5) atomically places TallGrassUpper at (5, 12, 5)
+    let changes = chunk
+        .set_and_update(5, 11, 5, Block::TallGrassLower)
+        .unwrap();
+    assert_eq!(chunk.block(5, 11, 5), Some(Block::TallGrassLower));
+    assert_eq!(chunk.block(5, 12, 5), Some(Block::TallGrassUpper));
+    assert!(changes.contains(&CellChange {
+        x: 5,
+        y: 11,
+        z: 5,
+        block: Block::TallGrassLower,
+    }));
+    assert!(changes.contains(&CellChange {
+        x: 5,
+        y: 12,
+        z: 5,
+        block: Block::TallGrassUpper,
+    }));
+
+    // 2. Placing TallGrassLower when above block is occupied by solid block (Stone) is rejected
+    let mut blocked_chunk = Chunk::empty(0, 0);
+    blocked_chunk
+        .set_and_update(5, 10, 5, Block::Grass)
+        .unwrap();
+    blocked_chunk.set_block(5, 12, 5, Block::Stone);
+    assert!(
+        blocked_chunk
+            .set_and_update(5, 11, 5, Block::TallGrassLower)
+            .is_none()
+    );
+    assert_eq!(blocked_chunk.block(5, 11, 5), Some(Block::Air));
+}
