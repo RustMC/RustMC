@@ -1740,7 +1740,7 @@ fn place_spring(
             rocks += 1;
         }
     }
-    if rocks == rock_count && holes == hole_count {
+    if rocks >= rock_count && holes == hole_count {
         target.set_block(pos.x, pos.y, pos.z, state);
         1
     } else {
@@ -4380,8 +4380,32 @@ mod tests {
 
         let data = FeatureData::default();
         let mut random = DecorationRandom::new(999);
-        let written = data.run_chain(&mut target, &placed_spring, 0, origin, &mut random);
-        assert_eq!(written, 1);
+
+        // 2a. Successful placement with 5 rocks and 1 hole (natural cave pocket):
+        target.set_block(8, 64, 8, "minecraft:air");
+        target.set_block(8, 63, 8, "minecraft:stone"); // below: rock 1
+        target.set_block(8, 65, 8, "minecraft:stone"); // above: rock 2
+        target.set_block(8, 64, 7, "minecraft:stone"); // north: rock 3
+        target.set_block(8, 64, 9, "minecraft:stone"); // south: rock 4
+        target.set_block(9, 64, 8, "minecraft:stone"); // east: rock 5
+        target.set_block(7, 64, 8, "minecraft:air"); // west: hole 1 (opening into cave)
+
+        let written_5_rocks = data.run_chain(&mut target, &placed_spring, 0, origin, &mut random);
+        assert_eq!(
+            written_5_rocks, 1,
+            "5 rocks and 1 hole must successfully place spring"
+        );
+        assert_eq!(
+            target.block_at(8, 64, 8),
+            Some("minecraft:water[falling=true]")
+        );
+
+        // 2b. Successful placement with 4 rocks, 1 hole, and 1 non-rock/non-air block:
+        target.set_block(8, 64, 8, "minecraft:air");
+        target.set_block(8, 64, 9, "minecraft:granite"); // south: granite (rock 4)
+        target.set_block(9, 64, 8, "minecraft:obsidian"); // east: obsidian (neither rock nor hole)
+        let written_4_rocks = data.run_chain(&mut target, &placed_spring, 0, origin, &mut random);
+        assert_eq!(written_4_rocks, 1);
         assert_eq!(
             target.block_at(8, 64, 8),
             Some("minecraft:water[falling=true]")
