@@ -30,6 +30,87 @@ pub enum Block {
     RedSand,
     RedSandstone,
     Terracotta,
+    ShortGrass,
+    SnowLayer,
+    Carpet,
+    TallGrassLower,
+    TallGrassUpper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportRequirement {
+    None,
+    Soil,
+    TopSupport,
+    DoublePlantLower,
+    DoublePlantUpper,
+}
+
+impl SupportRequirement {
+    pub const fn is_self_supporting(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+impl Block {
+    pub const fn provides_top_support(self) -> bool {
+        !matches!(
+            self,
+            Self::Air
+                | Self::ShortGrass
+                | Self::SnowLayer
+                | Self::Carpet
+                | Self::TallGrassLower
+                | Self::TallGrassUpper
+        )
+    }
+
+    pub const fn is_soil(self) -> bool {
+        matches!(self, Self::Dirt | Self::Grass)
+    }
+
+    pub const fn support_requirement(self) -> SupportRequirement {
+        match self {
+            Self::ShortGrass => SupportRequirement::Soil,
+            Self::SnowLayer | Self::Carpet => SupportRequirement::TopSupport,
+            Self::TallGrassLower => SupportRequirement::DoublePlantLower,
+            Self::TallGrassUpper => SupportRequirement::DoublePlantUpper,
+            _ => SupportRequirement::None,
+        }
+    }
+
+    pub const fn can_survive_with(self, below: Option<Block>, above: Option<Block>) -> bool {
+        match self.support_requirement() {
+            SupportRequirement::None => true,
+            SupportRequirement::Soil => match below {
+                Some(b) => b.is_soil(),
+                None => false,
+            },
+            SupportRequirement::TopSupport => match below {
+                Some(b) => b.provides_top_support(),
+                None => false,
+            },
+            SupportRequirement::DoublePlantLower => match (below, above) {
+                (Some(b), Some(Self::TallGrassUpper)) => b.is_soil(),
+                _ => false,
+            },
+            SupportRequirement::DoublePlantUpper => matches!(below, Some(Self::TallGrassLower)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellChange {
+    pub x: usize,
+    pub y: usize,
+    pub z: usize,
+    pub block: Block,
+}
+
+impl CellChange {
+    pub const fn new(x: usize, y: usize, z: usize, block: Block) -> Self {
+        Self { x, y, z, block }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,12 +158,138 @@ pub struct Chunk {
     blocks: Vec<Block>,
 }
 impl Chunk {
+    pub fn empty(x: i32, z: i32) -> Self {
+        Self {
+            x,
+            z,
+            blocks: vec![Block::Air; CHUNK_SIDE * CHUNK_SIDE * WORLD_HEIGHT],
+        }
+    }
+
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: Block) {
+        if x < CHUNK_SIDE && y < WORLD_HEIGHT && z < CHUNK_SIDE {
+            self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x] = block;
+        }
+    }
+
     pub fn block(&self, x: usize, y: usize, z: usize) -> Option<Block> {
         if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
             return None;
         }
         Some(self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x])
     }
+
+    pub fn set_and_update(
+        &mut self,
+        x: usize,
+        y: usize,
+        z: usize,
+        block: Block,
+    ) -> Option<Vec<CellChange>> {
+        if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
+            return None;
+        }
+
+        // Gate placement support if placing dependent blocks.
+        let below = if y > 0 { self.block(x, y - 1, z) } else { None };
+        let above = if y + 1 < WORLD_HEIGHT {
+            self.block(x, y + 1, z)
+        } else {
+            None
+        };
+
+        match block.support_requirement() {
+            SupportRequirement::None => {}
+            SupportRequirement::Soil => {
+                if !below.is_some_and(|b| b.is_soil()) {
+                    return None;
+                }
+            }
+            SupportRequirement::TopSupport => {
+                if !below.is_some_and(|b| b.provides_top_support()) {
+                    return None;
+                }
+            }
+            SupportRequirement::DoublePlantLower => {
+                if !below.is_some_and(|b| b.is_soil())
+                    || y + 1 >= WORLD_HEIGHT
+                    || !matches!(above, Some(Block::Air) | Some(Block::TallGrassUpper))
+                {
+                    return None;
+                }
+            }
+            SupportRequirement::DoublePlantUpper => {
+                if below != Some(Block::TallGrassLower) {
+                    return None;
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+
+        // Primary write at (x, y, z).
+        let index = (y * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+        self.blocks[index] = block;
+        changes.push(CellChange { x, y, z, block });
+
+        // Atomic double plant placement: placing TallGrassLower atomically places TallGrassUpper at y + 1.
+        if block == Block::TallGrassLower && y + 1 < WORLD_HEIGHT {
+            let upper_index = ((y + 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            if self.blocks[upper_index] != Block::TallGrassUpper {
+                self.blocks[upper_index] = Block::TallGrassUpper;
+                changes.push(CellChange {
+                    x,
+                    y: y + 1,
+                    z,
+                    block: Block::TallGrassUpper,
+                });
+            }
+        }
+
+        // Step A: downward coupled-half check at y - 1 (breaks lower half if upper half broken).
+        if y > 0 {
+            let prev_y = y - 1;
+            let prev_index = (prev_y * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            if self.blocks[prev_index] == Block::TallGrassLower && block != Block::TallGrassUpper {
+                self.blocks[prev_index] = Block::Air;
+                changes.push(CellChange {
+                    x,
+                    y: prev_y,
+                    z,
+                    block: Block::Air,
+                });
+            }
+        }
+
+        // Step B: bounded upward pass (cy = y + 1 .. WORLD_HEIGHT), breaking unsupported dependent blocks until Air or a surviving block is hit.
+        for cy in (y + 1)..WORLD_HEIGHT {
+            let curr_index = (cy * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            let current = self.blocks[curr_index];
+            if current == Block::Air {
+                break;
+            }
+            let curr_below = Some(self.blocks[((cy - 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x]);
+            let curr_above = if cy + 1 < WORLD_HEIGHT {
+                Some(self.blocks[((cy + 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x])
+            } else {
+                None
+            };
+            if current.can_survive_with(curr_below, curr_above) {
+                break;
+            } else {
+                self.blocks[curr_index] = Block::Air;
+                changes.push(CellChange {
+                    x,
+                    y: cy,
+                    z,
+                    block: Block::Air,
+                });
+            }
+        }
+
+        Some(changes)
+    }
+
     fn set(&mut self, x: i64, y: i64, z: i64, block: Block) {
         if y < 0 || y >= WORLD_HEIGHT as i64 {
             return;
