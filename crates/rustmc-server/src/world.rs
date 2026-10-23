@@ -3,7 +3,8 @@
 pub mod entity_tracker;
 
 pub use entity_tracker::{
-    EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingEvent, chunk_coords,
+    EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingError, TrackingEvent,
+    chunk_coords, try_chunk_coords,
 };
 
 #[cfg(test)]
