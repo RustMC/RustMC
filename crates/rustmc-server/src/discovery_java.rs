@@ -423,7 +423,7 @@ impl Session {
                             preview.pending_keepalive = None;
                         }
                         30 => {
-                            if body.len() != 25 || !matches!(body[24], 0 | 1) {
+                            if body.len() != 25 || (body[24] & !0x03) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
@@ -435,7 +435,7 @@ impl Session {
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         31 => {
-                            if body.len() != 33 || !matches!(body[32], 0 | 1) {
+                            if body.len() != 33 || (body[32] & !0x03) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
@@ -449,7 +449,7 @@ impl Session {
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         32 => {
-                            if body.len() != 9 || !matches!(body[8], 0 | 1) {
+                            if body.len() != 9 || (body[8] & !0x03) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let yaw = f32::from_be_bytes(body[0..4].try_into().unwrap());
@@ -458,7 +458,12 @@ impl Session {
                                 return Err(Error::Malformed);
                             }
                         }
-                        33 | 40 | 43 => {
+                        33 => {
+                            if body.len() != 1 || (body[0] & !0x03) != 0 {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        40 | 43 => {
                             if body.len() != 1 || !matches!(body[0], 0 | 1) {
                                 return Err(Error::Malformed);
                             }
@@ -873,30 +878,57 @@ mod tests {
             Err(Error::Malformed)
         );
 
-        // 4. Invalid on_ground byte guards
-        assert_eq!(
-            enter_play_session().receive(&frame(30, &player_position(0.0, 64.0, 0.0, 2)), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(30, &player_position(0.0, 64.0, 0.0, 255)), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, 2)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(32, &player_rotation(0.0, 0.0, 2)), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(33, &[2]), 4096),
-            Err(Error::Malformed)
-        );
+        // 4. On-ground and horizontal-collision flag bit validation (0..=3 valid)
+        for flag in [0, 1, 2, 3] {
+            let mut s = enter_play_session();
+            s.receive(&frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0)), 4096)
+                .unwrap();
+            assert!(
+                s.receive(&frame(30, &player_position(0.0, 64.0, 0.0, flag)), 4096)
+                    .is_ok()
+            );
+            assert!(
+                s.receive(
+                    &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, flag)),
+                    4096
+                )
+                .is_ok()
+            );
+            assert!(
+                s.receive(&frame(32, &player_rotation(0.0, 0.0, flag)), 4096)
+                    .is_ok()
+            );
+            assert!(s.receive(&frame(33, &[flag]), 4096).is_ok());
+        }
+
+        // Invalid flags (> 3, unknown bits set) are rejected as malformed
+        for invalid_flag in [4, 5, 8, 255] {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(30, &player_position(0.0, 64.0, 0.0, invalid_flag)),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, invalid_flag)),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session()
+                    .receive(&frame(32, &player_rotation(0.0, 0.0, invalid_flag)), 4096),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session().receive(&frame(33, &[invalid_flag]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+
+        // Boolean-only packets (40, 43) reject any non-boolean byte (> 1)
         assert_eq!(
             enter_play_session().receive(&frame(40, &[2]), 4096),
             Err(Error::Malformed)
