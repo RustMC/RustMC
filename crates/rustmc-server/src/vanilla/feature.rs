@@ -440,12 +440,80 @@ pub struct PlacedFeature {
 }
 
 impl PlacedFeature {
+    /// Validates that total feature attempts and nesting depth stay bounded.
+    ///
+    /// Multiplies placement count modifiers by child configured-feature tries and
+    /// any nested placed feature attempts, ensuring total work per feature does not
+    /// exceed 4,096 and nesting depth does not exceed 2.
+    pub fn validate_attempt_budget(&self, depth: usize) -> Result<u32, WorldgenError> {
+        if depth > 2 {
+            return Err(WorldgenError::Invalid(format!(
+                "{}: random_patch nesting depth exceeds limit (maximum allowed depth is 2)",
+                self.id
+            )));
+        }
+
+        let modifier_budget = self
+            .modifiers
+            .iter()
+            .try_fold(1u32, |product, modifier| {
+                if let PlacementModifier::Count { count } = modifier {
+                    match count.range(0, 0) {
+                        Some((_, max)) => product.checked_mul(max.max(0) as u32),
+                        None => Some(product),
+                    }
+                } else {
+                    Some(product)
+                }
+            })
+            .ok_or_else(|| {
+                WorldgenError::Invalid(format!(
+                    "{}: count modifiers overflow attempt budget",
+                    self.id
+                ))
+            })?;
+
+        let child_budget = match self.feature.as_ref() {
+            ConfiguredFeature::RandomPatch {
+                tries,
+                feature: child,
+                ..
+            } => {
+                let child_attempts = child.validate_attempt_budget(depth + 1)?;
+                (*tries as u32).checked_mul(child_attempts).ok_or_else(|| {
+                    WorldgenError::Invalid(format!(
+                        "{}: random_patch tries overflow attempt budget",
+                        self.id
+                    ))
+                })?
+            }
+            _ => 1,
+        };
+
+        let total = modifier_budget.checked_mul(child_budget).ok_or_else(|| {
+            WorldgenError::Invalid(format!(
+                "{}: total feature attempts overflow budget",
+                self.id
+            ))
+        })?;
+
+        if total > 4096 {
+            return Err(WorldgenError::Invalid(format!(
+                "{}: total attempts ({total}) exceed the 4096-attempt placement budget",
+                self.id
+            )));
+        }
+
+        Ok(total)
+    }
+
     /// Whether every decoration and the configured feature itself can be
     /// modeled here. A false answer means this runtime places nothing for
     /// this feature; the feature still holds its ordinal in its step, so
     /// the numbers the other features are seeded with do not move.
     pub fn is_modelable(&self) -> bool {
         self.feature.is_supported()
+            && self.validate_attempt_budget(0).is_ok()
             && self.modifiers.iter().all(|modifier| match modifier {
                 PlacementModifier::Unsupported { .. } => false,
                 PlacementModifier::Count { count } => count.is_modelable(),
@@ -1019,19 +1087,23 @@ fn parse_inline_placed_feature(value: &Value) -> Result<PlacedFeature, WorldgenE
             Rc::new(parse_configured_feature(inner)?)
         };
         let modifiers = parse_modifiers_list(object.get("placement"), "inline_patch")?;
-        Ok(PlacedFeature {
+        let placed = PlacedFeature {
             id: "inline_patch".to_string(),
             feature,
             modifiers,
-        })
+        };
+        placed.validate_attempt_budget(0)?;
+        Ok(placed)
     } else {
         let feature = Rc::new(parse_configured_feature(value)?);
         let modifiers = parse_modifiers_list(object.get("placement"), "inline_patch")?;
-        Ok(PlacedFeature {
+        let placed = PlacedFeature {
             id: "inline_patch".to_string(),
             feature,
             modifiers,
-        })
+        };
+        placed.validate_attempt_budget(0)?;
+        Ok(placed)
     }
 }
 
@@ -1097,17 +1169,17 @@ pub(crate) fn parse_configured_feature(
             let tries = body
                 .get("tries")
                 .and_then(Value::as_i64)
-                .map(|v| (v as i32).clamp(1, 256))
+                .map(|v| v.clamp(1, 256) as i32)
                 .unwrap_or(96);
             let xz_spread = body
                 .get("xz_spread")
                 .and_then(Value::as_i64)
-                .map(|v| (v as i32).clamp(0, 32))
+                .map(|v| v.clamp(0, 32) as i32)
                 .unwrap_or(7);
             let y_spread = body
                 .get("y_spread")
                 .and_then(Value::as_i64)
-                .map(|v| (v as i32).clamp(0, 32))
+                .map(|v| v.clamp(0, 32) as i32)
                 .unwrap_or(3);
             let feature_val = body.get("feature").ok_or_else(|| {
                 WorldgenError::Invalid("random_patch feature missing".to_string())
@@ -1305,11 +1377,13 @@ pub(crate) fn parse_placed_feature(
         ))
     })?;
     let modifiers = parse_modifiers_list(document.get("placement"), id)?;
-    Ok(PlacedFeature {
+    let placed = PlacedFeature {
         id: id.to_string(),
         feature,
         modifiers,
-    })
+    };
+    placed.validate_attempt_budget(0)?;
+    Ok(placed)
 }
 
 fn parse_placement_modifier(
@@ -3779,6 +3853,120 @@ mod tests {
         assert_eq!(*tries, 256, "tries clamped to 256");
         assert_eq!(*xz_spread, 32, "xz_spread clamped to 32");
         assert_eq!(*y_spread, 0, "y_spread clamped to 0");
+
+        // Wraparound test: tries = 4294967297 (0x1_0000_0001) must clamp to 256, not wrap to 1
+        let wraparound_doc = json!({
+            "type": "minecraft:random_patch",
+            "tries": 4294967297_i64,
+            "feature": {
+                "type": "minecraft:flower",
+                "state": "minecraft:dandelion"
+            }
+        });
+        let wraparound_feature =
+            parse_configured_feature(&wraparound_doc).expect("parses large tries");
+        let ConfiguredFeature::RandomPatch { tries: w_tries, .. } = &wraparound_feature else {
+            panic!("expected RandomPatch");
+        };
+        assert_eq!(
+            *w_tries, 256,
+            "4294967297 must clamp to 256 without wraparound"
+        );
+    }
+
+    #[test]
+    fn test_random_patch_attempt_budget_and_nesting_limits() {
+        use std::rc::Rc;
+        let mut configured = HashMap::new();
+
+        // 1. Valid budget: count = 10, tries = 96 (total = 960 <= 4096)
+        let valid_patch = json!({
+            "type": "minecraft:random_patch",
+            "tries": 96,
+            "feature": {
+                "type": "minecraft:flower",
+                "state": "minecraft:poppy"
+            }
+        });
+        let cf_valid = Rc::new(parse_configured_feature(&valid_patch).unwrap());
+        configured.insert("valid_patch".to_string(), cf_valid);
+
+        let valid_placed_doc = json!({
+            "feature": "valid_patch",
+            "placement": [
+                {
+                    "type": "minecraft:count",
+                    "count": 10
+                }
+            ]
+        });
+        let placed_valid =
+            parse_placed_feature("test:valid", &valid_placed_doc, &configured).unwrap();
+        assert!(placed_valid.is_modelable());
+        assert_eq!(placed_valid.validate_attempt_budget(0).unwrap(), 960);
+
+        // 2. Excessive budget: count = 256, tries = 256 (total = 65,536 > 4096)
+        let huge_patch = json!({
+            "type": "minecraft:random_patch",
+            "tries": 256,
+            "feature": {
+                "type": "minecraft:flower",
+                "state": "minecraft:dandelion"
+            }
+        });
+        let cf_huge = Rc::new(parse_configured_feature(&huge_patch).unwrap());
+        configured.insert("huge_patch".to_string(), cf_huge);
+
+        let huge_placed_doc = json!({
+            "feature": "huge_patch",
+            "placement": [
+                {
+                    "type": "minecraft:count",
+                    "count": 256
+                }
+            ]
+        });
+        let err = parse_placed_feature("test:huge", &huge_placed_doc, &configured).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceed the 4096-attempt placement budget"),
+            "Error was: {err}"
+        );
+
+        // 3. Deep nesting exceeding depth limit (> 2)
+        let deep_nested_patch = json!({
+            "type": "minecraft:random_patch",
+            "tries": 2,
+            "feature": {
+                "feature": {
+                    "type": "minecraft:random_patch",
+                    "tries": 2,
+                    "feature": {
+                        "feature": {
+                            "type": "minecraft:random_patch",
+                            "tries": 2,
+                            "feature": {
+                                "feature": {
+                                    "type": "minecraft:random_patch",
+                                    "tries": 2,
+                                    "feature": {
+                                        "type": "minecraft:flower",
+                                        "state": "minecraft:poppy"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let err_nesting = parse_configured_feature(&deep_nested_patch).unwrap_err();
+        assert!(
+            err_nesting
+                .to_string()
+                .contains("nesting depth exceeds limit"),
+            "Error was: {err_nesting}"
+        );
     }
 
     #[test]
