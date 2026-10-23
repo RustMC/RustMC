@@ -1,9 +1,13 @@
 //! Minecraft Bedrock game packet batch framing (packet ID 0xFE).
 //!
 //! All Bedrock game packets are wrapped into batches. A batch packet begins with
-//! [`BATCH_PACKET_ID`] (0xFE), followed by a zlib-compressed stream containing
+//! [`BATCH_PACKET_ID`] (0xFE), followed by a compressed stream containing
 //! one or more length-prefixed game packets. Packet lengths are encoded as
 //! unsigned 32-bit variable-length integers (VarUint32 / VarInt).
+//!
+//! This module provides zlib-based batch framing, which is the canonical compression
+//! algorithm for Bedrock Edition batches before or alongside protocol negotiation
+//! (NetworkSettings packet 0x8F may negotiate Zlib, Snappy, or uncompressed batches).
 
 use std::io::{Read, Write};
 
@@ -29,6 +33,8 @@ pub enum BedrockFramingError {
     DecompressFailed(String),
     /// Decompressed batch payload exceeded [`MAX_DECOMPRESSED_BATCH_SIZE`].
     DecompressionBomb { size: usize, limit: usize },
+    /// Total uncompressed batch size to encode exceeded [`MAX_DECOMPRESSED_BATCH_SIZE`].
+    BatchTooLarge { size: usize, limit: usize },
     /// VarInt / VarUint byte sequence is malformed, truncated, or exceeds 32 bits.
     MalformedVarInt,
     /// Packet payload was shorter than the declared length prefix.
@@ -49,6 +55,10 @@ impl std::fmt::Display for BedrockFramingError {
             Self::DecompressionBomb { size, limit } => write!(
                 f,
                 "bedrock batch decompressed size {size} exceeds limit {limit}"
+            ),
+            Self::BatchTooLarge { size, limit } => write!(
+                f,
+                "bedrock batch uncompressed size {size} exceeds limit {limit}"
             ),
             Self::MalformedVarInt => write!(f, "malformed VarInt in bedrock batch"),
             Self::TruncatedPacket {
@@ -127,7 +137,23 @@ pub fn encode_batch(packets: &[&[u8]]) -> Result<Vec<u8>, BedrockFramingError> {
     let mut uncompressed = Vec::new();
     for packet in packets {
         let len = u32::try_from(packet.len()).map_err(|_| BedrockFramingError::MalformedVarInt)?;
-        write_varuint32(len, &mut uncompressed);
+        let mut varint_bytes = Vec::with_capacity(5);
+        write_varuint32(len, &mut varint_bytes);
+        let needed = uncompressed
+            .len()
+            .checked_add(varint_bytes.len())
+            .and_then(|l| l.checked_add(packet.len()))
+            .ok_or(BedrockFramingError::BatchTooLarge {
+                size: usize::MAX,
+                limit: MAX_DECOMPRESSED_BATCH_SIZE,
+            })?;
+        if needed > MAX_DECOMPRESSED_BATCH_SIZE {
+            return Err(BedrockFramingError::BatchTooLarge {
+                size: needed,
+                limit: MAX_DECOMPRESSED_BATCH_SIZE,
+            });
+        }
+        uncompressed.extend_from_slice(&varint_bytes);
         uncompressed.extend_from_slice(packet);
     }
 
@@ -436,5 +462,19 @@ mod tests {
             decode_batch(&corrupt).unwrap_err(),
             BedrockFramingError::DecompressFailed(_)
         ));
+    }
+
+    #[test]
+    fn test_encode_batch_too_large_rejection() {
+        // Single packet exceeding MAX_DECOMPRESSED_BATCH_SIZE
+        let huge_packet = vec![0xaa; MAX_DECOMPRESSED_BATCH_SIZE + 1];
+        let err = encode_batch(&[&huge_packet]).unwrap_err();
+        assert!(matches!(err, BedrockFramingError::BatchTooLarge { .. }));
+
+        // Multiple packets whose aggregate uncompressed size exceeds limit
+        let chunk1 = vec![0xbb; MAX_DECOMPRESSED_BATCH_SIZE / 2 + 10];
+        let chunk2 = vec![0xcc; MAX_DECOMPRESSED_BATCH_SIZE / 2 + 10];
+        let err = encode_batch(&[&chunk1, &chunk2]).unwrap_err();
+        assert!(matches!(err, BedrockFramingError::BatchTooLarge { .. }));
     }
 }
