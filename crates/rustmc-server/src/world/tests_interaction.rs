@@ -424,3 +424,18 @@ fn smoke_operator_save_layout_matches_the_chunk_coordinate_mapping() {
         );
     }
 }
+
+#[test]
+fn test_inventory_slot_bounds_and_held_selection() {
+    super::tests::test_inventory_slot_bounds_and_held_selection();
+}
+
+#[test]
+fn test_inventory_atomic_swap_and_count_conservation() {
+    super::tests::test_inventory_atomic_swap_and_count_conservation();
+}
+
+#[test]
+fn test_inventory_grant_and_consume_held() {
+    super::tests::test_inventory_grant_and_consume_held();
+}
