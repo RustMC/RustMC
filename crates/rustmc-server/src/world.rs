@@ -1,7 +1,15 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod fluid;
+
+#[cfg(test)]
+mod tests_fluid;
 #[cfg(test)]
 mod tests_interaction;
+
+pub use fluid::{
+    BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
+};
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
