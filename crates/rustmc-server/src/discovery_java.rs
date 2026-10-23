@@ -383,27 +383,26 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     if rest.is_empty() {
         return Err(Error::Malformed);
     }
+    let world_border_byte = rest[0];
+    if world_border_byte > 1 {
+        return Err(Error::Malformed);
+    }
+    let world_border_hit = world_border_byte == 1;
+    rest = &rest[1..];
 
-    // Modern 26.3 has `sequence: VarInt`.
-    // Alternatively, some protocol definitions include `world_border_hit: u8` before sequence.
-    let (world_border_hit, sequence) = if let Some((seq, seq_len)) = varint(rest)? {
-        if seq_len == rest.len() {
-            (false, seq)
-        } else if (rest[0] == 0 || rest[0] == 1) && rest.len() > 1 {
-            let hit = rest[0] == 1;
-            let Some((seq2, seq2_len)) = varint(&rest[1..])? else {
-                return Err(Error::Malformed);
-            };
-            if seq2_len != rest.len() - 1 {
-                return Err(Error::Malformed);
-            }
-            (hit, seq2)
-        } else {
-            return Err(Error::Malformed);
-        }
-    } else {
+    if rest.is_empty() {
+        return Err(Error::Malformed);
+    }
+
+    // Pinned Java 26.3 (1.21.2+) ServerboundUseItemOnPacket schema:
+    // hand: VarInt, pos: Position (i64), face: VarInt,
+    // cursor: 3x f32, inside_block: Boolean (u8), world_border_hit: Boolean (u8), sequence: VarInt
+    let Some((sequence, seq_len)) = varint(rest)? else {
         return Err(Error::Malformed);
     };
+    if seq_len != rest.len() {
+        return Err(Error::Malformed);
+    }
 
     Ok(UseItemOn {
         hand,
@@ -418,7 +417,7 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     })
 }
 
-/// Encodes a `UseItemOn` packet body.
+/// Encodes a `UseItemOn` packet body according to the pinned Java 26.3 specification.
 pub fn encode_use_item_on(action: &UseItemOn) -> Vec<u8> {
     let mut body = Vec::new();
     put_varint(action.hand, &mut body);
@@ -429,9 +428,7 @@ pub fn encode_use_item_on(action: &UseItemOn) -> Vec<u8> {
     body.extend_from_slice(&action.cursor_y.to_be_bytes());
     body.extend_from_slice(&action.cursor_z.to_be_bytes());
     body.push(if action.inside_block { 1 } else { 0 });
-    if action.world_border_hit {
-        body.push(1);
-    }
+    body.push(if action.world_border_hit { 1 } else { 0 });
     put_varint(action.sequence, &mut body);
     body
 }
@@ -451,24 +448,15 @@ pub fn acknowledge_block_change_packet(sequence: u32) -> Vec<u8> {
     packet
 }
 
-/// Decodes an `AcknowledgeBlockChange` packet (either framed or unframed) and returns sequence.
-pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
-    let input = if let Ok(Some((len, prefix))) = varint(bytes) {
-        if prefix + len as usize == bytes.len() {
-            &bytes[prefix..]
-        } else {
-            bytes
-        }
-    } else {
-        bytes
-    };
-    let Some((id, prefix)) = varint(input)? else {
+/// Decodes an unframed `AcknowledgeBlockChange` packet payload `[0x05, varint(sequence)]`.
+pub fn decode_acknowledge_block_change_packet(bytes: &[u8]) -> Result<u32, Error> {
+    let Some((id, prefix)) = varint(bytes)? else {
         return Err(Error::Malformed);
     };
     if id != 0x05 {
         return Err(Error::Malformed);
     }
-    let rest = &input[prefix..];
+    let rest = &bytes[prefix..];
     let Some((sequence, seq_len)) = varint(rest)? else {
         return Err(Error::Malformed);
     };
@@ -476,6 +464,17 @@ pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
         return Err(Error::Malformed);
     }
     Ok(sequence)
+}
+
+/// Decodes a framed `AcknowledgeBlockChange` packet: `[varint(length), 0x05, varint(sequence)]`.
+pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
+    let Some((len, prefix)) = varint(bytes)? else {
+        return Err(Error::Malformed);
+    };
+    if prefix + len as usize != bytes.len() {
+        return Err(Error::Malformed);
+    }
+    decode_acknowledge_block_change_packet(&bytes[prefix..])
 }
 
 pub struct Session {
@@ -1243,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_acknowledge_block_change_round_trip() {
-        let test_sequences = [0, 1, 42, 127, 128, 255, 1000, 65536, 1_000_000];
+        let test_sequences = [0, 1, 42, 127, 128, 255, 1000, 65536, 1_000_000, 1 << 28];
         for seq in test_sequences {
             // Test framed packet round-trip
             let framed = acknowledge_block_change(seq);
@@ -1254,9 +1253,25 @@ mod tests {
             let unframed = acknowledge_block_change_packet(seq);
             assert_eq!(unframed[0], 0x05, "packet ID must be 0x05");
             let decoded_unframed =
-                decode_acknowledge_block_change(&unframed).expect("decode unframed ack");
+                decode_acknowledge_block_change_packet(&unframed).expect("decode unframed ack");
             assert_eq!(decoded_unframed, seq);
         }
+
+        // Exact byte boundary verification for sequence = 1 << 28:
+        // unframed is [0x05, 0x80, 0x80, 0x80, 0x80, 0x01] (6 bytes total).
+        // decode_acknowledge_block_change must reject this unframed payload rather than
+        // misinterpreting 0x05 as frame length 5 and failing on packet ID.
+        let large_seq_unframed = acknowledge_block_change_packet(1 << 28);
+        assert_eq!(large_seq_unframed.len(), 6);
+        assert_eq!(large_seq_unframed[0], 0x05);
+        assert_eq!(
+            decode_acknowledge_block_change_packet(&large_seq_unframed).unwrap(),
+            1 << 28
+        );
+        assert_eq!(
+            decode_acknowledge_block_change(&large_seq_unframed),
+            Err(Error::Malformed)
+        );
 
         // Test exact byte encoding for known sequences
         assert_eq!(acknowledge_block_change_packet(0), vec![0x05, 0x00]);
@@ -1266,15 +1281,19 @@ mod tests {
         // Malformed AcknowledgeBlockChange
         assert_eq!(decode_acknowledge_block_change(&[]), Err(Error::Malformed));
         assert_eq!(
-            decode_acknowledge_block_change(&[0x04, 0x01]),
+            decode_acknowledge_block_change_packet(&[]),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            decode_acknowledge_block_change_packet(&[0x04, 0x01]),
             Err(Error::Malformed)
         ); // Wrong ID
         assert_eq!(
-            decode_acknowledge_block_change(&[0x05, 0x80]),
+            decode_acknowledge_block_change_packet(&[0x05, 0x80]),
             Err(Error::Malformed)
         ); // Truncated varint
         assert_eq!(
-            decode_acknowledge_block_change(&[0x05, 0x01, 0x99]),
+            decode_acknowledge_block_change_packet(&[0x05, 0x01, 0x99]),
             Err(Error::Malformed)
         ); // Trailing byte
     }
