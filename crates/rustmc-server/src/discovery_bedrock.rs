@@ -4,6 +4,8 @@
 //! and version compatibility. Connected frame sets (0x80..=0x8f) and subsequent
 //! game sessions are rejected at this offline boundary.
 
+use std::net::SocketAddr;
+
 pub const VERSION: &str = "1.26.51";
 pub const PROTOCOL: u32 = 2193;
 pub const RAKNET_PROTOCOL_VERSION: u8 = 11;
@@ -15,8 +17,36 @@ pub const MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
 
-/// Handle incoming UDP datagrams for Bedrock discovery and offline RakNet handshake.
-pub fn handle_datagram(input: &[u8], server_guid: u64, port: u16) -> Option<Vec<u8>> {
+/// Encodes a `SocketAddr` into RakNet system address wire representation.
+pub fn encode_system_address(addr: &SocketAddr) -> Vec<u8> {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let mut bytes = Vec::with_capacity(7);
+            bytes.push(4);
+            bytes.extend_from_slice(&v4.ip().octets());
+            bytes.extend_from_slice(&v4.port().to_be_bytes());
+            bytes
+        }
+        SocketAddr::V6(v6) => {
+            let mut bytes = Vec::with_capacity(29);
+            bytes.push(6);
+            bytes.extend_from_slice(&23u16.to_be_bytes()); // AF_INET6
+            bytes.extend_from_slice(&v6.port().to_be_bytes());
+            bytes.extend_from_slice(&v6.flowinfo().to_be_bytes());
+            bytes.extend_from_slice(&v6.ip().octets());
+            bytes.extend_from_slice(&v6.scope_id().to_be_bytes());
+            bytes
+        }
+    }
+}
+
+/// Handle incoming UDP datagrams for Bedrock discovery and offline RakNet handshake with peer address.
+pub fn handle_datagram_with_peer(
+    input: &[u8],
+    server_guid: u64,
+    port: u16,
+    peer: Option<SocketAddr>,
+) -> Option<Vec<u8>> {
     if input.is_empty() || input.len() > MAX_DATAGRAM {
         return None;
     }
@@ -95,12 +125,18 @@ pub fn handle_datagram(input: &[u8], server_guid: u64, port: u16) -> Option<Vec<
                 return None;
             }
 
+            // Client address in Reply 2 must be the peer's actual network address.
+            let encoded_client_addr = match peer {
+                Some(p) => encode_system_address(&p),
+                None => addr_slice.to_vec(),
+            };
+
             // Open Connection Reply 2 (0x08)
-            let mut out = Vec::with_capacity(1 + 16 + 8 + addr_slice.len() + 2 + 1);
+            let mut out = Vec::with_capacity(1 + 16 + 8 + encoded_client_addr.len() + 2 + 1);
             out.push(0x08);
             out.extend_from_slice(&MAGIC);
             out.extend_from_slice(&server_guid.to_be_bytes());
-            out.extend_from_slice(addr_slice);
+            out.extend_from_slice(&encoded_client_addr);
             out.extend_from_slice(&mtu.to_be_bytes());
             out.push(0x00); // encryption enabled = false
             Some(out)
@@ -111,6 +147,11 @@ pub fn handle_datagram(input: &[u8], server_guid: u64, port: u16) -> Option<Vec<
         }
         _ => None,
     }
+}
+
+/// Handle incoming UDP datagrams for Bedrock discovery and offline RakNet handshake.
+pub fn handle_datagram(input: &[u8], server_guid: u64, port: u16) -> Option<Vec<u8>> {
+    handle_datagram_with_peer(input, server_guid, port, None)
 }
 
 /// Backwards-compatible alias for [`handle_datagram`].
@@ -253,6 +294,17 @@ mod tests {
         assert_eq!(&reply_v6[25..54], &req_v6[17..46]);
         assert_eq!(&reply_v6[54..56], &1200u16.to_be_bytes());
         assert_eq!(reply_v6[56], 0x00);
+
+        // With explicit peer SocketAddr: Reply 2 encodes the peer's actual network address
+        let peer_v4: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+        let reply_peer_v4 = handle_datagram_with_peer(&req_v4, server_guid, 19132, Some(peer_v4))
+            .expect("reply 2 peer v4");
+        assert_eq!(reply_peer_v4[0], 0x08);
+        assert_eq!(
+            &reply_peer_v4[25..32],
+            &[4, 192, 168, 1, 50, (54321 >> 8) as u8, (54321 & 0xff) as u8],
+            "Reply 2 must encode the actual UDP client peer address"
+        );
     }
 
     #[test]

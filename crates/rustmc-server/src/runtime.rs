@@ -390,9 +390,12 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             let mut buffer = [0u8; discovery_bedrock::MAX_DATAGRAM + 1];
             match udp.recv_from(&mut buffer) {
                 Ok((length, peer)) => {
-                    if let Some(reply) =
-                        discovery_bedrock::pong(&buffer[..length], 0x525553544d43, address.port())
-                    {
+                    if let Some(reply) = discovery_bedrock::handle_datagram_with_peer(
+                        &buffer[..length],
+                        0x525553544d43,
+                        address.port(),
+                        Some(peer),
+                    ) {
                         let _ = udp.send_to(&reply, peer);
                     }
                 }
