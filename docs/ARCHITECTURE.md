@@ -28,7 +28,7 @@ A **Pulse** is a numbered logical tick with a proposed 50 ms budget when not ove
 - Migration needs ownership epoch and committed transfer point, with no lost/duplicate actions or changed entity IDs.
 - In-process native plugins do not guarantee fault isolation. Runtime and isolation are deferred.
 
-Reject or revise Pulse–Parcel if same-tick, partition-independent replay, migration, recovery, or realistic load evidence fails. See [ADR-0005](decisions/ADR-0005.md).
+Reject or revise Pulse–Parcel if same-tick, partition-independent replay, migration, recovery, or realistic load evidence fails. See [ADR-0005](decisions/ADR-0005.md) and the M6 evaluation slice in [M6-pulse-parcel-evaluation.md](milestones/M6-pulse-parcel-evaluation.md) implemented in `crates/rustmc-server/src/pulse_parcel.rs`.
 
 ## Readiness and capacity
 Future events are `process_started`, `listeners_bound`, `protocol_ready`, and `world_ready`/first playable join. A bound port proves no playable readiness. Recovery, authentication, spawn preparation, and enabled plugins must be ready before claiming world readiness. A generated immutable Boot Image is a candidate optimization only; compare against simple loading and measure generation, corruption, first-join, and first-chunk costs.
