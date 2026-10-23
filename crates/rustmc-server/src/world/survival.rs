@@ -68,21 +68,21 @@ pub const FALL_DAMAGE_DISTANCE_THRESHOLD: f32 = 3.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSurvival {
     /// Current health, clamped to `0.0..=20.0`.
-    pub health: f32,
+    health: f32,
     /// Current food level, clamped to `0..=20`.
-    pub food_level: u32,
-    /// Food saturation reserve, clamped to `0.0..=20.0`.
-    pub saturation: f32,
+    food_level: u32,
+    /// Food saturation reserve, clamped to `0.0..=food_level`.
+    saturation: f32,
     /// Exhaustion level towards the next food/saturation depletion, clamped to `0.0..=4.0`.
-    pub exhaustion: f32,
+    exhaustion: f32,
     /// Air supply in ticks, clamped to `-20..=300`.
-    pub air_supply: i32,
+    air_supply: i32,
     /// Distance accumulated during fall.
-    pub fall_distance: f32,
+    fall_distance: f32,
     /// Elapsed ticks suffocating inside a block.
-    pub suffocation_timer: u32,
+    suffocation_timer: u32,
     /// Elapsed ticks for food healing or starvation.
-    pub food_timer: u32,
+    food_timer: u32,
 }
 
 impl Default for PlayerSurvival {
@@ -106,11 +106,109 @@ impl PlayerSurvival {
         Self::default()
     }
 
+    /// Read-only accessor for current health.
+    pub fn health(&self) -> f32 {
+        self.health
+    }
+
+    /// Authoritatively sets current health, rejecting non-finite values and clamping to `0.0..=20.0`.
+    pub fn set_health(&mut self, health: f32) {
+        if health.is_finite() {
+            self.health = health.clamp(0.0, MAX_HEALTH);
+        }
+    }
+
+    /// Read-only accessor for current food level.
+    pub fn food_level(&self) -> u32 {
+        self.food_level
+    }
+
+    /// Authoritatively sets current food level, clamping to `0..=20` and constraining saturation.
+    pub fn set_food_level(&mut self, food_level: u32) {
+        self.food_level = food_level.min(MAX_FOOD_LEVEL);
+        self.saturation = self.saturation.min(self.food_level as f32);
+    }
+
+    /// Read-only accessor for saturation reserve.
+    pub fn saturation(&self) -> f32 {
+        self.saturation
+    }
+
+    /// Authoritatively sets saturation, rejecting non-finite values and clamping to `0.0..=food_level`.
+    pub fn set_saturation(&mut self, saturation: f32) {
+        if saturation.is_finite() {
+            self.saturation = saturation.clamp(0.0, self.food_level as f32);
+        }
+    }
+
+    /// Read-only accessor for exhaustion level.
+    pub fn exhaustion(&self) -> f32 {
+        self.exhaustion
+    }
+
+    /// Authoritatively sets exhaustion level, rejecting non-finite values and clamping to `0.0..=4.0`.
+    pub fn set_exhaustion(&mut self, exhaustion: f32) {
+        if exhaustion.is_finite() {
+            self.exhaustion = exhaustion.clamp(0.0, MAX_EXHAUSTION);
+        }
+    }
+
+    /// Read-only accessor for air supply in ticks.
+    pub fn air_supply(&self) -> i32 {
+        self.air_supply
+    }
+
+    /// Authoritatively sets air supply, clamping to `-20..=300`.
+    pub fn set_air_supply(&mut self, air_supply: i32) {
+        self.air_supply = air_supply.clamp(MIN_AIR_SUPPLY, MAX_AIR_SUPPLY);
+    }
+
+    /// Read-only accessor for accumulated fall distance.
+    pub fn fall_distance(&self) -> f32 {
+        self.fall_distance
+    }
+
+    /// Sets accumulated fall distance, ensuring non-negative values.
+    pub fn set_fall_distance(&mut self, fall_distance: f32) {
+        if fall_distance.is_finite() {
+            self.fall_distance = fall_distance.max(0.0);
+        }
+    }
+
+    /// Read-only accessor for suffocation timer ticks.
+    pub fn suffocation_timer(&self) -> u32 {
+        self.suffocation_timer
+    }
+
+    /// Read-only accessor for food timer ticks.
+    pub fn food_timer(&self) -> u32 {
+        self.food_timer
+    }
+
+    /// Builder method to configure initial health.
+    pub fn with_health(mut self, health: f32) -> Self {
+        self.set_health(health);
+        self
+    }
+
+    /// Builder method to configure initial food level and saturation.
+    pub fn with_food(mut self, food_level: u32, saturation: f32) -> Self {
+        self.set_food_level(food_level);
+        self.set_saturation(saturation);
+        self
+    }
+
+    /// Builder method to configure initial air supply.
+    pub fn with_air_supply(mut self, air_supply: i32) -> Self {
+        self.set_air_supply(air_supply);
+        self
+    }
+
     /// Enforces boundary clamping across all survival fields.
     pub fn clamp(&mut self) {
         self.health = self.health.clamp(0.0, MAX_HEALTH);
         self.food_level = self.food_level.min(MAX_FOOD_LEVEL);
-        self.saturation = self.saturation.clamp(0.0, MAX_SATURATION);
+        self.saturation = self.saturation.clamp(0.0, self.food_level as f32);
         self.exhaustion = self.exhaustion.clamp(0.0, MAX_EXHAUSTION);
         self.air_supply = self.air_supply.clamp(MIN_AIR_SUPPLY, MAX_AIR_SUPPLY);
         if self.fall_distance < 0.0 {
