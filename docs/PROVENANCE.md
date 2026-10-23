@@ -21,7 +21,7 @@ No game data, protocol fixtures, or generated assets are distributed in M0. Depe
 
 M2's checked-in test bytes are independently constructed protocol probes, not captured client assets. Java 26.3 status was observed in the owner's running client on 29 September 2026. Bedrock discovery text still needs real-client observation before compatibility is marked tested. No new Cargo dependency was added for M2 discovery; the existing locked license policy remains unchanged.
 
-The opt-in Java preview adds `uuid` 1.26.1 to assign a fresh connection-scoped v4 session ID without implementing custom randomness. Its `getrandom` 0.4.3 dependency obtains entropy from the operating system; `cfg-if` 1.0.5 and target-specific `r-efi` 6.0.0 are transitive support packages. Their locked metadata declares `Apache-2.0 OR MIT`, `MIT OR Apache-2.0`, `MIT OR Apache-2.0`, and `MIT OR Apache-2.0 OR LGPL-2.1-or-later` respectively, so an Apache-2.0 option is available for each. The policy gate checks exact declarations and requires review on change. This is a metadata review, not a binary-distribution notice audit or security audit.
+The opt-in Java preview uses `uuid` 1.28.0 (initially added at 1.26.1) to assign a fresh connection-scoped v4 session ID without implementing custom randomness. Its `getrandom` 0.4.3 dependency obtains entropy from the operating system; `cfg-if` 1.0.5 and target-specific `r-efi` 6.0.0 are transitive support packages. Their locked metadata declares `Apache-2.0 OR MIT`, `MIT OR Apache-2.0`, `MIT OR Apache-2.0`, and `MIT OR Apache-2.0 OR LGPL-2.1-or-later` respectively, so an Apache-2.0 option is available for each. The policy gate checks exact declarations and requires review on change. This is a metadata review, not a binary-distribution notice audit or security audit.
 
 ## License and locked Cargo dependency review
 
@@ -43,11 +43,11 @@ Dependencies retain their own license terms and attribution. Recheck this ledger
 
 ## M1 dependency addition
 
-`signal-hook 0.4.4` is a direct dependency used only to set an atomic shutdown flag on Unix SIGINT/SIGTERM. It avoids first-party unsafe signal handlers; the development runtime remains Linux-first. Its declared license is `MIT OR Apache-2.0`. The new locked transitive packages are `errno 0.3.14`, `libc 0.2.189`, `signal-hook-registry 1.4.8`, `windows-link 0.2.1`, and `windows-sys 0.61.2`; each declares `MIT OR Apache-2.0` in Cargo metadata. The Windows packages are target-specific transitive entries, not a claim of tested Windows support. At the 29 September 2026 review, `cargo info` identified 0.4.4 as the current published `signal-hook` release, and its [upstream repository](https://github.com/vorner/signal-hook) was not archived and showed an April 2026 push. This is a maintenance signal, not a guarantee of future support. The current declared licenses are compatible with RustMC's Apache-2.0 source policy; future binary packages must collect applicable third-party notices. The [CI license policy](../crates/rustmc-tools/src/bin/check_dependency_licenses.rs) fails on new or changed declarations until reviewed here.
+`signal-hook 0.4.5` is a direct dependency used only to set an atomic shutdown flag on Unix SIGINT/SIGTERM. It avoids first-party unsafe signal handlers; the development runtime remains Linux-first. Its declared license is `MIT OR Apache-2.0`. The new locked transitive packages are `errno 0.3.14`, `libc 0.2.189`, `signal-hook-registry 1.4.8`, `windows-link 0.2.1`, and `windows-sys 0.61.2`; each declares `MIT OR Apache-2.0` in Cargo metadata. The Windows packages are target-specific transitive entries, not a claim of tested Windows support. At the 29 September 2026 review, `cargo info` identified 0.4.4 as the current published `signal-hook` release, and its [upstream repository](https://github.com/vorner/signal-hook) was not archived and showed an April 2026 push. This is a maintenance signal, not a guarantee of future support. The current declared licenses are compatible with RustMC's Apache-2.0 source policy; future binary packages must collect applicable third-party notices. The [CI license policy](../crates/rustmc-tools/src/bin/check_dependency_licenses.rs) fails on new or changed declarations until reviewed here.
 
 ## Rust development utilities (29 September 2026)
 
-The `rustmc-tools` workspace package replaces the earlier developer Python scripts; it is never linked into the server binary. Its direct `serde_json 1.0.151` dependency parses Cargo metadata and official version/registry reports (`MIT OR Apache-2.0`). Locked transitive `itoa 1.0.18` (`MIT OR Apache-2.0`) and `zmij 1.0.23` (`MIT`) support JSON serialization. These declared licenses are compatible with RustMC's Apache-2.0 source policy; binary distribution still needs notice review. The local registry preparation tool calls the system `sha1sum` and `unzip` utilities for the owner-supplied official archive. It verifies the official archive hash and version, then writes identifier metadata only to a local path. The startup timing tool is warm-only; it does not make cold-cache claims.
+The `rustmc-tools` workspace package replaces the earlier developer Python scripts; it is never linked into the server binary. Its direct `serde_json 1.0.154` dependency parses Cargo metadata and official version/registry reports (`MIT OR Apache-2.0`). Locked transitive `itoa 1.0.18` (`MIT OR Apache-2.0`) and `zmij 1.0.23` (`MIT`) support JSON serialization. These declared licenses are compatible with RustMC's Apache-2.0 source policy; binary distribution still needs notice review. The local registry preparation tool calls the system `sha1sum` and `unzip` utilities for the owner-supplied official archive. It verifies the official archive hash and version, then writes identifier metadata only to a local path. The startup timing tool is warm-only; it does not make cold-cache claims.
 
 ## Vanilla oracle (T0, 30 September 2026)
 
@@ -1094,7 +1094,7 @@ denominators and residuals are recorded in the M3 Overworld milestone note.
 No competing server source was used for this observation.
 ## Operator-local preview packet cache (2 October 2026)
 
-`sha2 0.11.0` (RustCrypto, `MIT OR Apache-2.0`) hashes the preview cache's
+`sha2 0.11.1` (RustCrypto, `MIT OR Apache-2.0`) hashes the preview cache's
 operator-provisioned inputs and packet bytes for invalidation and corruption
 detection. It was first pinned at `0.10.9`, whose new locked transitive was
 `cpufeatures 0.2.17`; the 0.11 line raises that to `cpufeatures 0.3.1` and
@@ -1117,14 +1117,15 @@ feeding the same inputs through repeated `update` calls, because that is how
 the cache actually hashes a record.
 ## TOML 1.1 dependency review (2 October 2026)
 
-The configuration parser upgrade to `toml 1.1.6+spec-1.1.0` changes the
+The configuration parser upgrade to `toml 1.1.6+spec-1.1.0` (now pinned at
+`1.1.8+spec-1.1.0`) changes the
 whole-document entry point: RustMC now uses `toml::from_str` in its two TOML
 document readers. `toml::Value::from_str` in this release parses one value,
 which broke valid configuration and registry manifests until corrected.
 
-The updated lockfile contains `serde_spanned 1.1.1`, `toml_datetime
-1.1.1+spec-1.1.0`, `toml_parser 1.1.3+spec-1.1.0`, `toml_writer
-1.1.2+spec-1.1.0`, and `winnow 1.0.4`. Their declared licenses are `MIT OR
+The current lockfile contains `serde_spanned 1.1.2`, `toml_datetime
+1.1.2+spec-1.1.0`, `toml_parser 1.1.5+spec-1.1.0`, `toml_writer
+1.1.3+spec-1.1.0`, and `winnow 1.0.4`. Their declared licenses are `MIT OR
 Apache-2.0` except `winnow`, which declares `MIT`; each has a compatible
 option under RustMC's Apache-2.0 policy. `toml_edit` and `toml_write` leave
 the lockfile. The locked license gate checks these declarations, while a
