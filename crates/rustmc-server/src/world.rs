@@ -1,5 +1,13 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod entity_tracker;
+
+pub use entity_tracker::{
+    EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingEvent, chunk_coords,
+};
+
+#[cfg(test)]
+mod tests_entity_tracker;
 #[cfg(test)]
 mod tests_interaction;
 
