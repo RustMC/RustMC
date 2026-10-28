@@ -8,9 +8,18 @@ pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
 const TREE_REACH: i64 = 3;
 
+pub mod explosion;
+
+pub use explosion::{
+    AxisAlignedBB, BlockGrid, EntityImpact, Explosion, ExplosionDestructionMode, ExplosionWorld,
+    RAY_COUNT, RAY_POWER_DECAY_PER_STEP, RAY_STEP_DISTANCE, generate_ray_directions,
+    raycast_line_of_sight,
+};
+
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Block {
+    #[default]
     Air,
     Bedrock,
     Stone,
@@ -30,6 +39,32 @@ pub enum Block {
     RedSand,
     RedSandstone,
     Terracotta,
+    Obsidian,
+}
+
+impl Block {
+    /// Blast resistance value according to vanilla Minecraft data specifications.
+    pub const fn blast_resistance(self) -> f32 {
+        match self {
+            Self::Air => 0.0,
+            Self::Dirt => 0.5,
+            Self::Stone => 6.0,
+            Self::Obsidian => 1200.0,
+            Self::Bedrock => 3600000.0,
+            Self::Grass => 0.6,
+            Self::Log | Self::SpruceLog | Self::AcaciaLog | Self::JungleLog => 2.0,
+            Self::Leaves | Self::SpruceLeaves | Self::AcaciaLeaves | Self::JungleLeaves => 0.2,
+            Self::Sand | Self::RedSand => 0.5,
+            Self::Sandstone | Self::RedSandstone => 0.8,
+            Self::Snow => 0.2,
+            Self::Terracotta => 4.2,
+        }
+    }
+
+    /// Whether this block represents air.
+    pub const fn is_air(self) -> bool {
+        matches!(self, Self::Air)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
