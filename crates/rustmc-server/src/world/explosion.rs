@@ -548,27 +548,27 @@ impl Explosion {
         let start_z = aabb.min_z + margin_z;
         let end_z = aabb.max_z - margin_z;
 
-        for ix in 0..n {
+        for step_x in 0..n {
             let fx = if n == 1 {
                 0.5
             } else {
-                ix as f64 / (n - 1) as f64
+                step_x as f64 / (n - 1) as f64
             };
             let px = start_x + (end_x - start_x) * fx;
 
-            for iy in 0..n {
+            for step_y in 0..n {
                 let fy = if n == 1 {
                     0.5
                 } else {
-                    iy as f64 / (n - 1) as f64
+                    step_y as f64 / (n - 1) as f64
                 };
                 let py = start_y + (end_y - start_y) * fy;
 
-                for iz in 0..n {
+                for step_z in 0..n {
                     let fz = if n == 1 {
                         0.5
                     } else {
-                        iz as f64 / (n - 1) as f64
+                        step_z as f64 / (n - 1) as f64
                     };
                     let pz = start_z + (end_z - start_z) * fz;
 
