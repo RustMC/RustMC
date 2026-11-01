@@ -27,7 +27,7 @@ pub enum Error {
     WrongState,
 }
 
-fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
+pub(crate) fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
     let mut value = 0u32;
     for (i, byte) in input.iter().take(5).enumerate() {
         if i == 4 && byte & 0xf0 != 0 {
