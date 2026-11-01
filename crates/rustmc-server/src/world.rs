@@ -3,6 +3,16 @@
 #[cfg(test)]
 mod tests_interaction;
 
+pub mod events;
+pub use events::{
+    AcknowledgeBlockChangePacket, BlockBreakEvent, BlockBreakOutcome, BlockFace, BlockPlaceEvent,
+    BlockPlaceOutcome, BlockPos, BlockUpdatePacket, BreakRollback, Cancellable,
+    ContainerSetSlotPacket, Direction, Event, EventBus, EventPriority, InteractAction,
+    InteractionHand, ItemStack, PlaceRollback, PlayerInteractEvent, apply_block_break,
+    apply_block_place, rollback_break, rollback_break_explicit, rollback_break_with_ack,
+    rollback_place, rollback_place_explicit, rollback_place_with_ack,
+};
+
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
@@ -30,6 +40,33 @@ pub enum Block {
     RedSand,
     RedSandstone,
     Terracotta,
+}
+
+impl Block {
+    /// Protocol-777 default block state ID for Java 26.3 preview.
+    pub const fn default_state_id(self) -> u32 {
+        match self {
+            Self::Air => 0,
+            Self::Bedrock => 88,
+            Self::Stone => 1,
+            Self::Dirt => 10,
+            Self::Grass => 9,
+            Self::Log => 140,
+            Self::Leaves => 294,
+            Self::Sand => 121,
+            Self::Sandstone => 677,
+            Self::Snow => 8598,
+            Self::SpruceLog => 143,
+            Self::SpruceLeaves => 322,
+            Self::AcaciaLog => 152,
+            Self::AcaciaLeaves => 406,
+            Self::JungleLog => 149,
+            Self::JungleLeaves => 378,
+            Self::RedSand => 126,
+            Self::RedSandstone => 15094,
+            Self::Terracotta => 14759,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +139,31 @@ impl Chunk {
             return;
         }
         self.blocks[index] = block;
+    }
+
+    /// Sets a block at chunk-local coordinates `(x, y, z)`.
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: Block) -> bool {
+        if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
+            return false;
+        }
+        self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x] = block;
+        true
+    }
+
+    /// Authoritatively sets a block at global world coordinates `(x, y, z)` if inside this chunk.
+    pub fn set_world_block(&mut self, x: i64, y: i64, z: i64, block: Block) -> bool {
+        if y < 0 || y >= WORLD_HEIGHT as i64 {
+            return false;
+        }
+        let local_x = x - i64::from(self.x) * CHUNK_SIDE as i64;
+        let local_z = z - i64::from(self.z) * CHUNK_SIDE as i64;
+        if !(0..CHUNK_SIDE as i64).contains(&local_x) || !(0..CHUNK_SIDE as i64).contains(&local_z)
+        {
+            return false;
+        }
+        let index = (y as usize * CHUNK_SIDE + local_z as usize) * CHUNK_SIDE + local_x as usize;
+        self.blocks[index] = block;
+        true
     }
 }
 
