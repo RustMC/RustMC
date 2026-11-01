@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod tests_interaction;
 
+pub mod anvil;
+
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
