@@ -9,6 +9,9 @@ use std::fmt;
 /// Maximum allowable grid dimension (width or height) to prevent unbounded memory allocation.
 pub const MAX_GRID_DIMENSION: usize = 16;
 
+/// Maximum allowable total slots in a recipe grid.
+pub const MAX_GRID_SLOTS: usize = MAX_GRID_DIMENSION * MAX_GRID_DIMENSION;
+
 /// Standard vanilla items and their known crafting remainders.
 ///
 /// Under documented Minecraft crafting rules, consuming these items leaves behind
@@ -499,6 +502,8 @@ pub struct ShapedRecipe {
 
 impl ShapedRecipe {
     /// Constructs a new shaped recipe with explicit dimensions and ingredients.
+    ///
+    /// Normalizes recipe borders by trimming empty leading/trailing rows and columns.
     pub fn new(
         width: usize,
         height: usize,
@@ -521,11 +526,37 @@ impl ShapedRecipe {
             return Err(CraftingError::EmptyRecipeIngredients);
         }
 
+        // Normalize recipe borders: trim leading/trailing empty rows and columns
+        let mut min_r = height;
+        let mut max_r = 0;
+        let mut min_c = width;
+        let mut max_c = 0;
+
+        for r in 0..height {
+            for c in 0..width {
+                if ingredients[r * width + c].is_some() {
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r);
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c);
+                }
+            }
+        }
+
+        let trimmed_width = max_c - min_c + 1;
+        let trimmed_height = max_r - min_r + 1;
+        let mut trimmed_ingredients = Vec::with_capacity(trimmed_width * trimmed_height);
+        for r in min_r..=max_r {
+            for c in min_c..=max_c {
+                trimmed_ingredients.push(ingredients[r * width + c].clone());
+            }
+        }
+
         Ok(Self {
             id: None,
-            width,
-            height,
-            ingredients,
+            width: trimmed_width,
+            height: trimmed_height,
+            ingredients: trimmed_ingredients,
             result,
             allow_mirroring: true,
         })
@@ -544,11 +575,17 @@ impl ShapedRecipe {
         }
         let height = pattern.len();
         let width = pattern[0].chars().count();
-        if width == 0 {
-            return Err(CraftingError::EmptyRecipePattern);
+        if width == 0 || width > MAX_GRID_DIMENSION || height > MAX_GRID_DIMENSION {
+            return Err(CraftingError::InvalidDimensions { width, height });
+        }
+        let total = width
+            .checked_mul(height)
+            .ok_or(CraftingError::InvalidDimensions { width, height })?;
+        if total > MAX_GRID_SLOTS {
+            return Err(CraftingError::InvalidDimensions { width, height });
         }
 
-        let mut ingredients = Vec::with_capacity(width * height);
+        let mut ingredients = Vec::with_capacity(total);
         for row in pattern {
             let row_len = row.chars().count();
             if row_len != width {
@@ -745,11 +782,26 @@ impl ShapelessRecipe {
     /// Matches this shapeless recipe against a crafting grid.
     ///
     /// Requires that non-empty slots in the grid match the exact multiset of ingredients.
+    /// Uses O(N log N) sorted multiset comparison when all ingredients are discrete items,
+    /// falling back to bipartite matching for multi-variant ingredients.
     #[must_use]
     pub fn matches(&self, grid: &CraftingGrid) -> bool {
         let non_empty = grid.non_empty_items();
         if non_empty.len() != self.ingredients.len() {
             return false;
+        }
+
+        // Fast path: if all ingredients have single exact item matches, multiset comparison is exact and O(N log N)
+        if self.ingredients.iter().all(|ing| ing.allowed.len() == 1) {
+            let mut expected: Vec<&str> = self
+                .ingredients
+                .iter()
+                .map(|ing| ing.allowed[0].as_str())
+                .collect();
+            let mut actual: Vec<&str> = non_empty.iter().map(|item| item.item()).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            return expected == actual;
         }
 
         let mut used = vec![false; non_empty.len()];
