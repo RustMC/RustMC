@@ -1,5 +1,12 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod crafting;
+
+pub use crafting::{
+    CraftResult, CraftingError, CraftingGrid, GridBoundingBox, Ingredient, ItemStack, Recipe,
+    RecipeRegistry, ShapedRecipe, ShapelessRecipe, default_remainder,
+};
+
 #[cfg(test)]
 mod tests_interaction;
 
