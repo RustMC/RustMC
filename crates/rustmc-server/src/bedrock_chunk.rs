@@ -60,6 +60,10 @@ pub enum BedrockChunkError {
     IndexOutOfBounds(usize),
     /// Local coordinates within subchunk were out of bounds (0..16).
     CoordinatesOutOfBounds { x: usize, y: usize, z: usize },
+    /// Biome cell count was invalid (expected 64 coarse cells or 4,096 subchunk blocks).
+    InvalidBiomeCellCount(usize),
+    /// NBT palette data was malformed or corrupted.
+    MalformedNbtPalette,
 }
 
 impl fmt::Display for BedrockChunkError {
@@ -119,6 +123,11 @@ impl fmt::Display for BedrockChunkError {
                 f,
                 "local block coordinates ({x}, {y}, {z}) out of bounds (0..16)"
             ),
+            Self::InvalidBiomeCellCount(count) => write!(
+                f,
+                "invalid biome cell count {count}: expected 64 or {BLOCKS_PER_SUBCHUNK}"
+            ),
+            Self::MalformedNbtPalette => write!(f, "malformed NBT palette in subchunk storage"),
         }
     }
 }
@@ -455,7 +464,273 @@ impl BlockStorage {
         }
         Ok(())
     }
+}
 
+fn scan_nbt_compound_le(bytes: &[u8], offset: &mut usize) -> Result<(), BedrockChunkError> {
+    if *offset >= bytes.len() {
+        return Err(BedrockChunkError::TruncatedPacket {
+            expected: *offset + 1,
+            available: bytes.len(),
+        });
+    }
+    let tag_type = bytes[*offset];
+    *offset += 1;
+    if tag_type != 10 {
+        return Err(BedrockChunkError::MalformedNbtPalette);
+    }
+    if *offset + 2 > bytes.len() {
+        return Err(BedrockChunkError::TruncatedPacket {
+            expected: *offset + 2,
+            available: bytes.len(),
+        });
+    }
+    let name_len = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]) as usize;
+    *offset += 2;
+    if *offset + name_len > bytes.len() {
+        return Err(BedrockChunkError::TruncatedPacket {
+            expected: *offset + name_len,
+            available: bytes.len(),
+        });
+    }
+    *offset += name_len;
+    scan_compound_payload_le(bytes, offset, 0)
+}
+
+fn scan_compound_payload_le(
+    bytes: &[u8],
+    offset: &mut usize,
+    depth: usize,
+) -> Result<(), BedrockChunkError> {
+    if depth > 128 {
+        return Err(BedrockChunkError::MalformedNbtPalette);
+    }
+    loop {
+        if *offset >= bytes.len() {
+            return Err(BedrockChunkError::TruncatedPacket {
+                expected: *offset + 1,
+                available: bytes.len(),
+            });
+        }
+        let tag_id = bytes[*offset];
+        *offset += 1;
+        if tag_id == 0 {
+            break;
+        }
+        if *offset + 2 > bytes.len() {
+            return Err(BedrockChunkError::TruncatedPacket {
+                expected: *offset + 2,
+                available: bytes.len(),
+            });
+        }
+        let name_len = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]) as usize;
+        *offset += 2;
+        if *offset + name_len > bytes.len() {
+            return Err(BedrockChunkError::TruncatedPacket {
+                expected: *offset + name_len,
+                available: bytes.len(),
+            });
+        }
+        *offset += name_len;
+        skip_nbt_tag_payload_le(tag_id, bytes, offset, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn skip_nbt_tag_payload_le(
+    tag_id: u8,
+    bytes: &[u8],
+    offset: &mut usize,
+    depth: usize,
+) -> Result<(), BedrockChunkError> {
+    match tag_id {
+        1 => {
+            if *offset >= bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 1,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 1;
+        }
+        2 => {
+            if *offset + 2 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 2,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 2;
+        }
+        3 => {
+            if *offset + 4 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 4,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 4;
+        }
+        4 => {
+            if *offset + 8 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 8,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 8;
+        }
+        5 => {
+            if *offset + 4 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 4,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 4;
+        }
+        6 => {
+            if *offset + 8 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 8,
+                    available: bytes.len(),
+                });
+            }
+            *offset += 8;
+        }
+        7 => {
+            if *offset + 4 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 4,
+                    available: bytes.len(),
+                });
+            }
+            let len = i32::from_le_bytes([
+                bytes[*offset],
+                bytes[*offset + 1],
+                bytes[*offset + 2],
+                bytes[*offset + 3],
+            ]);
+            *offset += 4;
+            if len < 0 {
+                return Err(BedrockChunkError::MalformedNbtPalette);
+            }
+            let len = len as usize;
+            if *offset + len > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + len,
+                    available: bytes.len(),
+                });
+            }
+            *offset += len;
+        }
+        8 => {
+            if *offset + 2 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 2,
+                    available: bytes.len(),
+                });
+            }
+            let len = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]) as usize;
+            *offset += 2;
+            if *offset + len > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + len,
+                    available: bytes.len(),
+                });
+            }
+            *offset += len;
+        }
+        9 => {
+            if *offset + 5 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 5,
+                    available: bytes.len(),
+                });
+            }
+            let elem_type = bytes[*offset];
+            *offset += 1;
+            let count = i32::from_le_bytes([
+                bytes[*offset],
+                bytes[*offset + 1],
+                bytes[*offset + 2],
+                bytes[*offset + 3],
+            ]);
+            *offset += 4;
+            if count <= 0 {
+                return Ok(());
+            }
+            if elem_type == 0 {
+                return Err(BedrockChunkError::MalformedNbtPalette);
+            }
+            for _ in 0..count {
+                skip_nbt_tag_payload_le(elem_type, bytes, offset, depth + 1)?;
+            }
+        }
+        10 => {
+            scan_compound_payload_le(bytes, offset, depth + 1)?;
+        }
+        11 => {
+            if *offset + 4 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 4,
+                    available: bytes.len(),
+                });
+            }
+            let count = i32::from_le_bytes([
+                bytes[*offset],
+                bytes[*offset + 1],
+                bytes[*offset + 2],
+                bytes[*offset + 3],
+            ]);
+            *offset += 4;
+            if count < 0 {
+                return Err(BedrockChunkError::MalformedNbtPalette);
+            }
+            let bytes_len = (count as usize)
+                .checked_mul(4)
+                .ok_or(BedrockChunkError::MalformedNbtPalette)?;
+            if *offset + bytes_len > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + bytes_len,
+                    available: bytes.len(),
+                });
+            }
+            *offset += bytes_len;
+        }
+        12 => {
+            if *offset + 4 > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + 4,
+                    available: bytes.len(),
+                });
+            }
+            let count = i32::from_le_bytes([
+                bytes[*offset],
+                bytes[*offset + 1],
+                bytes[*offset + 2],
+                bytes[*offset + 3],
+            ]);
+            *offset += 4;
+            if count < 0 {
+                return Err(BedrockChunkError::MalformedNbtPalette);
+            }
+            let bytes_len = (count as usize)
+                .checked_mul(8)
+                .ok_or(BedrockChunkError::MalformedNbtPalette)?;
+            if *offset + bytes_len > bytes.len() {
+                return Err(BedrockChunkError::TruncatedPacket {
+                    expected: *offset + bytes_len,
+                    available: bytes.len(),
+                });
+            }
+            *offset += bytes_len;
+        }
+        _ => return Err(BedrockChunkError::MalformedNbtPalette),
+    }
+    Ok(())
+}
+
+impl BlockStorage {
     /// Deserializes a storage layer from bytes, returning the layer and bytes consumed.
     pub fn deserialize(bytes: &[u8]) -> Result<(Self, usize), BedrockChunkError> {
         if bytes.is_empty() {
@@ -526,9 +801,9 @@ impl BlockStorage {
             }
             let mut entries = Vec::with_capacity(palette_count);
             for _ in 0..palette_count {
-                // In NBT format, each entry is an NBT compound. For safety and isolation,
-                // we preserve raw bytes when decoding.
-                entries.push(Vec::new());
+                let start = offset;
+                scan_nbt_compound_le(bytes, &mut offset)?;
+                entries.push(bytes[start..offset].to_vec());
             }
             BlockPalette::Nbt(entries)
         };
@@ -694,6 +969,9 @@ impl BiomeStorage {
     }
 
     /// Creates a paletted 3D biome storage from cell indices and a palette of biome IDs.
+    ///
+    /// Accepts either a full 4,096-block subchunk grid or a coarse 4x4x4 (64-cell) grid,
+    /// which will be expanded to the full 4,096 blocks (covering 4x4x4 blocks per biome cell).
     pub fn from_indices(indices: &[u16], palette: Vec<i32>) -> Result<Self, BedrockChunkError> {
         if palette.is_empty() {
             return Err(BedrockChunkError::EmptyPalette);
@@ -701,9 +979,30 @@ impl BiomeStorage {
         if palette.len() == 1 {
             return Ok(Self::Single(palette[0]));
         }
+        let full_indices: Vec<u16> = match indices.len() {
+            BLOCKS_PER_SUBCHUNK => indices.to_vec(),
+            64 => {
+                let mut expanded = vec![0u16; BLOCKS_PER_SUBCHUNK];
+                for x in 0..16 {
+                    let qx = x / 4;
+                    for z in 0..16 {
+                        let qz = z / 4;
+                        for y in 0..16 {
+                            let qy = y / 4;
+                            let quart_idx = (qx << 4) | (qz << 2) | qy;
+                            let block_idx = (x << 8) | (z << 4) | y;
+                            expanded[block_idx] = indices[quart_idx];
+                        }
+                    }
+                }
+                expanded
+            }
+            other => return Err(BedrockChunkError::InvalidBiomeCellCount(other)),
+        };
+
         let bpb = select_bits_per_block(palette.len())?;
         let bpw = blocks_per_word(bpb)?;
-        let total_words = indices.len().div_ceil(bpw);
+        let total_words = BLOCKS_PER_SUBCHUNK.div_ceil(bpw);
         let mut words = vec![0u32; total_words];
         let mask = (1u32 << bpb) - 1;
         let bpb_usize = usize::from(bpb);
@@ -712,10 +1011,10 @@ impl BiomeStorage {
             let mut current_word = 0u32;
             for slot in 0..bpw {
                 let cell_idx = w_idx * bpw + slot;
-                if cell_idx >= indices.len() {
+                if cell_idx >= full_indices.len() {
                     break;
                 }
-                let val = u32::from(indices[cell_idx]);
+                let val = u32::from(full_indices[cell_idx]);
                 if val > mask {
                     return Err(BedrockChunkError::IndexExceedsBitsPerBlock {
                         index: val,
@@ -760,11 +1059,8 @@ impl BiomeStorage {
         Ok(())
     }
 
-    /// Deserializes a biome storage entry from wire bytes.
-    pub fn deserialize(
-        bytes: &[u8],
-        cell_count: usize,
-    ) -> Result<(Self, usize), BedrockChunkError> {
+    /// Deserializes a biome storage entry from wire bytes covering all 4,096 blocks of a subchunk.
+    pub fn deserialize(bytes: &[u8]) -> Result<(Self, usize), BedrockChunkError> {
         if bytes.is_empty() {
             return Err(BedrockChunkError::TruncatedPacket {
                 expected: 1,
@@ -777,6 +1073,7 @@ impl BiomeStorage {
             let (biome_id, len) = read_varint32(&bytes[1..])?;
             Ok((Self::Single(biome_id), 1 + len))
         } else {
+            let cell_count = BLOCKS_PER_SUBCHUNK;
             let bpw = blocks_per_word(bits_per_biome)?;
             let total_words = cell_count.div_ceil(bpw);
             let words_bytes = total_words * 4;
@@ -884,10 +1181,14 @@ pub struct LevelChunkPacket {
     pub chunk_x: i32,
     /// Chunk Z grid coordinate (zigzag signed VarInt32 on wire).
     pub chunk_z: i32,
+    /// Dimension ID (0 = Overworld, 1 = Nether, 2 = The End; zigzag signed VarInt32 on wire).
+    pub dimension_id: i32,
     /// Number of subchunks enclosed (standard 24 for Overworld).
     pub subchunk_count: u32,
-    /// Whether client blob caching is enabled (set false for direct payload).
+    /// Whether client blob caching is enabled.
     pub cache_enabled: bool,
+    /// Blob hashes when caching is enabled (each 64-bit LE hash).
+    pub blob_hashes: Vec<u64>,
     /// Serialized chunk subchunks, biomes, and tile entities payload.
     pub data: Vec<u8>,
 }
@@ -900,8 +1201,10 @@ impl LevelChunkPacket {
     pub fn new(
         chunk_x: i32,
         chunk_z: i32,
+        dimension_id: i32,
         subchunk_count: u32,
         cache_enabled: bool,
+        blob_hashes: Vec<u64>,
         data: Vec<u8>,
     ) -> Result<Self, BedrockChunkError> {
         if subchunk_count > MAX_SUBCHUNKS {
@@ -916,21 +1219,42 @@ impl LevelChunkPacket {
         Ok(Self {
             chunk_x,
             chunk_z,
+            dimension_id,
             subchunk_count,
             cache_enabled,
+            blob_hashes,
             data,
         })
+    }
+
+    /// Convenience constructor for Overworld non-cached chunks.
+    pub fn overworld(
+        chunk_x: i32,
+        chunk_z: i32,
+        subchunk_count: u32,
+        data: Vec<u8>,
+    ) -> Result<Self, BedrockChunkError> {
+        Self::new(chunk_x, chunk_z, 0, subchunk_count, false, Vec::new(), data)
     }
 
     /// Convenience constructor creating a direct `LevelChunkPacket` from subchunks and biomes.
     pub fn from_subchunks(
         chunk_x: i32,
         chunk_z: i32,
+        dimension_id: i32,
         subchunks: &[SubChunk],
         biomes: &[BiomeStorage],
     ) -> Result<Self, BedrockChunkError> {
         let payload = encode_chunk_payload(subchunks, biomes)?;
-        Self::new(chunk_x, chunk_z, subchunks.len() as u32, false, payload)
+        Self::new(
+            chunk_x,
+            chunk_z,
+            dimension_id,
+            subchunks.len() as u32,
+            false,
+            Vec::new(),
+            payload,
+        )
     }
 
     /// Encodes this packet into Bedrock wire bytes prefixed with packet ID `0x3A`.
@@ -956,13 +1280,24 @@ impl LevelChunkPacket {
         // 3. Chunk Z (zigzag VarInt32)
         write_varint32(self.chunk_z, &mut out);
 
-        // 4. SubChunk count (Unsigned VarInt)
+        // 4. Dimension ID (zigzag VarInt32)
+        write_varint32(self.dimension_id, &mut out);
+
+        // 5. SubChunk count (Unsigned VarInt)
         write_varuint32(self.subchunk_count, &mut out);
 
-        // 5. Cache enabled (bool)
+        // 6. Cache enabled (bool)
         out.push(if self.cache_enabled { 1 } else { 0 });
 
-        // 6. Data payload (prefixed with unsigned VarInt32 byte length)
+        // If caching is enabled, write blob hashes
+        if self.cache_enabled {
+            write_varuint32(self.blob_hashes.len() as u32, &mut out);
+            for &hash in &self.blob_hashes {
+                out.extend_from_slice(&hash.to_le_bytes());
+            }
+        }
+
+        // 7. Data payload (prefixed with unsigned VarInt32 byte length)
         write_varuint32(self.data.len() as u32, &mut out);
         out.extend_from_slice(&self.data);
 
@@ -988,14 +1323,18 @@ impl LevelChunkPacket {
         let (chunk_z, len) = read_varint32(&bytes[offset..])?;
         offset += len;
 
-        // 4. SubChunk count
+        // 4. Dimension ID
+        let (dimension_id, len) = read_varint32(&bytes[offset..])?;
+        offset += len;
+
+        // 5. SubChunk count
         let (subchunk_count, len) = read_varuint32(&bytes[offset..])?;
         offset += len;
         if subchunk_count > MAX_SUBCHUNKS {
             return Err(BedrockChunkError::InvalidSubChunkCount(subchunk_count));
         }
 
-        // 5. Cache enabled
+        // 6. Cache enabled
         if offset >= bytes.len() {
             return Err(BedrockChunkError::TruncatedPacket {
                 expected: offset + 1,
@@ -1005,6 +1344,7 @@ impl LevelChunkPacket {
         let cache_enabled = bytes[offset] != 0;
         offset += 1;
 
+        let mut blob_hashes = Vec::new();
         if cache_enabled {
             let (blob_count, len) = read_varuint32(&bytes[offset..])?;
             offset += len;
@@ -1021,10 +1361,14 @@ impl LevelChunkPacket {
                     available: bytes.len(),
                 });
             }
+            blob_hashes.reserve(blob_count as usize);
+            for chunk in bytes[offset..offset + blob_bytes].as_chunks::<8>().0 {
+                blob_hashes.push(u64::from_le_bytes(*chunk));
+            }
             offset += blob_bytes;
         }
 
-        // 6. Data payload
+        // 7. Data payload
         let (data_len, len) = read_varuint32(&bytes[offset..])?;
         offset += len;
         let data_len = data_len as usize;
@@ -1045,8 +1389,10 @@ impl LevelChunkPacket {
         Ok(Self {
             chunk_x,
             chunk_z,
+            dimension_id,
             subchunk_count,
             cache_enabled,
+            blob_hashes,
             data,
         })
     }
@@ -1246,18 +1592,18 @@ mod tests {
         let mut buf = Vec::new();
         single.serialize(&mut buf).unwrap();
         assert_eq!(buf[0], 0x01); // (0 << 1) | 1 = 1
-        let (deserialized, len) = BiomeStorage::deserialize(&buf, 64).unwrap();
+        let (deserialized, len) = BiomeStorage::deserialize(&buf).unwrap();
         assert_eq!(len, buf.len());
         assert_eq!(deserialized, BiomeStorage::Single(42));
 
-        // Paletted biomes
+        // Paletted biomes: 64 coarse cells expanded to 4,096 blocks
         let palette = vec![1, 2, 3];
         let indices: Vec<u16> = (0..64).map(|i| (i % 3) as u16).collect();
         let paletted = BiomeStorage::from_indices(&indices, palette.clone()).unwrap();
         let mut p_buf = Vec::new();
         paletted.serialize(&mut p_buf).unwrap();
 
-        let (deserialized_p, p_len) = BiomeStorage::deserialize(&p_buf, 64).unwrap();
+        let (deserialized_p, p_len) = BiomeStorage::deserialize(&p_buf).unwrap();
         assert_eq!(p_len, p_buf.len());
         assert_eq!(
             deserialized_p,
@@ -1290,9 +1636,10 @@ mod tests {
 
         let biomes: Vec<BiomeStorage> = (0..24).map(|_| BiomeStorage::single(1)).collect();
 
-        let packet = LevelChunkPacket::from_subchunks(10, -25, &subchunks, &biomes).unwrap();
+        let packet = LevelChunkPacket::from_subchunks(10, -25, 0, &subchunks, &biomes).unwrap();
         assert_eq!(packet.chunk_x, 10);
         assert_eq!(packet.chunk_z, -25);
+        assert_eq!(packet.dimension_id, 0);
         assert_eq!(packet.subchunk_count, 24);
         assert!(!packet.cache_enabled);
         assert!(!packet.data.is_empty());
@@ -1307,6 +1654,7 @@ mod tests {
         let decoded = LevelChunkPacket::decode(&wire).unwrap();
         assert_eq!(decoded.chunk_x, 10);
         assert_eq!(decoded.chunk_z, -25);
+        assert_eq!(decoded.dimension_id, 0);
         assert_eq!(decoded.subchunk_count, 24);
         assert!(!decoded.cache_enabled);
         assert_eq!(decoded.data, packet.data);
@@ -1316,19 +1664,21 @@ mod tests {
     fn bounds_check_rejects_excessive_or_invalid_subchunk_counts() {
         // > 32 subchunks rejected
         assert_eq!(
-            LevelChunkPacket::new(0, 0, 33, false, vec![0]),
+            LevelChunkPacket::overworld(0, 0, 33, vec![0]),
             Err(BedrockChunkError::InvalidSubChunkCount(33))
         );
         assert_eq!(
-            LevelChunkPacket::new(0, 0, 100, false, vec![0]),
+            LevelChunkPacket::overworld(0, 0, 100, vec![0]),
             Err(BedrockChunkError::InvalidSubChunkCount(100))
         );
 
         let invalid_packet = LevelChunkPacket {
             chunk_x: 0,
             chunk_z: 0,
+            dimension_id: 0,
             subchunk_count: 35,
             cache_enabled: false,
+            blob_hashes: Vec::new(),
             data: vec![0],
         };
         assert_eq!(
@@ -1341,6 +1691,7 @@ mod tests {
         write_varuint32(LEVEL_CHUNK_PACKET_ID, &mut wire);
         write_varint32(0, &mut wire);
         write_varint32(0, &mut wire);
+        write_varint32(0, &mut wire); // dimension_id
         write_varuint32(33, &mut wire); // invalid count
         wire.push(0); // cache_enabled
         write_varuint32(1, &mut wire); // data len
@@ -1355,7 +1706,7 @@ mod tests {
     fn bounds_check_rejects_payload_exceeding_limit() {
         let oversized = vec![0u8; MAX_SERIALIZED_CHUNK_SIZE + 1];
         assert_eq!(
-            LevelChunkPacket::new(0, 0, 24, false, oversized.clone()),
+            LevelChunkPacket::overworld(0, 0, 24, oversized.clone()),
             Err(BedrockChunkError::PayloadTooLarge {
                 size: MAX_SERIALIZED_CHUNK_SIZE + 1,
                 limit: MAX_SERIALIZED_CHUNK_SIZE,
@@ -1365,8 +1716,10 @@ mod tests {
         let packet = LevelChunkPacket {
             chunk_x: 0,
             chunk_z: 0,
+            dimension_id: 0,
             subchunk_count: 24,
             cache_enabled: false,
+            blob_hashes: Vec::new(),
             data: oversized,
         };
         assert_eq!(
@@ -1385,6 +1738,7 @@ mod tests {
         write_varuint32(0x39, &mut wire);
         write_varint32(0, &mut wire);
         write_varint32(0, &mut wire);
+        write_varint32(0, &mut wire);
         write_varuint32(24, &mut wire);
         wire.push(0);
         write_varuint32(0, &mut wire);
@@ -1397,5 +1751,62 @@ mod tests {
         // Truncated packet
         assert!(LevelChunkPacket::decode(&[0x3a]).is_err());
         assert!(LevelChunkPacket::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn independently_constructed_wire_header_decodes_expected_fields() {
+        // Wire bytes: Packet ID (0x3a), chunk_x: -1 (zigzag 1), chunk_z: 2 (zigzag 4),
+        // dimension_id: 0 (zigzag 0), subchunks: 24, cache_enabled: false (0), data len: 4
+        let mut wire = vec![0x3a, 0x01, 0x04, 0x00, 24, 0, 4];
+        wire.extend_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+
+        let decoded = LevelChunkPacket::decode(&wire).unwrap();
+        assert_eq!(decoded.chunk_x, -1);
+        assert_eq!(decoded.chunk_z, 2);
+        assert_eq!(decoded.dimension_id, 0);
+        assert_eq!(decoded.subchunk_count, 24);
+        assert!(!decoded.cache_enabled);
+        assert!(decoded.blob_hashes.is_empty());
+        assert_eq!(decoded.data, vec![0xca, 0xfe, 0xba, 0xbe]);
+    }
+
+    #[test]
+    fn cache_enabled_round_trip_with_blob_hashes() {
+        let hashes = vec![0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        let packet =
+            LevelChunkPacket::new(5, -3, 0, 16, true, hashes.clone(), vec![1, 2, 3]).unwrap();
+        let encoded = packet.encode().unwrap();
+        let decoded = LevelChunkPacket::decode(&encoded).unwrap();
+        assert_eq!(decoded.chunk_x, 5);
+        assert_eq!(decoded.chunk_z, -3);
+        assert_eq!(decoded.dimension_id, 0);
+        assert_eq!(decoded.subchunk_count, 16);
+        assert!(decoded.cache_enabled);
+        assert_eq!(decoded.blob_hashes, hashes);
+        assert_eq!(decoded.data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn nbt_palette_compounds_round_trip_and_preserve_bytes() {
+        // Construct two minimal LE NBT compounds:
+        // Compound 1: TAG_Compound (10), name_len 0 (00 00), TAG_End (0) -> [10, 0, 0, 0]
+        let comp1 = vec![10, 0, 0, 0];
+        // Compound 2: TAG_Compound (10), name_len 0, TAG_Byte (1), name_len 1 ('a'), val 42, TAG_End (0)
+        let comp2 = vec![10, 0, 0, 1, 1, 0, b'a', 42, 0];
+        let palette = BlockPalette::Nbt(vec![comp1.clone(), comp2.clone()]);
+        let storage = BlockStorage::new(1, vec![0u32; 128], palette).unwrap();
+        let mut bytes = Vec::new();
+        storage.serialize(&mut bytes).unwrap();
+
+        let (decoded, consumed) = BlockStorage::deserialize(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        match decoded.palette {
+            BlockPalette::Nbt(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0], comp1);
+                assert_eq!(entries[1], comp2);
+            }
+            _ => panic!("expected Nbt palette"),
+        }
     }
 }
