@@ -652,6 +652,144 @@ impl NbtTag {
     }
 }
 
+/// Encodes a UTF-8 string into Java Modified UTF-8 bytes for NBT storage.
+///
+/// Under Java Modified UTF-8:
+/// - Code points 1..=127 are 1 byte.
+/// - Code point 0 is encoded as `[0xC0, 0x80]`.
+/// - Code points 128..=2047 are encoded in 2 bytes.
+/// - Code points 2048..=65535 are encoded in 3 bytes.
+/// - Supplementary characters (> 65535, e.g. emoji like 😀) are encoded as surrogate pairs,
+///   each surrogate occupying 3 bytes, producing a total of 6 bytes.
+pub fn encode_modified_utf8(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp == 0 {
+            out.push(0xc0);
+            out.push(0x80);
+        } else if cp <= 0x7f {
+            out.push(cp as u8);
+        } else if cp <= 0x7ff {
+            out.push((0xc0 | ((cp >> 6) & 0x1f)) as u8);
+            out.push((0x80 | (cp & 0x3f)) as u8);
+        } else if cp <= 0xffff {
+            out.push((0xe0 | ((cp >> 12) & 0x0f)) as u8);
+            out.push((0x80 | ((cp >> 6) & 0x3f)) as u8);
+            out.push((0x80 | (cp & 0x3f)) as u8);
+        } else {
+            // Supplementary character: encode as surrogate pair in two 3-byte chunks
+            let u_prime = cp - 0x10000;
+            let w1 = 0xd800 + ((u_prime >> 10) & 0x3ff);
+            let w2 = 0xdc00 + (u_prime & 0x3ff);
+
+            out.push((0xe0 | ((w1 >> 12) & 0x0f)) as u8);
+            out.push((0x80 | ((w1 >> 6) & 0x3f)) as u8);
+            out.push((0x80 | (w1 & 0x3f)) as u8);
+
+            out.push((0xe0 | ((w2 >> 12) & 0x0f)) as u8);
+            out.push((0x80 | ((w2 >> 6) & 0x3f)) as u8);
+            out.push((0x80 | (w2 & 0x3f)) as u8);
+        }
+    }
+    out
+}
+
+/// Decodes Java Modified UTF-8 bytes into a standard Rust UTF-8 String.
+pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, BlockEntityError> {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b <= 0x7f && b != 0 {
+            s.push(b as char);
+            i += 1;
+        } else if b & 0xe0 == 0xc0 {
+            if i + 1 >= bytes.len() {
+                return Err(BlockEntityError::Malformed(
+                    "truncated modified UTF-8 sequence",
+                ));
+            }
+            let b2 = bytes[i + 1];
+            if b2 & 0xc0 != 0x80 {
+                return Err(BlockEntityError::Malformed(
+                    "invalid continuation in modified UTF-8",
+                ));
+            }
+            if b == 0xc0 && b2 == 0x80 {
+                s.push('\0');
+            } else {
+                let cp = (((b & 0x1f) as u32) << 6) | ((b2 & 0x3f) as u32);
+                let c = char::from_u32(cp).ok_or(BlockEntityError::Malformed(
+                    "invalid codepoint in modified UTF-8",
+                ))?;
+                s.push(c);
+            }
+            i += 2;
+        } else if b & 0xf0 == 0xe0 {
+            if i + 2 >= bytes.len() {
+                return Err(BlockEntityError::Malformed(
+                    "truncated modified UTF-8 sequence",
+                ));
+            }
+            let b2 = bytes[i + 1];
+            let b3 = bytes[i + 2];
+            if b2 & 0xc0 != 0x80 || b3 & 0xc0 != 0x80 {
+                return Err(BlockEntityError::Malformed(
+                    "invalid continuation in modified UTF-8",
+                ));
+            }
+            let cp =
+                (((b & 0x0f) as u32) << 12) | (((b2 & 0x3f) as u32) << 6) | ((b3 & 0x3f) as u32);
+            i += 3;
+            if (0xd800..=0xdbff).contains(&cp) {
+                // High surrogate: must be immediately followed by low surrogate (3-byte sequence)
+                if i + 2 >= bytes.len() {
+                    return Err(BlockEntityError::Malformed(
+                        "unpaired high surrogate in modified UTF-8",
+                    ));
+                }
+                let lb1 = bytes[i];
+                let lb2 = bytes[i + 1];
+                let lb3 = bytes[i + 2];
+                if lb1 & 0xf0 != 0xe0 || lb2 & 0xc0 != 0x80 || lb3 & 0xc0 != 0x80 {
+                    return Err(BlockEntityError::Malformed(
+                        "invalid low surrogate in modified UTF-8",
+                    ));
+                }
+                let low_cp = (((lb1 & 0x0f) as u32) << 12)
+                    | (((lb2 & 0x3f) as u32) << 6)
+                    | ((lb3 & 0x3f) as u32);
+                if !(0xdc00..=0xdfff).contains(&low_cp) {
+                    return Err(BlockEntityError::Malformed(
+                        "invalid low surrogate range in modified UTF-8",
+                    ));
+                }
+                i += 3;
+                let full_cp = 0x10000 + (((cp - 0xd800) << 10) | (low_cp - 0xdc00));
+                let c = char::from_u32(full_cp).ok_or(BlockEntityError::Malformed(
+                    "invalid supplementary codepoint in modified UTF-8",
+                ))?;
+                s.push(c);
+            } else if (0xdc00..=0xdfff).contains(&cp) {
+                return Err(BlockEntityError::Malformed(
+                    "unpaired low surrogate in modified UTF-8",
+                ));
+            } else {
+                let c = char::from_u32(cp).ok_or(BlockEntityError::Malformed(
+                    "invalid codepoint in modified UTF-8",
+                ))?;
+                s.push(c);
+            }
+        } else {
+            return Err(BlockEntityError::Malformed(
+                "invalid leading byte in modified UTF-8",
+            ));
+        }
+    }
+    Ok(s)
+}
+
 fn write_nbt_payload(tag: &NbtTag, out: &mut Vec<u8>) {
     match tag {
         NbtTag::End => {}
@@ -666,8 +804,9 @@ fn write_nbt_payload(tag: &NbtTag, out: &mut Vec<u8>) {
             out.extend(v.iter().map(|b| *b as u8));
         }
         NbtTag::String(v) => {
-            out.extend_from_slice(&(v.len() as u16).to_be_bytes());
-            out.extend_from_slice(v.as_bytes());
+            let encoded = encode_modified_utf8(v);
+            out.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            out.extend_from_slice(&encoded);
         }
         NbtTag::List(items) => {
             if items.is_empty() {
@@ -685,8 +824,9 @@ fn write_nbt_payload(tag: &NbtTag, out: &mut Vec<u8>) {
         NbtTag::Compound(entries) => {
             for (name, val) in entries {
                 out.push(val.tag_type_id());
-                out.extend_from_slice(&(name.len() as u16).to_be_bytes());
-                out.extend_from_slice(name.as_bytes());
+                let enc_name = encode_modified_utf8(name);
+                out.extend_from_slice(&(enc_name.len() as u16).to_be_bytes());
+                out.extend_from_slice(&enc_name);
                 write_nbt_payload(val, out);
             }
             out.push(0); // TAG_End
@@ -709,6 +849,15 @@ fn write_nbt_payload(tag: &NbtTag, out: &mut Vec<u8>) {
 /// Encodes an anonymous root compound tag into network NBT bytes.
 pub fn write_network_nbt(tag: &NbtTag, out: &mut Vec<u8>) {
     out.push(10); // TAG_Compound
+    write_nbt_payload(tag, out);
+}
+
+/// Encodes a named root compound tag into standard NBT bytes.
+pub fn write_named_network_nbt(name: &str, tag: &NbtTag, out: &mut Vec<u8>) {
+    out.push(10); // TAG_Compound
+    let enc_name = encode_modified_utf8(name);
+    out.extend_from_slice(&(enc_name.len() as u16).to_be_bytes());
+    out.extend_from_slice(&enc_name);
     write_nbt_payload(tag, out);
 }
 
@@ -768,9 +917,7 @@ impl<'a> NbtReader<'a> {
     fn read_string(&mut self) -> Result<String, BlockEntityError> {
         let len = self.read_u16()? as usize;
         let bytes = self.read_bytes(len)?;
-        std::str::from_utf8(bytes)
-            .map(|s| s.to_string())
-            .map_err(|_| BlockEntityError::Malformed("invalid UTF-8 in NBT string"))
+        decode_modified_utf8(bytes)
     }
 
     fn read_payload(&mut self, tag_type: u8, depth: usize) -> Result<NbtTag, BlockEntityError> {
@@ -805,6 +952,9 @@ impl<'a> NbtReader<'a> {
                 let len = self.read_i32()?;
                 if len < 0 {
                     return Err(BlockEntityError::Malformed("negative List length"));
+                }
+                if elem_type == 0 && len > 0 {
+                    return Err(BlockEntityError::Malformed("nonempty TAG_End list"));
                 }
                 let count = len as usize;
                 let mut items = Vec::with_capacity(count.min(1024));
@@ -868,15 +1018,13 @@ pub fn read_network_nbt(data: &[u8]) -> Result<NbtTag, BlockEntityError> {
         ));
     }
 
-    // Check if this is a named root compound (has u16 name_len + name bytes)
+    // Check if this is a named root compound (has u16 name_len + name bytes).
     // In anonymous network NBT, the next byte is either TAG_End (0) or a child tag type (1..=12).
-    if reader.remaining() >= 2 {
-        let b0 = reader.data[reader.pos];
-        let b1 = reader.data[reader.pos + 1];
-        if b0 == 0 && b1 == 0 && reader.remaining() > 2 {
-            // Named compound with empty name
-            reader.pos += 2;
-        }
+    // If the next byte is 0 and there are 2+ bytes available with data following,
+    // or if the first 2 bytes declare a name length, consume the root name.
+    if reader.remaining() >= 2 && reader.data[reader.pos] == 0 {
+        let name_len = reader.read_u16()? as usize;
+        let _root_name = reader.read_bytes(name_len)?;
     }
 
     let mut entries = Vec::new();
@@ -890,6 +1038,32 @@ pub fn read_network_nbt(data: &[u8]) -> Result<NbtTag, BlockEntityError> {
         entries.push((name, val));
     }
     Ok(NbtTag::Compound(entries))
+}
+
+/// Decodes a named root compound tag from standard NBT bytes, returning the root name and tag.
+pub fn read_named_network_nbt(data: &[u8]) -> Result<(String, NbtTag), BlockEntityError> {
+    let mut reader = NbtReader::new(data);
+    let root_type = reader.read_u8()?;
+    if root_type == 0 {
+        return Ok((String::new(), NbtTag::Compound(Vec::new())));
+    }
+    if root_type != 10 {
+        return Err(BlockEntityError::Malformed(
+            "root NBT tag must be Compound (10)",
+        ));
+    }
+    let root_name = reader.read_string()?;
+    let mut entries = Vec::new();
+    loop {
+        let child_type = reader.read_u8()?;
+        if child_type == 0 {
+            break;
+        }
+        let name = reader.read_string()?;
+        let val = reader.read_payload(child_type, 1)?;
+        entries.push((name, val));
+    }
+    Ok((root_name, NbtTag::Compound(entries)))
 }
 
 fn read_varint_slice(input: &[u8]) -> Result<(u32, usize), BlockEntityError> {
@@ -1521,5 +1695,64 @@ mod tests {
         .unwrap();
         assert_eq!(malicious_edit.apply_to(sign_entry), Err(SignError::Waxed));
         assert_eq!(sign_entry.front_text.messages, front_lines);
+    }
+
+    #[test]
+    fn test_modified_utf8_supplementary_characters_surrogate_pairs() {
+        let text = "Hello 😀 world \0 test!";
+        let encoded = encode_modified_utf8(text);
+        let decoded = decode_modified_utf8(&encoded).expect("decode modified utf-8");
+        assert_eq!(decoded, text);
+
+        // Verify that 😀 (U+1F600) is encoded as a 6-byte surrogate pair
+        let emoji_encoded = encode_modified_utf8("😀");
+        assert_eq!(emoji_encoded.len(), 6);
+        assert_eq!(emoji_encoded, &[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]);
+
+        // Verify NBT string round-trip with emoji
+        let tag = NbtTag::Compound(vec![(
+            "emoji".to_string(),
+            NbtTag::String("😀".to_string()),
+        )]);
+        let mut nbt_bytes = Vec::new();
+        write_network_nbt(&tag, &mut nbt_bytes);
+        let parsed = read_network_nbt(&nbt_bytes).expect("parse NBT with emoji");
+        assert_eq!(parsed, tag);
+    }
+
+    #[test]
+    fn test_reject_nonempty_tag_end_list() {
+        // Tag type 9 (List), element type 0 (TAG_End), declared count 1000
+        let malformed_list = vec![
+            10, // TAG_Compound
+            9,  // TAG_List
+            0, 4, b'l', b'i', b's', b't', // Name "list"
+            0,    // elem_type: TAG_End
+            0, 0, 0x03, 0xe8, // count: 1000 in BE
+            0,    // TAG_End of root
+        ];
+        let res = read_network_nbt(&malformed_list);
+        assert!(
+            matches!(res, Err(BlockEntityError::Malformed(_))),
+            "must reject nonempty TAG_End list, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_named_root_compound_preserves_data() {
+        // Standard NBT root named "root" containing string field "foo" = "bar"
+        let tag = NbtTag::Compound(vec![("foo".to_string(), NbtTag::String("bar".to_string()))]);
+        let mut named_bytes = Vec::new();
+        write_named_network_nbt("root", &tag, &mut named_bytes);
+
+        // Decode with read_network_nbt
+        let decoded = read_network_nbt(&named_bytes).expect("read_network_nbt named root");
+        assert_eq!(decoded, tag);
+
+        // Decode with read_named_network_nbt
+        let (root_name, decoded_named) =
+            read_named_network_nbt(&named_bytes).expect("read_named_network_nbt");
+        assert_eq!(root_name, "root");
+        assert_eq!(decoded_named, tag);
     }
 }
