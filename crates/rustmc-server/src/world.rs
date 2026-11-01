@@ -1,7 +1,13 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod physics;
 #[cfg(test)]
 mod tests_interaction;
+
+pub use physics::{
+    Aabb, PhysicsBody, SimpleVoxelWorld, StepResult, WorldCollisionView, compute_fall_damage,
+    compute_fall_damage_f32,
+};
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
@@ -30,6 +36,14 @@ pub enum Block {
     RedSand,
     RedSandstone,
     Terracotta,
+}
+
+impl Block {
+    /// Whether this block represents a solid obstacle for collision sweeps.
+    #[inline]
+    pub const fn is_solid(self) -> bool {
+        !matches!(self, Block::Air)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
