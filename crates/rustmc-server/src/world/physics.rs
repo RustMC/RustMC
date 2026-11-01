@@ -346,22 +346,24 @@ impl WorldCollisionView for SimpleVoxelWorld {
 /// Calculate fall damage for an entity landing after falling `fall_distance` blocks.
 ///
 /// Vanilla rule: `max(0, floor(fall_distance - 3.0))`.
+/// A small epsilon `1e-4` is applied to prevent numerical roundoff during discrete per-tick
+/// integration (e.g. 14.999999 vs 15.0) from removing a whole damage point.
 #[inline]
 pub fn compute_fall_damage(fall_distance: f32) -> u32 {
-    if !fall_distance.is_finite() || fall_distance <= 3.0 {
+    if !fall_distance.is_finite() || fall_distance <= (3.0 - 1e-4) {
         0
     } else {
-        (fall_distance - 3.0).floor() as u32
+        ((fall_distance - 3.0 + 1e-4).floor()).max(0.0) as u32
     }
 }
 
 /// Floating-point variation of `compute_fall_damage`.
 #[inline]
 pub fn compute_fall_damage_f32(fall_distance: f32) -> f32 {
-    if !fall_distance.is_finite() || fall_distance <= 3.0 {
+    if !fall_distance.is_finite() || fall_distance <= (3.0 - 1e-4) {
         0.0
     } else {
-        (fall_distance - 3.0).floor()
+        ((fall_distance - 3.0 + 1e-4).floor()).max(0.0)
     }
 }
 
@@ -482,7 +484,22 @@ pub fn collide_and_sweep(
     let floor_hit = (resolved_dy - delta[1]).abs() > EPSILON && delta[1] < 0.0;
     let ceiling_hit = (resolved_dy - delta[1]).abs() > EPSILON && delta[1] > 0.0;
     let final_on_ground = if stepped_up {
-        true
+        let stepped_box = start_box.offset(resolved_dx, resolved_dy, resolved_dz);
+        let check_depth = 0.05;
+        let mut actual_support = false;
+        for b in colliding_boxes {
+            if b.max[1] <= stepped_box.min[1] + EPSILON
+                && b.max[1] >= stepped_box.min[1] - check_depth - EPSILON
+                && stepped_box.min[0] < b.max[0]
+                && stepped_box.max[0] > b.min[0]
+                && stepped_box.min[2] < b.max[2]
+                && stepped_box.max[2] > b.min[2]
+            {
+                actual_support = true;
+                break;
+            }
+        }
+        actual_support
     } else {
         floor_hit || (on_ground && resolved_dy.abs() < EPSILON && delta[1].abs() < EPSILON)
     };
@@ -586,10 +603,10 @@ impl PhysicsBody {
         self.position[2] += resolved[2];
         self.on_ground = on_ground;
 
-        if (resolved[0] - delta[0]).abs() > EPSILON && !stepped_up {
+        if (resolved[0] - delta[0]).abs() > EPSILON {
             self.velocity[0] = 0.0;
         }
-        if (resolved[2] - delta[2]).abs() > EPSILON && !stepped_up {
+        if (resolved[2] - delta[2]).abs() > EPSILON {
             self.velocity[2] = 0.0;
         }
         if on_ground || ceiling_hit {
