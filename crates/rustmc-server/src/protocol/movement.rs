@@ -34,20 +34,20 @@ use std::fmt;
 /// Serverbound packet ID for Java 26.3 AcceptTeleportation (Play state).
 pub const PACKET_ID_ACCEPT_TELEPORTATION: u32 = 0x00;
 
-/// Serverbound packet ID for Java 26.3 MovePlayerPos (Play state).
-pub const PACKET_ID_MOVE_PLAYER_POS: u32 = 0x1A;
+/// Serverbound packet ID for Java 26.3 MovePlayerPos (Play state 30 / 0x1E).
+pub const PACKET_ID_MOVE_PLAYER_POS: u32 = 0x1E;
 
-/// Serverbound packet ID for Java 26.3 MovePlayerPosRot (Play state).
-pub const PACKET_ID_MOVE_PLAYER_POS_ROT: u32 = 0x1B;
+/// Serverbound packet ID for Java 26.3 MovePlayerPosRot (Play state 31 / 0x1F).
+pub const PACKET_ID_MOVE_PLAYER_POS_ROT: u32 = 0x1F;
 
-/// Serverbound packet ID for Java 26.3 MovePlayerRot (Play state).
-pub const PACKET_ID_MOVE_PLAYER_ROT: u32 = 0x1C;
+/// Serverbound packet ID for Java 26.3 MovePlayerRot (Play state 32 / 0x20).
+pub const PACKET_ID_MOVE_PLAYER_ROT: u32 = 0x20;
 
-/// Serverbound packet ID for Java 26.3 MovePlayerStatus (Play state).
-pub const PACKET_ID_MOVE_PLAYER_STATUS: u32 = 0x1D;
+/// Serverbound packet ID for Java 26.3 MovePlayerStatus (Play state 33 / 0x21).
+pub const PACKET_ID_MOVE_PLAYER_STATUS: u32 = 0x21;
 
-/// Clientbound packet ID for Java 26.3 PlayerPositionSync (Play state).
-pub const PACKET_ID_PLAYER_POSITION_SYNC: u32 = 0x40;
+/// Clientbound packet ID for Java 26.3 PlayerPositionSync (Play state 73 / 0x49).
+pub const PACKET_ID_PLAYER_POSITION_SYNC: u32 = 0x49;
 
 /// Maximum single-tick Euclidean displacement threshold (in blocks).
 pub const MAX_DISPLACEMENT_PER_TICK: f64 = 100.0;
@@ -167,11 +167,15 @@ pub enum MovementValidationError {
     },
     TeleportError(TeleportError),
     MalformedPacket(MovementError),
+    NonFiniteCoordinate,
+    NonFiniteRotation,
 }
 
 impl fmt::Display for MovementValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NonFiniteCoordinate => write!(f, "coordinate component is not finite (NaN/Inf)"),
+            Self::NonFiniteRotation => write!(f, "rotation component is not finite (NaN/Inf)"),
             Self::TeleportPending {
                 pending_id,
                 expected,
@@ -656,31 +660,89 @@ impl MovePlayerStatus {
 }
 
 /// Serverbound `AcceptTeleportation` packet (0x00): `teleport_id: i32` (VarInt).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcceptTeleportation {
     pub teleport_id: i32,
+    pub target_pos: Option<[f64; 3]>,
+    pub target_rot: Option<[f32; 2]>,
 }
 
 impl AcceptTeleportation {
     pub const PACKET_ID: u32 = PACKET_ID_ACCEPT_TELEPORTATION;
 
+    #[inline]
     pub const fn new(teleport_id: i32) -> Self {
-        Self { teleport_id }
+        Self {
+            teleport_id,
+            target_pos: None,
+            target_rot: None,
+        }
     }
 
-    /// Decodes the payload bytes for `AcceptTeleportation` (VarInt).
+    #[inline]
+    pub const fn with_confirmation(
+        teleport_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Self {
+        Self {
+            teleport_id,
+            target_pos: Some([x, y, z]),
+            target_rot: Some([yaw, pitch]),
+        }
+    }
+
+    /// Decodes the payload bytes for `AcceptTeleportation`.
+    ///
+    /// Accepts either VarInt alone (teleport ID) or the complete 26.3 client confirmation
+    /// containing VarInt teleport ID followed by 24 bytes (3x f64 coords) and 8 bytes (2x f32 rotation).
     pub fn decode(data: &[u8]) -> Result<Self, MovementError> {
         let (teleport_id, bytes_read) = read_varint(data)?;
-        if bytes_read != data.len() {
-            return Err(MovementError::TrailingData);
+        let remainder = &data[bytes_read..];
+        if remainder.is_empty() {
+            return Ok(Self {
+                teleport_id,
+                target_pos: None,
+                target_rot: None,
+            });
         }
-        Ok(Self { teleport_id })
+        if remainder.len() == 32 {
+            let x = f64::from_be_bytes(remainder[0..8].try_into().unwrap());
+            let y = f64::from_be_bytes(remainder[8..16].try_into().unwrap());
+            let z = f64::from_be_bytes(remainder[16..24].try_into().unwrap());
+            let yaw = f32::from_be_bytes(remainder[24..28].try_into().unwrap());
+            let pitch = f32::from_be_bytes(remainder[28..32].try_into().unwrap());
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(MovementError::NonFiniteCoordinate);
+            }
+            if !yaw.is_finite() || !pitch.is_finite() {
+                return Err(MovementError::NonFiniteRotation);
+            }
+            return Ok(Self {
+                teleport_id,
+                target_pos: Some([x, y, z]),
+                target_rot: Some([yaw, pitch]),
+            });
+        }
+        Err(MovementError::TrailingData)
     }
 
     /// Encodes the packet payload to bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(5);
+        let mut out = Vec::with_capacity(37);
         write_varint(self.teleport_id as u32, &mut out);
+        if let Some([x, y, z]) = self.target_pos {
+            out.extend_from_slice(&x.to_be_bytes());
+            out.extend_from_slice(&y.to_be_bytes());
+            out.extend_from_slice(&z.to_be_bytes());
+            if let Some([yaw, pitch]) = self.target_rot {
+                out.extend_from_slice(&yaw.to_be_bytes());
+                out.extend_from_slice(&pitch.to_be_bytes());
+            }
+        }
         out
     }
 
@@ -1076,6 +1138,8 @@ pub enum MovementOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MovementGuard {
     authoritative_pos: (f64, f64, f64),
+    tick_baseline_pos: (f64, f64, f64),
+    accumulated_tick_displacement: f64,
     authoritative_rot: (f32, f32),
     authoritative_on_ground: bool,
     teleport_tracker: TeleportTracker,
@@ -1087,6 +1151,8 @@ impl MovementGuard {
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self {
             authoritative_pos: (x, y, z),
+            tick_baseline_pos: (x, y, z),
+            accumulated_tick_displacement: 0.0,
             authoritative_rot: (0.0, 0.0),
             authoritative_on_ground: true,
             teleport_tracker: TeleportTracker::new(),
@@ -1098,11 +1164,25 @@ impl MovementGuard {
     pub fn with_rotation(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Self {
         Self {
             authoritative_pos: (x, y, z),
+            tick_baseline_pos: (x, y, z),
+            accumulated_tick_displacement: 0.0,
             authoritative_rot: (normalize_yaw(yaw), normalize_pitch(pitch)),
             authoritative_on_ground: true,
             teleport_tracker: TeleportTracker::new(),
             max_displacement: MAX_DISPLACEMENT_PER_TICK,
         }
+    }
+
+    /// Advances to the next server tick, resetting accumulated per-tick displacement.
+    pub fn advance_tick(&mut self) {
+        self.tick_baseline_pos = self.authoritative_pos;
+        self.accumulated_tick_displacement = 0.0;
+    }
+
+    /// Returns accumulated displacement in the current server tick.
+    #[inline]
+    pub const fn accumulated_tick_displacement(&self) -> f64 {
+        self.accumulated_tick_displacement
     }
 
     #[inline]
@@ -1163,6 +1243,8 @@ impl MovementGuard {
     ) -> Result<PendingTeleport, TeleportError> {
         let confirmed = self.teleport_tracker.accept_teleport(teleport_id)?;
         self.authoritative_pos = (confirmed.x, confirmed.y, confirmed.z);
+        self.tick_baseline_pos = self.authoritative_pos;
+        self.accumulated_tick_displacement = 0.0;
         Ok(confirmed)
     }
 
@@ -1179,6 +1261,10 @@ impl MovementGuard {
         new_z: f64,
         on_ground: bool,
     ) -> Result<f64, MovementValidationError> {
+        if !new_x.is_finite() || !new_y.is_finite() || !new_z.is_finite() {
+            return Err(MovementValidationError::NonFiniteCoordinate);
+        }
+
         if self.teleport_tracker.has_pending_teleport() {
             let pending = self.teleport_tracker.pending_teleport().unwrap();
             return Err(MovementValidationError::TeleportPending {
@@ -1187,7 +1273,7 @@ impl MovementGuard {
             });
         }
 
-        let displacement = calculate_displacement(
+        let step_displacement = calculate_displacement(
             self.authoritative_pos.0,
             self.authoritative_pos.1,
             self.authoritative_pos.2,
@@ -1196,17 +1282,19 @@ impl MovementGuard {
             new_z,
         );
 
-        if displacement > self.max_displacement {
+        let new_accumulated = self.accumulated_tick_displacement + step_displacement;
+        if new_accumulated > self.max_displacement {
             return Err(MovementValidationError::SpeedExceeded {
-                displacement,
+                displacement: new_accumulated,
                 max_allowed: self.max_displacement,
                 reset_to: self.authoritative_pos,
             });
         }
 
+        self.accumulated_tick_displacement = new_accumulated;
         self.authoritative_pos = (new_x, new_y, new_z);
         self.authoritative_on_ground = on_ground;
-        Ok(displacement)
+        Ok(step_displacement)
     }
 
     /// Validates and applies a position and rotation update (`MovePlayerPosRot`).
@@ -1219,6 +1307,13 @@ impl MovementGuard {
         pitch: f32,
         on_ground: bool,
     ) -> Result<f64, MovementValidationError> {
+        if !new_x.is_finite() || !new_y.is_finite() || !new_z.is_finite() {
+            return Err(MovementValidationError::NonFiniteCoordinate);
+        }
+        if !yaw.is_finite() || !pitch.is_finite() {
+            return Err(MovementValidationError::NonFiniteRotation);
+        }
+
         if self.teleport_tracker.has_pending_teleport() {
             let pending = self.teleport_tracker.pending_teleport().unwrap();
             return Err(MovementValidationError::TeleportPending {
@@ -1227,7 +1322,7 @@ impl MovementGuard {
             });
         }
 
-        let displacement = calculate_displacement(
+        let step_displacement = calculate_displacement(
             self.authoritative_pos.0,
             self.authoritative_pos.1,
             self.authoritative_pos.2,
@@ -1236,18 +1331,20 @@ impl MovementGuard {
             new_z,
         );
 
-        if displacement > self.max_displacement {
+        let new_accumulated = self.accumulated_tick_displacement + step_displacement;
+        if new_accumulated > self.max_displacement {
             return Err(MovementValidationError::SpeedExceeded {
-                displacement,
+                displacement: new_accumulated,
                 max_allowed: self.max_displacement,
                 reset_to: self.authoritative_pos,
             });
         }
 
+        self.accumulated_tick_displacement = new_accumulated;
         self.authoritative_pos = (new_x, new_y, new_z);
         self.authoritative_rot = (yaw, pitch);
         self.authoritative_on_ground = on_ground;
-        Ok(displacement)
+        Ok(step_displacement)
     }
 
     /// Validates and applies a rotation-only update (`MovePlayerRot`).
@@ -1257,6 +1354,10 @@ impl MovementGuard {
         pitch: f32,
         on_ground: bool,
     ) -> Result<(), MovementValidationError> {
+        if !yaw.is_finite() || !pitch.is_finite() {
+            return Err(MovementValidationError::NonFiniteRotation);
+        }
+
         if self.teleport_tracker.has_pending_teleport() {
             let pending = self.teleport_tracker.pending_teleport().unwrap();
             return Err(MovementValidationError::TeleportPending {
@@ -1869,6 +1970,11 @@ mod tests {
             }
         );
         assert_eq!(guard.position(), (10.0, 64.0, 0.0));
+        assert_eq!(guard.accumulated_tick_displacement(), 10.0);
+
+        // Advance tick resets accumulated displacement
+        guard.advance_tick();
+        assert_eq!(guard.accumulated_tick_displacement(), 0.0);
 
         // Movement exceeding single-tick threshold (> 100.0 blocks, e.g. 10.0 -> 120.0 = 110 blocks)
         let illegal_move = MovePlayerPos::new(120.0, 64.0, 0.0, true);
@@ -1889,21 +1995,62 @@ mod tests {
             other => panic!("expected SpeedExceeded, got {other:?}"),
         }
 
+        // Multi-packet fragmentation within a single tick is bounded:
+        guard.advance_tick();
+        // First packet in tick: +60 blocks (allowed)
+        let step1 = MovePlayerPos::new(70.0, 64.0, 0.0, true);
+        guard
+            .handle_movement_packet(&ServerboundMovementPacket::Pos(step1))
+            .unwrap();
+        assert_eq!(guard.accumulated_tick_displacement(), 60.0);
+
+        // Second packet in same tick: +50 blocks (60 + 50 = 110 > 100 -> rejected)
+        let step2 = MovePlayerPos::new(120.0, 64.0, 0.0, true);
+        let err2 = guard
+            .handle_movement_packet(&ServerboundMovementPacket::Pos(step2))
+            .unwrap_err();
+        match err2 {
+            MovementValidationError::SpeedExceeded { displacement, .. } => {
+                assert!((displacement - 110.0).abs() < 1e-4);
+            }
+            other => panic!("expected SpeedExceeded, got {other:?}"),
+        }
+
+        // Non-finite coordinates and rotations are rejected at public entry points
+        assert_eq!(
+            guard.validate_and_apply_pos(f64::NAN, 64.0, 0.0, true),
+            Err(MovementValidationError::NonFiniteCoordinate)
+        );
+        assert_eq!(
+            guard.validate_and_apply_pos_rot(10.0, 64.0, 0.0, f32::INFINITY, 0.0, true),
+            Err(MovementValidationError::NonFiniteRotation)
+        );
+        assert_eq!(
+            guard.validate_and_apply_rot(0.0, f32::NAN, true),
+            Err(MovementValidationError::NonFiniteRotation)
+        );
+
         // Authoritative position must remain at the pre-violation coordinate
-        assert_eq!(guard.position(), (10.0, 64.0, 0.0));
+        assert_eq!(guard.position(), (70.0, 64.0, 0.0));
 
         // Server can generate an authoritative reset packet
         let reset_sync = guard.create_position_sync_reset(300);
-        assert_eq!(reset_sync.x, 10.0);
+        assert_eq!(reset_sync.x, 70.0);
         assert_eq!(reset_sync.y, 64.0);
         assert_eq!(reset_sync.z, 0.0);
 
-        // Client acknowledges the reset teleport
+        // Client acknowledges the reset teleport with full 33-byte 26.3 confirmation
+        let full_confirm = AcceptTeleportation::with_confirmation(
+            reset_sync.teleport_id,
+            70.0,
+            64.0,
+            0.0,
+            0.0,
+            0.0,
+        );
         guard
-            .handle_movement_packet(&ServerboundMovementPacket::AcceptTeleport(
-                AcceptTeleportation::new(reset_sync.teleport_id),
-            ))
+            .handle_movement_packet(&ServerboundMovementPacket::AcceptTeleport(full_confirm))
             .unwrap();
-        assert_eq!(guard.position(), (10.0, 64.0, 0.0));
+        assert_eq!(guard.position(), (70.0, 64.0, 0.0));
     }
 }
