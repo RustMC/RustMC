@@ -1,5 +1,6 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod projectile;
 #[cfg(test)]
 mod tests_interaction;
 
