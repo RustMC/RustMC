@@ -1,10 +1,10 @@
-//! Java Edition 26.3 PlayerInfoUpdate (packet 0x3E, protocol 777) packet codec
+//! Java Edition 26.3 PlayerInfoUpdate (packet 0x47, protocol 777) packet codec
 //! and player tab-list tracker.
 //!
 //! # Protocol Specification
 //!
 //! Under Minecraft Java Edition 26.3 (protocol 777), tab-list state and player presence
-//! updates are communicated using clientbound `PlayerInfoUpdate` (ID 0x3E in Play state).
+//! updates are communicated using clientbound `PlayerInfoUpdate` (ID 0x47 in Play state).
 //!
 //! The packet consists of:
 //! - An `actions` bitmask (`u8`) controlling which fields are populated for each entry.
@@ -19,13 +19,15 @@
 //! - `UpdateGameMode` (0x04): GameMode VarInt (0: Survival, 1: Creative, 2: Adventure, 3: Spectator).
 //! - `UpdateListed` (0x08): Boolean flag controlling tab-list visibility.
 //! - `UpdateLatency` (0x10): Latency in milliseconds (VarInt).
-//! - `UpdateDisplayName` (0x20): Optional text component display name.
+//! - `UpdateDisplayName` (0x20): Optional Network NBT text component display name.
+//! - `UpdateListOrder` (0x40): Tab-list display ordering index (VarInt).
+//! - `UpdateHat` (0x80): Boolean flag controlling whether the player skin hat layer is shown.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Packet ID for clientbound PlayerInfoUpdate in Java Edition 26.3 (Play state 0x3E / 62).
-pub const PACKET_ID_PLAYER_INFO_UPDATE: u32 = 0x3E;
+/// Packet ID for clientbound PlayerInfoUpdate in Java Edition 26.3 (Play state 0x47 / 71).
+pub const PACKET_ID_PLAYER_INFO_UPDATE: u32 = 0x47;
 
 /// Maximum character length for player usernames in Java Edition.
 pub const MAX_NAME_CHARS: usize = 16;
@@ -46,6 +48,8 @@ pub enum PlayerInfoAction {
     UpdateListed = 0x08,
     UpdateLatency = 0x10,
     UpdateDisplayName = 0x20,
+    UpdateListOrder = 0x40,
+    UpdateHat = 0x80,
 }
 
 impl PlayerInfoAction {
@@ -55,16 +59,20 @@ impl PlayerInfoAction {
     pub const UPDATE_LISTED: u8 = 0x08;
     pub const UPDATE_LATENCY: u8 = 0x10;
     pub const UPDATE_DISPLAY_NAME: u8 = 0x20;
+    pub const UPDATE_LIST_ORDER: u8 = 0x40;
+    pub const UPDATE_HAT: u8 = 0x80;
 
-    /// Bitmask with all 6 valid player info actions enabled.
+    /// Bitmask with all 8 valid player info actions enabled (0xFF).
     pub const ALL: u8 = Self::ADD_PLAYER
         | Self::INITIALIZE_CHAT
         | Self::UPDATE_GAME_MODE
         | Self::UPDATE_LISTED
         | Self::UPDATE_LATENCY
-        | Self::UPDATE_DISPLAY_NAME;
+        | Self::UPDATE_DISPLAY_NAME
+        | Self::UPDATE_LIST_ORDER
+        | Self::UPDATE_HAT;
 
-    /// Bitmask of all recognized action bits (0x3F).
+    /// Bitmask of all recognized action bits (0xFF).
     pub const MASK_VALID: u8 = Self::ALL;
 
     /// Returns the raw bitmask flag for this action.
@@ -125,6 +133,8 @@ impl TryFrom<u8> for PlayerInfoAction {
             0x08 => Ok(Self::UpdateListed),
             0x10 => Ok(Self::UpdateLatency),
             0x20 => Ok(Self::UpdateDisplayName),
+            0x40 => Ok(Self::UpdateListOrder),
+            0x80 => Ok(Self::UpdateHat),
             other => Err(ProtocolError::InvalidActionBitmask(other)),
         }
     }
@@ -230,6 +240,8 @@ pub struct PlayerInfoEntry {
     pub listed: bool,
     pub latency: i32,
     pub display_name: Option<String>,
+    pub list_order: i32,
+    pub show_hat: bool,
 }
 
 impl Default for PlayerInfoEntry {
@@ -243,6 +255,8 @@ impl Default for PlayerInfoEntry {
             listed: true,
             latency: 0,
             display_name: None,
+            list_order: 0,
+            show_hat: true,
         }
     }
 }
@@ -277,6 +291,16 @@ impl PlayerInfoEntry {
         self
     }
 
+    pub fn with_list_order(mut self, list_order: i32) -> Self {
+        self.list_order = list_order;
+        self
+    }
+
+    pub fn with_show_hat(mut self, show_hat: bool) -> Self {
+        self.show_hat = show_hat;
+        self
+    }
+
     pub fn with_properties(mut self, properties: Vec<ProfileProperty>) -> Self {
         self.properties = properties;
         self
@@ -299,6 +323,7 @@ pub enum ProtocolError {
     InvalidGameMode(i32),
     InvalidActionBitmask(u8),
     InvalidBoolean(u8),
+    InvalidNbtTag(u8),
     UnexpectedPacketId { expected: u32, received: u32 },
     InvalidPacketLength { expected: usize, received: usize },
     TrailingData { remaining: usize },
@@ -329,6 +354,12 @@ impl fmt::Display for ProtocolError {
             Self::InvalidBoolean(val) => {
                 write!(f, "invalid boolean value: {val} (expected 0 or 1)")
             }
+            Self::InvalidNbtTag(tag) => {
+                write!(
+                    f,
+                    "invalid NBT tag type for network text component: 0x{tag:02X}"
+                )
+            }
             Self::UnexpectedPacketId { expected, received } => {
                 write!(
                     f,
@@ -353,7 +384,7 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Clientbound `PlayerInfoUpdate` packet (packet ID 0x3E in Java 26.3 protocol 777).
+/// Clientbound `PlayerInfoUpdate` packet (packet ID 0x47 in Java 26.3 protocol 777).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerInfoUpdatePacket {
     pub actions: u8,
@@ -376,7 +407,7 @@ impl PlayerInfoUpdatePacket {
         }
     }
 
-    /// Encodes the packet into framed byte format (VarInt length + VarInt packet ID 0x3E + body).
+    /// Encodes the packet into framed byte format (VarInt length + VarInt packet ID 0x47 + body).
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         let payload = self.encode_payload()?;
         let mut header = Vec::with_capacity(5);
@@ -392,10 +423,6 @@ impl PlayerInfoUpdatePacket {
 
     /// Encodes only the unframed packet payload (actions bitmask + entry count + entries).
     pub fn encode_payload(&self) -> Result<Vec<u8>, ProtocolError> {
-        if (self.actions & !PlayerInfoAction::MASK_VALID) != 0 {
-            return Err(ProtocolError::InvalidActionBitmask(self.actions));
-        }
-
         let mut out = Vec::new();
         out.push(self.actions);
         write_varint(self.entries.len() as i32, &mut out);
@@ -413,10 +440,28 @@ impl PlayerInfoUpdatePacket {
                 write_string(&entry.name, &mut out);
                 write_varint(entry.properties.len() as i32, &mut out);
                 for prop in &entry.properties {
+                    if prop.name.chars().count() > MAX_STRING_CHARS {
+                        return Err(ProtocolError::StringTooLong {
+                            length: prop.name.chars().count(),
+                            max: MAX_STRING_CHARS,
+                        });
+                    }
+                    if prop.value.chars().count() > MAX_STRING_CHARS {
+                        return Err(ProtocolError::StringTooLong {
+                            length: prop.value.chars().count(),
+                            max: MAX_STRING_CHARS,
+                        });
+                    }
                     write_string(&prop.name, &mut out);
                     write_string(&prop.value, &mut out);
                     match &prop.signature {
                         Some(sig) => {
+                            if sig.chars().count() > MAX_STRING_CHARS {
+                                return Err(ProtocolError::StringTooLong {
+                                    length: sig.chars().count(),
+                                    max: MAX_STRING_CHARS,
+                                });
+                            }
                             write_bool(true, &mut out);
                             write_string(sig, &mut out);
                         }
@@ -430,6 +475,18 @@ impl PlayerInfoUpdatePacket {
             if PlayerInfoAction::is_set(self.actions, PlayerInfoAction::InitializeChat) {
                 match &entry.chat_session {
                     Some(session) => {
+                        if session.public_key.len() > MAX_KEY_BYTES {
+                            return Err(ProtocolError::StringTooLong {
+                                length: session.public_key.len(),
+                                max: MAX_KEY_BYTES,
+                            });
+                        }
+                        if session.key_signature.len() > MAX_KEY_BYTES {
+                            return Err(ProtocolError::StringTooLong {
+                                length: session.key_signature.len(),
+                                max: MAX_KEY_BYTES,
+                            });
+                        }
                         write_bool(true, &mut out);
                         write_uuid(&session.session_id, &mut out);
                         out.extend_from_slice(&session.expires_at.to_be_bytes());
@@ -458,19 +515,27 @@ impl PlayerInfoUpdatePacket {
                 match &entry.display_name {
                     Some(name) => {
                         write_bool(true, &mut out);
-                        write_string(name, &mut out);
+                        write_display_name_nbt(name, &mut out)?;
                     }
                     None => {
                         write_bool(false, &mut out);
                     }
                 }
             }
+
+            if PlayerInfoAction::is_set(self.actions, PlayerInfoAction::UpdateListOrder) {
+                write_varint(entry.list_order, &mut out);
+            }
+
+            if PlayerInfoAction::is_set(self.actions, PlayerInfoAction::UpdateHat) {
+                write_bool(entry.show_hat, &mut out);
+            }
         }
 
         Ok(out)
     }
 
-    /// Decodes a framed packet with VarInt length prefix and packet ID 0x3E.
+    /// Decodes a framed packet with VarInt length prefix and packet ID 0x47.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         let (frame_len, offset) = read_varint(bytes)?;
         if frame_len < 0 {
@@ -508,10 +573,6 @@ impl PlayerInfoUpdatePacket {
         }
         let actions = payload[cursor];
         cursor += 1;
-
-        if (actions & !PlayerInfoAction::MASK_VALID) != 0 {
-            return Err(ProtocolError::InvalidActionBitmask(actions));
-        }
 
         let (entry_count, n) = read_varint(&payload[cursor..])?;
         cursor += n;
@@ -618,12 +679,25 @@ impl PlayerInfoUpdatePacket {
                 let (has_display, n) = read_bool(&payload[cursor..])?;
                 cursor += n;
                 if has_display {
-                    let (display_name, n) = read_string(&payload[cursor..], MAX_STRING_CHARS)?;
+                    let (display_name, n) =
+                        read_display_name_nbt(&payload[cursor..], MAX_STRING_CHARS)?;
                     cursor += n;
                     entry.display_name = Some(display_name);
                 } else {
                     entry.display_name = None;
                 }
+            }
+
+            if PlayerInfoAction::is_set(actions, PlayerInfoAction::UpdateListOrder) {
+                let (list_order, n) = read_varint(&payload[cursor..])?;
+                cursor += n;
+                entry.list_order = list_order;
+            }
+
+            if PlayerInfoAction::is_set(actions, PlayerInfoAction::UpdateHat) {
+                let (show_hat, n) = read_bool(&payload[cursor..])?;
+                cursor += n;
+                entry.show_hat = show_hat;
             }
 
             entries.push(entry);
@@ -696,7 +770,9 @@ impl TabListTracker {
             | PlayerInfoAction::UpdateGameMode
             | PlayerInfoAction::UpdateListed
             | PlayerInfoAction::UpdateLatency
-            | PlayerInfoAction::UpdateDisplayName;
+            | PlayerInfoAction::UpdateDisplayName
+            | PlayerInfoAction::UpdateListOrder
+            | PlayerInfoAction::UpdateHat;
         if entry.chat_session.is_some() {
             actions |= PlayerInfoAction::InitializeChat;
         }
@@ -764,6 +840,44 @@ impl TabListTracker {
             PlayerInfoEntry {
                 uuid: *uuid,
                 display_name,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Updates the list order for an online player and generates
+    /// an `UpdateListOrder` diff packet for broadcast. Returns `None` if the player is not online.
+    pub fn update_list_order(
+        &mut self,
+        uuid: &[u8; 16],
+        list_order: i32,
+    ) -> Option<PlayerInfoUpdatePacket> {
+        let entry = self.players.get_mut(uuid)?;
+        entry.list_order = list_order;
+        Some(PlayerInfoUpdatePacket::single(
+            PlayerInfoAction::UpdateListOrder as u8,
+            PlayerInfoEntry {
+                uuid: *uuid,
+                list_order,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Updates the hat visibility for an online player and generates
+    /// an `UpdateHat` diff packet for broadcast. Returns `None` if the player is not online.
+    pub fn update_hat(
+        &mut self,
+        uuid: &[u8; 16],
+        show_hat: bool,
+    ) -> Option<PlayerInfoUpdatePacket> {
+        let entry = self.players.get_mut(uuid)?;
+        entry.show_hat = show_hat;
+        Some(PlayerInfoUpdatePacket::single(
+            PlayerInfoAction::UpdateHat as u8,
+            PlayerInfoEntry {
+                uuid: *uuid,
+                show_hat,
                 ..Default::default()
             },
         ))
@@ -954,6 +1068,277 @@ pub fn read_byte_array(input: &[u8], max_len: usize) -> Result<(Vec<u8>, usize),
     Ok((input[offset..total].to_vec(), total))
 }
 
+/// Helper to skip the payload of an NBT tag by type ID.
+pub fn skip_nbt_tag_payload(tag_type: u8, input: &[u8]) -> Result<usize, ProtocolError> {
+    match tag_type {
+        1 => {
+            // TAG_Byte
+            if input.is_empty() {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(1)
+        }
+        2 => {
+            // TAG_Short
+            if input.len() < 2 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(2)
+        }
+        3 => {
+            // TAG_Int
+            if input.len() < 4 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(4)
+        }
+        4 => {
+            // TAG_Long
+            if input.len() < 8 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(8)
+        }
+        5 => {
+            // TAG_Float
+            if input.len() < 4 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(4)
+        }
+        6 => {
+            // TAG_Double
+            if input.len() < 8 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(8)
+        }
+        7 => {
+            // TAG_Byte_Array
+            if input.len() < 4 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
+            if len < 0 {
+                return Err(ProtocolError::InvalidPacketLength {
+                    expected: 0,
+                    received: len as usize,
+                });
+            }
+            let total = 4 + len as usize;
+            if input.len() < total {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(total)
+        }
+        8 => {
+            // TAG_String
+            if input.len() < 2 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let len = u16::from_be_bytes([input[0], input[1]]) as usize;
+            let total = 2 + len;
+            if input.len() < total {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(total)
+        }
+        9 => {
+            // TAG_List
+            if input.len() < 5 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let elem_type = input[0];
+            let count = i32::from_be_bytes(input[1..5].try_into().unwrap());
+            if count < 0 {
+                return Err(ProtocolError::InvalidPacketLength {
+                    expected: 0,
+                    received: count as usize,
+                });
+            }
+            let mut cursor = 5;
+            for _ in 0..count {
+                let n = skip_nbt_tag_payload(elem_type, &input[cursor..])?;
+                cursor += n;
+            }
+            Ok(cursor)
+        }
+        10 => {
+            // TAG_Compound
+            let mut cursor = 0;
+            loop {
+                if cursor >= input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                let item_tag = input[cursor];
+                cursor += 1;
+                if item_tag == 0 {
+                    break;
+                }
+                if cursor + 2 > input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                let name_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
+                cursor += 2;
+                if cursor + name_len > input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                cursor += name_len;
+                let payload_len = skip_nbt_tag_payload(item_tag, &input[cursor..])?;
+                cursor += payload_len;
+            }
+            Ok(cursor)
+        }
+        11 => {
+            // TAG_Int_Array
+            if input.len() < 4 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
+            if len < 0 {
+                return Err(ProtocolError::InvalidPacketLength {
+                    expected: 0,
+                    received: len as usize,
+                });
+            }
+            let total = 4 + (len as usize * 4);
+            if input.len() < total {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(total)
+        }
+        12 => {
+            // TAG_Long_Array
+            if input.len() < 4 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
+            if len < 0 {
+                return Err(ProtocolError::InvalidPacketLength {
+                    expected: 0,
+                    received: len as usize,
+                });
+            }
+            let total = 4 + (len as usize * 8);
+            if input.len() < total {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            Ok(total)
+        }
+        other => Err(ProtocolError::InvalidNbtTag(other)),
+    }
+}
+
+/// Serializes a display name string as an anonymous Network NBT TAG_String component.
+pub fn write_display_name_nbt(text: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    let char_count = text.chars().count();
+    if char_count > MAX_STRING_CHARS {
+        return Err(ProtocolError::StringTooLong {
+            length: char_count,
+            max: MAX_STRING_CHARS,
+        });
+    }
+    let byte_len = text.len();
+    if byte_len > u16::MAX as usize {
+        return Err(ProtocolError::StringTooLong {
+            length: byte_len,
+            max: u16::MAX as usize,
+        });
+    }
+    out.push(0x08); // TAG_String
+    out.extend_from_slice(&(byte_len as u16).to_be_bytes());
+    out.extend_from_slice(text.as_bytes());
+    Ok(())
+}
+
+/// Reads an anonymous Network NBT text component display name.
+/// Supports both TAG_String (0x08) and TAG_Compound (0x0A with "text" tag).
+pub fn read_display_name_nbt(
+    input: &[u8],
+    max_chars: usize,
+) -> Result<(String, usize), ProtocolError> {
+    if input.is_empty() {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    match input[0] {
+        0x08 => {
+            // TAG_String
+            if input.len() < 3 {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let len = u16::from_be_bytes([input[1], input[2]]) as usize;
+            let total = 3 + len;
+            if input.len() < total {
+                return Err(ProtocolError::UnexpectedEof);
+            }
+            let s =
+                std::str::from_utf8(&input[3..total]).map_err(|_| ProtocolError::InvalidUtf8)?;
+            let char_count = s.chars().count();
+            if char_count > max_chars {
+                return Err(ProtocolError::StringTooLong {
+                    length: char_count,
+                    max: max_chars,
+                });
+            }
+            Ok((s.to_string(), total))
+        }
+        0x0A => {
+            // TAG_Compound
+            let mut cursor = 1;
+            let mut extracted = None;
+            loop {
+                if cursor >= input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                let item_tag = input[cursor];
+                cursor += 1;
+                if item_tag == 0 {
+                    break;
+                }
+                if cursor + 2 > input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                let name_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
+                cursor += 2;
+                if cursor + name_len > input.len() {
+                    return Err(ProtocolError::UnexpectedEof);
+                }
+                let name = std::str::from_utf8(&input[cursor..cursor + name_len])
+                    .map_err(|_| ProtocolError::InvalidUtf8)?;
+                cursor += name_len;
+
+                if item_tag == 0x08 && name == "text" {
+                    if cursor + 2 > input.len() {
+                        return Err(ProtocolError::UnexpectedEof);
+                    }
+                    let str_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
+                    cursor += 2;
+                    if cursor + str_len > input.len() {
+                        return Err(ProtocolError::UnexpectedEof);
+                    }
+                    let s = std::str::from_utf8(&input[cursor..cursor + str_len])
+                        .map_err(|_| ProtocolError::InvalidUtf8)?;
+                    cursor += str_len;
+                    extracted = Some(s.to_string());
+                } else {
+                    let payload_len = skip_nbt_tag_payload(item_tag, &input[cursor..])?;
+                    cursor += payload_len;
+                }
+            }
+            let s = extracted.unwrap_or_default();
+            let char_count = s.chars().count();
+            if char_count > max_chars {
+                return Err(ProtocolError::StringTooLong {
+                    length: char_count,
+                    max: max_chars,
+                });
+            }
+            Ok((s, cursor))
+        }
+        other => Err(ProtocolError::InvalidNbtTag(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1365,8 @@ mod tests {
             listed: true,
             latency: 42,
             display_name: Some(format!("§6{name}§r")),
+            list_order: 10,
+            show_hat: true,
         }
     }
 
@@ -991,6 +1378,8 @@ mod tests {
         assert_eq!(PlayerInfoAction::UpdateListed.flag(), 0x08);
         assert_eq!(PlayerInfoAction::UpdateLatency.flag(), 0x10);
         assert_eq!(PlayerInfoAction::UpdateDisplayName.flag(), 0x20);
+        assert_eq!(PlayerInfoAction::UpdateListOrder.flag(), 0x40);
+        assert_eq!(PlayerInfoAction::UpdateHat.flag(), 0x80);
 
         let combined = PlayerInfoAction::AddPlayer | PlayerInfoAction::UpdateLatency;
         assert_eq!(combined, 0x11);
@@ -1008,7 +1397,7 @@ mod tests {
         ));
 
         let all = PlayerInfoAction::ALL;
-        assert_eq!(all, 0x3F);
+        assert_eq!(all, 0xFF);
         for action in [
             PlayerInfoAction::AddPlayer,
             PlayerInfoAction::InitializeChat,
@@ -1016,14 +1405,16 @@ mod tests {
             PlayerInfoAction::UpdateListed,
             PlayerInfoAction::UpdateLatency,
             PlayerInfoAction::UpdateDisplayName,
+            PlayerInfoAction::UpdateListOrder,
+            PlayerInfoAction::UpdateHat,
         ] {
             assert!(PlayerInfoAction::is_set(all, action));
             assert_eq!(PlayerInfoAction::try_from(action.flag()).unwrap(), action);
         }
 
         assert_eq!(
-            PlayerInfoAction::try_from(0x40).unwrap_err(),
-            ProtocolError::InvalidActionBitmask(0x40)
+            PlayerInfoAction::try_from(0x00).unwrap_err(),
+            ProtocolError::InvalidActionBitmask(0x00)
         );
     }
 
@@ -1180,11 +1571,38 @@ mod tests {
         let encoded = packet.encode().unwrap();
         let decoded = PlayerInfoUpdatePacket::decode(&encoded).unwrap();
         assert_eq!(decoded.entries[0].display_name, None);
+
+        // 8. UpdateListOrder only
+        for order in [0, 1, 999, -50] {
+            let entry = PlayerInfoEntry {
+                uuid,
+                list_order: order,
+                ..Default::default()
+            };
+            let packet =
+                PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateListOrder as u8, entry);
+            let encoded = packet.encode().unwrap();
+            let decoded = PlayerInfoUpdatePacket::decode(&encoded).unwrap();
+            assert_eq!(decoded.entries[0].list_order, order);
+        }
+
+        // 9. UpdateHat only
+        for hat in [true, false] {
+            let entry = PlayerInfoEntry {
+                uuid,
+                show_hat: hat,
+                ..Default::default()
+            };
+            let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateHat as u8, entry);
+            let encoded = packet.encode().unwrap();
+            let decoded = PlayerInfoUpdatePacket::decode(&encoded).unwrap();
+            assert_eq!(decoded.entries[0].show_hat, hat);
+        }
     }
 
     #[test]
-    fn test_all_64_bitmask_combinations_roundtrip() {
-        for mask in 0u8..=0x3F {
+    fn test_all_256_bitmask_combinations_roundtrip() {
+        for mask in 0u8..=0xFF {
             let entry = sample_entry(mask, "Tester");
             let packet = PlayerInfoUpdatePacket::new(mask, vec![entry]);
             let encoded = packet.encode().expect("encoding must succeed");
@@ -1214,6 +1632,12 @@ mod tests {
                     decoded.entries[0].display_name.as_deref(),
                     Some("§6Tester§r")
                 );
+            }
+            if PlayerInfoAction::is_set(mask, PlayerInfoAction::UpdateListOrder) {
+                assert_eq!(decoded.entries[0].list_order, 10);
+            }
+            if PlayerInfoAction::is_set(mask, PlayerInfoAction::UpdateHat) {
+                assert!(decoded.entries[0].show_hat);
             }
         }
     }
@@ -1247,7 +1671,7 @@ mod tests {
             ProtocolError::UnexpectedEof
         );
 
-        // 5. Unexpected packet ID (0x3F instead of 0x3E)
+        // 5. Unexpected packet ID (0x3F instead of 0x47)
         let mut wrong_packet = Vec::new();
         write_varint(2, &mut wrong_packet); // Frame len = 2
         write_varint(0x3F, &mut wrong_packet); // Wrong packet ID 0x3F
@@ -1255,22 +1679,19 @@ mod tests {
         assert_eq!(
             PlayerInfoUpdatePacket::decode(&wrong_packet).unwrap_err(),
             ProtocolError::UnexpectedPacketId {
-                expected: 0x3E,
+                expected: 0x47,
                 received: 0x3F,
             }
         );
 
-        // 6. Invalid action bitmask with upper bits (0x40)
-        let mut invalid_mask_payload = Vec::new();
-        invalid_mask_payload.push(0x40); // Bit 6 set
-        write_varint(0, &mut invalid_mask_payload); // 0 entries
-        let mut framed = Vec::new();
-        write_varint((1 + invalid_mask_payload.len()) as i32, &mut framed);
-        write_varint(0x3E, &mut framed);
-        framed.extend_from_slice(&invalid_mask_payload);
+        // 6. Action bitmask TryFrom rejects invalid single flags (0x00, 0x43)
         assert_eq!(
-            PlayerInfoUpdatePacket::decode(&framed).unwrap_err(),
-            ProtocolError::InvalidActionBitmask(0x40)
+            PlayerInfoAction::try_from(0x00).unwrap_err(),
+            ProtocolError::InvalidActionBitmask(0x00)
+        );
+        assert_eq!(
+            PlayerInfoAction::try_from(0x43).unwrap_err(),
+            ProtocolError::InvalidActionBitmask(0x43)
         );
 
         // 7. Invalid boolean (byte 0x02)
@@ -1531,5 +1952,215 @@ mod tests {
         assert_eq!(decoded_chat.expires_at, 1_234_567_890_123);
         assert_eq!(decoded_chat.public_key, pub_key);
         assert_eq!(decoded_chat.key_signature, key_sig);
+    }
+
+    #[test]
+    fn test_independent_protocol_777_player_info_update_fixture() {
+        // Independently constructed framed fixture for Java 26.3 protocol 777 PlayerInfoUpdate:
+        // Frame length: 27 bytes (0x1B)
+        // Packet ID: VarInt 0x47 (clientbound PlayerInfoUpdate)
+        // Actions bitmask: 0x20 (UpdateDisplayName)
+        // Number of entries: VarInt 1 (0x01)
+        // UUID: 16 bytes [0x07; 16]
+        // has_display_name: 0x01 (true)
+        // Network NBT TAG_String (0x08):
+        //   tag type: 0x08
+        //   length (u16 BE): 0x00, 0x04
+        //   string: b"Nick"
+        let mut fixture = Vec::new();
+        // Frame length = 1 (packet ID 0x47) + 1 (action 0x20) + 1 (count 1) + 16 (UUID) + 1 (has_dn) + 1 (tag 0x08) + 2 (len 4) + 4 (Nick) = 27 bytes
+        write_varint(27, &mut fixture);
+        write_varint(0x47, &mut fixture); // Packet ID 0x47
+        fixture.push(0x20); // Action: UpdateDisplayName
+        write_varint(1, &mut fixture); // 1 entry
+        fixture.extend_from_slice(&[0x07; 16]); // UUID
+        fixture.push(0x01); // has_display_name = true
+        fixture.push(0x08); // TAG_String
+        fixture.extend_from_slice(&[0x00, 0x04]); // length 4
+        fixture.extend_from_slice(b"Nick"); // string "Nick"
+
+        let packet = PlayerInfoUpdatePacket::decode(&fixture)
+            .expect("fixture decoding must succeed with packet ID 0x47");
+        assert_eq!(packet.actions, 0x20);
+        assert_eq!(packet.entries.len(), 1);
+        assert_eq!(packet.entries[0].uuid, [0x07; 16]);
+        assert_eq!(packet.entries[0].display_name.as_deref(), Some("Nick"));
+    }
+
+    #[test]
+    fn test_network_nbt_compound_display_name_decoding() {
+        // Independently constructed framed fixture with anonymous TAG_Compound display name:
+        // Actions: 0x20
+        // has_display_name: true
+        // Anonymous TAG_Compound (0x0A):
+        //   TAG_String (0x08)
+        //   name length (u16 BE): 0x00, 0x04
+        //   name: "text"
+        //   string length (u16 BE): 0x00, 0x05
+        //   value: "Hello"
+        //   TAG_End (0x00)
+        let mut fixture = Vec::new();
+        let mut compound = Vec::new();
+        compound.push(0x0A); // TAG_Compound
+        compound.push(0x08); // TAG_String
+        compound.extend_from_slice(&4u16.to_be_bytes()); // "text" length
+        compound.extend_from_slice(b"text");
+        compound.extend_from_slice(&5u16.to_be_bytes()); // "Hello" length
+        compound.extend_from_slice(b"Hello");
+        compound.push(0x00); // TAG_End
+
+        let payload_len = 1 + 1 + 16 + 1 + compound.len();
+        let total_frame_len = 1 + payload_len; // 1 byte for VarInt 0x47
+        write_varint(total_frame_len as i32, &mut fixture);
+        write_varint(0x47, &mut fixture);
+        fixture.push(0x20);
+        write_varint(1, &mut fixture);
+        fixture.extend_from_slice(&[0x08; 16]);
+        fixture.push(0x01);
+        fixture.extend_from_slice(&compound);
+
+        let packet = PlayerInfoUpdatePacket::decode(&fixture)
+            .expect("compound display name fixture must decode successfully");
+        assert_eq!(packet.entries[0].display_name.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn test_actions_0x40_and_0x80_wire_fixture() {
+        // Test independently constructed wire bytes for UpdateListOrder (0x40) and UpdateHat (0x80)
+        let mut fixture = Vec::new();
+        let mut payload = Vec::new();
+        payload.push(0xC0); // 0x40 | 0x80
+        write_varint(1, &mut payload); // 1 entry
+        payload.extend_from_slice(&[0x09; 16]); // UUID
+        write_varint(42, &mut payload); // list_order = 42
+        payload.push(0x01); // show_hat = true
+
+        let total_frame_len = 1 + payload.len();
+        write_varint(total_frame_len as i32, &mut fixture);
+        write_varint(0x47, &mut fixture);
+        fixture.extend_from_slice(&payload);
+
+        let packet = PlayerInfoUpdatePacket::decode(&fixture)
+            .expect("0xC0 actions fixture must decode successfully");
+        assert_eq!(packet.actions, 0xC0);
+        assert_eq!(packet.entries[0].list_order, 42);
+        assert!(packet.entries[0].show_hat);
+    }
+
+    #[test]
+    fn test_encode_field_size_limit_validations() {
+        let uuid = sample_uuid(1);
+
+        // 1. Property value exceeding MAX_STRING_CHARS (32767)
+        let oversized_val = "x".repeat(MAX_STRING_CHARS + 1);
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.properties = vec![ProfileProperty::unsigned("custom", oversized_val)];
+        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 32768,
+                max: 32767
+            }
+        ));
+
+        // 2. Property name exceeding MAX_STRING_CHARS
+        let oversized_prop_name = "n".repeat(MAX_STRING_CHARS + 1);
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.properties = vec![ProfileProperty::unsigned(oversized_prop_name, "val")];
+        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 32768,
+                max: 32767
+            }
+        ));
+
+        // 3. Property signature exceeding MAX_STRING_CHARS
+        let oversized_sig = "s".repeat(MAX_STRING_CHARS + 1);
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.properties = vec![ProfileProperty::signed("textures", "val", oversized_sig)];
+        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 32768,
+                max: 32767
+            }
+        ));
+
+        // 4. Chat session public key exceeding MAX_KEY_BYTES (65536)
+        let oversized_key = vec![0x42; MAX_KEY_BYTES + 1];
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.chat_session = Some(ChatSessionData::new(
+            sample_uuid(2),
+            12345,
+            oversized_key,
+            vec![1, 2, 3],
+        ));
+        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::InitializeChat as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 65537,
+                max: 65536
+            }
+        ));
+
+        // 5. Chat session key signature exceeding MAX_KEY_BYTES
+        let oversized_key_sig = vec![0x42; MAX_KEY_BYTES + 1];
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.chat_session = Some(ChatSessionData::new(
+            sample_uuid(2),
+            12345,
+            vec![1, 2, 3],
+            oversized_key_sig,
+        ));
+        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::InitializeChat as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 65537,
+                max: 65536
+            }
+        ));
+
+        // 6. Display name exceeding MAX_STRING_CHARS
+        let oversized_display = "d".repeat(MAX_STRING_CHARS + 1);
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.display_name = Some(oversized_display);
+        let packet =
+            PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateDisplayName as u8, entry);
+        assert!(matches!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 32768,
+                max: 32767
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tracker_list_order_and_hat() {
+        let mut tracker = TabListTracker::new();
+        let uuid = sample_uuid(4);
+        let entry = sample_entry(4, "OrderHatTester");
+        tracker.add_player(entry);
+
+        // Update list order
+        let order_packet = tracker.update_list_order(&uuid, 77).unwrap();
+        assert_eq!(
+            order_packet.actions,
+            PlayerInfoAction::UpdateListOrder as u8
+        );
+        assert_eq!(order_packet.entries[0].list_order, 77);
+        assert_eq!(tracker.get_player(&uuid).unwrap().list_order, 77);
+
+        // Update hat
+        let hat_packet = tracker.update_hat(&uuid, false).unwrap();
+        assert_eq!(hat_packet.actions, PlayerInfoAction::UpdateHat as u8);
+        assert!(!hat_packet.entries[0].show_hat);
+        assert!(!tracker.get_player(&uuid).unwrap().show_hat);
     }
 }
