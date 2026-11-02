@@ -268,25 +268,26 @@ impl PlayerSurvival {
         if !self.is_alive() {
             return None;
         }
+        let measured_distance = if fall_distance.is_finite() {
+            fall_distance.max(0.0)
+        } else {
+            0.0
+        };
         if on_ground {
-            let dist = if fall_distance > 0.0 {
-                fall_distance
-            } else {
-                self.fall_distance
-            };
+            let dist = measured_distance.max(self.fall_distance);
             self.fall_distance = 0.0;
             let damage = (dist - FALL_DAMAGE_DISTANCE_THRESHOLD).max(0.0);
             if damage > 0.0 {
-                self.apply_damage(DamageSource::Fall, damage);
+                let applied = self.apply_damage(DamageSource::Fall, damage);
                 Some(DamageEvent {
                     source: DamageSource::Fall,
-                    amount: damage,
+                    amount: applied,
                 })
             } else {
                 None
             }
         } else {
-            self.fall_distance = fall_distance.max(self.fall_distance);
+            self.fall_distance = measured_distance.max(self.fall_distance);
             None
         }
     }
@@ -317,10 +318,10 @@ impl PlayerSurvival {
             self.air_supply = (self.air_supply - 1).clamp(MIN_AIR_SUPPLY, MAX_AIR_SUPPLY);
             if self.air_supply <= MIN_AIR_SUPPLY {
                 self.air_supply = 0;
-                self.apply_damage(DamageSource::Drowning, DROWNING_DAMAGE);
+                let applied = self.apply_damage(DamageSource::Drowning, DROWNING_DAMAGE);
                 events.push(DamageEvent {
                     source: DamageSource::Drowning,
-                    amount: DROWNING_DAMAGE,
+                    amount: applied,
                 });
             }
         } else {
@@ -333,10 +334,10 @@ impl PlayerSurvival {
 
         // 2. Void damage
         if y_pos < VOID_THRESHOLD_Y {
-            self.apply_damage(DamageSource::Void, VOID_DAMAGE);
+            let applied = self.apply_damage(DamageSource::Void, VOID_DAMAGE);
             events.push(DamageEvent {
                 source: DamageSource::Void,
-                amount: VOID_DAMAGE,
+                amount: applied,
             });
         }
 
@@ -349,10 +350,10 @@ impl PlayerSurvival {
             self.suffocation_timer += 1;
             if self.suffocation_timer >= SUFFOCATION_INTERVAL_TICKS {
                 self.suffocation_timer = 0;
-                self.apply_damage(DamageSource::Suffocation, SUFFOCATION_DAMAGE);
+                let applied = self.apply_damage(DamageSource::Suffocation, SUFFOCATION_DAMAGE);
                 events.push(DamageEvent {
                     source: DamageSource::Suffocation,
-                    amount: SUFFOCATION_DAMAGE,
+                    amount: applied,
                 });
             }
         } else {
@@ -382,10 +383,10 @@ impl PlayerSurvival {
             self.food_timer += 1;
             if self.food_timer >= STARVATION_INTERVAL_TICKS {
                 self.food_timer = 0;
-                self.apply_damage(DamageSource::Starvation, STARVATION_DAMAGE);
+                let applied = self.apply_damage(DamageSource::Starvation, STARVATION_DAMAGE);
                 events.push(DamageEvent {
                     source: DamageSource::Starvation,
-                    amount: STARVATION_DAMAGE,
+                    amount: applied,
                 });
             }
         } else {

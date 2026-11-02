@@ -67,6 +67,56 @@ fn test_fall_damage_threshold_and_scaling() {
 }
 
 #[test]
+fn landing_uses_recorded_fall_and_reports_only_applied_damage() {
+    let mut player = PlayerSurvival::default().with_health(1.0);
+    assert_eq!(player.handle_fall(false, 6.0), None);
+    assert_eq!(player.handle_fall(false, f32::INFINITY), None);
+    assert_eq!(player.fall_distance(), 6.0);
+    assert_eq!(
+        player.handle_fall(true, 1.0),
+        Some(DamageEvent::new(DamageSource::Fall, 1.0))
+    );
+    assert_eq!(player.health(), 0.0);
+    assert_eq!(player.fall_distance(), 0.0);
+}
+
+#[test]
+fn hazard_events_report_actual_health_lost() {
+    let mut drowning = PlayerSurvival::default().with_health(1.0);
+    drowning.set_air_supply(-20);
+    assert_eq!(
+        drowning.tick(true, false, 0.0),
+        vec![DamageEvent::new(DamageSource::Drowning, 1.0)]
+    );
+
+    let mut void = PlayerSurvival::default().with_health(1.0);
+    assert_eq!(
+        void.tick(false, false, -70.0),
+        vec![DamageEvent::new(DamageSource::Void, 1.0)]
+    );
+
+    let mut suffocation = PlayerSurvival::default().with_health(0.5);
+    suffocation.set_food_level(0);
+    for _ in 0..19 {
+        assert!(suffocation.tick(false, true, 0.0).is_empty());
+    }
+    assert_eq!(
+        suffocation.tick(false, true, 0.0),
+        vec![DamageEvent::new(DamageSource::Suffocation, 0.5)]
+    );
+
+    let mut starvation = PlayerSurvival::default().with_health(0.5);
+    starvation.set_food_level(0);
+    for _ in 0..79 {
+        assert!(starvation.tick(false, false, 0.0).is_empty());
+    }
+    assert_eq!(
+        starvation.tick(false, false, 0.0),
+        vec![DamageEvent::new(DamageSource::Starvation, 0.5)]
+    );
+}
+
+#[test]
 fn test_air_depletion_and_drowning_damage() {
     let mut player = PlayerSurvival::default();
     assert_eq!(player.air_supply(), 300);
