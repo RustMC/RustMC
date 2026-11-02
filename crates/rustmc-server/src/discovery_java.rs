@@ -190,6 +190,8 @@ pub struct Session {
     preview_radius: u8,
     preview_terrain: crate::world::Terrain,
     vanilla_source: Option<crate::java_preview::VanillaSource>,
+    player_name: String,
+    dispatcher: crate::protocol::chat::CommandDispatcher,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -205,6 +207,8 @@ impl Default for Session {
             preview_radius: 2,
             preview_terrain: crate::world::Terrain::Preview,
             vanilla_source: None,
+            player_name: "Player".to_string(),
+            dispatcher: crate::protocol::chat::CommandDispatcher::new(),
         }
     }
 }
@@ -316,6 +320,10 @@ impl Session {
                     {
                         return Err(Error::Malformed);
                     }
+                    let player_name = String::from_utf8_lossy(name).to_string();
+                    self.dispatcher
+                        .add_player(crate::protocol::chat::PlayerState::new(&player_name));
+                    self.player_name = player_name;
                     // The client UUID is an opaque, unverified local-session value.
                     let mut success = body[prefix + name_len..].to_vec();
                     put_varint(name_len as u32, &mut success);
@@ -429,6 +437,25 @@ impl Session {
                         }
                         54 if body.len() == 2 => {} // Selected hotbar slot is client-local here.
                         14 | 22 => {} // Bounded information/custom payloads have no effect.
+                        6 => {
+                            let chat = crate::protocol::chat::ChatPacket::decode_payload(body)
+                                .map_err(|_| Error::Malformed)?;
+                            let broadcast = crate::protocol::chat::broadcast_chat(
+                                &self.player_name,
+                                &chat.message,
+                            );
+                            responses.push(broadcast.to_frame());
+                        }
+                        4 => {
+                            let cmd =
+                                crate::protocol::chat::ChatCommandPacket::decode_payload(body)
+                                    .map_err(|_| Error::Malformed)?;
+                            let sender = crate::protocol::chat::CommandSender::Player(
+                                self.player_name.clone(),
+                            );
+                            let reply = self.dispatcher.dispatch_to_chat(&sender, &cmd.command);
+                            responses.push(reply.to_frame());
+                        }
                         _ => {
                             eprintln!(
                                 "event=preview_unsupported_packet packet_id={id} bytes={}",
@@ -557,5 +584,55 @@ mod tests {
         let mut s = Session::default();
         s.receive(&handshake(777), 4096).unwrap();
         assert_eq!(s.receive(&frame(1, &[0; 8]), 4096), Err(Error::WrongState));
+    }
+
+    #[test]
+    fn chat_and_command_packets_in_play_state() {
+        let manifest = RegistryManifest {
+            tags: Vec::new(),
+            registries: vec![
+                (
+                    "minecraft:dimension_type".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:world_clock".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:worldgen/biome".into(),
+                    crate::world::Biome::ALL
+                        .iter()
+                        .map(|b| b.identifier().into())
+                        .collect(),
+                ),
+            ],
+        };
+        let mut s = Session::new(true);
+        s.state = State::Play;
+        s.player_name = "Alice".to_string();
+        s.dispatcher
+            .add_player(crate::protocol::chat::PlayerState::new("Alice"));
+        s.preview =
+            crate::java_preview::Preview::new(0, 2, crate::world::Terrain::Preview, &manifest);
+
+        // Send ChatPacket (0x06)
+        let chat =
+            crate::protocol::chat::ChatPacket::unsigned("Hello from Alice!", 12345, 67890).unwrap();
+        let replies = s.receive(&chat.to_frame(), 4096).unwrap();
+        assert_eq!(replies.len(), 1);
+        let sys_chat = crate::protocol::chat::SystemChatMessagePacket::decode(&replies[0]).unwrap();
+        assert!(!sys_chat.overlay);
+        assert!(sys_chat.content.contains("<Alice> Hello from Alice!"));
+
+        // Send ChatCommandPacket (0x04)
+        let cmd = crate::protocol::chat::ChatCommandPacket::unsigned("time set day", 12345, 67890)
+            .unwrap();
+        let replies2 = s.receive(&cmd.to_frame(), 4096).unwrap();
+        assert_eq!(replies2.len(), 1);
+        let sys_reply =
+            crate::protocol::chat::SystemChatMessagePacket::decode(&replies2[0]).unwrap();
+        assert!(!sys_reply.overlay);
+        assert!(sys_reply.content.contains("1000"));
     }
 }
