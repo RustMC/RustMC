@@ -1,7 +1,11 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod time_weather;
+
 #[cfg(test)]
 mod tests_interaction;
+#[cfg(test)]
+mod tests_time_weather;
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
