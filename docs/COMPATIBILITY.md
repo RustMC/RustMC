@@ -20,4 +20,12 @@ These identifiers select discovery responses only. Java's handshake carries a cl
 | Save/import/export | planned | unknown | None |
 | Cross-edition translation differences | not applicable | planned | None |
 
+The T4 oracle's `flowers` row counts selected small-flower block names; its
+historical measurements used an older definition, so their values are not
+interchangeable with current rows. Neither is a count of all flowering
+vegetation. The census also reports `wildflowers`, `bushes`, and
+`tall_flowers` as separate block-row
+families. These are measurement categories, not evidence that their placement
+or behavior is implemented.
+
 The proposed shared world uses Java-style game rules. Bedrock support would translate client actions and results; it does not promise identical edition mechanics. The discovery version targets are selected; the gameplay rules baseline still needs owner approval. The matrix must grow into versioned feature entries backed by black-box observations and tests. The default loopback process answers discovery only. With explicit local preview configuration, Java 26.3 can inspect immutable generated chunks; it has no authenticated, persistent, or shared gameplay world.
