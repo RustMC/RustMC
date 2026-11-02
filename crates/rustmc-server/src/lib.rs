@@ -9,6 +9,7 @@ pub mod discovery_java;
 pub mod java_preview;
 pub mod preview_cache;
 pub mod preview_data;
+pub mod protocol;
 pub mod runtime;
 pub mod vanilla;
 pub mod world;
