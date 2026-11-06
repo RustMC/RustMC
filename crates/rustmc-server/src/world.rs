@@ -32,6 +32,14 @@ pub enum Block {
     Terracotta,
 }
 
+impl Block {
+    /// Whether this block represents a solid obstacle for collision sweeps.
+    #[inline]
+    pub const fn is_solid(self) -> bool {
+        !matches!(self, Block::Air)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Biome {
     Plains,
@@ -77,6 +85,22 @@ pub struct Chunk {
     blocks: Vec<Block>,
 }
 impl Chunk {
+    /// Construct an empty chunk filled with `Block::Air`.
+    pub fn new(x: i32, z: i32) -> Self {
+        Self {
+            x,
+            z,
+            blocks: vec![Block::Air; CHUNK_SIDE * CHUNK_SIDE * WORLD_HEIGHT],
+        }
+    }
+
+    /// Set a block at local chunk coordinates `(lx, y, lz)`.
+    pub fn set_block(&mut self, lx: usize, y: usize, lz: usize, block: Block) {
+        if lx < CHUNK_SIDE && y < WORLD_HEIGHT && lz < CHUNK_SIDE {
+            self.blocks[(y * CHUNK_SIDE + lz) * CHUNK_SIDE + lx] = block;
+        }
+    }
+
     pub fn block(&self, x: usize, y: usize, z: usize) -> Option<Block> {
         if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
             return None;

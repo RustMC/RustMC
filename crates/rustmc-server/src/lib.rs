@@ -6,6 +6,7 @@
 pub mod chunk_adapter;
 pub mod discovery_bedrock;
 pub mod discovery_java;
+pub mod entity;
 pub mod java_preview;
 pub mod preview_cache;
 pub mod preview_data;
