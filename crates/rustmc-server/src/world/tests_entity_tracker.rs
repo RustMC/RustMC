@@ -1,6 +1,8 @@
 use super::entity_tracker::{
-    EntityType, SpatialEntityTracker, TrackingError, TrackingEvent, chunk_coords, try_chunk_coords,
+    EntityId, EntityType, MAX_TRACKING_RANGE, SpatialEntityTracker, TrackingError, TrackingEvent,
+    chunk_coords, try_chunk_coords,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn test_entity_spawn_visibility_in_range() {
@@ -563,4 +565,209 @@ fn test_spatial_chunk_indexing_candidate_bounding() {
     let p1_move_events = tracker.move_entity(p1, (2.0, 64.0, 0.0)).unwrap();
     assert!(p1_move_events.is_empty());
     assert_eq!(tracker.observed_by(p1).unwrap().len(), 1);
+}
+
+/// Asserts that the reverse index is exactly the inverse of the observer view sets.
+fn assert_reverse_index_consistent(tracker: &SpatialEntityTracker) {
+    let mut expected: BTreeMap<EntityId, BTreeSet<EntityId>> = BTreeMap::new();
+    for (&observer, seen) in tracker.observer_view_sets() {
+        for &entity in seen {
+            expected.entry(entity).or_default().insert(observer);
+        }
+    }
+    for &entity in tracker.entity_registry().keys() {
+        assert_eq!(
+            tracker.observers_of(entity),
+            expected.get(&entity),
+            "entity {entity}"
+        );
+    }
+    for entity in expected.keys() {
+        assert!(tracker.get_entity(*entity).is_some(), "stale {entity}");
+    }
+}
+
+#[test]
+fn test_move_notifies_linked_observers_and_skips_distant_ones() {
+    let mut tracker = SpatialEntityTracker::new();
+    let (near, _) = tracker
+        .add_entity(EntityType::Player, (0.0, 64.0, 0.0))
+        .unwrap();
+    let (far, _) = tracker
+        .add_entity(EntityType::Player, (10_000.0, 64.0, 0.0))
+        .unwrap();
+    let (mob, _) = tracker
+        .add_entity(EntityType::Monster, (10.0, 64.0, 0.0))
+        .unwrap();
+    assert_eq!(
+        tracker.observers_of(mob),
+        Some(&BTreeSet::from([near])),
+        "only the nearby observer is linked"
+    );
+
+    // A single jump far beyond the old chunks must still reach the old observer.
+    let events = tracker.move_entity(mob, (9_990.0, 64.0, 0.0)).unwrap();
+    assert_eq!(
+        events,
+        vec![
+            TrackingEvent::Destroy {
+                observer: near,
+                entity: mob,
+            },
+            TrackingEvent::Spawn {
+                observer: far,
+                entity: mob,
+                pos: (9_990.0, 64.0, 0.0),
+                entity_type: EntityType::Monster,
+            },
+        ]
+    );
+    assert_eq!(tracker.observers_of(mob), Some(&BTreeSet::from([far])));
+    assert_reverse_index_consistent(&tracker);
+}
+
+#[test]
+fn test_removing_an_observer_clears_its_reverse_links() {
+    let mut tracker = SpatialEntityTracker::new();
+    let (player, _) = tracker
+        .add_entity(EntityType::Player, (0.0, 64.0, 0.0))
+        .unwrap();
+    let (mob, _) = tracker
+        .add_entity(EntityType::Monster, (5.0, 64.0, 0.0))
+        .unwrap();
+    assert!(tracker.is_observing(player, mob));
+
+    tracker.remove_entity(player);
+    assert_eq!(tracker.observers_of(mob), None);
+
+    // The removed observer must not receive anything for the mob afterwards.
+    assert!(
+        tracker
+            .move_entity(mob, (6.0, 64.0, 0.0))
+            .unwrap()
+            .is_empty()
+    );
+    assert_reverse_index_consistent(&tracker);
+}
+
+#[test]
+fn test_removing_an_entity_notifies_only_linked_observers() {
+    let mut tracker = SpatialEntityTracker::new();
+    let (a, _) = tracker
+        .add_entity(EntityType::Player, (0.0, 64.0, 0.0))
+        .unwrap();
+    let (b, _) = tracker
+        .add_entity(EntityType::Player, (1.0, 64.0, 0.0))
+        .unwrap();
+    tracker
+        .add_entity(EntityType::Player, (5_000.0, 64.0, 0.0))
+        .unwrap();
+    let (mob, _) = tracker
+        .add_entity(EntityType::Monster, (2.0, 64.0, 0.0))
+        .unwrap();
+
+    assert_eq!(
+        tracker.remove_entity(mob),
+        vec![
+            TrackingEvent::Destroy {
+                observer: a,
+                entity: mob,
+            },
+            TrackingEvent::Destroy {
+                observer: b,
+                entity: mob,
+            },
+        ]
+    );
+    assert_reverse_index_consistent(&tracker);
+}
+
+#[test]
+fn test_reverse_index_survives_a_deterministic_workload() {
+    let mut tracker = SpatialEntityTracker::new();
+    let mut ids = Vec::new();
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let types = [
+        EntityType::Player,
+        EntityType::Monster,
+        EntityType::Animal,
+        EntityType::Item,
+        EntityType::Projectile,
+    ];
+
+    for step in 0..2_000 {
+        let pos = (next(400) as f64 - 200.0, 64.0, next(400) as f64 - 200.0);
+        match next(4) {
+            0 | 1 if !ids.is_empty() => {
+                let id = ids[next(ids.len() as u64) as usize];
+                tracker.move_entity(id, pos).unwrap();
+            }
+            2 if !ids.is_empty() => {
+                let index = next(ids.len() as u64) as usize;
+                tracker.remove_entity(ids.swap_remove(index));
+            }
+            _ => {
+                let kind = types[next(types.len() as u64) as usize];
+                ids.push(tracker.add_entity(kind, pos).unwrap().0);
+            }
+        }
+        if step % 50 == 0 {
+            assert_reverse_index_consistent(&tracker);
+        }
+    }
+    assert_reverse_index_consistent(&tracker);
+}
+
+#[test]
+fn test_max_tracking_range_covers_every_type() {
+    let types = [
+        EntityType::Player,
+        EntityType::Monster,
+        EntityType::Animal,
+        EntityType::Item,
+        EntityType::Projectile,
+    ];
+    let widest = types
+        .iter()
+        .map(|kind| kind.tracking_range())
+        .fold(0.0, f64::max);
+    assert_eq!(widest, MAX_TRACKING_RANGE);
+}
+
+/// Reports movement cost as the distant observer population grows. Run with
+/// `cargo test --release -p rustmc-server movement_cost_report -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing report, not a correctness check"]
+fn movement_cost_report() {
+    const MOVES: u32 = 200_000;
+    for observers in [100_u32, 1_000, 10_000, 100_000] {
+        let mut tracker = SpatialEntityTracker::new();
+        for index in 0..observers {
+            // One observer every 256 blocks on a grid: none can see the moving mob.
+            let x = f64::from(index % 1_000) * 256.0 + 1_000.0;
+            let z = f64::from(index / 1_000) * 256.0 + 1_000.0;
+            tracker
+                .add_entity(EntityType::Player, (x, 64.0, z))
+                .unwrap();
+        }
+        let (mob, _) = tracker
+            .add_entity(EntityType::Monster, (0.0, 64.0, 0.0))
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        for step in 0..MOVES {
+            let events = tracker
+                .move_entity(mob, (f64::from(step % 16), 64.0, 0.0))
+                .unwrap();
+            assert!(events.is_empty());
+        }
+        let per_move = start.elapsed().as_nanos() / u128::from(MOVES);
+        println!("observers={observers} ns_per_move={per_move}");
+    }
 }

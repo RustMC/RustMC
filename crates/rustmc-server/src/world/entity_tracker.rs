@@ -3,14 +3,26 @@
 //! Maintains spatial indices (by chunk) and observer view sets so that
 //! visibility events (`Spawn`, `Destroy`, `Move`) are deterministically emitted
 //! when entities enter, leave, or move within an observer's tracking range.
-//! Chunk spatial queries bound candidate evaluation to neighboring chunks.
+//!
+//! Each operation visits the entities in chunks near the affected position plus the
+//! observers already linked to the entity through a reverse index, never the whole
+//! population. Cost still grows with local density, so this is not a constant bound.
+//!
+//! The ranges and limits here are RustMC policy, not vanilla values.
+//! `docs/research/entity-tracking-limits.md` separates them from the facts they rest on.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Maximum tracking range among all entity types (in blocks).
+/// Maximum tracking range among all entity types (in blocks). RustMC policy.
 pub const MAX_TRACKING_RANGE: f64 = 64.0;
 
-/// Entity categories and their canonical tracking ranges in blocks.
+/// Largest accepted absolute X or Z. RustMC policy, rounded from the public teleport limit.
+pub const MAX_HORIZONTAL_COORDINATE: f64 = 30_000_000.0;
+
+/// Largest accepted absolute Y. RustMC policy with no vanilla counterpart.
+pub const MAX_VERTICAL_COORDINATE: f64 = 2048.0;
+
+/// Entity categories and their RustMC policy tracking ranges in blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntityType {
     Player,
@@ -21,7 +33,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    /// Tracking radius in blocks for this entity type.
+    /// Tracking radius in blocks for this entity type. RustMC policy, not vanilla values.
     pub const fn tracking_range(self) -> f64 {
         match self {
             Self::Player => 64.0,
@@ -105,7 +117,9 @@ pub fn try_chunk_coords(pos: (f64, f64, f64)) -> Option<(i32, i32)> {
     if !pos.0.is_finite() || !pos.1.is_finite() || !pos.2.is_finite() {
         return None;
     }
-    if pos.0.abs() > 30_000_000.0 || pos.2.abs() > 30_000_000.0 || pos.1 < -2048.0 || pos.1 > 2048.0
+    if pos.0.abs() > MAX_HORIZONTAL_COORDINATE
+        || pos.2.abs() > MAX_HORIZONTAL_COORDINATE
+        || pos.1.abs() > MAX_VERTICAL_COORDINATE
     {
         return None;
     }
@@ -147,7 +161,8 @@ fn chunks_in_radius(pos: (f64, f64, f64), radius: f64) -> impl Iterator<Item = (
 /// Spatial entity tracker indexing entities by chunk and maintaining observer view sets.
 ///
 /// Indexes and registries are encapsulated as private fields to prevent desynchronization.
-/// Spatial candidate bounding uses chunk indices to prevent $O(N_{\text{all}})$ full table scans.
+/// The chunk index finds candidates near a position; `entity_observers` finds who already
+/// sees an entity, so neither movement nor removal scans every observer.
 #[derive(Debug, Clone)]
 pub struct SpatialEntityTracker {
     /// Chunk index mapping `(chunk_x, chunk_z)` to the entities in that chunk.
@@ -156,6 +171,9 @@ pub struct SpatialEntityTracker {
     entity_registry: BTreeMap<EntityId, TrackedEntity>,
     /// Observer view sets mapping observer `EntityId` to the set of entities it observes.
     observer_view_sets: BTreeMap<EntityId, BTreeSet<EntityId>>,
+    /// Reverse of `observer_view_sets`: entity to the observers that see it. Entities that
+    /// no observer sees have no entry.
+    entity_observers: BTreeMap<EntityId, BTreeSet<EntityId>>,
     /// Monotonically increasing next entity ID (starts at 1).
     next_entity_id: EntityId,
 }
@@ -173,6 +191,7 @@ impl SpatialEntityTracker {
             chunk_index: BTreeMap::new(),
             entity_registry: BTreeMap::new(),
             observer_view_sets: BTreeMap::new(),
+            entity_observers: BTreeMap::new(),
             next_entity_id: 1,
         }
     }
@@ -192,6 +211,11 @@ impl SpatialEntityTracker {
         &self.observer_view_sets
     }
 
+    /// Returns the observers currently tracking `entity`, if any.
+    pub fn observers_of(&self, entity: EntityId) -> Option<&BTreeSet<EntityId>> {
+        self.entity_observers.get(&entity)
+    }
+
     /// Retrieves an entity by its ID if registered.
     pub fn get_entity(&self, id: EntityId) -> Option<&TrackedEntity> {
         self.entity_registry.get(&id)
@@ -207,6 +231,16 @@ impl SpatialEntityTracker {
         self.observer_view_sets
             .get(&observer)
             .is_some_and(|set| set.contains(&target))
+    }
+
+    /// Drops `observer` from the reverse index entry of `entity`.
+    fn unlink_observer(&mut self, entity: EntityId, observer: EntityId) {
+        if let Some(observers) = self.entity_observers.get_mut(&entity) {
+            observers.remove(&observer);
+            if observers.is_empty() {
+                self.entity_observers.remove(&entity);
+            }
+        }
     }
 
     /// Adds a new entity with the given type and initial position.
@@ -268,6 +302,7 @@ impl SpatialEntityTracker {
                 if let Some(view_set) = self.observer_view_sets.get_mut(&obs_id) {
                     view_set.insert(id);
                 }
+                self.entity_observers.entry(id).or_default().insert(obs_id);
                 events.push(TrackingEvent::Spawn {
                     observer: obs_id,
                     entity: id,
@@ -296,6 +331,10 @@ impl SpatialEntityTracker {
                     && is_in_range(pos, other.pos, other.entity_type.tracking_range())
                 {
                     newly_observed.insert(other_id);
+                    self.entity_observers
+                        .entry(other_id)
+                        .or_default()
+                        .insert(id);
                     events.push(TrackingEvent::Spawn {
                         observer: id,
                         entity: other_id,
@@ -358,13 +397,8 @@ impl SpatialEntityTracker {
         let range = entity_type.tracking_range();
 
         // 1. Gather candidate observers from both old and new positions using chunk index bounding
-        let mut candidate_observers = BTreeSet::new();
         // Any observer currently viewing this entity must be checked (in case it left range)
-        for (&obs_id, view_set) in self.observer_view_sets.iter() {
-            if view_set.contains(&id) {
-                candidate_observers.insert(obs_id);
-            }
-        }
+        let mut candidate_observers = self.entity_observers.get(&id).cloned().unwrap_or_default();
         // Observers in chunks near the new position may newly see this entity
         for ch in chunks_in_radius(new_pos, range) {
             if let Some(chunk_entities) = self.chunk_index.get(&ch) {
@@ -391,6 +425,7 @@ impl SpatialEntityTracker {
                     if let Some(s) = self.observer_view_sets.get_mut(&obs_id) {
                         s.insert(id);
                     }
+                    self.entity_observers.entry(id).or_default().insert(obs_id);
                     events.push(TrackingEvent::Spawn {
                         observer: obs_id,
                         entity: id,
@@ -401,6 +436,7 @@ impl SpatialEntityTracker {
                     if let Some(s) = self.observer_view_sets.get_mut(&obs_id) {
                         s.remove(&id);
                     }
+                    self.unlink_observer(id, obs_id);
                     events.push(TrackingEvent::Destroy {
                         observer: obs_id,
                         entity: id,
@@ -442,26 +478,33 @@ impl SpatialEntityTracker {
                 })
                 .collect();
 
-            if let Some(this_view_set) = self.observer_view_sets.get_mut(&id) {
-                for (other_id, other_pos, other_type) in candidate_list {
-                    let in_range = is_in_range(new_pos, other_pos, other_type.tracking_range());
-                    let was_observing = this_view_set.contains(&other_id);
+            for (other_id, other_pos, other_type) in candidate_list {
+                let in_range = is_in_range(new_pos, other_pos, other_type.tracking_range());
+                let was_observing = self.is_observing(id, other_id);
 
-                    if !was_observing && in_range {
-                        this_view_set.insert(other_id);
-                        events.push(TrackingEvent::Spawn {
-                            observer: id,
-                            entity: other_id,
-                            pos: other_pos,
-                            entity_type: other_type,
-                        });
-                    } else if was_observing && !in_range {
-                        this_view_set.remove(&other_id);
-                        events.push(TrackingEvent::Destroy {
-                            observer: id,
-                            entity: other_id,
-                        });
+                if !was_observing && in_range {
+                    if let Some(view_set) = self.observer_view_sets.get_mut(&id) {
+                        view_set.insert(other_id);
                     }
+                    self.entity_observers
+                        .entry(other_id)
+                        .or_default()
+                        .insert(id);
+                    events.push(TrackingEvent::Spawn {
+                        observer: id,
+                        entity: other_id,
+                        pos: other_pos,
+                        entity_type: other_type,
+                    });
+                } else if was_observing && !in_range {
+                    if let Some(view_set) = self.observer_view_sets.get_mut(&id) {
+                        view_set.remove(&other_id);
+                    }
+                    self.unlink_observer(other_id, id);
+                    events.push(TrackingEvent::Destroy {
+                        observer: id,
+                        entity: other_id,
+                    });
                 }
             }
         }
@@ -488,20 +531,20 @@ impl SpatialEntityTracker {
         let mut events = Vec::new();
 
         // Notify observers that were viewing this entity
-        for (&obs_id, view_set) in self.observer_view_sets.iter_mut() {
-            if obs_id == id {
-                continue;
+        for obs_id in self.entity_observers.remove(&id).unwrap_or_default() {
+            if let Some(view_set) = self.observer_view_sets.get_mut(&obs_id) {
+                view_set.remove(&id);
             }
-            if view_set.remove(&id) {
-                events.push(TrackingEvent::Destroy {
-                    observer: obs_id,
-                    entity: id,
-                });
-            }
+            events.push(TrackingEvent::Destroy {
+                observer: obs_id,
+                entity: id,
+            });
         }
 
-        // If the removed entity was an observer, remove its view set
-        self.observer_view_sets.remove(&id);
+        // If the removed entity was an observer, drop its view set and reverse links
+        for seen in self.observer_view_sets.remove(&id).unwrap_or_default() {
+            self.unlink_observer(seen, id);
+        }
 
         events
     }
