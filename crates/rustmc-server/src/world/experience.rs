@@ -1,9 +1,12 @@
 //! Player experience points, leveling, and progress mechanics.
 //!
-//! Implements canonical Minecraft Java 26.3 experience mechanics and leveling curves
-//! as documented by the official game specifications.
+//! The curves below match the community [Minecraft Wiki Experience page], retrieved
+//! 7 November 2026. That is a secondary source not pinned to Java 26.3, and no primary
+//! source or client observation has been recorded for them.
 //!
-//! # Canonical Formulas (Java Edition)
+//! [Minecraft Wiki Experience page]: https://minecraft.wiki/w/Experience
+//!
+//! # Formulas (Java Edition)
 //!
 //! The experience required to advance from `level` to `level + 1`:
 //! - Level 0–15: `2 * level + 7`
@@ -17,16 +20,29 @@
 //!
 //! # Player Experience State
 //!
-//! Tracks `level`, `progress` (in `[0.0, 1.0)`), and `total_xp`.
-//! In vanilla Java, dying players drop `min(100, 7 * level)` XP points.
+//! Tracks `level`, `progress` (in `[0.0, 1.0)`), and `total_xp`. The three always describe
+//! one position on the curve: `total_xp` determines `level` and `progress`.
+//! The same page gives the death drop as `min(100, 7 * level)` XP points.
+//!
+//! # Limits
+//!
+//! [`MAX_LEVEL`] and [`MAX_TOTAL_XP`] are RustMC policy, not vanilla values: the wiki
+//! describes far higher levels. They keep every total inside `i32`, and a total is never
+//! retained above the cap, so no experience hides behind a clamped progress bar.
 
 use std::fmt;
 
-/// Maximum allowable player level (capped to prevent 32-bit arithmetic overflow).
+/// Maximum player level, a RustMC policy limit that keeps cumulative totals inside `i32`.
 pub const MAX_LEVEL: u32 = 21_863;
 
+/// Maximum retained experience: exactly the total at [`MAX_LEVEL`] with an empty bar.
+pub const MAX_TOTAL_XP: u32 = 2_147_407_943;
+
 /// Returns the experience points required to advance from `level` to `level + 1`.
+///
+/// Levels above [`MAX_LEVEL`] are treated as [`MAX_LEVEL`].
 pub fn xp_for_next_level(level: u32) -> u32 {
+    let level = level.min(MAX_LEVEL);
     if level <= 15 {
         2 * level + 7
     } else if level <= 30 {
@@ -37,20 +53,26 @@ pub fn xp_for_next_level(level: u32) -> u32 {
 }
 
 /// Returns the exact cumulative experience points required to reach level `level` from 0.
+///
+/// Levels above [`MAX_LEVEL`] are treated as [`MAX_LEVEL`].
 pub fn total_xp_for_level(level: u32) -> u32 {
-    let l = level as u64;
+    let l = u64::from(level.min(MAX_LEVEL));
     let total = if l <= 16 {
         l * l + 6 * l
     } else if l <= 31 {
-        (5 * l * l - 81 * l + 720) / 2
+        (5 * l * l + 720 - 81 * l) / 2
     } else {
-        (9 * l * l - 325 * l + 4440) / 2
+        // The positive constant comes first: 9 * 32^2 is smaller than 325 * 32.
+        (9 * l * l + 4440 - 325 * l) / 2
     };
-    total.min(u32::MAX as u64) as u32
+    total as u32
 }
 
 /// Converts cumulative experience points into `(level, remaining_xp_in_level)`.
-pub fn level_from_total_xp(mut total_xp: u32) -> (u32, u32) {
+///
+/// Totals above [`MAX_TOTAL_XP`] are treated as [`MAX_TOTAL_XP`].
+pub fn level_from_total_xp(total_xp: u32) -> (u32, u32) {
+    let mut total_xp = total_xp.min(MAX_TOTAL_XP);
     let mut level = 0;
     loop {
         let req = xp_for_next_level(level);
@@ -145,16 +167,19 @@ impl PlayerExperience {
     }
 
     /// Adds experience points, updating level and fractional progress.
+    ///
+    /// Experience beyond [`MAX_TOTAL_XP`] is discarded.
     pub fn add_experience(&mut self, amount: u32) {
-        self.total_xp = self.total_xp.saturating_add(amount);
+        self.set_total_xp(self.total_xp.saturating_add(amount));
+    }
+
+    /// Stores `total_xp` and derives the level and progress bar from it.
+    fn set_total_xp(&mut self, total_xp: u32) {
+        self.total_xp = total_xp.min(MAX_TOTAL_XP);
         let (new_level, in_level_xp) = level_from_total_xp(self.total_xp);
         self.level = new_level;
         let req = xp_for_next_level(self.level);
-        self.progress = if req > 0 {
-            (in_level_xp as f32 / req as f32).clamp(0.0, 0.999_999)
-        } else {
-            0.0
-        };
+        self.progress = (in_level_xp as f32 / req as f32).clamp(0.0, 0.999_999);
     }
 
     /// Consumes experience points directly.
@@ -165,21 +190,14 @@ impl PlayerExperience {
                 available: self.total_xp,
             });
         }
-        self.total_xp -= amount;
-        let (new_level, in_level_xp) = level_from_total_xp(self.total_xp);
-        self.level = new_level;
-        let req = xp_for_next_level(self.level);
-        self.progress = if req > 0 {
-            (in_level_xp as f32 / req as f32).clamp(0.0, 0.999_999)
-        } else {
-            0.0
-        };
+        self.set_total_xp(self.total_xp - amount);
         Ok(())
     }
 
     /// Consumes full levels (e.g. for enchanting tables or anvil repairs).
     ///
-    /// Preserves the fractional progress bar within the new lower level.
+    /// Carries the fractional progress bar into the new lower level, rounded to a whole
+    /// point and kept below that level's requirement so no spent level is restored.
     pub fn consume_levels(&mut self, levels: u32) -> Result<(), ExperienceError> {
         if self.level < levels {
             return Err(ExperienceError::InsufficientLevels {
@@ -187,17 +205,16 @@ impl PlayerExperience {
                 available: self.level,
             });
         }
-        self.level -= levels;
-        let req = xp_for_next_level(self.level);
-        let in_level = (self.progress * req as f32).round() as u32;
-        let base_xp = total_xp_for_level(self.level);
-        self.total_xp = base_xp.saturating_add(in_level);
+        let new_level = self.level - levels;
+        let req = xp_for_next_level(new_level);
+        let in_level = ((self.progress * req as f32).round() as u32).min(req - 1);
+        self.set_total_xp(total_xp_for_level(new_level) + in_level);
         Ok(())
     }
 
     /// Computes experience dropped by the player upon death.
     ///
-    /// Capped in vanilla Java Edition at 100 XP (or `7 * level` if lower).
+    /// Capped at 100 XP (or `7 * level` if lower).
     pub fn calculate_death_dropped_xp(&self) -> u32 {
         (self.level * 7).min(100)
     }
