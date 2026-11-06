@@ -250,6 +250,8 @@ fn test_crash_during_compaction_orphaned_temp_file_ignored() {
         let mut world = World::open(test_dir.path(), generator).expect("open world");
         assert_eq!(world.block(3, 60, 3), Some(Block::Stone));
 
+        assert!(!orphaned_path.exists(), "orphans are removed at open");
+
         // Compaction succeeds without interference
         assert!(world.set_block(4, 60, 4, Block::Dirt));
         world.commit_tick().expect("commit tick 1");
@@ -327,7 +329,8 @@ fn test_mid_journal_corruption_rejected() {
     // Corrupt bytes in the 1st record payload, while 2nd record remains in file
     let log_path = test_dir.path().join("journal.log");
     let mut bytes = std::fs::read(&log_path).expect("read log");
-    // Offset 32 is start of first record; offset 50 is inside first record's coordinate payload
+    // Offset 32 is start of first record; offset 50 is inside first record's coordinate payload,
+    // which starts after the 16-byte record header
     bytes[50] ^= 0xff;
     std::fs::write(&log_path, &bytes).expect("write corrupted log");
 
@@ -363,6 +366,8 @@ fn test_non_monotonic_sequence_rejected() {
     let mut record = Vec::new();
     record.extend_from_slice(&0u64.to_be_bytes()); // tick 0 < recovered_tick 1
     record.extend_from_slice(&1u32.to_be_bytes()); // count 1
+    let header_crc = crc32fast::hash(&record);
+    record.extend_from_slice(&header_crc.to_be_bytes());
     record.extend_from_slice(&10i64.to_be_bytes()); // x
     record.extend_from_slice(&60i64.to_be_bytes()); // y
     record.extend_from_slice(&10i64.to_be_bytes()); // z
@@ -385,4 +390,604 @@ fn test_non_monotonic_sequence_rejected() {
         }
         other => panic!("expected WorldError::Corrupted, got {other:?}"),
     }
+}
+
+fn journal_path(dir: &TestDir) -> std::path::PathBuf {
+    dir.path().join("journal.log")
+}
+
+fn checkpoint_path(dir: &TestDir) -> std::path::PathBuf {
+    dir.path().join("checkpoint.bin")
+}
+
+/// Commits `count` ticks that each write a distinct cell.
+fn commit_ticks(world: &mut World, count: u64) {
+    for _ in 0..count {
+        let x = world.current_tick() as i64;
+        assert!(world.set_block(x, 60, 0, Block::Stone));
+        world.commit_tick().expect("commit tick");
+    }
+}
+
+/// Asserts the reopened world holds exactly ticks `0..expected_tick`.
+fn assert_recovered(dir: &TestDir, generator: Generator, expected_tick: u64) -> World {
+    let world = World::open(dir.path(), generator).expect("recover world");
+    assert_eq!(world.current_tick(), expected_tick);
+    assert_eq!(world.mutations().len(), expected_tick as usize);
+    for x in 0..expected_tick as i64 {
+        assert_eq!(world.mutations().get(&(x, 60, 0)), Some(&Block::Stone));
+    }
+    world
+}
+
+/// Offset of record `index` in a journal of single-mutation records:
+/// 32-byte file header, then 16 + 25 + 4 bytes per record.
+fn record_offset(index: usize) -> usize {
+    32 + index * 45
+}
+
+#[test]
+fn record_layout_matches_independently_computed_bytes() {
+    let dir = TestDir::new("record-layout");
+    let generator = Generator::new(7);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    assert!(world.set_block(1, 2, -1, Block::Dirt));
+    world.commit_tick().expect("commit tick");
+    drop(world);
+
+    let bytes = std::fs::read(journal_path(&dir)).expect("read log");
+    // CRC-32/ISO-HDLC values below were computed with Python's zlib, so a
+    // layout change cannot pass by matching its own encoder.
+    let tick_and_count = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    assert_eq!(bytes[32..44], tick_and_count);
+    assert_eq!(bytes[44..48], [0x0C, 0xD2, 0xF6, 0xF9]);
+    assert_eq!(bytes[48..56], [0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(bytes[56..64], [0, 0, 0, 0, 0, 0, 0, 2]);
+    assert_eq!(bytes[64..72], [0xFF; 8]);
+    assert_eq!(bytes[72], 3);
+    assert_eq!(bytes[73..77], [0x35, 0x92, 0x66, 0xAE]);
+    assert_eq!(bytes.len(), record_offset(1));
+}
+
+#[test]
+fn every_truncation_point_recovers_the_complete_records() {
+    let dir = TestDir::new("every-truncation");
+    let generator = Generator::new(11);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    drop(world);
+    let full = std::fs::read(journal_path(&dir)).expect("read log");
+
+    for len in journal::HEADER_SIZE..=full.len() {
+        std::fs::write(journal_path(&dir), &full[..len]).expect("truncate log");
+        let complete = (len - 32) / 45;
+        let mut world = assert_recovered(&dir, generator, complete as u64);
+        assert_eq!(
+            std::fs::metadata(journal_path(&dir))
+                .expect("metadata")
+                .len(),
+            record_offset(complete) as u64,
+            "torn bytes must be removed at length {len}"
+        );
+
+        // The next tick lands on the record boundary and replays afterwards.
+        commit_ticks(&mut world, 1);
+        drop(world);
+        drop(assert_recovered(&dir, generator, complete as u64 + 1));
+    }
+}
+
+#[test]
+fn a_journal_shorter_than_its_header_is_rejected() {
+    let dir = TestDir::new("short-header");
+    let generator = Generator::new(11);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 1);
+    drop(world);
+    let full = std::fs::read(journal_path(&dir)).expect("read log");
+
+    for len in 0..journal::HEADER_SIZE {
+        std::fs::write(journal_path(&dir), &full[..len]).expect("truncate log");
+        assert!(matches!(
+            World::open(dir.path(), generator),
+            Err(WorldError::Corrupted(_))
+        ));
+    }
+}
+
+#[test]
+fn every_bit_flip_before_the_final_record_is_reported() {
+    let dir = TestDir::new("bit-flips");
+    let generator = Generator::new(13);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    drop(world);
+    let full = std::fs::read(journal_path(&dir)).expect("read log");
+
+    for offset in 0..record_offset(2) {
+        for bit in 0..8 {
+            let mut damaged = full.clone();
+            damaged[offset] ^= 1 << bit;
+            std::fs::write(journal_path(&dir), &damaged).expect("write damaged log");
+            let result = World::open(dir.path(), generator);
+            assert!(
+                result.is_err(),
+                "flip at byte {offset} bit {bit} must not be accepted"
+            );
+            assert_eq!(
+                std::fs::read(journal_path(&dir)).expect("read log"),
+                damaged,
+                "a rejected journal must be left untouched"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_bit_flip_in_the_final_record_costs_at_most_that_tick() {
+    let dir = TestDir::new("final-record-flips");
+    let generator = Generator::new(13);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    drop(world);
+    let full = std::fs::read(journal_path(&dir)).expect("read log");
+
+    for offset in record_offset(2)..full.len() {
+        for bit in 0..8 {
+            let mut damaged = full.clone();
+            damaged[offset] ^= 1 << bit;
+            std::fs::write(journal_path(&dir), &damaged).expect("write damaged log");
+            drop(assert_recovered(&dir, generator, 2));
+        }
+    }
+}
+
+#[test]
+fn flipped_record_count_does_not_truncate_committed_ticks() {
+    let dir = TestDir::new("flipped-count");
+    let generator = Generator::new(17);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 2);
+    drop(world);
+
+    let mut bytes = std::fs::read(journal_path(&dir)).expect("read log");
+    // Count is at record offset 8..12: 1 becomes 3, longer than the file.
+    bytes[record_offset(0) + 11] = 3;
+    std::fs::write(journal_path(&dir), &bytes).expect("write damaged log");
+
+    assert!(matches!(
+        World::open(dir.path(), generator),
+        Err(WorldError::Corrupted(_))
+    ));
+    assert_eq!(
+        std::fs::read(journal_path(&dir)).expect("read log"),
+        bytes,
+        "committed records must survive a failed recovery"
+    );
+}
+
+#[test]
+fn damage_longer_than_one_record_is_corruption() {
+    let dir = TestDir::new("long-damage");
+    let generator = Generator::new(19);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 1);
+    drop(world);
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(journal_path(&dir))
+        .expect("open log");
+    file.write_all(&vec![0xA5; 16 + 100_000 * 25 + 4 + 1])
+        .expect("append damage");
+    drop(file);
+
+    assert!(matches!(
+        World::open(dir.path(), generator),
+        Err(WorldError::Corrupted(_))
+    ));
+}
+
+#[test]
+fn zero_filled_tail_is_treated_as_a_torn_write() {
+    let dir = TestDir::new("zero-tail");
+    let generator = Generator::new(19);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 2);
+    drop(world);
+
+    // Some filesystems extend the file before its data blocks reach disk.
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(journal_path(&dir))
+        .expect("open log");
+    file.write_all(&[0u8; 45]).expect("append zeros");
+    drop(file);
+
+    drop(assert_recovered(&dir, generator, 2));
+}
+
+#[test]
+fn replayed_duplicate_tick_is_corruption_not_a_torn_tail() {
+    let dir = TestDir::new("duplicate-tick");
+    let generator = Generator::new(23);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 1);
+    drop(world);
+
+    let mut bytes = std::fs::read(journal_path(&dir)).expect("read log");
+    let record = bytes[record_offset(0)..].to_vec();
+    bytes.extend_from_slice(&record);
+    std::fs::write(journal_path(&dir), &bytes).expect("write log");
+
+    assert!(matches!(
+        World::open(dir.path(), generator),
+        Err(WorldError::Corrupted(message)) if message.contains("non-monotonic")
+    ));
+}
+
+#[test]
+fn append_sync_failure_never_leaves_an_unrecoverable_log() {
+    for failing in [
+        vec!["append.sync"],
+        vec!["append.write"],
+        vec!["append.partial_write"],
+        vec!["append.sync", "append.rollback"],
+        vec!["append.partial_write", "append.rollback"],
+    ] {
+        let dir = TestDir::new("append-failure");
+        let generator = Generator::new(29);
+        let mut world = World::open(dir.path(), generator).expect("open world");
+        commit_ticks(&mut world, 2);
+
+        assert!(world.set_block(2, 60, 0, Block::Stone));
+        journal::faults::fail_steps(&failing);
+        let error = world
+            .commit_tick()
+            .expect_err("commit must report the fault");
+        assert!(matches!(error, WorldError::Io(_)));
+        assert_eq!(journal::faults::clear().len(), failing.len());
+
+        // The tick must not be acknowledged by a retry on the same handle.
+        assert_eq!(world.current_tick(), 2);
+        assert!(matches!(
+            world.commit_tick(),
+            Err(WorldError::JournalUnusable)
+        ));
+        assert!(matches!(world.flush(), Err(WorldError::JournalUnusable)));
+        assert!(matches!(world.compact(), Err(WorldError::JournalUnusable)));
+        drop(world);
+
+        // A successful rollback drops the tick. Without one, a complete record
+        // recovers as that tick; either way the log stays replayable.
+        let survived = failing == ["append.sync", "append.rollback"];
+        let expected = if survived { 3 } else { 2 };
+        let mut world = assert_recovered(&dir, generator, expected);
+        commit_ticks(&mut world, 1);
+        drop(world);
+        drop(assert_recovered(&dir, generator, expected + 1));
+    }
+}
+
+#[test]
+fn failed_flush_makes_the_journal_unusable() {
+    let dir = TestDir::new("flush-failure");
+    let generator = Generator::new(29);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 1);
+
+    journal::faults::fail_steps(&["flush.sync"]);
+    assert!(matches!(world.flush(), Err(WorldError::Io(_))));
+    journal::faults::clear();
+    assert!(matches!(
+        world.commit_tick(),
+        Err(WorldError::JournalUnusable)
+    ));
+    drop(world);
+    drop(assert_recovered(&dir, generator, 1));
+}
+
+#[test]
+fn checkpoint_directory_sync_failure_preserves_the_journal() {
+    let dir = TestDir::new("dir-sync-failure");
+    let generator = Generator::new(31);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    let journal_before = std::fs::read(journal_path(&dir)).expect("read log");
+
+    journal::faults::fail_steps(&["checkpoint.dir_sync"]);
+    assert!(matches!(world.compact(), Err(WorldError::Io(_))));
+    assert_eq!(journal::faults::clear(), ["checkpoint.dir_sync"]);
+    assert_eq!(
+        std::fs::read(journal_path(&dir)).expect("read log"),
+        journal_before,
+        "the journal must outlive an unconfirmed checkpoint"
+    );
+
+    // Power loss can roll the rename back; the journal alone still recovers.
+    std::fs::remove_file(checkpoint_path(&dir)).expect("roll back rename");
+    commit_ticks(&mut world, 1);
+    drop(world);
+    drop(assert_recovered(&dir, generator, 4));
+}
+
+#[test]
+fn appends_after_a_failed_compaction_replay_past_the_checkpoint() {
+    let dir = TestDir::new("append-after-failed-compaction");
+    let generator = Generator::new(31);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+
+    journal::faults::fail_steps(&["log.write"]);
+    assert!(matches!(world.compact(), Err(WorldError::Io(_))));
+    journal::faults::clear();
+    drop(world);
+
+    // The checkpoint is installed and the old journal stays in place.
+    let world = assert_recovered(&dir, generator, 3);
+    drop(world);
+
+    let dir = TestDir::new("append-after-failed-checkpoint-sync");
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    journal::faults::fail_steps(&["checkpoint.dir_sync"]);
+    assert!(matches!(world.compact(), Err(WorldError::Io(_))));
+    journal::faults::clear();
+    commit_ticks(&mut world, 2);
+    drop(world);
+
+    // Ticks 3 and 4 exist only in the journal and must not be dropped.
+    let world = assert_recovered(&dir, generator, 5);
+    assert!(checkpoint_path(&dir).is_file());
+    drop(world);
+    drop(assert_recovered(&dir, generator, 5));
+}
+
+#[test]
+fn journal_replacement_failure_after_rename_refuses_further_appends() {
+    let dir = TestDir::new("log-dir-sync-failure");
+    let generator = Generator::new(31);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 2);
+
+    journal::faults::fail_steps(&["log.dir_sync"]);
+    assert!(matches!(world.compact(), Err(WorldError::Io(_))));
+    journal::faults::clear();
+    assert!(matches!(
+        world.commit_tick(),
+        Err(WorldError::JournalUnusable)
+    ));
+    drop(world);
+    drop(assert_recovered(&dir, generator, 2));
+}
+
+#[test]
+fn crash_at_every_compaction_step_recovers_all_ticks() {
+    let generator = Generator::new(37);
+    let mut steps_seen = Vec::new();
+    for skipped in 0.. {
+        let dir = TestDir::new("compaction-crash");
+        let mut world = World::open(dir.path(), generator).expect("open world");
+        commit_ticks(&mut world, 3);
+        world.compact().expect("first compaction");
+        commit_ticks(&mut world, 2);
+
+        journal::faults::fail_after(skipped);
+        let result = world.compact();
+        let fired = journal::faults::clear();
+        drop(world);
+        if fired.is_empty() {
+            result.expect("compaction with no fault");
+            drop(assert_recovered(&dir, generator, 5));
+            break;
+        }
+        assert!(result.is_err());
+        steps_seen.extend(fired);
+
+        let mut world = assert_recovered(&dir, generator, 5);
+        commit_ticks(&mut world, 1);
+        drop(world);
+        drop(assert_recovered(&dir, generator, 6));
+    }
+    assert_eq!(
+        steps_seen,
+        [
+            "checkpoint.write",
+            "checkpoint.sync",
+            "checkpoint.rename",
+            "checkpoint.dir_sync",
+            "log.write",
+            "log.sync",
+            "log.rename",
+            "log.dir_sync",
+        ]
+    );
+}
+
+#[test]
+fn crash_between_checkpoint_and_journal_reset_recovers_and_finishes_compaction() {
+    let dir = TestDir::new("checkpoint-with-old-journal");
+    let generator = Generator::new(41);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    let old_journal = std::fs::read(journal_path(&dir)).expect("read log");
+    world.compact().expect("compact world");
+    drop(world);
+
+    // A valid new checkpoint beside the complete old journal.
+    std::fs::write(journal_path(&dir), &old_journal).expect("restore old journal");
+
+    let mut world = assert_recovered(&dir, generator, 3);
+    assert_eq!(
+        std::fs::metadata(journal_path(&dir))
+            .expect("metadata")
+            .len(),
+        32,
+        "recovery finishes the interrupted compaction"
+    );
+    commit_ticks(&mut world, 1);
+    drop(world);
+    drop(assert_recovered(&dir, generator, 4));
+}
+
+#[test]
+fn checkpoint_beside_a_torn_old_journal_keeps_tick_continuity() {
+    let dir = TestDir::new("checkpoint-torn-old-journal");
+    let generator = Generator::new(41);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 3);
+    let old_journal = std::fs::read(journal_path(&dir)).expect("read log");
+    world.compact().expect("compact world");
+    drop(world);
+
+    // Unsynced tail of the old journal lost: it now ends before the checkpoint.
+    std::fs::write(journal_path(&dir), &old_journal[..record_offset(1) + 7])
+        .expect("write torn journal");
+
+    let mut world = assert_recovered(&dir, generator, 3);
+    commit_ticks(&mut world, 2);
+    drop(world);
+    drop(assert_recovered(&dir, generator, 5));
+}
+
+#[test]
+fn crash_while_finishing_a_compaction_at_open_stays_recoverable() {
+    let generator = Generator::new(43);
+    let mut fired_steps = 0;
+    for skipped in 0.. {
+        let dir = TestDir::new("open-crash");
+        let mut world = World::open(dir.path(), generator).expect("open world");
+        commit_ticks(&mut world, 3);
+        let old_journal = std::fs::read(journal_path(&dir)).expect("read log");
+        world.compact().expect("compact world");
+        drop(world);
+        std::fs::write(journal_path(&dir), &old_journal).expect("restore old journal");
+
+        journal::faults::fail_after(skipped);
+        let result = World::open(dir.path(), generator);
+        let fired = journal::faults::clear();
+        if fired.is_empty() {
+            assert_eq!(result.expect("open with no fault").current_tick(), 3);
+            break;
+        }
+        assert!(result.is_err());
+        fired_steps += 1;
+        drop(assert_recovered(&dir, generator, 3));
+    }
+    assert_eq!(fired_steps, 5);
+}
+
+#[test]
+fn crash_while_truncating_a_torn_tail_stays_recoverable() {
+    let dir = TestDir::new("truncate-crash");
+    let generator = Generator::new(43);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 2);
+    drop(world);
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(journal_path(&dir))
+        .expect("open log");
+    file.write_all(&[0x55; 20]).expect("append torn bytes");
+    drop(file);
+
+    for step in ["open.truncate", "open.sync"] {
+        journal::faults::fail_steps(&[step]);
+        assert!(World::open(dir.path(), generator).is_err());
+        assert_eq!(journal::faults::clear(), [step]);
+    }
+    drop(assert_recovered(&dir, generator, 2));
+}
+
+#[test]
+fn a_journal_starting_after_the_checkpoint_is_rejected() {
+    let dir = TestDir::new("checkpoint-rolled-back");
+    let generator = Generator::new(47);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 2);
+    world.compact().expect("compact world");
+    commit_ticks(&mut world, 1);
+    drop(world);
+
+    // The new journal without the checkpoint it depends on: ticks 0 and 1 gone.
+    std::fs::remove_file(checkpoint_path(&dir)).expect("remove checkpoint");
+    assert!(matches!(
+        World::open(dir.path(), generator),
+        Err(WorldError::Corrupted(message)) if message.contains("acknowledged ticks are missing")
+    ));
+}
+
+#[test]
+fn a_checkpoint_without_its_journal_is_rejected() {
+    let dir = TestDir::new("missing-journal");
+    let generator = Generator::new(47);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    commit_ticks(&mut world, 1);
+    world.compact().expect("compact world");
+    drop(world);
+
+    std::fs::remove_file(journal_path(&dir)).expect("remove journal");
+    assert!(matches!(
+        World::open(dir.path(), generator),
+        Err(WorldError::Corrupted(_))
+    ));
+}
+
+#[test]
+fn mutation_limit_is_enforced_before_commit_and_replays() {
+    let dir = TestDir::new("mutation-limit");
+    let generator = Generator::new(53);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+
+    for _ in 0..MAX_MUTATIONS_PER_TICK {
+        assert!(world.set_block(0, 60, 0, Block::Stone));
+    }
+    assert!(
+        !world.set_block(0, 60, 0, Block::Dirt),
+        "the writer must refuse what the reader would reject"
+    );
+    world.commit_tick().expect("commit a full tick");
+    assert!(world.set_block(1, 60, 0, Block::Dirt));
+    world.commit_tick().expect("commit the next tick");
+    drop(world);
+
+    let world = World::open(dir.path(), generator).expect("replay a full tick");
+    assert_eq!(world.current_tick(), 2);
+    assert_eq!(world.get_block(0, 60, 0), Some(Block::Stone));
+    assert_eq!(world.get_block(1, 60, 0), Some(Block::Dirt));
+}
+
+#[test]
+fn direct_appends_are_bounded_and_sequenced_without_touching_the_log() {
+    let dir = TestDir::new("direct-append");
+    let generator = Generator::new(53);
+    let mut world = World::open(dir.path(), generator).expect("open world");
+    let journal = world.journal_mut().expect("journal");
+
+    let oversized = vec![BlockMutation::new(0, 60, 0, Block::Dirt); MAX_MUTATIONS_PER_TICK + 1];
+    assert!(matches!(
+        journal.append_tick(0, &oversized),
+        Err(WorldError::TooManyMutations { .. })
+    ));
+    assert!(matches!(
+        journal.append_tick(5, &[]),
+        Err(WorldError::TickOutOfSequence {
+            expected: 0,
+            found: 5
+        })
+    ));
+    assert!(matches!(
+        journal.compact(5, &std::collections::BTreeMap::new()),
+        Err(WorldError::TickOutOfSequence { .. })
+    ));
+    journal.append_tick(0, &[]).expect("journal stays usable");
+    drop(world);
+
+    assert_eq!(
+        std::fs::metadata(journal_path(&dir))
+            .expect("metadata")
+            .len(),
+        32 + 16 + 4
+    );
 }

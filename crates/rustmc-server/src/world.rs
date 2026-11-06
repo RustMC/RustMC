@@ -1,7 +1,7 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
 pub mod journal;
-pub use journal::WorldJournal;
+pub use journal::{MAX_MUTATIONS_PER_TICK, WorldJournal};
 
 #[cfg(test)]
 mod tests_interaction;
@@ -406,12 +406,32 @@ impl BlockMutation {
 pub enum WorldError {
     Io(std::io::Error),
     Corrupted(String),
-    SeedMismatch { expected: u64, found: u64 },
-    TerrainMismatch { expected: Terrain, found: Terrain },
+    SeedMismatch {
+        expected: u64,
+        found: u64,
+    },
+    TerrainMismatch {
+        expected: Terrain,
+        found: Terrain,
+    },
     InvalidMagic,
-    OutOfBounds { x: i64, y: i64, z: i64 },
+    OutOfBounds {
+        x: i64,
+        y: i64,
+        z: i64,
+    },
     InvalidBlockId(u8),
     InvalidTerrainId(u8),
+    /// A commit or sync failed earlier; the world must be reopened.
+    JournalUnusable,
+    TooManyMutations {
+        count: usize,
+        limit: usize,
+    },
+    TickOutOfSequence {
+        expected: u64,
+        found: u64,
+    },
 }
 
 impl std::fmt::Display for WorldError {
@@ -434,6 +454,18 @@ impl std::fmt::Display for WorldError {
             }
             Self::InvalidBlockId(id) => write!(f, "invalid block id: {id}"),
             Self::InvalidTerrainId(id) => write!(f, "invalid terrain id: {id}"),
+            Self::JournalUnusable => {
+                write!(f, "journal failed earlier and must be reopened")
+            }
+            Self::TooManyMutations { count, limit } => {
+                write!(f, "{count} mutations exceed the per-tick limit of {limit}")
+            }
+            Self::TickOutOfSequence { expected, found } => {
+                write!(
+                    f,
+                    "tick out of sequence: expected {expected}, found {found}"
+                )
+            }
         }
     }
 }
@@ -575,8 +607,14 @@ impl World {
             .expect("chunk was just inserted")
     }
 
+    /// Stages a mutation for the current tick. Returns `false` when the
+    /// coordinates are out of range or the tick already holds
+    /// [`MAX_MUTATIONS_PER_TICK`] mutations.
     pub fn set_block(&mut self, x: i64, y: i64, z: i64, block: Block) -> bool {
         if y < 0 || y >= WORLD_HEIGHT as i64 {
+            return false;
+        }
+        if self.pending_tick_mutations.len() >= MAX_MUTATIONS_PER_TICK {
             return false;
         }
         let side = CHUNK_SIDE as i64;
@@ -594,6 +632,9 @@ impl World {
         true
     }
 
+    /// Commits the staged mutations. `Ok` means they are durable. After `Err`
+    /// the staged mutations remain in memory but their durability is unknown,
+    /// and a journaled world must be reopened to continue.
     pub fn commit_tick(&mut self) -> Result<(), WorldError> {
         if let Some(journal) = &mut self.journal {
             journal.append_tick(self.current_tick, &self.pending_tick_mutations)?;
