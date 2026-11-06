@@ -1,11 +1,13 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
-use crate::preview_data::RegistryManifest;
+use crate::{preview_data::RegistryManifest, protocol::chat};
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
 pub const VERSION: &str = "26.3";
 pub const MAX_FRAME: usize = 4096;
+/// Chat frames held for the supervisor between two `receive` calls.
+const MAX_QUEUED_BROADCASTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -191,7 +193,8 @@ pub struct Session {
     preview_terrain: crate::world::Terrain,
     vanilla_source: Option<crate::java_preview::VanillaSource>,
     player_name: String,
-    dispatcher: crate::protocol::chat::CommandDispatcher,
+    dispatcher: chat::CommandDispatcher,
+    broadcasts: Vec<Vec<u8>>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -208,7 +211,8 @@ impl Default for Session {
             preview_terrain: crate::world::Terrain::Preview,
             vanilla_source: None,
             player_name: "Player".to_string(),
-            dispatcher: crate::protocol::chat::CommandDispatcher::new(),
+            dispatcher: chat::CommandDispatcher::read_only_preview(),
+            broadcasts: Vec::new(),
         }
     }
 }
@@ -240,6 +244,18 @@ impl Session {
     pub fn with_registry_manifest(mut self, manifest: Arc<RegistryManifest>) -> Self {
         self.registry_manifest = Some(manifest);
         self
+    }
+    /// Take the frames this session produced for every other Play connection.
+    pub fn take_broadcasts(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.broadcasts)
+    }
+    fn run_command(&mut self, command: &str) -> Result<Vec<u8>, Error> {
+        let sender = chat::CommandSender::Player(self.player_name.clone());
+        let reply = self
+            .dispatcher
+            .dispatch_to_chat(&sender, command)
+            .map_err(|_| Error::Malformed)?;
+        Ok(reply.to_frame())
     }
     pub fn receive(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, Error> {
         self.bytes = self
@@ -320,10 +336,7 @@ impl Session {
                     {
                         return Err(Error::Malformed);
                     }
-                    let player_name = String::from_utf8_lossy(name).to_string();
-                    self.dispatcher
-                        .add_player(crate::protocol::chat::PlayerState::new(&player_name));
-                    self.player_name = player_name;
+                    self.player_name = String::from_utf8_lossy(name).to_string();
                     // The client UUID is an opaque, unverified local-session value.
                     let mut success = body[prefix + name_len..].to_vec();
                     put_varint(name_len as u32, &mut success);
@@ -437,25 +450,40 @@ impl Session {
                         }
                         54 if body.len() == 2 => {} // Selected hotbar slot is client-local here.
                         14 | 22 => {} // Bounded information/custom payloads have no effect.
-                        6 => {
-                            let chat = crate::protocol::chat::ChatPacket::decode_payload(body)
+                        chat::CHAT_PACKET_ID => {
+                            // No secure chat is negotiated, so a signature is
+                            // not verified and the text is relayed as system chat.
+                            let packet = chat::ChatPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
-                            let broadcast = crate::protocol::chat::broadcast_chat(
-                                &self.player_name,
-                                &chat.message,
-                            );
-                            responses.push(broadcast.to_frame());
+                            let frame = chat::broadcast_chat(&self.player_name, &packet.message)
+                                .map_err(|_| Error::Malformed)?
+                                .to_frame();
+                            if self.broadcasts.len() >= MAX_QUEUED_BROADCASTS {
+                                return Err(Error::Oversized);
+                            }
+                            self.broadcasts.push(frame.clone());
+                            responses.push(frame);
                         }
-                        4 => {
-                            let cmd =
-                                crate::protocol::chat::ChatCommandPacket::decode_payload(body)
-                                    .map_err(|_| Error::Malformed)?;
-                            let sender = crate::protocol::chat::CommandSender::Player(
-                                self.player_name.clone(),
-                            );
-                            let reply = self.dispatcher.dispatch_to_chat(&sender, &cmd.command);
-                            responses.push(reply.to_frame());
+                        chat::CHAT_COMMAND_PACKET_ID => {
+                            let packet = chat::ChatCommandPacket::decode_payload(body)
+                                .map_err(|_| Error::Malformed)?;
+                            responses.push(self.run_command(&packet.command)?);
                         }
+                        chat::CHAT_COMMAND_SIGNED_PACKET_ID => {
+                            let packet = chat::SignedChatCommandPacket::decode_payload(body)
+                                .map_err(|_| Error::Malformed)?;
+                            responses.push(self.run_command(&packet.command)?);
+                        }
+                        // Only system chat is sent, so there is nothing to acknowledge.
+                        chat::CHAT_ACK_PACKET_ID => {
+                            let (_, n) = varint(body)?.ok_or(Error::Malformed)?;
+                            if n != body.len() {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        // A keyed client may announce a session; it is unused
+                        // because the login packet negotiates no secure chat.
+                        chat::CHAT_SESSION_UPDATE_PACKET_ID => {}
                         _ => {
                             eprintln!(
                                 "event=preview_unsupported_packet packet_id={id} bytes={}",
@@ -586,8 +614,7 @@ mod tests {
         assert_eq!(s.receive(&frame(1, &[0; 8]), 4096), Err(Error::WrongState));
     }
 
-    #[test]
-    fn chat_and_command_packets_in_play_state() {
+    fn play_session() -> Session {
         let manifest = RegistryManifest {
             tags: Vec::new(),
             registries: vec![
@@ -611,28 +638,81 @@ mod tests {
         let mut s = Session::new(true);
         s.state = State::Play;
         s.player_name = "Alice".to_string();
-        s.dispatcher
-            .add_player(crate::protocol::chat::PlayerState::new("Alice"));
         s.preview =
             crate::java_preview::Preview::new(0, 2, crate::world::Terrain::Preview, &manifest);
+        s
+    }
 
-        // Send ChatPacket (0x06)
-        let chat =
-            crate::protocol::chat::ChatPacket::unsigned("Hello from Alice!", 12345, 67890).unwrap();
-        let replies = s.receive(&chat.to_frame(), 4096).unwrap();
+    #[test]
+    fn chat_and_command_packets_in_play_state() {
+        let mut s = play_session();
+
+        // Unsigned chat with the mandatory acknowledgment tail, written by hand.
+        let mut chat = vec![0x09, 0x05, b'H', b'e', b'l', b'l', b'o'];
+        chat.extend([0; 16]); // Timestamp and salt.
+        chat.extend([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // No signature, empty tail.
+        let replies = s.receive(&frame_bytes(&chat), 4096).unwrap();
+        let expected: &[u8] = b"<Alice> Hello";
+        let mut system_chat = vec![0x7C, 0x08, 0x00, expected.len() as u8];
+        system_chat.extend(expected);
+        system_chat.push(0x00);
+        assert_eq!(replies, vec![frame_bytes(&system_chat)]);
+        assert_eq!(s.take_broadcasts(), vec![frame_bytes(&system_chat)]);
+        assert!(s.take_broadcasts().is_empty());
+
+        // An offline client sends a string-only command.
+        let command = [
+            0x07, 0x0C, b't', b'i', b'm', b'e', b' ', b's', b'e', b't', b' ', b'd', b'a', b'y',
+        ];
+        let replies = s.receive(&frame_bytes(&command), 4096).unwrap();
         assert_eq!(replies.len(), 1);
-        let sys_chat = crate::protocol::chat::SystemChatMessagePacket::decode(&replies[0]).unwrap();
-        assert!(!sys_chat.overlay);
-        assert!(sys_chat.content.contains("<Alice> Hello from Alice!"));
+        let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
+        assert_eq!(reply.content().color, Some(chat::ChatColor::Red));
+        assert!(reply.content().text.contains("read-only"));
+        assert!(s.take_broadcasts().is_empty());
 
-        // Send ChatCommandPacket (0x04)
-        let cmd = crate::protocol::chat::ChatCommandPacket::unsigned("time set day", 12345, 67890)
-            .unwrap();
-        let replies2 = s.receive(&cmd.to_frame(), 4096).unwrap();
-        assert_eq!(replies2.len(), 1);
-        let sys_reply =
-            crate::protocol::chat::SystemChatMessagePacket::decode(&replies2[0]).unwrap();
-        assert!(!sys_reply.overlay);
-        assert!(sys_reply.content.contains("1000"));
+        // The signed form reaches the same read-only dispatcher.
+        let mut signed = vec![0x08, 0x04, b'h', b'e', b'l', b'p'];
+        signed.extend([0; 16]);
+        signed.extend([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // No arguments, empty tail.
+        let replies = s.receive(&frame_bytes(&signed), 4096).unwrap();
+        let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
+        assert!(reply.content().text.contains("/help"));
+
+        // Acknowledgments and session announcements have no reply.
+        assert!(
+            s.receive(&frame_bytes(&[0x06, 0x00]), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.receive(&frame_bytes(&[0x0A, 0x00]), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.receive(&frame_bytes(&[0x06, 0x00, 0x00]), 4096),
+            Err(Error::Malformed)
+        );
+    }
+
+    fn frame_bytes(packet: &[u8]) -> Vec<u8> {
+        let mut out = vec![packet.len() as u8];
+        assert!(packet.len() < 0x80);
+        out.extend(packet);
+        out
+    }
+
+    #[test]
+    fn queued_broadcasts_are_bounded() {
+        let mut s = play_session();
+        let mut chat = vec![0x09, 0x01, b'x'];
+        chat.extend([0; 22]);
+        let chat = frame_bytes(&chat);
+        for _ in 0..MAX_QUEUED_BROADCASTS {
+            s.receive(&chat, 1 << 20).unwrap();
+        }
+        assert_eq!(s.receive(&chat, 1 << 20), Err(Error::Oversized));
+        assert_eq!(s.take_broadcasts().len(), MAX_QUEUED_BROADCASTS);
     }
 }

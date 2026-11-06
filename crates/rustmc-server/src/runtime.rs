@@ -114,6 +114,17 @@ struct Connection {
     last_activity: Instant,
     created: Instant,
     pending_chunk_since: Option<Instant>,
+    write_overflow: bool,
+}
+
+/// Queue a frame for one recipient unless that would pass the write bound.
+/// A recipient too slow to accept it is closed rather than silently missing chat.
+fn queue_broadcast(pending: &mut Vec<u8>, write_overflow: &mut bool, frame: &[u8]) {
+    if pending.len().saturating_add(frame.len()) > MAX_PENDING_BYTES {
+        *write_overflow = true;
+    } else {
+        pending.extend_from_slice(frame);
+    }
 }
 
 fn event(
@@ -458,6 +469,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         last_activity: Instant::now(),
                         created: Instant::now(),
                         pending_chunk_since: None,
+                        write_overflow: false,
                     });
                     observe(event(
                         "connection_accepted",
@@ -503,7 +515,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             let remaining = byte_limit.saturating_sub(connection.bytes_read);
             let mut buffer = [0u8; 4096];
             let read_len = remaining.min(buffer.len());
-            let reason = if connection.created.elapsed() >= Duration::from_millis(lifetime_ms) {
+            let reason = if connection.write_overflow {
+                Some("write_limit")
+            } else if connection.created.elapsed() >= Duration::from_millis(lifetime_ms) {
                 Some("lifetime_timeout")
             } else {
                 match connection.stream.read(&mut buffer[..read_len]) {
@@ -622,6 +636,15 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     && connection.pending.is_empty())
                 .then_some("status_complete")
             });
+            // Chat is relayed even if its sender closed in this same pass.
+            let broadcasts = connection.discovery.take_broadcasts();
+            for (other_index, other) in connections.iter_mut().enumerate() {
+                if other_index != index && other.discovery.state() == discovery_java::State::Play {
+                    for frame in &broadcasts {
+                        queue_broadcast(&mut other.pending, &mut other.write_overflow, frame);
+                    }
+                }
+            }
             if let Some(reason) = reason {
                 let connection = connections.swap_remove(index);
                 let _ = connection.stream.shutdown(Shutdown::Both);
@@ -646,6 +669,18 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_queue_marks_a_recipient_that_would_pass_the_write_bound() {
+        let mut pending = vec![0; MAX_PENDING_BYTES - 2];
+        let mut overflow = false;
+        queue_broadcast(&mut pending, &mut overflow, &[1, 2]);
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+        assert!(!overflow);
+        queue_broadcast(&mut pending, &mut overflow, &[3]);
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+        assert!(overflow);
+    }
 
     #[test]
     fn prebind_shutdown_never_opens_socket() {
