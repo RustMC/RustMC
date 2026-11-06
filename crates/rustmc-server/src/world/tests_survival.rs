@@ -517,3 +517,50 @@ fn test_authoritative_boundary_invariants() {
     player.set_fall_distance(f32::NAN);
     assert_eq!(player.fall_distance(), 0.0);
 }
+
+#[test]
+fn test_water_cancels_recorded_fall() {
+    let mut player = PlayerSurvival::default();
+    assert_eq!(player.handle_fall(false, 6.0), None);
+    assert_eq!(player.fall_distance(), 6.0);
+
+    // One tick in water is enough to break the fall.
+    assert!(player.tick(true, false, 0.0).is_empty());
+    assert_eq!(player.fall_distance(), 0.0);
+
+    // Sinking to the pool floor and standing on it deals nothing.
+    for _ in 0..19 {
+        assert!(player.tick(true, false, 0.0).is_empty());
+    }
+    assert_eq!(player.handle_fall(false, 0.0), None);
+    assert_eq!(player.fall_distance(), 0.0);
+    assert_eq!(player.handle_fall(true, 0.0), None);
+    assert_eq!(player.health(), 20.0);
+}
+
+#[test]
+fn test_fall_recorded_after_leaving_water_still_counts() {
+    let mut player = PlayerSurvival::default();
+    player.handle_fall(false, 6.0);
+    player.tick(true, false, 0.0);
+
+    // A new fall that begins after the water is a new fall: 5 blocks deals 2 damage.
+    player.tick(false, false, 0.0);
+    assert_eq!(player.handle_fall(false, 5.0), None);
+    assert_eq!(
+        player.handle_fall(true, 0.0),
+        Some(DamageEvent {
+            source: DamageSource::Fall,
+            amount: 2.0,
+        })
+    );
+    assert_eq!(player.health(), 18.0);
+}
+
+#[test]
+fn test_dry_tick_keeps_recorded_fall() {
+    let mut player = PlayerSurvival::default();
+    player.handle_fall(false, 6.0);
+    assert!(player.tick(false, false, 0.0).is_empty());
+    assert_eq!(player.fall_distance(), 6.0);
+}

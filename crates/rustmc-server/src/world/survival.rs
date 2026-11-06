@@ -1,4 +1,8 @@
 //! Player survival state, health, hunger, exhaustion, and environmental damage.
+//!
+//! The numeric rules here are RustMC's current scoped model, not a claim of Java 26.3
+//! parity. `docs/research/survival-constants.md` records, per constant, which values have
+//! a public source, which conflict with one, and which remain unverified.
 
 /// Causes of player damage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,6 +298,8 @@ impl PlayerSurvival {
 
     /// Runs a deterministic survival simulation tick.
     ///
+    /// - Water: being in water cancels any recorded fall, so a later landing on the pool
+    ///   floor cannot apply damage from the height above the surface.
     /// - Air supply: depletes in water (-1 per tick), refills instantly out of water.
     ///   If <= 0, applies 2.0 drowning damage every 20 ticks.
     /// - Void: if `y_pos < -64.0`, applies 4.0 void damage per tick.
@@ -315,6 +321,7 @@ impl PlayerSurvival {
 
         // 1. Air supply / Drowning
         if is_in_water {
+            self.fall_distance = 0.0;
             self.air_supply = (self.air_supply - 1).clamp(MIN_AIR_SUPPLY, MAX_AIR_SUPPLY);
             if self.air_supply <= MIN_AIR_SUPPLY {
                 self.air_supply = 0;
