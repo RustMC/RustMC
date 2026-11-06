@@ -236,7 +236,7 @@ fn test_creative_instant_break() {
         }
     );
 
-    // Survival mode: DiggingStatus::Finished breaks the block.
+    // Survival mode: Finished without a tracked session never breaks the block.
     let survival_finish = DiggingAction {
         status: DiggingStatus::Finished,
         pos: target,
@@ -251,9 +251,8 @@ fn test_creative_instant_break() {
     );
     assert_eq!(
         res_survival_finish,
-        InteractionResult::Accepted {
-            placed: None,
-            broken: Some(target),
+        InteractionResult::Rejected {
+            reason: InteractionRejectReason::PrematureFinish,
             sequence: 21,
         }
     );
@@ -640,7 +639,6 @@ fn test_stateful_survival_digging_progression() {
         Some("minecraft:stone"),
         1000, // current tick
         None,
-        false, // do not allow untracked
     );
     assert_eq!(
         res_start,
@@ -664,7 +662,6 @@ fn test_stateful_survival_digging_progression() {
         Some("minecraft:stone"),
         1020,
         Some(&active_session),
-        false,
     );
     assert_eq!(
         res_early,
@@ -673,7 +670,7 @@ fn test_stateful_survival_digging_progression() {
             sequence: 101,
         }
     );
-    assert_eq!(retained_session, Some(active_session));
+    assert_eq!(retained_session.as_ref(), Some(&active_session));
 
     // 3. Client finishes after sufficient ticks at tick 1045 (45 ticks elapsed) -> Accepted break
     let (res_valid, completed_session) = BlockInteractionEngine::validate_digging_stateful(
@@ -683,7 +680,6 @@ fn test_stateful_survival_digging_progression() {
         Some("minecraft:stone"),
         1045,
         Some(&active_session),
-        false,
     );
     assert_eq!(
         res_valid,
@@ -703,7 +699,6 @@ fn test_stateful_survival_digging_progression() {
         Some("minecraft:stone"),
         1045,
         None,
-        false,
     );
     assert_eq!(
         res_no_session,
@@ -785,4 +780,143 @@ fn test_non_collidable_block_placement_inside_player() {
             sequence: 200,
         }
     );
+}
+
+fn dig(status: DiggingStatus, pos: (i32, i32, i32), sequence: i32) -> DiggingAction {
+    DiggingAction {
+        status,
+        pos,
+        face: Direction::Up,
+        sequence,
+    }
+}
+
+#[test]
+fn test_zero_hardness_blocks_break_on_survival_start() {
+    let eye = (0.5, 66.0, 0.5);
+    let target = (0, 64, 0);
+    for block in [
+        "minecraft:short_grass",
+        "minecraft:dandelion",
+        "minecraft:fern",
+    ] {
+        let (result, session) = BlockInteractionEngine::validate_digging_stateful(
+            eye,
+            false,
+            &dig(DiggingStatus::Started, target, 1),
+            Some(block),
+            500,
+            None,
+        );
+        assert_eq!(
+            result,
+            InteractionResult::Accepted {
+                placed: None,
+                broken: Some(target),
+                sequence: 1,
+            },
+            "{block}"
+        );
+        assert_eq!(session, None, "{block} leaves no session");
+    }
+}
+
+#[test]
+fn test_starting_on_air_breaks_nothing() {
+    let (result, session) = BlockInteractionEngine::validate_digging_stateful(
+        (0.5, 66.0, 0.5),
+        false,
+        &dig(DiggingStatus::Started, (0, 64, 0), 1),
+        Some("minecraft:air"),
+        500,
+        None,
+    );
+    assert_eq!(
+        result,
+        InteractionResult::Accepted {
+            placed: None,
+            broken: None,
+            sequence: 1,
+        }
+    );
+    assert_eq!(session, None);
+}
+
+#[test]
+fn test_replaced_target_invalidates_digging_progress() {
+    let eye = (0.5, 66.0, 0.5);
+    let target = (0, 64, 0);
+    let (_, session) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &dig(DiggingStatus::Started, target, 1),
+        Some("minecraft:dirt"),
+        100,
+        None,
+    );
+    let session = session.expect("dirt starts a session");
+    assert_eq!(session.required_ticks, 15);
+
+    for replacement in [Some("minecraft:obsidian"), Some("minecraft:air"), None] {
+        let (result, remaining) = BlockInteractionEngine::validate_digging_stateful(
+            eye,
+            false,
+            &dig(DiggingStatus::Finished, target, 2),
+            replacement,
+            115,
+            Some(&session),
+        );
+        assert_eq!(
+            result,
+            InteractionResult::Rejected {
+                reason: InteractionRejectReason::TargetChanged,
+                sequence: 2,
+            },
+            "{replacement:?}"
+        );
+        assert_eq!(remaining, None, "stale progress must not survive");
+    }
+}
+
+#[test]
+fn test_block_state_change_keeps_digging_progress() {
+    let eye = (0.5, 66.0, 0.5);
+    let target = (0, 64, 0);
+    let (_, session) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &dig(DiggingStatus::Started, target, 1),
+        Some("minecraft:grass_block[snowy=false]"),
+        100,
+        None,
+    );
+    let session = session.expect("grass block starts a session");
+    assert_eq!(session.required_ticks, 15, "state must not alter hardness");
+
+    let (result, _) = BlockInteractionEngine::validate_digging_stateful(
+        eye,
+        false,
+        &dig(DiggingStatus::Finished, target, 2),
+        Some("minecraft:grass_block[snowy=true]"),
+        115,
+        Some(&session),
+    );
+    assert_eq!(
+        result,
+        InteractionResult::Accepted {
+            placed: None,
+            broken: Some(target),
+            sequence: 2,
+        }
+    );
+}
+
+#[test]
+fn test_block_state_suffix_does_not_change_collision() {
+    assert!(!BlockInteractionEngine::is_block_collidable(Some(
+        "minecraft:water[level=0]"
+    )));
+    assert!(BlockInteractionEngine::is_block_collidable(Some(
+        "minecraft:grass_block[snowy=false]"
+    )));
 }

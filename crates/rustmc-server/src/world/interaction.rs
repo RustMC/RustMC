@@ -1,15 +1,22 @@
-//! Authoritative block interaction engine and validation types.
+//! Validation of player block interaction intents.
 //!
-//! Handles server-side validation of block digging progression and placement intents
-//! according to Minecraft protocol rules and spatial constraints (reach, world bounds,
-//! tick-based digging progression, and block-type aware player hitbox collision).
+//! Checks block digging progression and placement intents against spatial
+//! constraints (reach, world bounds, player hitbox collision) and a tick-based
+//! digging session.
 //!
-//! # Scope & Progression
+//! # Scope
 //!
-//! This module provides authoritative validation for digging and placement actions.
-//! Survival digging progression enforces start-to-finish tick duration checks and
-//! rejects unbreakable blocks (e.g. bedrock). Placement checks account for non-collidable
-//! blocks (e.g. torches, flowers) to avoid invalid collision rejections.
+//! This module is a standalone validator. It is not yet connected to the Java
+//! packet path or to world state: callers supply the target block and hold the
+//! [`DiggingSession`] between actions.
+//!
+//! A survival `Finished` needs a session started on the same block; breaking
+//! from `Started` happens only for zero-hardness blocks. Durations model bare
+//! hands only. Tools, enchantments, and status effects shorten real break times
+//! and are not modelled, so [`BlockInteractionEngine::required_break_ticks`]
+//! would reject legitimate tool use. This must not gate live clients until that
+//! data exists. Block hardness and collision cover the listed blocks; any other
+//! block uses a default.
 
 /// 3D cardinal and vertical directions for block faces and neighbor offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,24 +107,43 @@ pub struct UseItemOnAction {
 }
 
 /// Tracks an ongoing digging action for a player session in survival mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiggingSession {
     pub pos: (i32, i32, i32),
+    /// Name of the block digging started on, without namespace or state.
+    /// `None` when the block was unknown.
+    pub target: Option<String>,
     pub start_tick: u64,
     pub required_ticks: u32,
 }
 
 impl DiggingSession {
-    pub const fn new(pos: (i32, i32, i32), start_tick: u64, required_ticks: u32) -> Self {
+    pub fn new(
+        pos: (i32, i32, i32),
+        target: Option<&str>,
+        start_tick: u64,
+        required_ticks: u32,
+    ) -> Self {
         Self {
             pos,
+            target: target.map(|id| block_name(id).to_owned()),
             start_tick,
             required_ticks,
         }
     }
+
+    fn matches_target(&self, current_block: Option<&str>) -> bool {
+        self.target.as_deref() == current_block.map(block_name)
+    }
 }
 
-/// Rejection reason when an authoritative block interaction cannot be accepted.
+/// Strips the namespace and block-state properties from a block identifier.
+fn block_name(id: &str) -> &str {
+    let id = id.split_once('[').map_or(id, |(name, _)| name);
+    id.strip_prefix("minecraft:").unwrap_or(id)
+}
+
+/// Rejection reason when a block interaction cannot be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionRejectReason {
     TooFar,
@@ -126,9 +152,11 @@ pub enum InteractionRejectReason {
     TargetNotReplaceable,
     Malformed,
     PrematureFinish,
+    /// The block at the position is no longer the one digging started on.
+    TargetChanged,
 }
 
-/// Result of authoritative interaction validation.
+/// Result of interaction validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionResult {
     Accepted {
@@ -161,7 +189,7 @@ impl InteractionResult {
     }
 }
 
-/// Authoritative validator for player block interactions.
+/// Validator for player block interactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockInteractionEngine;
 
@@ -179,7 +207,7 @@ impl BlockInteractionEngine {
     pub const MIN_XZ: i32 = -30_000_000;
     pub const MAX_XZ: i32 = 30_000_000;
 
-    /// Checks if a block position is within the authoritative world bounds.
+    /// Checks if a block position is within the world bounds.
     #[inline]
     pub const fn is_within_bounds(pos: (i32, i32, i32)) -> bool {
         pos.1 >= Self::MIN_Y
@@ -208,8 +236,7 @@ impl BlockInteractionEngine {
         let Some(id) = block_id else {
             return 1.0;
         };
-        let stripped = id.strip_prefix("minecraft:").unwrap_or(id);
-        match stripped {
+        match block_name(id) {
             "bedrock" | "barrier" | "end_portal_frame" => -1.0,
             "air" | "cave_air" | "void_air" => 0.0,
             "short_grass" | "grass" | "fern" | "dead_bush" | "dandelion" | "poppy" => 0.0,
@@ -221,9 +248,11 @@ impl BlockInteractionEngine {
         }
     }
 
-    /// Computes minimum required ticks to break a block given block hardness.
-    /// In vanilla, break time in ticks without tool multiplier is `(hardness * 30.0)` for blocks requiring tools,
-    /// or `(hardness * 15.0)` when harvestable. Instant breaks (hardness == 0.0) take 0 ticks.
+    /// Computes required ticks to break a block with bare hands: 1.5 seconds
+    /// per hardness point, per the documented breaking formula at
+    /// <https://minecraft.wiki/w/Breaking>. Blocks that need a tool take longer
+    /// by hand and tools shorten this; neither is modelled, see the module
+    /// documentation. Instant breaks (hardness == 0.0) take 0 ticks.
     pub fn required_break_ticks(hardness: f32) -> u32 {
         if hardness <= 0.0 {
             0
@@ -238,9 +267,8 @@ impl BlockInteractionEngine {
         let Some(id) = block_id else {
             return true;
         };
-        let stripped = id.strip_prefix("minecraft:").unwrap_or(id);
         !matches!(
-            stripped,
+            block_name(id),
             "air"
                 | "cave_air"
                 | "void_air"
@@ -282,7 +310,9 @@ impl BlockInteractionEngine {
         )
     }
 
-    /// Validates a digging action authoritative intent without tracking session state.
+    /// Validates a digging action without session state. A survival `Finished`
+    /// is therefore always rejected; use
+    /// [`Self::validate_digging_stateful`] to track progress.
     pub fn validate_digging(
         player_eye: (f64, f64, f64),
         is_creative: bool,
@@ -296,7 +326,6 @@ impl BlockInteractionEngine {
             current_block,
             0,
             None,
-            true,
         );
         result
     }
@@ -309,7 +338,6 @@ impl BlockInteractionEngine {
         current_block: Option<&str>,
         current_tick: u64,
         session: Option<&DiggingSession>,
-        allow_untracked: bool,
     ) -> (InteractionResult, Option<DiggingSession>) {
         if player_eye.0.is_nan()
             || player_eye.1.is_nan()
@@ -379,13 +407,32 @@ impl BlockInteractionEngine {
                     )
                 } else {
                     let req_ticks = Self::required_break_ticks(hardness);
+                    if req_ticks == 0 {
+                        // The client breaks these on Started and sends no Finished.
+                        let is_air = current_block.is_some_and(|id| {
+                            matches!(block_name(id), "air" | "cave_air" | "void_air")
+                        });
+                        return (
+                            InteractionResult::Accepted {
+                                placed: None,
+                                broken: (!is_air).then_some(action.pos),
+                                sequence: action.sequence,
+                            },
+                            None,
+                        );
+                    }
                     (
                         InteractionResult::Accepted {
                             placed: None,
                             broken: None,
                             sequence: action.sequence,
                         },
-                        Some(DiggingSession::new(action.pos, current_tick, req_ticks)),
+                        Some(DiggingSession::new(
+                            action.pos,
+                            current_block,
+                            current_tick,
+                            req_ticks,
+                        )),
                     )
                 }
             }
@@ -398,7 +445,7 @@ impl BlockInteractionEngine {
                         },
                         None,
                     )
-                } else if is_creative || allow_untracked {
+                } else if is_creative {
                     (
                         InteractionResult::Accepted {
                             placed: None,
@@ -409,6 +456,13 @@ impl BlockInteractionEngine {
                     )
                 } else {
                     match session {
+                        Some(s) if s.pos == action.pos && !s.matches_target(current_block) => (
+                            InteractionResult::Rejected {
+                                reason: InteractionRejectReason::TargetChanged,
+                                sequence: action.sequence,
+                            },
+                            None,
+                        ),
                         Some(s) if s.pos == action.pos => {
                             let elapsed = current_tick.saturating_sub(s.start_tick);
                             if elapsed >= s.required_ticks as u64 {
@@ -426,7 +480,7 @@ impl BlockInteractionEngine {
                                         reason: InteractionRejectReason::PrematureFinish,
                                         sequence: action.sequence,
                                     },
-                                    Some(*s),
+                                    Some(s.clone()),
                                 )
                             }
                         }
@@ -443,7 +497,7 @@ impl BlockInteractionEngine {
         }
     }
 
-    /// Validates a block placement authoritative intent.
+    /// Validates a block placement intent, treating the block as a full cube.
     pub fn validate_block_placement(
         player_pos: (f64, f64, f64),
         player_eye: (f64, f64, f64),
@@ -463,7 +517,7 @@ impl BlockInteractionEngine {
         )
     }
 
-    /// Validates a block placement authoritative intent with block-type collision awareness.
+    /// Validates a block placement intent with block-type collision awareness.
     pub fn validate_block_placement_with_block(
         player_pos: (f64, f64, f64),
         player_eye: (f64, f64, f64),
