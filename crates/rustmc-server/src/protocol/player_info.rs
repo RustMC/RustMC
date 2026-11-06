@@ -613,9 +613,7 @@ pub fn decode_mutf8(bytes: &[u8]) -> Result<String, ProtocolError> {
                 let ch = char::from_u32(cp).ok_or(ProtocolError::InvalidUtf8)?;
                 s.push(ch);
                 i += 6;
-            } else if (0xDC00..=0xDFFF).contains(&code) {
-                return Err(ProtocolError::InvalidUtf8);
-            } else if code < 0x800 {
+            } else if (0xDC00..=0xDFFF).contains(&code) || code < 0x800 {
                 return Err(ProtocolError::InvalidUtf8);
             } else {
                 let ch = char::from_u32(code).ok_or(ProtocolError::InvalidUtf8)?;
