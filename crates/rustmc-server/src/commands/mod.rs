@@ -72,6 +72,10 @@ impl Coordinate {
     }
 
     /// Resolve this coordinate against an origin value.
+    ///
+    /// A single axis cannot apply the rotated basis that `^` needs, so a local component
+    /// is only an axis offset here. Destinations must go through
+    /// [`Coordinates3::resolve_with_rotation`].
     pub fn resolve(&self, origin: f64) -> f64 {
         match *self {
             Self::Absolute(val) => val,
@@ -233,7 +237,8 @@ impl Coordinates3 {
         }
     }
 
-    /// Resolve all 3 coordinate components against an origin point `(x, y, z)`.
+    /// Resolve all 3 coordinate components against an origin point `(x, y, z)`,
+    /// assuming zero rotation. Use [`Self::resolve_with_rotation`] for a real executor.
     pub fn resolve(&self, origin: (f64, f64, f64)) -> (f64, f64, f64) {
         self.resolve_with_rotation(origin, Some((0.0, 0.0)))
             .unwrap_or(origin)
@@ -242,6 +247,11 @@ impl Coordinates3 {
     /// Whether this coordinate triple uses local coordinates.
     pub fn is_local(&self) -> bool {
         self.x.is_local()
+    }
+
+    /// Whether every component is absolute, so no execution origin is needed.
+    pub fn is_absolute(&self) -> bool {
+        self.x.is_absolute() && self.y.is_absolute() && self.z.is_absolute()
     }
 }
 
@@ -615,9 +625,16 @@ pub struct CommandRegistration {
 }
 
 /// Dispatcher responsible for parsing and executing commands.
+///
+/// `/time` covers only `set`, `add`, and the `daytime`, `gametime`, and `day` queries over
+/// one day clock. The community wiki describes Java 26.1 and later as built on world clocks
+/// with different query forms, which are not implemented, so this is not a 26.3 parity claim.
 pub struct CommandDispatcher {
     pub seed: i64,
+    /// Mutable day clock, changed by `/time set` and `/time add`.
     pub time: u64,
+    /// Elapsed world ticks. Only [`Self::advance_ticks`] changes this.
+    game_time: u64,
     pub players: HashMap<String, PlayerTarget>,
     rng: RandomSource,
     commands: HashMap<String, CommandRegistration>,
@@ -640,6 +657,7 @@ impl CommandDispatcher {
         let mut dispatcher = Self {
             seed,
             time: 0,
+            game_time: 0,
             players: HashMap::new(),
             rng: RandomSource::from_world_seed(seed as u64),
             commands: HashMap::new(),
@@ -659,14 +677,25 @@ impl CommandDispatcher {
         self.rng = RandomSource::from_world_seed(seed as u64);
     }
 
-    /// Current world time in ticks.
+    /// Current day clock in ticks.
     pub fn time(&self) -> u64 {
         self.time
     }
 
-    /// Set world time in ticks.
+    /// Set the day clock in ticks. Elapsed game time is unaffected.
     pub fn set_time(&mut self, time: u64) {
         self.time = time;
+    }
+
+    /// Elapsed world ticks, independent of the day clock.
+    pub fn game_time(&self) -> u64 {
+        self.game_time
+    }
+
+    /// Record `ticks` elapsed world ticks, moving the day clock with them.
+    pub fn advance_ticks(&mut self, ticks: u64) {
+        self.game_time = self.game_time.saturating_add(ticks);
+        self.time = self.time.wrapping_add(ticks);
     }
 
     /// Register a player in the simulation.
@@ -827,12 +856,23 @@ impl CommandDispatcher {
         }
 
         // Auto-register or sync sender if it is an in-world player
-        if let CommandSender::Player { name, pos, .. } = sender {
+        if let CommandSender::Player {
+            name,
+            pos,
+            yaw,
+            pitch,
+            ..
+        } = sender
+        {
             if let Some(player) = self.players.get_mut(name) {
                 player.pos = *pos;
+                player.yaw = *yaw;
+                player.pitch = *pitch;
             } else {
-                self.players
-                    .insert(name.clone(), PlayerTarget::new(name.clone(), *pos));
+                self.players.insert(
+                    name.clone(),
+                    PlayerTarget::new(name.clone(), *pos).with_rotation(*yaw, *pitch),
+                );
             }
         }
 
@@ -848,6 +888,8 @@ impl CommandDispatcher {
 pub fn tokenize_command(input: &str) -> Result<Vec<String>, CommandError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    // Separate from `current` being empty, so `""` still yields an empty argument.
+    let mut token_started = false;
     let mut in_quote = None;
 
     for ch in input.chars() {
@@ -861,18 +903,20 @@ pub fn tokenize_command(input: &str) -> Result<Vec<String>, CommandError> {
                     }
                 } else {
                     in_quote = Some(ch);
+                    token_started = true;
                 }
             }
             ch if ch.is_whitespace() => {
                 if in_quote.is_some() {
                     current.push(ch);
-                } else if !current.is_empty() {
-                    tokens.push(current);
-                    current = String::new();
+                } else if token_started {
+                    tokens.push(std::mem::take(&mut current));
+                    token_started = false;
                 }
             }
             ch => {
                 current.push(ch);
+                token_started = true;
             }
         }
     }
@@ -882,7 +926,7 @@ pub fn tokenize_command(input: &str) -> Result<Vec<String>, CommandError> {
             "Unclosed quote in command".to_string(),
         ));
     }
-    if !current.is_empty() {
+    if token_started {
         tokens.push(current);
     }
 
@@ -909,6 +953,28 @@ fn validate_coordinate_bounds(pos: (f64, f64, f64)) -> Result<(), CommandError> 
         )));
     }
     Ok(())
+}
+
+/// Resolve a `/tp` destination once from the command source, never from a target.
+///
+/// The console has no position or rotation in this dispatcher, so it may only use absolute
+/// coordinates: its real execution origin depends on world spawn, which is not modelled here.
+fn resolve_source_destination(
+    coords: &Coordinates3,
+    sender: &CommandSender,
+) -> Result<(f64, f64, f64), CommandError> {
+    let origin = match sender.position() {
+        Some(pos) => pos,
+        None if coords.is_absolute() => (0.0, 0.0, 0.0),
+        None => {
+            return Err(CommandError::ConsoleNotAllowed(
+                "Relative and local coordinates require an in-world sender".to_string(),
+            ));
+        }
+    };
+    let dest_pos = coords.resolve_with_rotation(origin, sender.rotation())?;
+    validate_coordinate_bounds(dest_pos)?;
+    Ok(dest_pos)
 }
 
 /// Validate and normalize a namespaced Minecraft item identifier.
@@ -976,18 +1042,20 @@ fn handle_tp(
                 ));
             }
             let dest_name = &dest_targets[0];
-            let dest_pos = dispatcher
+            let (dest_pos, dest_yaw, dest_pitch) = dispatcher
                 .players
                 .get(dest_name)
+                .map(|dest| (dest.pos, dest.yaw, dest.pitch))
                 .ok_or_else(|| {
                     CommandError::PlayerNotFound(format!(
                         "Destination player not found: {dest_name}"
                     ))
-                })?
-                .pos;
+                })?;
 
             if let Some(player) = dispatcher.players.get_mut(&sender_name) {
                 player.pos = dest_pos;
+                player.yaw = dest_yaw;
+                player.pitch = dest_pitch;
             }
             Ok(format!(
                 "Teleported {sender_name} to {dest_name} ({}, {}, {})",
@@ -1015,15 +1083,15 @@ fn handle_tp(
                 ));
             }
             let dest_name = &dest_targets[0];
-            let dest_pos = dispatcher
+            let (dest_pos, dest_yaw, dest_pitch) = dispatcher
                 .players
                 .get(dest_name)
+                .map(|dest| (dest.pos, dest.yaw, dest.pitch))
                 .ok_or_else(|| {
                     CommandError::PlayerNotFound(format!(
                         "Destination player not found: {dest_name}"
                     ))
-                })?
-                .pos;
+                })?;
 
             let target_selector = TargetSelector::parse(args[0])?;
             let targets =
@@ -1037,6 +1105,8 @@ fn handle_tp(
             for name in &targets {
                 if let Some(player) = dispatcher.players.get_mut(name) {
                     player.pos = dest_pos;
+                    player.yaw = dest_yaw;
+                    player.pitch = dest_pitch;
                 }
             }
             if targets.len() == 1 {
@@ -1093,41 +1163,26 @@ fn handle_tp(
             }
             let coords = Coordinates3::parse(args[1], args[2], args[3])?;
 
-            // Transactional update: compute and validate destinations for ALL targets before applying mutations.
-            // If any destination is invalid, abort immediately without mutating ANY player.
-            let mut pending_updates: Vec<(String, (f64, f64, f64))> =
-                Vec::with_capacity(targets.len());
+            // One destination for every target, validated before anyone moves. Targets keep
+            // their own rotation.
+            let dest_pos = resolve_source_destination(&coords, sender)?;
             for name in &targets {
-                let (current_pos, rot) = match dispatcher.players.get(name) {
-                    Some(p) => (p.pos, Some((p.yaw, p.pitch))),
-                    None => ((0.0, 0.0, 0.0), sender.rotation()),
-                };
-                let dest_pos =
-                    coords.resolve_with_rotation(current_pos, rot.or_else(|| sender.rotation()))?;
-                validate_coordinate_bounds(dest_pos)?;
-                pending_updates.push((name.clone(), dest_pos));
-            }
-
-            // Commit all pre-validated mutations
-            let mut last_pos = (0.0, 0.0, 0.0);
-            for (name, dest_pos) in pending_updates {
-                if let Some(player) = dispatcher.players.get_mut(&name) {
+                if let Some(player) = dispatcher.players.get_mut(name) {
                     player.pos = dest_pos;
                 }
-                last_pos = dest_pos;
             }
             if targets.len() == 1 {
                 Ok(format!(
                     "Teleported {} to {}, {}, {}",
-                    targets[0], last_pos.0, last_pos.1, last_pos.2
+                    targets[0], dest_pos.0, dest_pos.1, dest_pos.2
                 ))
             } else {
                 Ok(format!(
                     "Teleported {} players to {}, {}, {}",
                     targets.len(),
-                    last_pos.0,
-                    last_pos.1,
-                    last_pos.2
+                    dest_pos.0,
+                    dest_pos.1,
+                    dest_pos.2
                 ))
             }
         }
@@ -1296,7 +1351,7 @@ fn handle_time(
                     Ok(format!("The time is {val}"))
                 }
                 "gametime" => {
-                    let val = dispatcher.time;
+                    let val = dispatcher.game_time;
                     Ok(format!("The time is {val}"))
                 }
                 "day" => {

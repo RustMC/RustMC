@@ -280,12 +280,12 @@ fn test_tp_execution() {
         (50.0, 80.0, 50.0)
     );
 
-    // 6. Teleport target to relative coordinates (relative to target's position)
+    // 6. The console has no execution origin, so it cannot use relative coordinates
     let res = dispatcher.execute(&CommandSender::console(), "/tp Alex ~ ~5 ~-10");
-    assert!(res.is_success());
+    assert!(res.is_error());
     assert_eq!(
         dispatcher.get_player("Alex").unwrap().pos,
-        (50.0, 85.0, 40.0)
+        (50.0, 80.0, 50.0)
     );
 
     // 7. Teleport target to another player
@@ -418,10 +418,10 @@ fn test_time_execution() {
     assert!(res.is_success());
     assert_eq!(res.message(), "The time is 1000");
 
-    // time query gametime (25000)
+    // time query gametime (no world ticks have elapsed)
     let res = dispatcher.execute(&console, "/time query gametime");
     assert!(res.is_success());
-    assert_eq!(res.message(), "The time is 25000");
+    assert_eq!(res.message(), "The time is 0");
 
     // time query day (25000 / 24000 = 1)
     let res = dispatcher.execute(&console, "/time query day");
@@ -768,25 +768,193 @@ fn test_tp_local_coordinates_with_rotation() {
 }
 
 #[test]
-fn test_tp_multi_target_transactional_rollback() {
+fn test_tp_out_of_bounds_destination_moves_nobody() {
     let mut dispatcher = CommandDispatcher::new();
     dispatcher.add_player(PlayerTarget::new("PlayerA", (0.0, 100.0, 0.0)));
-    dispatcher.add_player(PlayerTarget::new("PlayerB", (29_999_990.0, 100.0, 0.0)));
+    dispatcher.add_player(PlayerTarget::new("PlayerB", (5.0, 100.0, 0.0)));
 
-    // PlayerA's relative destination would be valid (X=20 <= 30,000,000),
-    // but PlayerB's relative destination would exceed world boundaries (X=30,000,010 > 30,000,000).
-    let res = dispatcher.execute(&CommandSender::console(), "/tp @a ~20 ~ ~");
+    // The destination comes from the sender, so it is invalid for every target alike.
+    let sender = CommandSender::player("Admin", (29_999_990.0, 100.0, 0.0), 2);
+    let res = dispatcher.execute(&sender, "/tp PlayerA ~20 ~ ~");
+    assert!(res.is_error());
+    let res = dispatcher.execute(&sender, "/tp @a ~20 ~ ~");
     assert!(res.is_error());
 
-    // Transactional rollback guarantee: PlayerA MUST NOT have moved!
     assert_eq!(
         dispatcher.get_player("PlayerA").unwrap().pos,
-        (0.0, 100.0, 0.0),
-        "PlayerA position must be rolled back on mixed-validity failure"
+        (0.0, 100.0, 0.0)
     );
     assert_eq!(
         dispatcher.get_player("PlayerB").unwrap().pos,
-        (29_999_990.0, 100.0, 0.0),
-        "PlayerB position must remain untouched"
+        (5.0, 100.0, 0.0)
+    );
+}
+
+#[test]
+fn test_tp_relative_coordinates_resolve_from_the_sender() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Bob", (100.0, 64.0, 100.0)));
+    let alice = CommandSender::player("Alice", (0.0, 64.0, 0.0), 2);
+
+    assert!(dispatcher.execute(&alice, "/tp Bob ~10 ~2 ~").is_success());
+    assert_eq!(dispatcher.get_player("Bob").unwrap().pos, (10.0, 66.0, 0.0));
+}
+
+#[test]
+fn test_tp_all_to_tilde_gathers_players_at_the_sender() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Bob", (100.0, 64.0, 100.0)));
+    dispatcher.add_player(PlayerTarget::new("Carol", (-40.0, 70.0, 8.0)));
+    let alice = CommandSender::player("Alice", (1.0, 64.0, 2.0), 2);
+
+    assert!(dispatcher.execute(&alice, "/tp @a ~ ~ ~").is_success());
+    for name in ["Alice", "Bob", "Carol"] {
+        assert_eq!(dispatcher.get_player(name).unwrap().pos, (1.0, 64.0, 2.0));
+    }
+}
+
+#[test]
+fn test_tp_local_coordinates_use_the_sender_rotation_not_the_target() {
+    let mut dispatcher = CommandDispatcher::new();
+    // Bob faces west; Alice faces south, where forward is +Z.
+    dispatcher.add_player(PlayerTarget::new("Bob", (100.0, 64.0, 100.0)).with_rotation(90.0, 0.0));
+    let alice = CommandSender::player_with_rotation("Alice", (0.0, 64.0, 0.0), 2, 0.0, 0.0);
+
+    assert!(dispatcher.execute(&alice, "/tp Bob ^ ^ ^10").is_success());
+    let bob = dispatcher.get_player("Bob").unwrap();
+    assert!((bob.pos.0 - 0.0).abs() < 1e-9);
+    assert!((bob.pos.1 - 64.0).abs() < 1e-9);
+    assert!((bob.pos.2 - 10.0).abs() < 1e-9);
+    assert_eq!((bob.yaw, bob.pitch), (90.0, 0.0), "rotation is kept");
+}
+
+#[test]
+fn test_console_tp_accepts_absolute_coordinates_only() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Bob", (100.0, 64.0, 100.0)));
+    let console = CommandSender::console();
+
+    assert!(dispatcher.execute(&console, "/tp Bob ~1 64 0").is_error());
+    assert!(dispatcher.execute(&console, "/tp Bob ^ ^ ^1").is_error());
+    assert_eq!(
+        dispatcher.get_player("Bob").unwrap().pos,
+        (100.0, 64.0, 100.0)
+    );
+    assert!(dispatcher.execute(&console, "/tp Bob 1 2 3").is_success());
+    assert_eq!(dispatcher.get_player("Bob").unwrap().pos, (1.0, 2.0, 3.0));
+}
+
+#[test]
+fn test_tp_to_player_copies_destination_rotation() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Bob", (5.0, 70.0, 5.0)).with_rotation(135.0, -20.0));
+    dispatcher.add_player(PlayerTarget::new("Carol", (9.0, 70.0, 9.0)).with_rotation(10.0, 10.0));
+
+    // Two-argument form
+    let console = CommandSender::console();
+    assert!(dispatcher.execute(&console, "/tp Carol Bob").is_success());
+    let carol = dispatcher.get_player("Carol").unwrap();
+    assert_eq!(carol.pos, (5.0, 70.0, 5.0));
+    assert_eq!((carol.yaw, carol.pitch), (135.0, -20.0));
+
+    // One-argument form
+    let alice = CommandSender::player_with_rotation("Alice", (0.0, 64.0, 0.0), 2, 45.0, 45.0);
+    assert!(dispatcher.execute(&alice, "/tp Bob").is_success());
+    let alice_state = dispatcher.get_player("Alice").unwrap();
+    assert_eq!(alice_state.pos, (5.0, 70.0, 5.0));
+    assert_eq!((alice_state.yaw, alice_state.pitch), (135.0, -20.0));
+}
+
+#[test]
+fn test_tp_to_sender_copies_the_sender_current_rotation() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Alice", (0.0, 64.0, 0.0)).with_rotation(1.0, 1.0));
+    dispatcher.add_player(PlayerTarget::new("Bob", (5.0, 70.0, 5.0)));
+
+    // The stored rotation is stale; the sender's live rotation must win.
+    let alice = CommandSender::player_with_rotation("Alice", (0.0, 64.0, 0.0), 2, -90.0, 30.0);
+    assert!(dispatcher.execute(&alice, "/tp Bob @s").is_success());
+    let bob = dispatcher.get_player("Bob").unwrap();
+    assert_eq!((bob.yaw, bob.pitch), (-90.0, 30.0));
+}
+
+#[test]
+fn test_game_time_is_separate_from_the_day_clock() {
+    let mut dispatcher = CommandDispatcher::new();
+    let console = CommandSender::console();
+
+    assert!(dispatcher.execute(&console, "/time set day").is_success());
+    assert_eq!(dispatcher.time(), 1000);
+    assert_eq!(dispatcher.game_time(), 0);
+    assert_eq!(
+        dispatcher
+            .execute(&console, "/time query gametime")
+            .message(),
+        "The time is 0"
+    );
+
+    assert!(dispatcher.execute(&console, "/time add 500").is_success());
+    assert_eq!(dispatcher.game_time(), 0);
+
+    dispatcher.advance_ticks(40);
+    assert_eq!(dispatcher.time(), 1540);
+    assert_eq!(dispatcher.game_time(), 40);
+
+    // Setting the clock backward cannot reduce elapsed time.
+    assert!(dispatcher.execute(&console, "/time set 0").is_success());
+    assert_eq!(
+        dispatcher
+            .execute(&console, "/time query gametime")
+            .message(),
+        "The time is 40"
+    );
+    assert_eq!(
+        dispatcher
+            .execute(&console, "/time query daytime")
+            .message(),
+        "The time is 0"
+    );
+}
+
+#[test]
+fn test_tokenizer_preserves_empty_quoted_arguments() {
+    assert_eq!(
+        tokenize_command("tp \"\" Bob").unwrap(),
+        vec!["tp".to_string(), String::new(), "Bob".to_string()]
+    );
+    assert_eq!(
+        tokenize_command("gamemode creative ''").unwrap(),
+        vec![
+            "gamemode".to_string(),
+            "creative".to_string(),
+            String::new()
+        ]
+    );
+    assert_eq!(
+        tokenize_command("say  a   b ").unwrap(),
+        vec!["say".to_string(), "a".to_string(), "b".to_string()]
+    );
+}
+
+#[test]
+fn test_empty_quoted_arguments_keep_their_arity() {
+    let mut dispatcher = CommandDispatcher::new();
+    dispatcher.add_player(PlayerTarget::new("Bob", (5.0, 70.0, 5.0)));
+    let alice = CommandSender::player("Alice", (0.0, 64.0, 0.0), 2);
+
+    assert!(dispatcher.execute(&alice, "/tp \"\" Bob").is_error());
+    assert_eq!(
+        dispatcher.get_player("Alice").unwrap().pos,
+        (0.0, 64.0, 0.0)
+    );
+
+    assert!(
+        dispatcher
+            .execute(&alice, "/gamemode creative \"\"")
+            .is_error()
+    );
+    assert_eq!(
+        dispatcher.get_player("Alice").unwrap().gamemode,
+        GameMode::Survival
     );
 }
