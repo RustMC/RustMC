@@ -1,10 +1,31 @@
-//! Bedrock Edition packet definitions and wire codec for protocol version 766 (v1.21.50).
+//! Bedrock Edition packet definitions and wire codec for the discovery target,
+//! protocol 2193 (1.26.51).
+//!
+//! Field order, widths, and packet IDs follow Mojang's protocol schema: release
+//! `v1.26.51` of <https://github.com/Mojang/bedrock-protocol-docs>, commit
+//! `8667debe0adad27de6c692c88942c489a1193206`, with its wire rules at
+//! <https://mojang.github.io/bedrock-protocol-docs/1.26.51/primitives/>. Numeric
+//! enum values the schema omits come from Mojang's legacy changelogs and from
+//! <https://minecraft.wiki/w/Bedrock_Edition_protocol/Data_Types>, revision
+//! 3867656. Mojang's generated enum pages number entries by position, which
+//! contradicts its own changelogs for `GameType`, so they are not used for values.
+//!
+//! Three encodings have no primary source and need a real client to confirm:
+//! the contents of the Login `Connection Request`, the NBT form of `StartGame`
+//! `Player Property Data`, and the `Player Permissions` field, whose schema
+//! combines `int8` with `Compression`. No Bedrock client has exercised this code.
 
 use crate::bedrock::session::BedrockSessionError;
+use crate::discovery_bedrock::{PROTOCOL, VERSION};
 use std::fmt;
 
-pub const BEDROCK_PROTOCOL_VERSION: i32 = 766;
-pub const BEDROCK_GAME_VERSION: &str = "1.21.50";
+/// Network protocol this module implements, shared with discovery.
+pub const BEDROCK_PROTOCOL_VERSION: i32 = PROTOCOL as i32;
+/// Game version this module implements, shared with discovery.
+pub const BEDROCK_GAME_VERSION: &str = VERSION;
+
+/// Schema `maxItems` for the resource pack lists.
+const MAX_PACK_ENTRIES: u32 = 65_535;
 
 pub const ID_LOGIN: u32 = 0x01;
 pub const ID_PLAY_STATUS: u32 = 0x02;
@@ -172,10 +193,100 @@ pub fn base64_url_encode(input: &[u8]) -> String {
     out
 }
 
-fn strip_packet_id(bytes: &[u8], expected_id: u32) -> &[u8] {
-    match read_varuint32(bytes) {
-        Ok((id, len)) if id & 0x3ff == expected_id => &bytes[len..],
-        _ => bytes,
+fn malformed(reason: &str) -> BedrockSessionError {
+    BedrockSessionError::MalformedPacket(reason.to_string())
+}
+
+fn strip_packet_id(bytes: &[u8], expected_id: u32) -> Result<&[u8], BedrockSessionError> {
+    let (header, len) = read_varuint32(bytes)?;
+    let id = header & 0x3ff;
+    if id != expected_id {
+        return Err(BedrockSessionError::MalformedPacket(format!(
+            "expected packet ID {expected_id}, found {id}"
+        )));
+    }
+    Ok(&bytes[len..])
+}
+
+/// Bounds-checked cursor over a packet body.
+struct Reader<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn new(rest: &'a [u8]) -> Self {
+        Self { rest }
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8], BedrockSessionError> {
+        if self.rest.len() < len {
+            return Err(malformed("truncated packet body"));
+        }
+        let (head, tail) = self.rest.split_at(len);
+        self.rest = tail;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], BedrockSessionError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.bytes(N)?);
+        Ok(out)
+    }
+
+    fn bool(&mut self) -> Result<bool, BedrockSessionError> {
+        Ok(self.bytes(1)?[0] != 0)
+    }
+
+    fn f32(&mut self) -> Result<f32, BedrockSessionError> {
+        Ok(f32::from_le_bytes(self.array()?))
+    }
+
+    fn varuint32(&mut self) -> Result<u32, BedrockSessionError> {
+        let (value, len) = read_varuint32(self.rest)?;
+        self.rest = &self.rest[len..];
+        Ok(value)
+    }
+
+    fn varint32(&mut self) -> Result<i32, BedrockSessionError> {
+        let (value, len) = read_varint32(self.rest)?;
+        self.rest = &self.rest[len..];
+        Ok(value)
+    }
+
+    fn varuint64(&mut self) -> Result<u64, BedrockSessionError> {
+        let (value, len) = read_varuint64(self.rest)?;
+        self.rest = &self.rest[len..];
+        Ok(value)
+    }
+
+    fn varint64(&mut self) -> Result<i64, BedrockSessionError> {
+        let (value, len) = read_varint64(self.rest)?;
+        self.rest = &self.rest[len..];
+        Ok(value)
+    }
+
+    fn string(&mut self) -> Result<&'a str, BedrockSessionError> {
+        let (value, len) = read_bedrock_string(self.rest)?;
+        self.rest = &self.rest[len..];
+        Ok(value)
+    }
+
+    /// Reads a collection size that RustMC only ever emits as empty.
+    fn expect_empty(&mut self, field: &str, size: u32) -> Result<(), BedrockSessionError> {
+        if size != 0 {
+            return Err(BedrockSessionError::MalformedPacket(format!(
+                "unsupported non-empty {field}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), BedrockSessionError> {
+        if self.rest.is_empty() {
+            Ok(())
+        } else {
+            Err(malformed("trailing bytes after packet body"))
+        }
     }
 }
 
@@ -200,13 +311,9 @@ impl RequestNetworkSettings {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_REQUEST_NETWORK_SETTINGS);
-        if rest.len() < 4 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "RequestNetworkSettings too short".to_string(),
-            ));
-        }
-        let protocol_version = i32::from_be_bytes(rest[0..4].try_into().unwrap());
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_REQUEST_NETWORK_SETTINGS)?);
+        let protocol_version = i32::from_be_bytes(reader.array()?);
+        reader.finish()?;
         Ok(Self { protocol_version })
     }
 }
@@ -224,17 +331,25 @@ impl From<&RequestNetworkSettings> for RequestNetworkSettings {
 }
 
 /// Server-to-client network configuration parameters (Packet 0x8F / 143).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NetworkSettings {
+    /// Smallest payload to compress; `0` disables compression.
     pub compression_threshold: u16,
     pub compression_algorithm: u16,
+    pub client_throttle_enabled: bool,
+    pub client_throttle_threshold: u8,
+    pub client_throttle_scalar: f32,
 }
 
 impl NetworkSettings {
+    /// Settings with client throttling disabled.
     pub fn new(compression_threshold: u16, compression_algorithm: u16) -> Self {
         Self {
             compression_threshold,
             compression_algorithm,
+            client_throttle_enabled: false,
+            client_throttle_threshold: 0,
+            client_throttle_scalar: 0.0,
         }
     }
 
@@ -243,26 +358,29 @@ impl NetworkSettings {
         put_varuint32(ID_NETWORK_SETTINGS, &mut out);
         out.extend_from_slice(&self.compression_threshold.to_le_bytes());
         out.extend_from_slice(&self.compression_algorithm.to_le_bytes());
+        out.push(u8::from(self.client_throttle_enabled));
+        out.push(self.client_throttle_threshold);
+        out.extend_from_slice(&self.client_throttle_scalar.to_le_bytes());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_NETWORK_SETTINGS);
-        if rest.len() < 4 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "NetworkSettings too short".to_string(),
-            ));
-        }
-        let compression_threshold = u16::from_le_bytes(rest[0..2].try_into().unwrap());
-        let compression_algorithm = u16::from_le_bytes(rest[2..4].try_into().unwrap());
-        Ok(Self {
-            compression_threshold,
-            compression_algorithm,
-        })
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_NETWORK_SETTINGS)?);
+        let settings = Self {
+            compression_threshold: u16::from_le_bytes(reader.array()?),
+            compression_algorithm: u16::from_le_bytes(reader.array()?),
+            client_throttle_enabled: reader.bool()?,
+            client_throttle_threshold: reader.array::<1>()?[0],
+            client_throttle_scalar: reader.f32()?,
+        };
+        reader.finish()?;
+        Ok(settings)
     }
 }
 
-/// Extracted player authentication identity from Bedrock Login JWT chain.
+/// Player identity claimed by a Bedrock Login JWT chain.
+///
+/// Token signatures are not verified, so these claims are unauthenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BedrockIdentity {
     pub display_name: String,
@@ -345,90 +463,38 @@ impl Login {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_LOGIN);
-        if rest.len() < 4 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "Login packet too short".to_string(),
-            ));
-        }
-        let protocol_version = i32::from_be_bytes(rest[0..4].try_into().unwrap());
-        let payload_bytes = &rest[4..];
-        let payload = if let Ok((len, pfx)) = read_varuint32(payload_bytes) {
-            let len = len as usize;
-            if payload_bytes.len() >= pfx + len {
-                payload_bytes[pfx..pfx + len].to_vec()
-            } else {
-                payload_bytes.to_vec()
-            }
-        } else {
-            payload_bytes.to_vec()
-        };
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_LOGIN)?);
+        let protocol_version = i32::from_be_bytes(reader.array()?);
+        let len = reader.varuint32()? as usize;
+        let payload = reader.bytes(len)?.to_vec();
+        reader.finish()?;
         Ok(Self {
             protocol_version,
             payload,
         })
     }
 
-    /// Extract public key, displayName, and XUID from the payload JWT chain or JSON structure.
+    /// Extract the claimed public key, display name, and XUID from the JWT chain.
+    ///
+    /// The `Connection Request` is opaque in Mojang's schema. This reads the shape
+    /// [`Login::create`] writes: a little-endian `u32` length, then a JSON object
+    /// whose `chain` array holds JWTs. A real client's payload has not been checked
+    /// against it. The result comes from the first token carrying `extraData`,
+    /// because earlier certificates can hold only an `identityPublicKey`.
     pub fn extract_identity(&self) -> Result<BedrockIdentity, BedrockSessionError> {
-        if self.payload.is_empty() {
-            return Err(BedrockSessionError::MalformedPacket(
-                "empty login payload".to_string(),
-            ));
-        }
+        let mut reader = Reader::new(&self.payload);
+        let len = u32::from_le_bytes(reader.array()?) as usize;
+        let document: serde_json::Value = serde_json::from_slice(reader.bytes(len)?)
+            .map_err(|e| BedrockSessionError::MalformedPacket(e.to_string()))?;
 
-        // Check if there is a 4-byte LE length prefix for the chain JSON string
-        let payload_str = if self.payload.len() >= 4 {
-            let len = u32::from_le_bytes(self.payload[0..4].try_into().unwrap()) as usize;
-            if self.payload.len() >= 4 + len && len > 0 {
-                std::str::from_utf8(&self.payload[4..4 + len]).ok()
-            } else {
-                std::str::from_utf8(&self.payload).ok()
-            }
-        } else {
-            std::str::from_utf8(&self.payload).ok()
-        };
-
-        let payload_str = payload_str.ok_or_else(|| {
-            BedrockSessionError::MalformedPacket("payload is not utf-8".to_string())
-        })?;
-
-        // 1. Parse as JSON structure
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload_str) {
-            if let Some(chain) = val.get("chain").and_then(|c| c.as_array()) {
-                for token_val in chain {
-                    let maybe_ident = token_val.as_str().and_then(|s| parse_jwt_identity(s).ok());
-                    if let Some(identity) = maybe_ident {
-                        return Ok(identity);
-                    }
-                }
-            }
-            if let Some(display_name) = val.get("displayName").and_then(|v| v.as_str()) {
-                let xuid = val
-                    .get("xuid")
-                    .or_else(|| val.get("XUID"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let pubkey = val
-                    .get("identityPublicKey")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                return Ok(BedrockIdentity {
-                    display_name: display_name.to_string(),
-                    xuid: xuid.to_string(),
-                    identity_public_key: pubkey.to_string(),
-                });
-            }
-        }
-
-        // 2. Direct single JWT string
-        if let Ok(identity) = parse_jwt_identity(payload_str) {
-            return Ok(identity);
-        }
-
-        Err(BedrockSessionError::MalformedPacket(
-            "no valid identity tokens found in login payload".to_string(),
-        ))
+        document
+            .get("chain")
+            .and_then(|chain| chain.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|token| token.as_str())
+            .find_map(parse_jwt_identity)
+            .ok_or_else(|| malformed("no identity token in login payload"))
     }
 }
 
@@ -438,48 +504,32 @@ impl From<&Login> for Login {
     }
 }
 
-fn parse_jwt_identity(jwt: &str) -> Result<BedrockIdentity, BedrockSessionError> {
-    let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() < 2 {
-        return Err(BedrockSessionError::MalformedPacket(
-            "invalid jwt token parts".to_string(),
-        ));
+/// Reads the identity claims of one JWT, or `None` if it holds no player identity.
+fn parse_jwt_identity(jwt: &str) -> Option<BedrockIdentity> {
+    let mut parts = jwt.split('.');
+    let (Some(_header), Some(claims), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let claims = base64_url_decode(claims).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&claims).ok()?;
+
+    let extra_data = claims.get("extraData")?;
+    let display_name = extra_data.get("displayName")?.as_str()?;
+    let identity_public_key = claims.get("identityPublicKey")?.as_str()?;
+    if display_name.is_empty() || identity_public_key.is_empty() {
+        return None;
     }
-    let claim_bytes = base64_url_decode(parts[1])?;
-    let claim_val: serde_json::Value = serde_json::from_slice(&claim_bytes)
-        .map_err(|e| BedrockSessionError::MalformedPacket(e.to_string()))?;
-
-    let identity_public_key = claim_val
-        .get("identityPublicKey")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let extra_data = claim_val.get("extraData");
-    let display_name = extra_data
-        .and_then(|e| e.get("displayName"))
-        .or_else(|| claim_val.get("displayName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
     let xuid = extra_data
-        .and_then(|e| e.get("XUID").or_else(|| e.get("xuid")))
-        .or_else(|| claim_val.get("XUID").or_else(|| claim_val.get("xuid")))
+        .get("XUID")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
-    if display_name.is_empty() && xuid.is_empty() && identity_public_key.is_empty() {
-        return Err(BedrockSessionError::MalformedPacket(
-            "empty jwt claims".to_string(),
-        ));
-    }
-
-    Ok(BedrockIdentity {
-        display_name,
-        xuid,
-        identity_public_key,
+    Some(BedrockIdentity {
+        display_name: display_name.to_string(),
+        xuid: xuid.to_string(),
+        identity_public_key: identity_public_key.to_string(),
     })
 }
 
@@ -524,13 +574,9 @@ impl PlayStatus {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_PLAY_STATUS);
-        if rest.len() < 4 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "PlayStatus packet too short".to_string(),
-            ));
-        }
-        let code = i32::from_be_bytes(rest[0..4].try_into().unwrap());
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_PLAY_STATUS)?);
+        let code = i32::from_be_bytes(reader.array()?);
+        reader.finish()?;
         Self::from_i32(code).ok_or_else(|| {
             BedrockSessionError::MalformedPacket(format!("unknown PlayStatus code: {code}"))
         })
@@ -544,56 +590,69 @@ impl fmt::Display for PlayStatus {
 }
 
 /// Server resource packs metadata (Packet 0x06).
+///
+/// RustMC offers no packs, so the world template is empty and the list has no
+/// entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourcePacksInfo {
     pub must_accept: bool,
+    pub has_addon_packs: bool,
     pub has_scripts: bool,
-    pub force_server_packs: bool,
+    pub force_disable_vibrant_visuals: bool,
 }
 
 impl ResourcePacksInfo {
-    pub fn new(must_accept: bool, has_scripts: bool, force_server_packs: bool) -> Self {
+    pub fn new(
+        must_accept: bool,
+        has_addon_packs: bool,
+        has_scripts: bool,
+        force_disable_vibrant_visuals: bool,
+    ) -> Self {
         Self {
             must_accept,
+            has_addon_packs,
             has_scripts,
-            force_server_packs,
+            force_disable_vibrant_visuals,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_varuint32(ID_RESOURCE_PACKS_INFO, &mut out);
-        out.push(self.must_accept as u8);
-        out.push(self.has_scripts as u8);
-        out.push(self.force_server_packs as u8);
-        out.extend_from_slice(&0u16.to_le_bytes()); // 0 behavior packs
-        out.extend_from_slice(&0u16.to_le_bytes()); // 0 resource packs
+        out.push(u8::from(self.must_accept));
+        out.push(u8::from(self.has_addon_packs));
+        out.push(u8::from(self.has_scripts));
+        out.push(u8::from(self.force_disable_vibrant_visuals));
+        out.extend_from_slice(&[0; 16]); // World template UUID
+        put_bedrock_string("", &mut out); // World template version
+        put_varuint32(0, &mut out); // Resource packs
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_RESOURCE_PACKS_INFO);
-        if rest.len() < 3 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "ResourcePacksInfo too short".to_string(),
-            ));
-        }
-        let must_accept = rest[0] != 0;
-        let has_scripts = rest[1] != 0;
-        let force_server_packs = rest[2] != 0;
-        Ok(Self {
-            must_accept,
-            has_scripts,
-            force_server_packs,
-        })
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_RESOURCE_PACKS_INFO)?);
+        let info = Self {
+            must_accept: reader.bool()?,
+            has_addon_packs: reader.bool()?,
+            has_scripts: reader.bool()?,
+            force_disable_vibrant_visuals: reader.bool()?,
+        };
+        reader.bytes(16)?;
+        reader.string()?;
+        let packs = reader.varuint32()?;
+        reader.expect_empty("resource pack list", packs)?;
+        reader.finish()?;
+        Ok(info)
     }
 }
 
 /// Response status code sent by client in ResourcePackClientResponse.
+///
+/// Mojang names these `Cancel`, `Downloading`, `DownloadingFinished`, and
+/// `ResourcePackStackFinished`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ResponseStatus {
-    None = 0,
     Refused = 1,
     SendPacks = 2,
     HaveAllPacks = 3,
@@ -603,7 +662,6 @@ pub enum ResponseStatus {
 impl ResponseStatus {
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
-            0 => Some(Self::None),
             1 => Some(Self::Refused),
             2 => Some(Self::SendPacks),
             3 => Some(Self::HaveAllPacks),
@@ -628,22 +686,19 @@ impl ResourcePackClientResponse {
         let mut out = Vec::new();
         put_varuint32(ID_RESOURCE_PACK_CLIENT_RESPONSE, &mut out);
         out.push(self.status as u8);
-        out.extend_from_slice(&0u16.to_le_bytes()); // 0 pack entries
+        if self.status == ResponseStatus::SendPacks {
+            put_varuint32(0, &mut out); // Downloading Packs
+        }
         out
     }
 
+    /// Reads the response tag only. Bytes after it are not validated: RustMC offers
+    /// no packs, so a `Downloading` list has nothing to select from.
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_RESOURCE_PACK_CLIENT_RESPONSE);
-        if rest.is_empty() {
-            return Err(BedrockSessionError::MalformedPacket(
-                "ResourcePackClientResponse empty".to_string(),
-            ));
-        }
-        let status = ResponseStatus::from_u8(rest[0]).ok_or_else(|| {
-            BedrockSessionError::MalformedPacket(format!(
-                "invalid ResponseStatus byte: {}",
-                rest[0]
-            ))
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_RESOURCE_PACK_CLIENT_RESPONSE)?);
+        let tag = reader.array::<1>()?[0];
+        let status = ResponseStatus::from_u8(tag).ok_or_else(|| {
+            BedrockSessionError::MalformedPacket(format!("invalid ResponseStatus byte: {tag}"))
         })?;
         Ok(Self { status })
     }
@@ -693,103 +748,80 @@ impl PackInstance {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourcePackStack {
     pub must_accept: bool,
-    pub behavior_packs: Vec<PackInstance>,
-    pub resource_packs: Vec<PackInstance>,
+    pub packs: Vec<PackInstance>,
 }
 
 impl ResourcePackStack {
     pub fn new(must_accept: bool) -> Self {
         Self {
             must_accept,
-            behavior_packs: Vec::new(),
-            resource_packs: Vec::new(),
+            packs: Vec::new(),
         }
     }
 
-    pub fn with_packs(
-        must_accept: bool,
-        behavior_packs: Vec<PackInstance>,
-        resource_packs: Vec<PackInstance>,
-    ) -> Self {
-        Self {
-            must_accept,
-            behavior_packs,
-            resource_packs,
-        }
+    pub fn with_packs(must_accept: bool, packs: Vec<PackInstance>) -> Self {
+        Self { must_accept, packs }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_varuint32(ID_RESOURCE_PACK_STACK, &mut out);
-        out.push(self.must_accept as u8);
+        out.push(u8::from(self.must_accept));
 
-        put_varuint32(self.behavior_packs.len() as u32, &mut out);
-        for pack in &self.behavior_packs {
-            put_bedrock_string(&pack.pack_id, &mut out);
-            put_bedrock_string(&pack.version, &mut out);
-            put_bedrock_string(&pack.sub_pack_name, &mut out);
-        }
-
-        put_varuint32(self.resource_packs.len() as u32, &mut out);
-        for pack in &self.resource_packs {
+        put_varuint32(self.packs.len() as u32, &mut out);
+        for pack in &self.packs {
             put_bedrock_string(&pack.pack_id, &mut out);
             put_bedrock_string(&pack.version, &mut out);
             put_bedrock_string(&pack.sub_pack_name, &mut out);
         }
 
         put_bedrock_string(BEDROCK_GAME_VERSION, &mut out);
-        out.extend_from_slice(&0u32.to_le_bytes()); // 0 experiments
-        out.push(0); // experiments previously toggled = false
+        out.extend_from_slice(&0u32.to_le_bytes()); // Experiment toggles
+        out.push(0); // Experiments ever toggled
+        out.push(0); // Include editor packs
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let rest = strip_packet_id(bytes, ID_RESOURCE_PACK_STACK);
-        if rest.is_empty() {
-            return Err(BedrockSessionError::MalformedPacket(
-                "ResourcePackStack empty".to_string(),
-            ));
-        }
-        let must_accept = rest[0] != 0;
-        let mut cursor = &rest[1..];
+        let mut reader = Reader::new(strip_packet_id(bytes, ID_RESOURCE_PACK_STACK)?);
+        let must_accept = reader.bool()?;
 
-        let mut behavior_packs = Vec::new();
-        if let Ok((count, len)) = read_varuint32(cursor) {
-            cursor = &cursor[len..];
-            for _ in 0..count {
-                let (pack_id, n1) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n1..];
-                let (version, n2) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n2..];
-                let (sub_pack, n3) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n3..];
-                behavior_packs.push(PackInstance::new(pack_id, version, sub_pack));
-            }
+        let count = reader.varuint32()?;
+        if count > MAX_PACK_ENTRIES {
+            return Err(malformed("too many resource pack stack entries"));
+        }
+        let mut packs = Vec::new();
+        for _ in 0..count {
+            let pack_id = reader.string()?;
+            let version = reader.string()?;
+            let sub_pack = reader.string()?;
+            packs.push(PackInstance::new(pack_id, version, sub_pack));
         }
 
-        let mut resource_packs = Vec::new();
-        if let Ok((count, len)) = read_varuint32(cursor) {
-            cursor = &cursor[len..];
-            for _ in 0..count {
-                let (pack_id, n1) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n1..];
-                let (version, n2) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n2..];
-                let (sub_pack, n3) = read_bedrock_string(cursor)?;
-                cursor = &cursor[n3..];
-                resource_packs.push(PackInstance::new(pack_id, version, sub_pack));
-            }
-        }
-
-        Ok(Self {
-            must_accept,
-            behavior_packs,
-            resource_packs,
-        })
+        reader.string()?; // Base game version
+        let toggles = u32::from_le_bytes(reader.array()?);
+        reader.expect_empty("experiment list", toggles)?;
+        reader.bool()?; // Experiments ever toggled
+        reader.bool()?; // Include editor packs
+        reader.finish()?;
+        Ok(Self { must_accept, packs })
     }
 }
 
+/// `LevelSettings.Server Chunk Tick Range`: the default four-chunk simulation
+/// distance offered by the game's world settings.
+const SERVER_CHUNK_TICK_RANGE: i32 = 4;
+
+/// An empty root compound for `Player Property Data`: tag type, empty name, end
+/// tag. Mojang's schema leaves this field untyped, so the encoding is unconfirmed.
+const EMPTY_NBT_COMPOUND: [u8; 3] = [0x0a, 0x00, 0x00];
+
 /// Server-to-client world initialization and player entity spawn packet (Packet 0x0B / 11).
+///
+/// The fields here are the ones RustMC models. [`StartGame::encode`] writes the
+/// complete protocol 2193 layout, filling everything else with the neutral value
+/// noted beside it. [`StartGame::decode`] walks the same layout and rejects
+/// non-empty collections that RustMC never emits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartGame {
     pub entity_id: i64,
@@ -805,6 +837,10 @@ pub struct StartGame {
     pub spawn_pos: (i32, i32, i32),
     pub level_id: String,
     pub world_name: String,
+    pub level_current_time: u64,
+    pub enchantment_seed: i32,
+    pub multiplayer_correlation_id: String,
+    pub server_version: String,
 }
 
 impl StartGame {
@@ -827,80 +863,194 @@ impl StartGame {
         out.extend_from_slice(&self.player_pos.2.to_le_bytes());
         out.extend_from_slice(&self.pitch_yaw.0.to_le_bytes());
         out.extend_from_slice(&self.pitch_yaw.1.to_le_bytes());
-        out.extend_from_slice(&self.seed.to_le_bytes());
-        put_varint32(self.dimension, &mut out);
-        put_varint32(self.generator, &mut out);
-        put_varint32(self.world_gamemode, &mut out);
-        put_varint32(self.difficulty, &mut out);
-        put_varint32(self.spawn_pos.0, &mut out);
-        put_varint32(self.spawn_pos.1, &mut out);
-        put_varint32(self.spawn_pos.2, &mut out);
+        self.encode_level_settings(&mut out);
         put_bedrock_string(&self.level_id, &mut out);
         put_bedrock_string(&self.world_name, &mut out);
+        put_bedrock_string("", &mut out); // Template content identity
+        out.push(0); // Is trial
+        put_varint32(0, &mut out); // Movement: rewind history size
+        out.push(0); // Movement: server authoritative block breaking
+        out.extend_from_slice(&self.level_current_time.to_le_bytes());
+        put_varint32(self.enchantment_seed, &mut out);
+        put_varuint32(0, &mut out); // Block properties
+        put_bedrock_string(&self.multiplayer_correlation_id, &mut out);
+        out.push(0); // Enable item stack net manager
+        put_bedrock_string(&self.server_version, &mut out);
+        out.extend_from_slice(&EMPTY_NBT_COMPOUND); // Player property data
+        out.extend_from_slice(&0u64.to_le_bytes()); // Block type registry checksum
+        out.extend_from_slice(&[0; 16]); // World template ID
+        out.push(0); // Server enabled client-side generation
+        out.push(0); // Block network IDs are hashes
+        out.push(0); // Server auth sound enabled
+        out.push(0); // Server configuration join info: absent
+        for _ in 0..4 {
+            put_bedrock_string("", &mut out); // Telemetry: server, scenario, world, owner
+        }
         out
     }
 
+    fn encode_level_settings(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.seed.to_le_bytes());
+        out.extend_from_slice(&0i16.to_le_bytes()); // Spawn biome type: Default
+        put_bedrock_string("", out); // User defined biome name
+        put_varint32(self.dimension, out);
+        put_varint32(self.generator, out);
+        put_varint32(self.world_gamemode, out);
+        out.push(0); // Is hardcore
+        put_varint32(self.difficulty, out);
+        put_varint32(self.spawn_pos.0, out);
+        put_varint32(self.spawn_pos.1, out);
+        put_varint32(self.spawn_pos.2, out);
+        out.push(1); // Achievements disabled: RustMC tracks none
+        put_varint32(0, out); // Editor world type: NonEditor
+        out.push(0); // Is created in editor
+        out.push(0); // Is exported from editor
+        put_varint32(0, out); // Day cycle stop time
+        put_varuint32(0, out); // Education edition offer: None
+        out.push(0); // Education features enabled
+        put_bedrock_string("", out); // Education product ID
+        out.extend_from_slice(&0f32.to_le_bytes()); // Rain level
+        out.extend_from_slice(&0f32.to_le_bytes()); // Lightning level
+        out.push(0); // Has confirmed platform locked content
+        out.push(1); // Multiplayer game intent
+        out.push(0); // LAN broadcast intent
+        put_varint32(0, out); // Xbox Live broadcast setting: NoMultiPlay
+        put_varint32(0, out); // Platform broadcast setting: NoMultiPlay
+        out.push(0); // Commands enabled
+        out.push(0); // Texture packs required
+        put_varuint32(0, out); // Game rules
+        out.extend_from_slice(&0u32.to_le_bytes()); // Experiment toggles
+        out.push(0); // Experiments ever toggled
+        out.push(0); // Has bonus chest enabled
+        out.push(0); // Start with map enabled
+        // Player permissions: Visitor. The schema marks this int8 field `Compression`,
+        // which Mojang defines only for 32- and 64-bit integers. Zero is the one value
+        // that is the same byte whether the field is raw or a zigzag varint.
+        out.push(0);
+        out.extend_from_slice(&SERVER_CHUNK_TICK_RANGE.to_le_bytes());
+        out.push(0); // Has locked behavior pack
+        out.push(0); // Has locked resource pack
+        out.push(0); // Is from locked template
+        out.push(0); // Use MSA gamertags only
+        out.push(0); // Is from world template
+        out.push(0); // Is world template option locked
+        out.push(0); // Only spawn V1 villagers
+        out.push(0); // Persona disabled
+        out.push(0); // Custom skins disabled
+        out.push(0); // Emote chat muted
+        put_bedrock_string(BEDROCK_GAME_VERSION, out); // Base game version
+        out.extend_from_slice(&0i32.to_le_bytes()); // Limited world width
+        out.extend_from_slice(&0i32.to_le_bytes()); // Limited world depth
+        out.push(0); // Nether type
+        put_bedrock_string("", out); // Edu shared resource: button name
+        put_bedrock_string("", out); // Edu shared resource: link URI
+        out.push(0); // Override force experimental gameplay: absent
+        out.push(0); // Chat restriction level: None
+        out.push(0); // Disable player interactions
+        put_varint32(0, out); // Server editor connection policy: MatchWorldType
+        out.push(0); // Allow anonymous block drops in editor worlds
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, BedrockSessionError> {
-        let mut rest = strip_packet_id(bytes, ID_START_GAME);
-        let (entity_id, n) = read_varint64(rest)?;
-        rest = &rest[n..];
-        let (runtime_id, n) = read_varuint64(rest)?;
-        rest = &rest[n..];
-        let (player_gamemode, n) = read_varint32(rest)?;
-        rest = &rest[n..];
+        let mut r = Reader::new(strip_packet_id(bytes, ID_START_GAME)?);
+        let entity_id = r.varint64()?;
+        let runtime_id = r.varuint64()?;
+        let player_gamemode = r.varint32()?;
+        let player_pos = (r.f32()?, r.f32()?, r.f32()?);
+        let pitch_yaw = (r.f32()?, r.f32()?);
 
-        if rest.len() < 28 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "StartGame position and seed too short".to_string(),
-            ));
+        // LevelSettings.
+        let seed = i64::from_le_bytes(r.array()?);
+        r.bytes(2)?; // Spawn biome type
+        r.string()?; // User defined biome name
+        let dimension = r.varint32()?;
+        let generator = r.varint32()?;
+        let world_gamemode = r.varint32()?;
+        r.bool()?; // Is hardcore
+        let difficulty = r.varint32()?;
+        let spawn_pos = (r.varint32()?, r.varint32()?, r.varint32()?);
+        r.bool()?; // Achievements disabled
+        r.varint32()?; // Editor world type
+        r.bytes(2)?; // Is created in, exported from editor
+        r.varint32()?; // Day cycle stop time
+        r.varuint32()?; // Education edition offer
+        r.bool()?; // Education features enabled
+        r.string()?; // Education product ID
+        r.bytes(8)?; // Rain and lightning levels
+        r.bytes(3)?; // Locked content, multiplayer intent, LAN intent
+        r.varint32()?; // Xbox Live broadcast setting
+        r.varint32()?; // Platform broadcast setting
+        r.bytes(2)?; // Commands enabled, texture packs required
+        let rules = r.varuint32()?;
+        r.expect_empty("game rule list", rules)?;
+        let toggles = u32::from_le_bytes(r.array()?);
+        r.expect_empty("experiment list", toggles)?;
+        r.bytes(3)?; // Experiments ever toggled, bonus chest, start with map
+        r.bytes(1)?; // Player permissions
+        r.bytes(4)?; // Server chunk tick range
+        r.bytes(10)?; // Locked packs through emote chat muted
+        r.string()?; // Base game version
+        r.bytes(8)?; // Limited world width and depth
+        r.bool()?; // Nether type
+        r.string()?; // Edu shared resource: button name
+        r.string()?; // Edu shared resource: link URI
+        if r.bool()? {
+            r.bool()?; // Override force experimental gameplay
         }
-        let px = f32::from_le_bytes(rest[0..4].try_into().unwrap());
-        let py = f32::from_le_bytes(rest[4..8].try_into().unwrap());
-        let pz = f32::from_le_bytes(rest[8..12].try_into().unwrap());
-        let pitch = f32::from_le_bytes(rest[12..16].try_into().unwrap());
-        let yaw = f32::from_le_bytes(rest[16..20].try_into().unwrap());
-        let seed = i64::from_le_bytes(rest[20..28].try_into().unwrap());
-        rest = &rest[28..];
+        r.bytes(2)?; // Chat restriction level, disable player interactions
+        r.varint32()?; // Server editor connection policy
+        r.bool()?; // Allow anonymous block drops in editor worlds
 
-        let (dimension, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-        let (generator, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-        let (world_gamemode, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-        let (difficulty, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-
-        let (sx, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-        let (sy, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-        let (sz, n) = read_varint32(rest)?;
-        rest = &rest[n..];
-
-        let (level_id, n) = read_bedrock_string(rest)?;
-        rest = &rest[n..];
-        let (world_name, _) = read_bedrock_string(rest)?;
+        let level_id = r.string()?.to_string();
+        let world_name = r.string()?.to_string();
+        r.string()?; // Template content identity
+        r.bool()?; // Is trial
+        r.varint32()?; // Movement: rewind history size
+        r.bool()?; // Movement: server authoritative block breaking
+        let level_current_time = u64::from_le_bytes(r.array()?);
+        let enchantment_seed = r.varint32()?;
+        let block_properties = r.varuint32()?;
+        r.expect_empty("block property list", block_properties)?;
+        let multiplayer_correlation_id = r.string()?.to_string();
+        r.bool()?; // Enable item stack net manager
+        let server_version = r.string()?.to_string();
+        if r.bytes(EMPTY_NBT_COMPOUND.len())? != EMPTY_NBT_COMPOUND {
+            return Err(malformed("unsupported player property data"));
+        }
+        r.bytes(8)?; // Block type registry checksum
+        r.bytes(16)?; // World template ID
+        r.bytes(3)?; // Client-side generation, hashed IDs, auth sound
+        if r.bool()? {
+            return Err(malformed("unsupported server configuration join info"));
+        }
+        for _ in 0..4 {
+            r.string()?; // Telemetry: server, scenario, world, owner
+        }
+        r.finish()?;
 
         Ok(Self {
             entity_id,
             runtime_id,
             player_gamemode,
-            player_pos: (px, py, pz),
-            pitch_yaw: (pitch, yaw),
+            player_pos,
+            pitch_yaw,
             seed,
             dimension,
             generator,
             world_gamemode,
             difficulty,
-            spawn_pos: (sx, sy, sz),
-            level_id: level_id.to_string(),
-            world_name: world_name.to_string(),
+            spawn_pos,
+            level_id,
+            world_name,
+            level_current_time,
+            enchantment_seed,
+            multiplayer_correlation_id,
+            server_version,
         })
     }
 }
 
-/// Unified enumeration of all supported Bedrock packets in protocol 766.
+/// Unified enumeration of all supported Bedrock packets in protocol 2193.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BedrockPacket {
     RequestNetworkSettings(RequestNetworkSettings),

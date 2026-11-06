@@ -1,4 +1,4 @@
-//! Bedrock session state machine and handshake lifecycle for protocol version 766 (v1.21.50).
+//! Bedrock session state machine and handshake lifecycle for protocol 2193 (1.26.51).
 
 use crate::bedrock::packet::{
     BEDROCK_PROTOCOL_VERSION, BedrockIdentity, BedrockPacket, Login, NetworkSettings, PlayStatus,
@@ -119,13 +119,13 @@ impl BedrockSession {
             dimension: 0, // Overworld
             generator: 1, // Overworld / infinite
             world_gamemode: 0,
-            difficulty: 1, // Normal
+            difficulty: 2, // Normal
             spawn_pos: (0, 64, 0),
             level_id: "world".to_string(),
             world_name: "RustMC Bedrock World".to_string(),
 
-            compression_threshold: 0, // No compression threshold for local preview
-            compression_algorithm: 0, // Deflate / Zlib
+            compression_threshold: 0, // Compression disabled
+            compression_algorithm: 0, // ZLib
         }
     }
 
@@ -189,9 +189,17 @@ impl BedrockSession {
         self
     }
 
+    /// Disconnects with a client failure, reporting the state the packet arrived in.
+    fn fail_out_of_order(&mut self, expected: BedrockSessionState) -> BedrockSessionError {
+        let actual = self.state;
+        self.state = BedrockSessionState::Disconnected;
+        self.disconnect_status = Some(PlayStatus::FailedClient);
+        BedrockSessionError::OutOfOrder { expected, actual }
+    }
+
     /// Handle client RequestNetworkSettings packet (0xC1 / 193).
     ///
-    /// Validates protocol version 766, transitions state to `Handshake`,
+    /// Validates [`BEDROCK_PROTOCOL_VERSION`], transitions state to `Handshake`,
     /// and emits `NetworkSettings` (0x8F / 143).
     /// Rejects or transitions to `Disconnected` on version mismatch or out-of-order state.
     pub fn handle_network_settings_request(
@@ -203,12 +211,7 @@ impl BedrockSession {
             self.state,
             BedrockSessionState::Offline | BedrockSessionState::Connected
         ) {
-            self.state = BedrockSessionState::Disconnected;
-            self.disconnect_status = Some(PlayStatus::FailedClient);
-            return Err(BedrockSessionError::OutOfOrder {
-                expected: BedrockSessionState::Offline,
-                actual: self.state,
-            });
+            return Err(self.fail_out_of_order(BedrockSessionState::Offline));
         }
 
         if req.protocol_version != BEDROCK_PROTOCOL_VERSION {
@@ -241,9 +244,10 @@ impl BedrockSession {
 
     /// Handle client Login packet (0x01).
     ///
-    /// Validates protocol version 766, extracts player identity tokens,
+    /// Validates [`BEDROCK_PROTOCOL_VERSION`], extracts player identity tokens,
     /// emits `PlayStatus(LoginSuccess)` and `ResourcePacksInfo`, and transitions to `ResourcePacks`.
-    /// Rejects or transitions to `Disconnected` on version mismatch or out-of-order state.
+    /// Rejects or transitions to `Disconnected` on version mismatch, out-of-order state,
+    /// or a payload with no usable identity.
     pub fn handle_login(
         &mut self,
         login: impl Into<Login>,
@@ -253,12 +257,7 @@ impl BedrockSession {
             self.state,
             BedrockSessionState::Handshake | BedrockSessionState::Connected
         ) {
-            self.state = BedrockSessionState::Disconnected;
-            self.disconnect_status = Some(PlayStatus::FailedClient);
-            return Err(BedrockSessionError::OutOfOrder {
-                expected: BedrockSessionState::Handshake,
-                actual: self.state,
-            });
+            return Err(self.fail_out_of_order(BedrockSessionState::Handshake));
         }
 
         if login_pkt.protocol_version != BEDROCK_PROTOCOL_VERSION {
@@ -270,12 +269,17 @@ impl BedrockSession {
             });
         }
 
-        if let Ok(identity) = login_pkt.extract_identity() {
-            self.identity = Some(identity);
+        match login_pkt.extract_identity() {
+            Ok(identity) => self.identity = Some(identity),
+            Err(error) => {
+                self.state = BedrockSessionState::Disconnected;
+                self.disconnect_status = Some(PlayStatus::FailedClient);
+                return Err(error);
+            }
         }
 
         self.state = BedrockSessionState::ResourcePacks;
-        let packs_info = ResourcePacksInfo::new(false, false, false);
+        let packs_info = ResourcePacksInfo::default();
         Ok(vec![
             BedrockPacket::PlayStatus(PlayStatus::LoginSuccess),
             BedrockPacket::ResourcePacksInfo(packs_info),
@@ -324,12 +328,7 @@ impl BedrockSession {
     ) -> Result<Vec<BedrockPacket>, BedrockSessionError> {
         let resp = response.into();
         if self.state != BedrockSessionState::ResourcePacks {
-            self.state = BedrockSessionState::Disconnected;
-            self.disconnect_status = Some(PlayStatus::FailedClient);
-            return Err(BedrockSessionError::OutOfOrder {
-                expected: BedrockSessionState::ResourcePacks,
-                actual: self.state,
-            });
+            return Err(self.fail_out_of_order(BedrockSessionState::ResourcePacks));
         }
 
         match resp.status {
@@ -353,6 +352,11 @@ impl BedrockSession {
                     spawn_pos: self.spawn_pos,
                     level_id: self.level_id.clone(),
                     world_name: self.world_name.clone(),
+                    level_current_time: 0,
+                    enchantment_seed: 0,
+                    multiplayer_correlation_id: uuid::Uuid::from_u128(u128::from(self.session_id))
+                        .to_string(),
+                    server_version: format!("RustMC {}", env!("CARGO_PKG_VERSION")),
                 };
                 Ok(vec![
                     BedrockPacket::StartGame(start_game),
@@ -369,7 +373,6 @@ impl BedrockSession {
                 let stack = ResourcePackStack::new(false);
                 Ok(vec![BedrockPacket::ResourcePackStack(stack)])
             }
-            ResponseStatus::None => Ok(Vec::new()),
         }
     }
 
@@ -430,19 +433,11 @@ impl BedrockSession {
                 self.handle_pack_client_response(resp.clone())
             }
             _ => {
-                self.state = BedrockSessionState::Disconnected;
-                self.disconnect_status = Some(PlayStatus::FailedClient);
-                Err(BedrockSessionError::OutOfOrder {
-                    expected: match self.state {
-                        BedrockSessionState::Offline | BedrockSessionState::Connected => {
-                            BedrockSessionState::Offline
-                        }
-                        BedrockSessionState::Handshake => BedrockSessionState::Handshake,
-                        BedrockSessionState::ResourcePacks => BedrockSessionState::ResourcePacks,
-                        _ => self.state,
-                    },
-                    actual: self.state,
-                })
+                let expected = match self.state {
+                    BedrockSessionState::Connected => BedrockSessionState::Offline,
+                    state => state,
+                };
+                Err(self.fail_out_of_order(expected))
             }
         }
     }
