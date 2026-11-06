@@ -8,9 +8,9 @@ pub use events::{
     AcknowledgeBlockChangePacket, BlockBreakEvent, BlockBreakOutcome, BlockFace, BlockPlaceEvent,
     BlockPlaceOutcome, BlockPos, BlockUpdatePacket, BreakRollback, Cancellable,
     ContainerSetSlotPacket, Direction, Event, EventBus, EventPriority, InteractAction,
-    InteractionHand, ItemStack, PlaceRollback, PlayerInteractEvent, apply_block_break,
-    apply_block_place, rollback_break, rollback_break_explicit, rollback_break_with_ack,
-    rollback_place, rollback_place_explicit, rollback_place_with_ack,
+    InteractionHand, ItemStack, PlaceRollback, PlayerInteractEvent, UnresolvedItemId,
+    apply_block_break, apply_block_place, rollback_break, rollback_break_explicit,
+    rollback_break_with_ack, rollback_place, rollback_place_explicit, rollback_place_with_ack,
 };
 
 pub const CHUNK_SIDE: usize = 16;
