@@ -22,6 +22,11 @@
 //! - `UpdateDisplayName` (0x20): Optional Network NBT text component display name.
 //! - `UpdateListOrder` (0x40): Tab-list display ordering index (VarInt).
 //! - `UpdateHat` (0x80): Boolean flag controlling whether the player skin hat layer is shown.
+//!
+//! The packet ID comes from the 26.3 server's generated packet report. Layouts and
+//! field limits follow the public protocol reference for 26.3 / protocol 777:
+//! <https://minecraft.wiki/w/Java_Edition_protocol/Packets> (revision 3868170) and
+//! <https://minecraft.wiki/w/Java_Edition_protocol/Data_types> (revision 3855787).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,11 +37,27 @@ pub const PACKET_ID_PLAYER_INFO_UPDATE: u32 = 0x47;
 /// Maximum character length for player usernames in Java Edition.
 pub const MAX_NAME_CHARS: usize = 16;
 
-/// Maximum character length for general protocol strings (e.g. display names, property values).
+/// Maximum UTF-16 length for general protocol strings (e.g. property values).
 pub const MAX_STRING_CHARS: usize = 32767;
 
-/// Maximum byte length for public key and key signature buffers.
-pub const MAX_KEY_BYTES: usize = 65536;
+/// Maximum number of profile properties for one player.
+pub const MAX_PROPERTIES: usize = 16;
+
+/// Maximum UTF-16 length of a profile property name.
+pub const MAX_PROPERTY_NAME_CHARS: usize = 64;
+
+/// Maximum UTF-16 length of a profile property signature.
+pub const MAX_PROPERTY_SIGNATURE_CHARS: usize = 1024;
+
+/// Maximum byte length of a chat session public key.
+pub const MAX_PUBLIC_KEY_BYTES: usize = 512;
+
+/// Maximum byte length of a chat session public key signature.
+pub const MAX_KEY_SIGNATURE_BYTES: usize = 4096;
+
+/// RustMC policy bound on NBT compound and list nesting. It limits recursion on
+/// untrusted input to prevent stack exhaustion; it is not a protocol value.
+pub const MAX_NBT_DEPTH: usize = 512;
 
 /// Action bitflags defining which fields are present in a `PlayerInfoUpdate` packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -239,7 +260,7 @@ pub struct PlayerInfoEntry {
     pub game_mode: GameMode,
     pub listed: bool,
     pub latency: i32,
-    pub display_name: Option<String>,
+    pub display_name: Option<PlayerDisplayName>,
     pub list_order: i32,
     pub show_hat: bool,
 }
@@ -286,7 +307,7 @@ impl PlayerInfoEntry {
         self
     }
 
-    pub fn with_display_name(mut self, display_name: Option<String>) -> Self {
+    pub fn with_display_name(mut self, display_name: Option<PlayerDisplayName>) -> Self {
         self.display_name = display_name;
         self
     }
@@ -324,6 +345,8 @@ pub enum ProtocolError {
     InvalidActionBitmask(u8),
     InvalidBoolean(u8),
     InvalidNbtTag(u8),
+    NbtDepthExceeded { depth: usize, max: usize },
+    UnsupportedComponent,
     UnexpectedPacketId { expected: u32, received: u32 },
     InvalidPacketLength { expected: usize, received: usize },
     TrailingData { remaining: usize },
@@ -360,6 +383,15 @@ impl fmt::Display for ProtocolError {
                     "invalid NBT tag type for network text component: 0x{tag:02X}"
                 )
             }
+            Self::NbtDepthExceeded { depth, max } => {
+                write!(
+                    f,
+                    "NBT nesting depth exceeded maximum permitted limit ({depth} > {max})"
+                )
+            }
+            Self::UnsupportedComponent => {
+                write!(f, "unsupported or empty text component structure in NBT")
+            }
             Self::UnexpectedPacketId { expected, received } => {
                 write!(
                     f,
@@ -383,6 +415,219 @@ impl fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
+
+/// Represents a player's tab-list display name.
+///
+/// In Java Edition 26.3 / protocol 777, display names on the wire are serialized
+/// as anonymous Network NBT (primitive `TAG_String` 0x08 or `TAG_Compound` 0x0A).
+///
+/// This type preserves complete component formatting, nested `extra` arrays, and
+/// translations on the wire while exposing the component's literal text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerDisplayName {
+    /// Plain text display name, serialized as an anonymous Network NBT TAG_String (0x08).
+    Plain(String),
+    /// Complete Network NBT compound, preserving all nested tags, styling, colors,
+    /// and extra components without loss. `text` joins its literal `text` and `extra`
+    /// content; other content, such as a translation, is only in `raw`. The encoder
+    /// validates `raw` again, so a hand-built value cannot emit invalid NBT.
+    RawNbt { raw: Vec<u8>, text: String },
+}
+
+impl PlayerDisplayName {
+    /// Creates a new plain text display name.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self::Plain(text.into())
+    }
+
+    /// Creates a display name from raw Network NBT bytes, parsing and validating
+    /// its structure and extracting visible text.
+    pub fn from_raw_nbt(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let (dn, consumed) = read_display_name_nbt(bytes, MAX_STRING_CHARS)?;
+        if consumed != bytes.len() {
+            return Err(ProtocolError::TrailingData {
+                remaining: bytes.len() - consumed,
+            });
+        }
+        Ok(dn)
+    }
+
+    /// Returns the literal text of the display name.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Plain(s) => s.as_str(),
+            Self::RawNbt { text, .. } => text.as_str(),
+        }
+    }
+
+    /// Returns the raw Network NBT bytes if this was parsed from a raw component.
+    pub fn raw_nbt(&self) -> Option<&[u8]> {
+        match self {
+            Self::Plain(_) => None,
+            Self::RawNbt { raw, .. } => Some(raw.as_slice()),
+        }
+    }
+}
+
+impl std::ops::Deref for PlayerDisplayName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for PlayerDisplayName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for PlayerDisplayName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<&str> for PlayerDisplayName {
+    fn from(s: &str) -> Self {
+        Self::Plain(s.to_string())
+    }
+}
+
+impl From<String> for PlayerDisplayName {
+    fn from(s: String) -> Self {
+        Self::Plain(s)
+    }
+}
+
+impl PartialEq<str> for PlayerDisplayName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for PlayerDisplayName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// Encodes a UTF-8 string slice into Java Modified UTF-8 (MUTF-8) bytes.
+///
+/// In Java MUTF-8:
+/// - U+0000 is encoded as 2 bytes: `0xC0 0x80`.
+/// - 1-byte ASCII (U+0001..=U+007F), 2-byte (U+0080..=U+07FF), and 3-byte (U+0800..=U+FFFF)
+///   use standard UTF-8 encodings.
+/// - Supplementary code points (U+010000..=U+10FFFF) are encoded as a UTF-16 surrogate pair,
+///   each encoded as a 3-byte sequence (total 6 bytes).
+pub fn encode_mutf8(s: &str, out: &mut Vec<u8>) {
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp == 0 {
+            out.push(0xC0);
+            out.push(0x80);
+        } else if cp <= 0x7F {
+            out.push(cp as u8);
+        } else if cp <= 0x7FF {
+            out.push((0xC0 | ((cp >> 6) & 0x1F)) as u8);
+            out.push((0x80 | (cp & 0x3F)) as u8);
+        } else if cp <= 0xFFFF {
+            out.push((0xE0 | ((cp >> 12) & 0x0F)) as u8);
+            out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+            out.push((0x80 | (cp & 0x3F)) as u8);
+        } else {
+            let temp = cp - 0x10000;
+            let high = 0xD800 + (temp >> 10);
+            let low = 0xDC00 + (temp & 0x3FF);
+            // High surrogate (0xD800..=0xDBFF)
+            out.push((0xE0 | ((high >> 12) & 0x0F)) as u8);
+            out.push((0x80 | ((high >> 6) & 0x3F)) as u8);
+            out.push((0x80 | (high & 0x3F)) as u8);
+            // Low surrogate (0xDC00..=0xDFFF)
+            out.push((0xE0 | ((low >> 12) & 0x0F)) as u8);
+            out.push((0x80 | ((low >> 6) & 0x3F)) as u8);
+            out.push((0x80 | (low & 0x3F)) as u8);
+        }
+    }
+}
+
+/// Decodes Java Modified UTF-8 (MUTF-8) bytes into a Rust String.
+pub fn decode_mutf8(bytes: &[u8]) -> Result<String, ProtocolError> {
+    let mut s = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b1 = bytes[i];
+        if b1 == 0 {
+            return Err(ProtocolError::InvalidUtf8);
+        }
+        if b1 <= 0x7F {
+            s.push(b1 as char);
+            i += 1;
+        } else if b1 & 0xE0 == 0xC0 {
+            if i + 1 >= bytes.len() {
+                return Err(ProtocolError::InvalidUtf8);
+            }
+            let b2 = bytes[i + 1];
+            if b2 & 0xC0 != 0x80 {
+                return Err(ProtocolError::InvalidUtf8);
+            }
+            let cp = (((b1 & 0x1F) as u32) << 6) | ((b2 & 0x3F) as u32);
+            if b1 == 0xC0 && b2 == 0x80 {
+                s.push('\0');
+            } else if cp < 0x80 {
+                return Err(ProtocolError::InvalidUtf8);
+            } else {
+                let ch = char::from_u32(cp).ok_or(ProtocolError::InvalidUtf8)?;
+                s.push(ch);
+            }
+            i += 2;
+        } else if b1 & 0xF0 == 0xE0 {
+            if i + 2 >= bytes.len() {
+                return Err(ProtocolError::InvalidUtf8);
+            }
+            let b2 = bytes[i + 1];
+            let b3 = bytes[i + 2];
+            if (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) {
+                return Err(ProtocolError::InvalidUtf8);
+            }
+            let code =
+                (((b1 & 0x0F) as u32) << 12) | (((b2 & 0x3F) as u32) << 6) | ((b3 & 0x3F) as u32);
+
+            if (0xD800..=0xDBFF).contains(&code) {
+                if i + 5 >= bytes.len() {
+                    return Err(ProtocolError::InvalidUtf8);
+                }
+                let b4 = bytes[i + 3];
+                let b5 = bytes[i + 4];
+                let b6 = bytes[i + 5];
+                if (b4 & 0xF0 != 0xE0) || (b5 & 0xC0 != 0x80) || (b6 & 0xC0 != 0x80) {
+                    return Err(ProtocolError::InvalidUtf8);
+                }
+                let low = (((b4 & 0x0F) as u32) << 12)
+                    | (((b5 & 0x3F) as u32) << 6)
+                    | ((b6 & 0x3F) as u32);
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return Err(ProtocolError::InvalidUtf8);
+                }
+                let cp = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                let ch = char::from_u32(cp).ok_or(ProtocolError::InvalidUtf8)?;
+                s.push(ch);
+                i += 6;
+            } else if (0xDC00..=0xDFFF).contains(&code) {
+                return Err(ProtocolError::InvalidUtf8);
+            } else if code < 0x800 {
+                return Err(ProtocolError::InvalidUtf8);
+            } else {
+                let ch = char::from_u32(code).ok_or(ProtocolError::InvalidUtf8)?;
+                s.push(ch);
+                i += 3;
+            }
+        } else {
+            return Err(ProtocolError::InvalidUtf8);
+        }
+    }
+    Ok(s)
+}
 
 /// Clientbound `PlayerInfoUpdate` packet (packet ID 0x47 in Java 26.3 protocol 777).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,37 +676,18 @@ impl PlayerInfoUpdatePacket {
             write_uuid(&entry.uuid, &mut out);
 
             if PlayerInfoAction::is_set(self.actions, PlayerInfoAction::AddPlayer) {
-                if entry.name.chars().count() > MAX_NAME_CHARS {
-                    return Err(ProtocolError::StringTooLong {
-                        length: entry.name.chars().count(),
-                        max: MAX_NAME_CHARS,
-                    });
-                }
+                check_chars(&entry.name, MAX_NAME_CHARS)?;
                 write_string(&entry.name, &mut out);
+                check_length(entry.properties.len(), MAX_PROPERTIES)?;
                 write_varint(entry.properties.len() as i32, &mut out);
                 for prop in &entry.properties {
-                    if prop.name.chars().count() > MAX_STRING_CHARS {
-                        return Err(ProtocolError::StringTooLong {
-                            length: prop.name.chars().count(),
-                            max: MAX_STRING_CHARS,
-                        });
-                    }
-                    if prop.value.chars().count() > MAX_STRING_CHARS {
-                        return Err(ProtocolError::StringTooLong {
-                            length: prop.value.chars().count(),
-                            max: MAX_STRING_CHARS,
-                        });
-                    }
+                    check_chars(&prop.name, MAX_PROPERTY_NAME_CHARS)?;
+                    check_chars(&prop.value, MAX_STRING_CHARS)?;
                     write_string(&prop.name, &mut out);
                     write_string(&prop.value, &mut out);
                     match &prop.signature {
                         Some(sig) => {
-                            if sig.chars().count() > MAX_STRING_CHARS {
-                                return Err(ProtocolError::StringTooLong {
-                                    length: sig.chars().count(),
-                                    max: MAX_STRING_CHARS,
-                                });
-                            }
+                            check_chars(sig, MAX_PROPERTY_SIGNATURE_CHARS)?;
                             write_bool(true, &mut out);
                             write_string(sig, &mut out);
                         }
@@ -475,18 +701,8 @@ impl PlayerInfoUpdatePacket {
             if PlayerInfoAction::is_set(self.actions, PlayerInfoAction::InitializeChat) {
                 match &entry.chat_session {
                     Some(session) => {
-                        if session.public_key.len() > MAX_KEY_BYTES {
-                            return Err(ProtocolError::StringTooLong {
-                                length: session.public_key.len(),
-                                max: MAX_KEY_BYTES,
-                            });
-                        }
-                        if session.key_signature.len() > MAX_KEY_BYTES {
-                            return Err(ProtocolError::StringTooLong {
-                                length: session.key_signature.len(),
-                                max: MAX_KEY_BYTES,
-                            });
-                        }
+                        check_length(session.public_key.len(), MAX_PUBLIC_KEY_BYTES)?;
+                        check_length(session.key_signature.len(), MAX_KEY_SIGNATURE_BYTES)?;
                         write_bool(true, &mut out);
                         write_uuid(&session.session_id, &mut out);
                         out.extend_from_slice(&session.expires_at.to_be_bytes());
@@ -603,16 +819,18 @@ impl PlayerInfoUpdatePacket {
                     return Err(ProtocolError::MalformedVarInt);
                 }
                 let prop_count = prop_count as usize;
-                let mut props = Vec::with_capacity(prop_count.min(64));
+                check_length(prop_count, MAX_PROPERTIES)?;
+                let mut props = Vec::with_capacity(prop_count);
                 for _ in 0..prop_count {
-                    let (prop_name, n) = read_string(&payload[cursor..], MAX_STRING_CHARS)?;
+                    let (prop_name, n) = read_string(&payload[cursor..], MAX_PROPERTY_NAME_CHARS)?;
                     cursor += n;
                     let (prop_val, n) = read_string(&payload[cursor..], MAX_STRING_CHARS)?;
                     cursor += n;
                     let (has_sig, n) = read_bool(&payload[cursor..])?;
                     cursor += n;
                     let sig = if has_sig {
-                        let (sig_str, n) = read_string(&payload[cursor..], MAX_STRING_CHARS)?;
+                        let (sig_str, n) =
+                            read_string(&payload[cursor..], MAX_PROPERTY_SIGNATURE_CHARS)?;
                         cursor += n;
                         Some(sig_str)
                     } else {
@@ -640,10 +858,12 @@ impl PlayerInfoUpdatePacket {
                         i64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
                     cursor += 8;
 
-                    let (public_key, n) = read_byte_array(&payload[cursor..], MAX_KEY_BYTES)?;
+                    let (public_key, n) =
+                        read_byte_array(&payload[cursor..], MAX_PUBLIC_KEY_BYTES)?;
                     cursor += n;
 
-                    let (key_signature, n) = read_byte_array(&payload[cursor..], MAX_KEY_BYTES)?;
+                    let (key_signature, n) =
+                        read_byte_array(&payload[cursor..], MAX_KEY_SIGNATURE_BYTES)?;
                     cursor += n;
 
                     entry.chat_session = Some(ChatSessionData {
@@ -831,7 +1051,7 @@ impl TabListTracker {
     pub fn update_display_name(
         &mut self,
         uuid: &[u8; 16],
-        display_name: Option<String>,
+        display_name: Option<PlayerDisplayName>,
     ) -> Option<PlayerInfoUpdatePacket> {
         let entry = self.players.get_mut(uuid)?;
         entry.display_name = display_name.clone();
@@ -1013,6 +1233,19 @@ pub fn write_string(s: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// Rejects a collection or byte buffer longer than `max`.
+fn check_length(length: usize, max: usize) -> Result<(), ProtocolError> {
+    if length > max {
+        return Err(ProtocolError::StringTooLong { length, max });
+    }
+    Ok(())
+}
+
+/// Rejects a string over `max_chars`, a limit the protocol counts in UTF-16 code units.
+fn check_chars(value: &str, max_chars: usize) -> Result<(), ProtocolError> {
+    check_length(value.encode_utf16().count(), max_chars)
+}
+
 /// Reads a VarInt-prefixed UTF-8 string bounded by `max_chars`.
 pub fn read_string(input: &[u8], max_chars: usize) -> Result<(String, usize), ProtocolError> {
     let (byte_len, offset) = read_varint(input)?;
@@ -1020,7 +1253,7 @@ pub fn read_string(input: &[u8], max_chars: usize) -> Result<(String, usize), Pr
         return Err(ProtocolError::MalformedVarInt);
     }
     let byte_len = byte_len as usize;
-    if byte_len > max_chars * 4 {
+    if byte_len > max_chars * 3 {
         return Err(ProtocolError::StringTooLong {
             length: byte_len,
             max: max_chars,
@@ -1032,13 +1265,7 @@ pub fn read_string(input: &[u8], max_chars: usize) -> Result<(String, usize), Pr
     }
     let slice = &input[offset..total];
     let s = std::str::from_utf8(slice).map_err(|_| ProtocolError::InvalidUtf8)?;
-    let char_count = s.chars().count();
-    if char_count > max_chars {
-        return Err(ProtocolError::StringTooLong {
-            length: char_count,
-            max: max_chars,
-        });
-    }
+    check_chars(s, max_chars)?;
     Ok((s.to_owned(), total))
 }
 
@@ -1068,8 +1295,33 @@ pub fn read_byte_array(input: &[u8], max_len: usize) -> Result<(Vec<u8>, usize),
     Ok((input[offset..total].to_vec(), total))
 }
 
-/// Helper to skip the payload of an NBT tag by type ID.
+/// Helper to skip the payload of an NBT tag by type ID, validating its structure.
 pub fn skip_nbt_tag_payload(tag_type: u8, input: &[u8]) -> Result<usize, ProtocolError> {
+    skip_nbt_payload(tag_type, input, 0)
+}
+
+/// Rejects a nested tag past [`MAX_NBT_DEPTH`] before it can recurse further.
+fn check_nbt_depth(depth: usize) -> Result<(), ProtocolError> {
+    if depth > MAX_NBT_DEPTH {
+        return Err(ProtocolError::NbtDepthExceeded {
+            depth,
+            max: MAX_NBT_DEPTH,
+        });
+    }
+    Ok(())
+}
+
+/// Reads a TAG_String payload: an unsigned 16-bit byte length and modified UTF-8.
+fn read_nbt_string(input: &[u8]) -> Result<(String, usize), ProtocolError> {
+    let (length, rest) = input
+        .split_first_chunk::<2>()
+        .ok_or(ProtocolError::UnexpectedEof)?;
+    let length = usize::from(u16::from_be_bytes(*length));
+    let bytes = rest.get(..length).ok_or(ProtocolError::UnexpectedEof)?;
+    Ok((decode_mutf8(bytes)?, 2 + length))
+}
+
+fn skip_nbt_payload(tag_type: u8, input: &[u8], depth: usize) -> Result<usize, ProtocolError> {
     match tag_type {
         1 => {
             // TAG_Byte
@@ -1133,18 +1385,11 @@ pub fn skip_nbt_tag_payload(tag_type: u8, input: &[u8]) -> Result<usize, Protoco
         }
         8 => {
             // TAG_String
-            if input.len() < 2 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let len = u16::from_be_bytes([input[0], input[1]]) as usize;
-            let total = 2 + len;
-            if input.len() < total {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            Ok(total)
+            Ok(read_nbt_string(input)?.1)
         }
         9 => {
             // TAG_List
+            check_nbt_depth(depth + 1)?;
             if input.len() < 5 {
                 return Err(ProtocolError::UnexpectedEof);
             }
@@ -1158,34 +1403,23 @@ pub fn skip_nbt_tag_payload(tag_type: u8, input: &[u8]) -> Result<usize, Protoco
             }
             let mut cursor = 5;
             for _ in 0..count {
-                let n = skip_nbt_tag_payload(elem_type, &input[cursor..])?;
+                let n = skip_nbt_payload(elem_type, &input[cursor..], depth + 1)?;
                 cursor += n;
             }
             Ok(cursor)
         }
         10 => {
             // TAG_Compound
+            check_nbt_depth(depth + 1)?;
             let mut cursor = 0;
             loop {
-                if cursor >= input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                let item_tag = input[cursor];
+                let item_tag = *input.get(cursor).ok_or(ProtocolError::UnexpectedEof)?;
                 cursor += 1;
                 if item_tag == 0 {
                     break;
                 }
-                if cursor + 2 > input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                let name_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
-                cursor += 2;
-                if cursor + name_len > input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                cursor += name_len;
-                let payload_len = skip_nbt_tag_payload(item_tag, &input[cursor..])?;
-                cursor += payload_len;
+                cursor += read_nbt_string(&input[cursor..])?.1;
+                cursor += skip_nbt_payload(item_tag, &input[cursor..], depth + 1)?;
             }
             Ok(cursor)
         }
@@ -1229,114 +1463,137 @@ pub fn skip_nbt_tag_payload(tag_type: u8, input: &[u8]) -> Result<usize, Protoco
     }
 }
 
-/// Serializes a display name string as an anonymous Network NBT TAG_String component.
-pub fn write_display_name_nbt(text: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
-    let char_count = text.chars().count();
-    if char_count > MAX_STRING_CHARS {
-        return Err(ProtocolError::StringTooLong {
-            length: char_count,
-            max: MAX_STRING_CHARS,
-        });
+/// Serializes a display name as an anonymous Network NBT text component.
+pub fn write_display_name_nbt(
+    name: &PlayerDisplayName,
+    out: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
+    match name {
+        PlayerDisplayName::Plain(text) => {
+            check_chars(text, MAX_STRING_CHARS)?;
+            let mut encoded = Vec::with_capacity(text.len());
+            encode_mutf8(text, &mut encoded);
+            // The NBT limit applies to encoded bytes, not to the source string.
+            let byte_len =
+                u16::try_from(encoded.len()).map_err(|_| ProtocolError::StringTooLong {
+                    length: encoded.len(),
+                    max: u16::MAX as usize,
+                })?;
+            out.push(0x08); // TAG_String
+            out.extend_from_slice(&byte_len.to_be_bytes());
+            out.extend_from_slice(&encoded);
+        }
+        PlayerDisplayName::RawNbt { raw, .. } => {
+            let (_, consumed) = read_display_name_nbt(raw, MAX_STRING_CHARS)?;
+            if consumed != raw.len() {
+                return Err(ProtocolError::TrailingData {
+                    remaining: raw.len() - consumed,
+                });
+            }
+            out.extend_from_slice(raw);
+        }
     }
-    let byte_len = text.len();
-    if byte_len > u16::MAX as usize {
-        return Err(ProtocolError::StringTooLong {
-            length: byte_len,
-            max: u16::MAX as usize,
-        });
-    }
-    out.push(0x08); // TAG_String
-    out.extend_from_slice(&(byte_len as u16).to_be_bytes());
-    out.extend_from_slice(text.as_bytes());
     Ok(())
 }
 
 /// Reads an anonymous Network NBT text component display name.
-/// Supports both TAG_String (0x08) and TAG_Compound (0x0A with "text" tag).
+///
+/// A TAG_String (0x08) becomes [`PlayerDisplayName::Plain`]. A TAG_Compound (0x0A)
+/// is validated and kept byte for byte as [`PlayerDisplayName::RawNbt`], so a later
+/// encode cannot lose styling, `extra` children or translations.
 pub fn read_display_name_nbt(
     input: &[u8],
     max_chars: usize,
-) -> Result<(String, usize), ProtocolError> {
-    if input.is_empty() {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-    match input[0] {
+) -> Result<(PlayerDisplayName, usize), ProtocolError> {
+    let (tag, body) = input.split_first().ok_or(ProtocolError::UnexpectedEof)?;
+    match *tag {
         0x08 => {
-            // TAG_String
-            if input.len() < 3 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let len = u16::from_be_bytes([input[1], input[2]]) as usize;
-            let total = 3 + len;
-            if input.len() < total {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let s =
-                std::str::from_utf8(&input[3..total]).map_err(|_| ProtocolError::InvalidUtf8)?;
-            let char_count = s.chars().count();
-            if char_count > max_chars {
-                return Err(ProtocolError::StringTooLong {
-                    length: char_count,
-                    max: max_chars,
-                });
-            }
-            Ok((s.to_string(), total))
+            let (text, consumed) = read_nbt_string(body)?;
+            check_chars(&text, max_chars)?;
+            Ok((PlayerDisplayName::Plain(text), 1 + consumed))
         }
         0x0A => {
-            // TAG_Compound
-            let mut cursor = 1;
-            let mut extracted = None;
-            loop {
-                if cursor >= input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                let item_tag = input[cursor];
-                cursor += 1;
-                if item_tag == 0 {
-                    break;
-                }
-                if cursor + 2 > input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                let name_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
-                cursor += 2;
-                if cursor + name_len > input.len() {
-                    return Err(ProtocolError::UnexpectedEof);
-                }
-                let name = std::str::from_utf8(&input[cursor..cursor + name_len])
-                    .map_err(|_| ProtocolError::InvalidUtf8)?;
-                cursor += name_len;
-
-                if item_tag == 0x08 && name == "text" {
-                    if cursor + 2 > input.len() {
-                        return Err(ProtocolError::UnexpectedEof);
-                    }
-                    let str_len = u16::from_be_bytes([input[cursor], input[cursor + 1]]) as usize;
-                    cursor += 2;
-                    if cursor + str_len > input.len() {
-                        return Err(ProtocolError::UnexpectedEof);
-                    }
-                    let s = std::str::from_utf8(&input[cursor..cursor + str_len])
-                        .map_err(|_| ProtocolError::InvalidUtf8)?;
-                    cursor += str_len;
-                    extracted = Some(s.to_string());
-                } else {
-                    let payload_len = skip_nbt_tag_payload(item_tag, &input[cursor..])?;
-                    cursor += payload_len;
-                }
+            if body.first() == Some(&0) {
+                return Err(ProtocolError::UnsupportedComponent);
             }
-            let s = extracted.unwrap_or_default();
-            let char_count = s.chars().count();
-            if char_count > max_chars {
-                return Err(ProtocolError::StringTooLong {
-                    length: char_count,
-                    max: max_chars,
-                });
-            }
-            Ok((s, cursor))
+            let mut text = String::new();
+            let consumed = read_component_compound(body, 1, &mut text)?;
+            check_chars(&text, max_chars)?;
+            let total = 1 + consumed;
+            Ok((
+                PlayerDisplayName::RawNbt {
+                    raw: input[..total].to_vec(),
+                    text,
+                },
+                total,
+            ))
         }
         other => Err(ProtocolError::InvalidNbtTag(other)),
     }
+}
+
+/// Validates one component compound and appends its literal text to `text`, its
+/// own `text` field first and then its `extra` children, whatever the tag order.
+fn read_component_compound(
+    input: &[u8],
+    depth: usize,
+    text: &mut String,
+) -> Result<usize, ProtocolError> {
+    check_nbt_depth(depth)?;
+    let mut own = String::new();
+    let mut children = String::new();
+    let mut cursor = 0;
+    loop {
+        let tag = *input.get(cursor).ok_or(ProtocolError::UnexpectedEof)?;
+        cursor += 1;
+        if tag == 0 {
+            break;
+        }
+        let (name, consumed) = read_nbt_string(&input[cursor..])?;
+        cursor += consumed;
+        cursor += match (tag, name.as_str()) {
+            (0x08, "text") => {
+                let (value, consumed) = read_nbt_string(&input[cursor..])?;
+                own = value;
+                consumed
+            }
+            (0x09, "extra") => read_component_list(&input[cursor..], depth, &mut children)?,
+            _ => skip_nbt_payload(tag, &input[cursor..], depth)?,
+        };
+    }
+    text.push_str(&own);
+    text.push_str(&children);
+    Ok(cursor)
+}
+
+/// Validates an `extra` list and appends the literal text of its children.
+fn read_component_list(
+    input: &[u8],
+    depth: usize,
+    text: &mut String,
+) -> Result<usize, ProtocolError> {
+    check_nbt_depth(depth + 1)?;
+    let (element, rest) = input.split_first().ok_or(ProtocolError::UnexpectedEof)?;
+    let (count, _) = rest
+        .split_first_chunk::<4>()
+        .ok_or(ProtocolError::UnexpectedEof)?;
+    let count = i32::from_be_bytes(*count);
+    if count < 0 {
+        return Err(ProtocolError::MalformedVarInt);
+    }
+    let mut cursor = 5;
+    for _ in 0..count {
+        cursor += match *element {
+            0x08 => {
+                let (value, consumed) = read_nbt_string(&input[cursor..])?;
+                text.push_str(&value);
+                consumed
+            }
+            0x0A => read_component_compound(&input[cursor..], depth + 1, text)?,
+            other => skip_nbt_payload(other, &input[cursor..], depth + 1)?,
+        };
+    }
+    Ok(cursor)
 }
 
 #[cfg(test)]
@@ -1364,7 +1621,7 @@ mod tests {
             game_mode: GameMode::Creative,
             listed: true,
             latency: 42,
-            display_name: Some(format!("§6{name}§r")),
+            display_name: Some(format!("§6{name}§r").into()),
             list_order: 10,
             show_hat: true,
         }
@@ -1549,7 +1806,7 @@ mod tests {
         // 7. UpdateDisplayName only (Some and None)
         let entry = PlayerInfoEntry {
             uuid,
-            display_name: Some("Custom Nick".to_owned()),
+            display_name: Some("Custom Nick".into()),
             ..Default::default()
         };
         let packet =
@@ -1789,7 +2046,7 @@ mod tests {
 
         // 5. Update display name
         let dn_packet = tracker
-            .update_display_name(&uuid1, Some("MasterOne".to_owned()))
+            .update_display_name(&uuid1, Some("MasterOne".into()))
             .expect("update display name should succeed");
         assert_eq!(dn_packet.actions, PlayerInfoAction::UpdateDisplayName as u8);
         assert_eq!(
@@ -2047,98 +2304,262 @@ mod tests {
         assert!(packet.entries[0].show_hat);
     }
 
+    fn too_long(packet: PlayerInfoUpdatePacket, length: usize, max: usize) {
+        assert_eq!(
+            packet.encode_payload().unwrap_err(),
+            ProtocolError::StringTooLong { length, max }
+        );
+    }
+
     #[test]
     fn test_encode_field_size_limit_validations() {
         let uuid = sample_uuid(1);
+        let add = PlayerInfoAction::AddPlayer as u8;
+        let chat = PlayerInfoAction::InitializeChat as u8;
 
-        // 1. Property value exceeding MAX_STRING_CHARS (32767)
-        let oversized_val = "x".repeat(MAX_STRING_CHARS + 1);
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
-        entry.properties = vec![ProfileProperty::unsigned("custom", oversized_val)];
-        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
-        assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 32768,
-                max: 32767
-            }
-        ));
+        entry.properties = vec![ProfileProperty::unsigned("custom", "x".repeat(32768))];
+        too_long(PlayerInfoUpdatePacket::single(add, entry), 32768, 32767);
 
-        // 2. Property name exceeding MAX_STRING_CHARS
-        let oversized_prop_name = "n".repeat(MAX_STRING_CHARS + 1);
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
-        entry.properties = vec![ProfileProperty::unsigned(oversized_prop_name, "val")];
-        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
-        assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 32768,
-                max: 32767
-            }
-        ));
+        entry.properties = vec![ProfileProperty::unsigned("n".repeat(65), "val")];
+        too_long(PlayerInfoUpdatePacket::single(add, entry), 65, 64);
 
-        // 3. Property signature exceeding MAX_STRING_CHARS
-        let oversized_sig = "s".repeat(MAX_STRING_CHARS + 1);
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
-        entry.properties = vec![ProfileProperty::signed("textures", "val", oversized_sig)];
-        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::AddPlayer as u8, entry);
-        assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 32768,
-                max: 32767
-            }
-        ));
+        entry.properties = vec![ProfileProperty::signed("textures", "val", "s".repeat(1025))];
+        too_long(PlayerInfoUpdatePacket::single(add, entry), 1025, 1024);
 
-        // 4. Chat session public key exceeding MAX_KEY_BYTES (65536)
-        let oversized_key = vec![0x42; MAX_KEY_BYTES + 1];
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.properties = vec![ProfileProperty::unsigned("a", "b"); 17];
+        too_long(PlayerInfoUpdatePacket::single(add, entry), 17, 16);
+
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
         entry.chat_session = Some(ChatSessionData::new(
             sample_uuid(2),
             12345,
-            oversized_key,
+            vec![0x42; 513],
             vec![1, 2, 3],
         ));
-        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::InitializeChat as u8, entry);
-        assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 65537,
-                max: 65536
-            }
-        ));
+        too_long(PlayerInfoUpdatePacket::single(chat, entry), 513, 512);
 
-        // 5. Chat session key signature exceeding MAX_KEY_BYTES
-        let oversized_key_sig = vec![0x42; MAX_KEY_BYTES + 1];
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
         entry.chat_session = Some(ChatSessionData::new(
             sample_uuid(2),
             12345,
             vec![1, 2, 3],
-            oversized_key_sig,
+            vec![0x42; 4097],
         ));
-        let packet = PlayerInfoUpdatePacket::single(PlayerInfoAction::InitializeChat as u8, entry);
-        assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 65537,
-                max: 65536
-            }
-        ));
+        too_long(PlayerInfoUpdatePacket::single(chat, entry), 4097, 4096);
 
-        // 6. Display name exceeding MAX_STRING_CHARS
-        let oversized_display = "d".repeat(MAX_STRING_CHARS + 1);
         let mut entry = PlayerInfoEntry::new(uuid, "Steve");
-        entry.display_name = Some(oversized_display);
+        entry.display_name = Some("d".repeat(32768).into());
+        too_long(
+            PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateDisplayName as u8, entry),
+            32768,
+            32767,
+        );
+
+        // 32767 code units fit the string limit, but not 65535 encoded NBT bytes.
+        let mut entry = PlayerInfoEntry::new(uuid, "Steve");
+        entry.display_name = Some("\u{20AC}".repeat(32767).into());
+        too_long(
+            PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateDisplayName as u8, entry),
+            98301,
+            65535,
+        );
+    }
+
+    #[test]
+    fn test_decode_enforces_the_same_field_limits() {
+        // Actions 0x01, one entry, name "ab", 17 properties.
+        let mut payload = vec![0x01, 0x01];
+        payload.extend([0x01; 16]);
+        payload.extend([0x02, b'a', b'b', 0x11]);
+        assert_eq!(
+            PlayerInfoUpdatePacket::decode_payload(&payload).unwrap_err(),
+            ProtocolError::StringTooLong {
+                length: 17,
+                max: 16
+            }
+        );
+    }
+
+    /// Wraps an anonymous NBT component in a display-name-only packet payload.
+    fn display_name_payload(component: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0x20, 0x01];
+        payload.extend([0x07; 16]);
+        payload.push(0x01);
+        payload.extend_from_slice(component);
+        payload
+    }
+
+    #[test]
+    fn test_display_name_uses_modified_utf8() {
+        // U+1F600 is the surrogate pair D83D DE00, three bytes each.
+        let component = [0x08, 0x00, 0x06, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        let payload = display_name_payload(&component);
+
+        let mut entry = PlayerInfoEntry::new([0x07; 16], "");
+        entry.display_name = Some("\u{1F600}".into());
         let packet =
             PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateDisplayName as u8, entry);
+        assert_eq!(packet.encode_payload().unwrap(), payload);
+
+        let decoded = PlayerInfoUpdatePacket::decode_payload(&payload).unwrap();
+        assert_eq!(
+            decoded.entries[0].display_name.as_deref(),
+            Some("\u{1F600}")
+        );
+
+        // U+0000 is C0 80 and never a zero byte.
+        let nul = [0x08, 0x00, 0x02, 0xC0, 0x80];
+        assert_eq!(
+            PlayerDisplayName::from_raw_nbt(&nul).unwrap(),
+            PlayerDisplayName::plain("\0")
+        );
+        for invalid in [
+            &[0x08, 0x00, 0x01, 0x00][..],                   // Raw NUL.
+            &[0x08, 0x00, 0x04, 0xF0, 0x9F, 0x98, 0x80][..], // Standard 4-byte UTF-8.
+            &[0x08, 0x00, 0x03, 0xED, 0xA0, 0xBD][..],       // Lone high surrogate.
+            &[0x08, 0x00, 0x03, 0xED, 0xB8, 0x80][..],       // Lone low surrogate.
+        ] {
+            assert_eq!(
+                PlayerDisplayName::from_raw_nbt(invalid),
+                Err(ProtocolError::InvalidUtf8)
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_component_is_preserved_byte_for_byte() {
+        // {"text":"","extra":[{"text":"Nick"}],"color":"gold"}
+        #[rustfmt::skip]
+        let component = [
+            0x0A,
+            0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x00,
+            0x09, 0x00, 0x05, b'e', b'x', b't', b'r', b'a', 0x0A, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x04, b'N', b'i', b'c', b'k',
+            0x00,
+            0x08, 0x00, 0x05, b'c', b'o', b'l', b'o', b'r', 0x00, 0x04, b'g', b'o', b'l', b'd',
+            0x00,
+        ];
+        let payload = display_name_payload(&component);
+        let decoded = PlayerInfoUpdatePacket::decode_payload(&payload).unwrap();
+        let name = decoded.entries[0].display_name.as_ref().unwrap();
+        assert_eq!(name.as_str(), "Nick");
+        assert_eq!(name.raw_nbt(), Some(&component[..]));
+        assert_eq!(decoded.encode_payload().unwrap(), payload);
+
+        // {"translate":"k"} has no literal text and still survives a round trip.
+        #[rustfmt::skip]
+        let translated = [
+            0x0A,
+            0x08, 0x00, 0x09, b't', b'r', b'a', b'n', b's', b'l', b'a', b't', b'e',
+            0x00, 0x01, b'k',
+            0x00,
+        ];
+        let payload = display_name_payload(&translated);
+        let decoded = PlayerInfoUpdatePacket::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.entries[0].display_name.as_deref(), Some(""));
+        assert_eq!(decoded.encode_payload().unwrap(), payload);
+
+        // Literal text keeps its order when `extra` precedes `text`, and an
+        // `extra` list may hold plain strings.
+        #[rustfmt::skip]
+        let reversed = [
+            0x0A,
+            0x09, 0x00, 0x05, b'e', b'x', b't', b'r', b'a', 0x08, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x01, b'b',
+            0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x01, b'a',
+            0x00,
+        ];
+        let name = PlayerDisplayName::from_raw_nbt(&reversed).unwrap();
+        assert_eq!(name.as_str(), "ab");
+
+        assert_eq!(
+            PlayerDisplayName::from_raw_nbt(&[0x0A, 0x00]),
+            Err(ProtocolError::UnsupportedComponent)
+        );
+    }
+
+    #[test]
+    fn test_hand_built_raw_component_is_validated_on_encode() {
+        let mut entry = PlayerInfoEntry::new([0x07; 16], "");
+        entry.display_name = Some(PlayerDisplayName::RawNbt {
+            raw: vec![0x0A, 0x63],
+            text: "x".into(),
+        });
+        let packet =
+            PlayerInfoUpdatePacket::single(PlayerInfoAction::UpdateDisplayName as u8, entry);
+        assert!(packet.encode_payload().is_err());
+    }
+
+    #[test]
+    fn test_nbt_nesting_is_bounded() {
+        let max = MAX_NBT_DEPTH;
+
+        // Nested compounds under a non-component field reach the skipper.
+        let mut compounds = vec![0x0A];
+        for _ in 0..100_000 {
+            compounds.extend([0x0A, 0x00, 0x01, b'a']);
+        }
         assert!(matches!(
-            packet.encode_payload().unwrap_err(),
-            ProtocolError::StringTooLong {
-                length: 32768,
-                max: 32767
-            }
+            PlayerInfoUpdatePacket::decode_payload(&display_name_payload(&compounds)),
+            Err(ProtocolError::NbtDepthExceeded { max: m, .. }) if m == max
         ));
+
+        // Nested lists of lists.
+        let mut lists = vec![0x0A, 0x09, 0x00, 0x01, b'a'];
+        for _ in 0..100_000 {
+            lists.extend([0x09, 0x00, 0x00, 0x00, 0x01]);
+        }
+        assert!(matches!(
+            PlayerInfoUpdatePacket::decode_payload(&display_name_payload(&lists)),
+            Err(ProtocolError::NbtDepthExceeded { max: m, .. }) if m == max
+        ));
+
+        // Nested `extra` children use the text-collecting path.
+        let mut extras = vec![0x0A];
+        for _ in 0..100_000 {
+            extras.extend([0x09, 0x00, 0x05, b'e', b'x', b't', b'r', b'a', 0x0A]);
+            extras.extend([0x00, 0x00, 0x00, 0x01]);
+        }
+        assert!(matches!(
+            PlayerInfoUpdatePacket::decode_payload(&display_name_payload(&extras)),
+            Err(ProtocolError::NbtDepthExceeded { max: m, .. }) if m == max
+        ));
+    }
+
+    #[test]
+    fn test_full_action_mask_wire_fixture() {
+        // Every action in table order, written by hand.
+        #[rustfmt::skip]
+        let mut payload = vec![0xFF, 0x01];
+        payload.extend([0x0B; 16]);
+        payload.extend([0x03, b'A', b'b', b'c']); // Name.
+        payload.push(0x01); // One property.
+        payload.extend([0x01, b'k', 0x01, b'v', 0x01, 0x01, b's']);
+        payload.push(0x01); // Chat session present.
+        payload.extend([0x0C; 16]);
+        payload.extend([0, 0, 0, 0, 0, 0, 0x30, 0x39]); // Expiry 12345.
+        payload.extend([0x01, 0xAA, 0x02, 0xBB, 0xCC]); // Key and key signature.
+        payload.push(0x03); // Spectator.
+        payload.push(0x01); // Listed.
+        payload.extend([0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // Ping -1.
+        payload.push(0x00); // No display name.
+        payload.push(0x2A); // Priority 42.
+        payload.push(0x00); // Hat hidden.
+
+        let decoded = PlayerInfoUpdatePacket::decode_payload(&payload).unwrap();
+        let entry = &decoded.entries[0];
+        assert_eq!(entry.name, "Abc");
+        assert_eq!(entry.properties[0].signature.as_deref(), Some("s"));
+        assert_eq!(entry.chat_session.as_ref().unwrap().expires_at, 12345);
+        assert_eq!(entry.game_mode, GameMode::Spectator);
+        assert_eq!(entry.latency, -1);
+        assert_eq!(entry.list_order, 42);
+        assert!(!entry.show_hat);
+        assert_eq!(decoded.encode_payload().unwrap(), payload);
     }
 
     #[test]
