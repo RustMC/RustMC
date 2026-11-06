@@ -1,12 +1,21 @@
 //! Mob AI engine, GoalSelector, and behavioral goal execution loop.
 //!
-//! Implements Milestone M5 mob behavior systems adhering to vanilla Minecraft
-//! AI mechanics: prioritized goal arbitration with flag-based mutual exclusion,
-//! target acquisition, movement navigation, look orientation, and melee combat loops.
+//! Milestone M5 mob behavior: prioritized goal arbitration with flag-based mutual
+//! exclusion, target acquisition, straight-line steering, look orientation, and melee.
+//!
+//! This is not a vanilla parity claim. Durations, radii, speeds, the follow margin, and
+//! the attack reach are RustMC placeholders with no recorded source, and no behavior here
+//! has been compared with Java 26.3. Steering has no pathfinding, collision, or gravity.
+//! [`WorldView`] is a self-contained reference world: it is not connected to the live
+//! server, and its nearest-target queries scan every entity.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{Add, AddAssign, BitAnd, BitOr, BitOrAssign, Div, Mul, Sub, SubAssign};
+
+/// Most damage events a [`WorldView`] retains between drains. RustMC policy: the oldest
+/// are discarded beyond this, and [`WorldView::dropped_damage_events`] counts them.
+pub const MAX_PENDING_DAMAGE_EVENTS: usize = 4096;
 
 /// 3D coordinate vector with standard Euclidean arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -26,6 +35,11 @@ impl Vec3 {
     #[inline]
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
+    }
+
+    #[inline]
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
     }
 
     #[inline]
@@ -144,7 +158,7 @@ impl Div<f64> for Vec3 {
     }
 }
 
-/// Normalizes an angle in degrees into canonical Minecraft `[-180.0, 180.0)` bounds.
+/// Normalizes an angle in degrees into `[-180.0, 180.0)`.
 #[inline]
 pub fn wrap_degrees(mut degrees: f32) -> f32 {
     degrees %= 360.0;
@@ -159,7 +173,7 @@ pub fn wrap_degrees(mut degrees: f32) -> f32 {
 
 /// Computes Minecraft yaw and pitch (in degrees) to look from observer eye to target eye.
 ///
-/// In vanilla coordinate orientation:
+/// Orientation:
 /// - Yaw: 0 deg = South (+Z), 90 deg = West (-X), 180/-180 deg = North (-Z), -90 deg = East (+X).
 /// - Pitch: -90 deg = looking straight up (+Y), 0 deg = level, +90 deg = looking straight down (-Y).
 pub fn calculate_look_at(from: Vec3, to: Vec3) -> (f32, f32) {
@@ -203,16 +217,16 @@ impl SimpleRng {
         if min >= max {
             return min;
         }
-        let range = (max - min + 1) as u64;
-        min + (self.next_u64() % range) as i32
+        let range = (i64::from(max) - i64::from(min) + 1) as u64;
+        (i64::from(min) + (self.next_u64() % range) as i64) as i32
     }
 
     pub fn next_u32_range(&mut self, min: u32, max: u32) -> u32 {
         if min >= max {
             return min;
         }
-        let range = (max - min + 1) as u64;
-        min + (self.next_u64() % range) as u32
+        let range = u64::from(max) - u64::from(min) + 1;
+        (u64::from(min) + self.next_u64() % range) as u32
     }
 }
 
@@ -355,6 +369,7 @@ impl EntityEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DamageEvent {
     pub target_id: u32,
+    /// Health actually removed, which may be less than the attack's strength.
     pub damage: f32,
     pub remaining_health: f32,
 }
@@ -365,7 +380,8 @@ pub struct WorldView {
     entities: RefCell<BTreeMap<u32, EntityEntry>>,
     solid_blocks: RefCell<BTreeSet<(i32, i32, i32)>>,
     flat_ground_y: Option<i32>,
-    damage_events: RefCell<Vec<DamageEvent>>,
+    damage_events: RefCell<VecDeque<DamageEvent>>,
+    dropped_damage_events: RefCell<u64>,
 }
 
 impl WorldView {
@@ -376,10 +392,8 @@ impl WorldView {
     /// Creates a world view where all coordinates at or below `ground_y` are solid ground.
     pub fn with_flat_ground(ground_y: i32) -> Self {
         Self {
-            entities: RefCell::new(BTreeMap::new()),
-            solid_blocks: RefCell::new(BTreeSet::new()),
             flat_ground_y: Some(ground_y),
-            damage_events: RefCell::new(Vec::new()),
+            ..Self::default()
         }
     }
 
@@ -414,11 +428,33 @@ impl WorldView {
         max_range: f64,
         kind: EntityKind,
     ) -> Option<EntityEntry> {
+        self.nearest_matching(pos, max_range, kind, None)
+    }
+
+    /// Like [`Self::find_nearest_target`], but never returns the entity `seeker`, so a mob
+    /// that hunts its own kind cannot select itself.
+    pub fn find_nearest_other(
+        &self,
+        seeker: u32,
+        pos: Vec3,
+        max_range: f64,
+        kind: EntityKind,
+    ) -> Option<EntityEntry> {
+        self.nearest_matching(pos, max_range, kind, Some(seeker))
+    }
+
+    fn nearest_matching(
+        &self,
+        pos: Vec3,
+        max_range: f64,
+        kind: EntityKind,
+        excluded: Option<u32>,
+    ) -> Option<EntityEntry> {
         let max_range_sq = max_range * max_range;
         let entities = self.entities.borrow();
         entities
             .values()
-            .filter(|e| e.kind == kind && e.is_alive())
+            .filter(|e| e.kind == kind && e.is_alive() && Some(e.id) != excluded)
             .filter_map(|e| {
                 let dist_sq = pos.distance_squared(e.position);
                 if dist_sq <= max_range_sq {
@@ -454,31 +490,54 @@ impl WorldView {
     /// Validates whether standing at block `(x, y, z)` has solid ground support
     /// beneath (`y - 1`) and passable clearance at body (`y`) and head (`y + 1`).
     pub fn has_ground_support(&self, x: i32, y: i32, z: i32) -> bool {
-        self.is_solid(x, y - 1, z) && !self.is_solid(x, y, z) && !self.is_solid(x, y + 1, z)
+        self.is_solid(x, y.saturating_sub(1), z)
+            && !self.is_solid(x, y, z)
+            && !self.is_solid(x, y.saturating_add(1), z)
     }
 
-    /// Delivers melee damage to a target entity, recording damage and updating entity health.
+    /// Delivers melee damage to a living target, recording the health actually removed.
+    ///
+    /// Returns `false`, recording nothing, for an invalid amount or a missing or dead target.
     pub fn apply_damage(&self, target_id: u32, amount: f32) -> bool {
         if !amount.is_finite() || amount < 0.0 {
             return false;
         }
         let mut entities = self.entities.borrow_mut();
-        if let Some(entry) = entities.get_mut(&target_id) {
-            entry.health = (entry.health - amount).max(0.0);
-            let remaining = entry.health;
-            self.damage_events.borrow_mut().push(DamageEvent {
-                target_id,
-                damage: amount,
-                remaining_health: remaining,
-            });
-            true
-        } else {
-            false
+        let Some(entry) = entities.get_mut(&target_id) else {
+            return false;
+        };
+        if !entry.is_alive() {
+            return false;
         }
+        let applied = amount.min(entry.health);
+        entry.health -= applied;
+        let remaining_health = entry.health;
+
+        let mut events = self.damage_events.borrow_mut();
+        if events.len() == MAX_PENDING_DAMAGE_EVENTS {
+            events.pop_front();
+            *self.dropped_damage_events.borrow_mut() += 1;
+        }
+        events.push_back(DamageEvent {
+            target_id,
+            damage: applied,
+            remaining_health,
+        });
+        true
     }
 
     pub fn damage_events(&self) -> Vec<DamageEvent> {
-        self.damage_events.borrow().clone()
+        self.damage_events.borrow().iter().cloned().collect()
+    }
+
+    /// Removes and returns the pending damage events, oldest first.
+    pub fn take_damage_events(&self) -> Vec<DamageEvent> {
+        self.damage_events.borrow_mut().drain(..).collect()
+    }
+
+    /// Damage events discarded because the pending buffer was full.
+    pub fn dropped_damage_events(&self) -> u64 {
+        *self.dropped_damage_events.borrow()
     }
 
     pub fn clear_damage_events(&self) {
@@ -548,6 +607,7 @@ impl GoalSelector {
     }
 
     /// Adds a prioritized goal (lower integer indicates higher execution priority).
+    /// Goals of equal priority are ranked by insertion order.
     pub fn add_goal(&mut self, priority: u32, goal: Box<dyn Goal>) {
         self.goals.push(PrioritizedGoal {
             priority,
@@ -567,6 +627,16 @@ impl GoalSelector {
 
     pub fn is_goal_running(&self, index: usize) -> bool {
         self.goals.get(index).is_some_and(|g| g.is_running)
+    }
+
+    /// Stops every running goal.
+    pub fn stop_all(&mut self, mob: &mut MobEntity) {
+        for pg in &mut self.goals {
+            if pg.is_running {
+                pg.goal.stop(mob);
+                pg.is_running = false;
+            }
+        }
     }
 
     /// Ticks active goals, stops ineligible goals, and arbitrates new goals in priority order.
@@ -714,8 +784,27 @@ impl MobEntity {
         self.target_selector.add_goal(priority, goal);
     }
 
+    /// Whether the mob has health remaining.
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        self.health > 0.0
+    }
+
     /// Steps active behavioral goals and integrates kinematic movement into entity position.
+    ///
+    /// When the mob is registered in `world`, that entry's health is authoritative, since
+    /// attacks land there. A dead mob stops its goals and does not act.
     pub fn tick(&mut self, world: &WorldView) {
+        if let Some(entry) = world.get_entity(self.id) {
+            self.health = entry.health;
+        }
+        if !self.is_alive() {
+            self.stop_all_goals();
+            self.navigation_velocity = Vec3::ZERO;
+            self.velocity = Vec3::ZERO;
+            return;
+        }
+
         // Step active goals without borrow conflicts
         let mut target_selector = std::mem::take(&mut self.target_selector);
         target_selector.tick(self, world);
@@ -729,13 +818,28 @@ impl MobEntity {
         world.update_entity_position(self.id, self.position);
     }
 
+    fn stop_all_goals(&mut self) {
+        let mut target_selector = std::mem::take(&mut self.target_selector);
+        target_selector.stop_all(self);
+        self.target_selector = target_selector;
+
+        let mut goal_selector = std::mem::take(&mut self.goal_selector);
+        goal_selector.stop_all(self);
+        self.goal_selector = goal_selector;
+    }
+
+    /// Integrates velocity into position. A non-finite velocity, which a goal built with a
+    /// non-finite speed can produce, is discarded so it cannot corrupt the position.
     pub fn apply_movement(&mut self) {
+        if !self.navigation_velocity.is_finite() {
+            self.navigation_velocity = Vec3::ZERO;
+        }
         self.velocity = self.navigation_velocity;
         self.position += self.velocity;
     }
 }
 
-/// Vanilla Goal: Detects nearest player within range and rotates mob yaw and pitch toward player head.
+/// Goal: Detects nearest player within range and rotates mob yaw and pitch toward player head.
 pub struct LookAtPlayerGoal {
     range: f64,
     look_time: u32,
@@ -783,7 +887,9 @@ impl Goal for LookAtPlayerGoal {
     }
 
     fn can_use(&mut self, mob: &MobEntity, world: &WorldView) -> bool {
-        if let Some(player) = world.find_nearest_player(mob.position, self.range) {
+        if let Some(player) =
+            world.find_nearest_other(mob.id, mob.position, self.range, EntityKind::Player)
+        {
             self.target_player_id = Some(player.id);
             true
         } else {
@@ -839,7 +945,7 @@ impl LookAtPlayerGoal {
     }
 }
 
-/// Vanilla Goal: Selects a ground-supported coordinate in range and navigates entity toward it.
+/// Goal: Selects a ground-supported coordinate in range and steers straight toward it.
 pub struct RandomStrollGoal {
     speed_modifier: f64,
     horizontal_radius: i32,
@@ -873,8 +979,8 @@ impl RandomStrollGoal {
     }
 
     pub fn with_radius(mut self, horizontal: i32, vertical: i32) -> Self {
-        self.horizontal_radius = horizontal;
-        self.vertical_radius = vertical;
+        self.horizontal_radius = horizontal.max(0);
+        self.vertical_radius = vertical.max(0);
         self
     }
 
@@ -903,9 +1009,9 @@ impl RandomStrollGoal {
                 .rng
                 .next_i32_range(-self.vertical_radius, self.vertical_radius);
 
-            let cx = base_x + dx;
-            let cy = base_y + dy;
-            let cz = base_z + dz;
+            let cx = base_x.saturating_add(dx);
+            let cy = base_y.saturating_add(dy);
+            let cz = base_z.saturating_add(dz);
 
             if world.has_ground_support(cx, cy, cz) {
                 return Some(Vec3::new(cx as f64 + 0.5, cy as f64, cz as f64 + 0.5));
@@ -942,9 +1048,9 @@ impl Goal for RandomStrollGoal {
         if self.stroll_duration >= self.max_duration {
             return false;
         }
-        // Continue while entity has not reached target center
-        let dist_sq = mob.position.horizontal_distance_squared(target);
-        dist_sq > 0.25
+        // Continue until the target is reached in all three axes, so a stroll to a
+        // different height does not end with the mob suspended between the two.
+        mob.position.distance_squared(target) > 0.25
     }
 
     fn start(&mut self, mob: &mut MobEntity) {
@@ -971,7 +1077,7 @@ impl Goal for RandomStrollGoal {
     }
 }
 
-/// Vanilla Goal: Scans spatial index for nearest enemy targets and sets mob target entity ID.
+/// Goal: Finds the nearest enemy target, other than the mob itself, and sets its target ID.
 pub struct NearestAttackableTargetGoal {
     target_kind: EntityKind,
     range: f64,
@@ -1002,7 +1108,8 @@ impl Goal for NearestAttackableTargetGoal {
     }
 
     fn can_use(&mut self, mob: &MobEntity, world: &WorldView) -> bool {
-        if let Some(target) = world.find_nearest_target(mob.position, self.range, self.target_kind)
+        if let Some(target) =
+            world.find_nearest_other(mob.id, mob.position, self.range, self.target_kind)
         {
             self.target_id = Some(target.id);
             true
@@ -1036,7 +1143,7 @@ impl Goal for NearestAttackableTargetGoal {
     }
 }
 
-/// Vanilla Goal: Pursues current target entity, checking reach distance and delivering melee damage on cooldown.
+/// Goal: Pursues current target entity, checking reach distance and delivering melee damage on cooldown.
 pub struct MeleeAttackGoal {
     speed_modifier: f64,
     damage: f32,
@@ -1062,7 +1169,8 @@ impl MeleeAttackGoal {
         self.cooldown_ticks
     }
 
-    /// Vanilla Minecraft attack reach distance squared: `(mob_width + target_width)^2 + 1.0`.
+    /// Attack reach distance squared: `(mob_width + target_width)^2 + 1.0`. A RustMC
+    /// placeholder with no recorded source.
     #[inline]
     pub fn attack_reach_squared(mob_width: f32, target_width: f32) -> f64 {
         let sum = (mob_width + target_width) as f64;
@@ -1518,5 +1626,188 @@ mod tests {
         assert_eq!(f1.union(f2), f3);
         assert_eq!(f3.difference(f1), f2);
         assert_eq!(GoalFlags::empty().bits(), 0);
+    }
+
+    #[test]
+    fn target_goal_never_selects_the_mob_itself() {
+        let world = WorldView::with_flat_ground(60);
+        world.add_entity(EntityEntry::new(
+            1,
+            EntityKind::Monster,
+            Vec3::new(0.0, 61.0, 0.0),
+        ));
+        world.add_entity(EntityEntry::new(
+            2,
+            EntityKind::Monster,
+            Vec3::new(4.0, 61.0, 0.0),
+        ));
+
+        let mut mob = MobEntity::new(1, EntityKind::Monster, Vec3::new(0.0, 61.0, 0.0));
+        mob.add_target_goal(
+            1,
+            Box::new(NearestAttackableTargetGoal::new(EntityKind::Monster, 16.0)),
+        );
+        mob.tick(&world);
+        assert_eq!(mob.target_id, Some(2));
+
+        // With no other candidate left the mob must end up with no target at all.
+        world.remove_entity(2);
+        mob.tick(&world);
+        mob.tick(&world);
+        assert_eq!(mob.target_id, None);
+    }
+
+    #[test]
+    fn dead_mob_stops_its_goals_and_does_not_act() {
+        let world = WorldView::with_flat_ground(60);
+        world.add_entity(EntityEntry::new(
+            1,
+            EntityKind::Monster,
+            Vec3::new(0.0, 61.0, 0.0),
+        ));
+        world.add_entity(EntityEntry::new(
+            100,
+            EntityKind::Player,
+            Vec3::new(1.0, 61.0, 0.0),
+        ));
+
+        let mut mob = MobEntity::new(1, EntityKind::Monster, Vec3::new(0.0, 61.0, 0.0));
+        mob.add_target_goal(1, Box::new(NearestAttackableTargetGoal::for_player(16.0)));
+        mob.add_goal(1, Box::new(MeleeAttackGoal::new(0.3, 5.0, 1)));
+        mob.tick(&world);
+        assert_eq!(world.get_entity(100).unwrap().health, 15.0);
+
+        // The mob is killed through the world, the only place attacks land.
+        assert!(world.apply_damage(1, 20.0));
+        let position = mob.position;
+        mob.tick(&world);
+
+        assert_eq!(mob.health, 0.0);
+        assert_eq!(mob.target_id, None);
+        assert_eq!(mob.goal_selector.running_count(), 0);
+        assert_eq!(mob.target_selector.running_count(), 0);
+        assert_eq!(mob.position, position);
+
+        mob.tick(&world);
+        assert_eq!(world.get_entity(100).unwrap().health, 15.0);
+    }
+
+    #[test]
+    fn damage_events_record_the_health_actually_removed() {
+        let world = WorldView::new();
+        world
+            .add_entity(EntityEntry::new(5, EntityKind::Player, Vec3::ZERO).with_health(3.0, 20.0));
+
+        assert!(world.apply_damage(5, 8.0));
+        assert_eq!(
+            world.damage_events(),
+            vec![DamageEvent {
+                target_id: 5,
+                damage: 3.0,
+                remaining_health: 0.0,
+            }]
+        );
+
+        // Hitting the corpse records nothing.
+        assert!(!world.apply_damage(5, 8.0));
+        assert_eq!(world.take_damage_events().len(), 1);
+        assert!(world.damage_events().is_empty());
+    }
+
+    #[test]
+    fn pending_damage_events_are_bounded() {
+        let world = WorldView::new();
+        world.add_entity(
+            EntityEntry::new(5, EntityKind::Player, Vec3::ZERO).with_health(1.0e9, 1.0e9),
+        );
+
+        for _ in 0..MAX_PENDING_DAMAGE_EVENTS + 10 {
+            assert!(world.apply_damage(5, 1.0));
+        }
+        assert_eq!(world.damage_events().len(), MAX_PENDING_DAMAGE_EVENTS);
+        assert_eq!(world.dropped_damage_events(), 10);
+    }
+
+    #[test]
+    fn rng_ranges_cover_the_full_integer_span_without_overflow() {
+        let mut rng = SimpleRng::new(7);
+        for _ in 0..1000 {
+            rng.next_i32_range(i32::MIN, i32::MAX);
+            rng.next_u32_range(0, u32::MAX);
+            let bounded = rng.next_i32_range(-3, 3);
+            assert!((-3..=3).contains(&bounded));
+            let bounded = rng.next_u32_range(40, 80);
+            assert!((40..=80).contains(&bounded));
+        }
+    }
+
+    #[test]
+    fn stroll_search_at_extreme_positions_does_not_overflow() {
+        let world = WorldView::with_flat_ground(60);
+        let mut mob = MobEntity::new(
+            1,
+            EntityKind::Monster,
+            Vec3::new(1.0e300, 1.0e300, -1.0e300),
+        );
+        mob.add_goal(
+            1,
+            Box::new(RandomStrollGoal::new(0.5).with_radius(i32::MAX, i32::MAX)),
+        );
+        mob.tick(&world);
+    }
+
+    #[test]
+    fn non_finite_speed_cannot_corrupt_the_position() {
+        let world = WorldView::with_flat_ground(60);
+        let start = Vec3::new(0.0, 61.0, 0.0);
+        let mut mob = MobEntity::new(1, EntityKind::Monster, start);
+        mob.add_goal(1, Box::new(RandomStrollGoal::new(f64::NAN).with_seed(42)));
+
+        mob.tick(&world);
+        assert_eq!(mob.position, start);
+        assert_eq!(mob.velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn stroll_finishes_at_the_target_height() {
+        // Ground steps up to a platform: y = 63 is the only standable height.
+        let world = WorldView::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                world.set_solid(x, 62, z, true);
+            }
+        }
+        let start = Vec3::new(0.5, 60.0, 0.5);
+        let mut mob = MobEntity::new(1, EntityKind::Monster, start);
+        mob.add_goal(
+            1,
+            Box::new(RandomStrollGoal::new(0.25).with_seed(3).with_radius(4, 3)),
+        );
+
+        for _ in 0..200 {
+            mob.tick(&world);
+            if mob.goal_selector.running_count() == 0 && mob.position != start {
+                break;
+            }
+        }
+        assert_eq!(mob.goal_selector.running_count(), 0);
+        assert!(
+            (mob.position.y - 63.0).abs() <= 0.5,
+            "ended at y = {}",
+            mob.position.y
+        );
+    }
+
+    #[test]
+    fn equal_priority_goals_rank_by_insertion_order() {
+        let mut selector = GoalSelector::new();
+        let mut mob = MobEntity::new(1, EntityKind::Monster, Vec3::ZERO);
+        let world = WorldView::new();
+        selector.add_goal(1, Box::new(TestGoal::new(GoalFlags::MOVE)));
+        selector.add_goal(1, Box::new(TestGoal::new(GoalFlags::MOVE)));
+
+        selector.tick(&mut mob, &world);
+        assert!(selector.is_goal_running(0));
+        assert!(!selector.is_goal_running(1));
     }
 }
