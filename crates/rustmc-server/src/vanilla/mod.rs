@@ -25,6 +25,7 @@ pub mod density;
 pub mod feature;
 pub mod generator;
 pub mod noise;
+pub(crate) mod plant_support;
 pub mod random;
 pub mod surface;
 pub mod worldgen;
