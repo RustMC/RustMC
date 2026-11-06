@@ -3,6 +3,13 @@
 #[cfg(test)]
 mod tests_interaction;
 
+pub mod brewing;
+
+pub use brewing::{
+    BrewingRecipe, BrewingRecipeRegistry, BrewingStandBlockEntity, BrewingStandProperty, ItemStack,
+    SetContainerDataPacket,
+};
+
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
