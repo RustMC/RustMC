@@ -64,7 +64,10 @@ const JOURNAL_TEMP_PREFIX: &str = ".journal.";
 
 /// Recovered journal state consisting of the active journal,
 /// committed mutations map, and the recovered tick sequence ID.
-pub type JournalRecovery = (WorldJournal, BTreeMap<(i64, i64, i64), Block>, u64);
+pub type JournalRecovery = (WorldJournal, MutationMap, u64);
+
+/// Committed block states by `(x, y, z)`.
+pub type MutationMap = BTreeMap<(i64, i64, i64), Block>;
 
 /// Test-only fault injection for every durability-relevant I/O step.
 #[cfg(test)]
@@ -200,7 +203,7 @@ fn read_checkpoint(
     path: &Path,
     seed: u64,
     terrain: Terrain,
-) -> Result<(BTreeMap<(i64, i64, i64), Block>, u64), WorldError> {
+) -> Result<(MutationMap, u64), WorldError> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < HEADER_SIZE + 4 {
         return Err(WorldError::Corrupted(
@@ -232,7 +235,10 @@ fn read_checkpoint(
     }
 
     let mut mutations = BTreeMap::new();
-    for entry in bytes[HEADER_SIZE..payload_len].chunks_exact(MUTATION_SIZE) {
+    for entry in bytes[HEADER_SIZE..payload_len]
+        .as_chunks::<MUTATION_SIZE>()
+        .0
+    {
         let block = Block::from_u8(entry[24]).ok_or(WorldError::InvalidBlockId(entry[24]))?;
         mutations.insert(
             (
@@ -309,7 +315,7 @@ fn replay_log(
     file_len: u64,
     start_tick: u64,
     checkpoint_tick: u64,
-    mutations: &mut BTreeMap<(i64, i64, i64), Block>,
+    mutations: &mut MutationMap,
 ) -> Result<Replay, WorldError> {
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
@@ -377,7 +383,7 @@ fn replay_log(
         }
 
         let mut decoded = Vec::with_capacity(count);
-        for entry in body[..payload_len].chunks_exact(MUTATION_SIZE) {
+        for entry in body[..payload_len].as_chunks::<MUTATION_SIZE>().0 {
             let Some(block) = Block::from_u8(entry[24]) else {
                 return Err(WorldError::Corrupted(format!(
                     "invalid block ID {} at offset {valid_end}",
@@ -675,7 +681,7 @@ impl WorldJournal {
     pub fn compact(
         &mut self,
         current_tick: u64,
-        committed_mutations: &BTreeMap<(i64, i64, i64), Block>,
+        committed_mutations: &MutationMap,
     ) -> Result<(), WorldError> {
         self.ensure_usable()?;
         if current_tick != self.next_tick {
@@ -703,7 +709,7 @@ impl WorldJournal {
     fn install_checkpoint(
         &self,
         current_tick: u64,
-        committed_mutations: &BTreeMap<(i64, i64, i64), Block>,
+        committed_mutations: &MutationMap,
     ) -> Result<(), WorldError> {
         let count = u32::try_from(committed_mutations.len()).map_err(|_| {
             WorldError::Corrupted("checkpoint mutation count exceeds the file format".into())
