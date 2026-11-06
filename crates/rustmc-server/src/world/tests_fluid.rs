@@ -207,7 +207,7 @@ fn test_downward_flow_falling_flag() {
     let outcome = compute_fluid_spread(&world, below_pos);
     assert_eq!(
         outcome,
-        Some(FluidState::new(FluidType::Water, 1, true)),
+        Some(FluidState::new(FluidType::Water, 0, true)),
         "downward flow should set falling: true"
     );
     assert!(outcome.unwrap().falling);
@@ -262,13 +262,16 @@ fn test_block_state_parsing_and_formatting() {
     let water_l3 = FluidState::from_block_state("minecraft:water[level=3]").unwrap();
     assert_eq!(water_l3, FluidState::new(FluidType::Water, 3, false));
 
-    let water_falling =
-        FluidState::from_block_state("minecraft:water[falling=true,level=2]").unwrap();
-    assert_eq!(water_falling, FluidState::new(FluidType::Water, 2, true));
+    // The official blocks report lists only `level`, 0..=15; 8 and up are falling.
+    let water_falling = FluidState::from_block_state("minecraft:water[level=8]").unwrap();
+    assert_eq!(water_falling, FluidState::new(FluidType::Water, 0, true));
+    assert!(!water_falling.is_source());
 
-    let water_falling_rev =
-        FluidState::from_block_state("minecraft:water[level=2,falling=true]").unwrap();
-    assert_eq!(water_falling_rev, water_falling);
+    let water_falling_high = FluidState::from_block_state("minecraft:water[level=15]").unwrap();
+    assert_eq!(
+        water_falling_high,
+        FluidState::new(FluidType::Water, 7, true)
+    );
 
     // Parsing lava states
     let lava_default = FluidState::from_block_state("minecraft:lava").unwrap();
@@ -281,15 +284,17 @@ fn test_block_state_parsing_and_formatting() {
     assert_eq!(water_l0.to_block_state(), "minecraft:water[level=0]");
     assert_eq!(water_l0.to_canonical_block_state(), "minecraft:water");
     assert_eq!(water_l3.to_block_state(), "minecraft:water[level=3]");
+    assert_eq!(water_falling.to_block_state(), "minecraft:water[level=8]");
     assert_eq!(
-        water_falling.to_block_state(),
-        "minecraft:water[falling=true,level=2]"
+        water_falling.to_canonical_block_state(),
+        "minecraft:water[level=8]"
     );
     assert_eq!(lava_l2.to_block_state(), "minecraft:lava[level=2]");
 
     // Invalid states
     assert!(FluidState::from_block_state("minecraft:stone").is_none());
-    assert!(FluidState::from_block_state("minecraft:water[level=9]").is_none());
+    assert!(FluidState::from_block_state("minecraft:water[level=16]").is_none());
+    assert!(FluidState::from_block_state("minecraft:water[falling=true,level=2]").is_none());
 }
 
 #[test]
@@ -365,4 +370,170 @@ fn test_horizontal_fluid_collision_empty_cell_cobblestone() {
         world.is_solid(empty_pos),
         "solidified cobblestone must be marked solid"
     );
+}
+
+/// Every `level` value in the official 26.3 blocks report for both fluids.
+#[test]
+fn test_every_reported_level_round_trips() {
+    for name in ["minecraft:water", "minecraft:lava"] {
+        for level in 0..=15 {
+            let state = format!("{name}[level={level}]");
+            let parsed = FluidState::from_block_state(&state).expect("reported state parses");
+            assert_eq!(parsed.falling, level >= 8, "{state}");
+            assert_eq!(parsed.to_block_state(), state);
+        }
+    }
+}
+
+fn floor(world: &mut InMemoryFluidWorld, y: i32, range: std::ops::RangeInclusive<i32>) {
+    for x in range.clone() {
+        for z in range.clone() {
+            world.set_solid(BlockPos::new(x, y, z), true);
+        }
+    }
+}
+
+#[test]
+fn test_replacing_fluid_with_solid_stops_it_emitting() {
+    let mut world = InMemoryFluidWorld::new();
+    let above = BlockPos::new(0, 1, 0);
+    let below = BlockPos::new(0, 0, 0);
+    world.set_fluid(above, FluidState::source(FluidType::Water));
+    assert!(compute_fluid_spread(&world, below).is_some());
+
+    world.set_block(above, BLOCK_STONE);
+    assert_eq!(world.get_fluid(above), None);
+    assert_eq!(world.get_block_id(above), BLOCK_STONE);
+    assert_eq!(compute_fluid_spread(&world, below), None);
+}
+
+#[test]
+fn test_water_between_water_source_and_lava_source_keeps_flowing() {
+    let mut world = InMemoryFluidWorld::new();
+    floor(&mut world, -1, -8..=8);
+    let water = BlockPos::new(-1, 0, 0);
+    let middle = BlockPos::new(0, 0, 0);
+    let lava = BlockPos::new(1, 0, 0);
+    world.set_fluid(water, FluidState::source(FluidType::Water));
+    world.set_fluid(middle, FluidState::new(FluidType::Water, 1, false));
+    world.set_fluid(lava, FluidState::source(FluidType::Lava));
+
+    assert_eq!(
+        FluidSimulator::step_cell(&world, middle),
+        FlowOutcome::Fluid(FluidState::new(FluidType::Water, 1, false))
+    );
+    world.step(&[middle, lava]);
+    assert_eq!(
+        world.get_fluid(middle),
+        Some(FluidState::new(FluidType::Water, 1, false))
+    );
+    assert_eq!(world.get_block_id(lava), BLOCK_OBSIDIAN);
+}
+
+#[test]
+fn test_source_above_source_spreads_sideways() {
+    let mut world = InMemoryFluidWorld::new();
+    floor(&mut world, -1, -3..=3);
+    for x in -3..=3 {
+        for z in -3..=3 {
+            if (x, z) != (0, 0) {
+                world.set_solid(BlockPos::new(x, 0, z), true);
+            }
+        }
+    }
+    let lower = BlockPos::new(0, 0, 0);
+    let upper = BlockPos::new(0, 1, 0);
+    world.set_fluid(lower, FluidState::source(FluidType::Water));
+    world.set_fluid(upper, FluidState::source(FluidType::Water));
+
+    assert_eq!(
+        compute_fluid_spread(&world, BlockPos::new(1, 1, 0)),
+        Some(FluidState::new(FluidType::Water, 1, false))
+    );
+
+    // Flowing water below can still be fed, so it keeps precedence.
+    world.set_fluid(lower, FluidState::new(FluidType::Water, 3, false));
+    assert_eq!(compute_fluid_spread(&world, BlockPos::new(1, 1, 0)), None);
+}
+
+#[test]
+fn test_new_source_forms_on_a_water_source() {
+    let mut world = InMemoryFluidWorld::new();
+    let pos = BlockPos::new(0, 1, 0);
+    world.set_fluid(pos.west(), FluidState::source(FluidType::Water));
+    world.set_fluid(pos.east(), FluidState::source(FluidType::Water));
+    assert_ne!(
+        compute_fluid_spread(&world, pos),
+        Some(FluidState::source(FluidType::Water)),
+        "nothing below to rest on"
+    );
+
+    world.set_fluid(pos.down(), FluidState::source(FluidType::Water));
+    assert_eq!(
+        compute_fluid_spread(&world, pos),
+        Some(FluidState::source(FluidType::Water))
+    );
+}
+
+/// Runs steps over a corridor at y = 0 fed by falling fluid at x = 0 and
+/// returns how many cells past the foot of the fall hold fluid.
+fn reach_from_foot_of_fall(fluid_type: FluidType) -> i32 {
+    let mut world = InMemoryFluidWorld::new();
+    for x in -2..=12 {
+        world.set_solid(BlockPos::new(x, -1, 0), true);
+        world.set_solid(BlockPos::new(x, 0, 1), true);
+        world.set_solid(BlockPos::new(x, 0, -1), true);
+    }
+    world.set_solid(BlockPos::new(-1, 0, 0), true);
+    world.set_fluid(BlockPos::new(0, 1, 0), FluidState::source(fluid_type));
+
+    let cells: Vec<BlockPos> = (0..=12).map(|x| BlockPos::new(x, 0, 0)).collect();
+    for _ in 0..16 {
+        world.step(&cells);
+    }
+    assert_eq!(
+        world.get_fluid(cells[0]),
+        Some(FluidState::new(fluid_type, 0, true))
+    );
+    (1..=12)
+        .take_while(|&x| world.get_fluid(BlockPos::new(x, 0, 0)).is_some())
+        .count() as i32
+}
+
+#[test]
+fn test_spread_restarts_at_the_foot_of_a_fall() {
+    assert_eq!(reach_from_foot_of_fall(FluidType::Water), 7);
+    assert_eq!(reach_from_foot_of_fall(FluidType::Lava), 3);
+}
+
+#[test]
+fn test_block_id_follows_fluid_after_clear_and_refill() {
+    let mut world = InMemoryFluidWorld::new();
+    floor(&mut world, -1, -2..=2);
+    let source = BlockPos::new(0, 0, 0);
+    let pos = BlockPos::new(1, 0, 0);
+    world.set_fluid(source, FluidState::source(FluidType::Water));
+    world.set_block(pos, BLOCK_AIR);
+    assert_eq!(world.get_block_id(pos), BLOCK_AIR);
+
+    world.step(&[pos]);
+    assert_eq!(
+        world.get_fluid(pos),
+        Some(FluidState::new(FluidType::Water, 1, false))
+    );
+    assert_eq!(world.get_block_id(pos), "minecraft:water[level=1]");
+}
+
+#[test]
+fn test_set_block_installs_fluid_block_states() {
+    let mut world = InMemoryFluidWorld::new();
+    let pos = BlockPos::new(0, 0, 0);
+    world.set_block(pos, "minecraft:stone");
+    world.set_block(pos, "minecraft:water[level=8]");
+    assert!(!world.is_solid(pos));
+    assert_eq!(
+        world.get_fluid(pos),
+        Some(FluidState::new(FluidType::Water, 0, true))
+    );
+    assert_eq!(world.get_block_id(pos), "minecraft:water[level=8]");
 }

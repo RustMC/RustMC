@@ -12,11 +12,13 @@
 //!
 //! # Vanilla Specification & Source Citations
 //!
-//! - **Level Property**: Follows Java 26.3 `net.minecraft.world.level.block.LiquidBlock` where
-//!   `BlockStateProperties.LEVEL` is an integer property `0..=7` (source to decayed spread) and `1..=8`
-//!   in block state mapping (`net.minecraft.world.level.material.FlowingFluid`).
-//! - **Falling Property**: Follows Java 26.3 `net.minecraft.world.level.material.FlowingFluid` where
-//!   `BlockStateProperties.FALLING` is a boolean property indicating fluid flowing vertically downward.
+//! - **Level Property**: `generated/reports/blocks.json` from the official Java 26.3 server data
+//!   generator lists a single property for `minecraft:water` and `minecraft:lava`: `level`,
+//!   `0..=15`. There is no `falling` block-state property.
+//! - **Falling Encoding**: [Minecraft Wiki: Water](https://minecraft.wiki/w/Water) and
+//!   [Lava](https://minecraft.wiki/w/Lava) document block-state level 8 as falling fluid, and
+//!   `falling` as a fluid-state property only. [`FluidState`] keeps `falling` as a separate field
+//!   and translates it to and from `level` at the block-state boundary: `8 + level` when falling.
 //! - **Fluid Collisions**: Water touching lava source blocks creates `minecraft:obsidian`;
 //!   water touching flowing lava creates `minecraft:cobblestone`; lava flowing on top of water creates `minecraft:stone`.
 //!   Simultaneous horizontal arrival of water and lava at an empty cell creates `minecraft:cobblestone`.
@@ -31,6 +33,10 @@ pub const BLOCK_OBSIDIAN: &str = "minecraft:obsidian";
 pub const BLOCK_COBBLESTONE: &str = "minecraft:cobblestone";
 pub const BLOCK_STONE: &str = "minecraft:stone";
 pub const BLOCK_AIR: &str = "minecraft:air";
+
+/// Block-state `level` values from here up mean falling fluid.
+const FALLING_LEVEL: u8 = 8;
+const MAX_BLOCK_STATE_LEVEL: u8 = 15;
 
 /// A 3D discrete block position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -167,14 +173,24 @@ impl FluidState {
         self.level == 0 && !self.falling
     }
 
+    /// The level this fluid gives a horizontal neighbor, or `None` past its
+    /// reach. Falling fluid counts as full strength, so spread restarts at the
+    /// foot of a fall.
+    fn spread_level(&self) -> Option<u8> {
+        let strength = if self.falling { 0 } else { self.level };
+        let level = strength + self.type_.flow_decay();
+        (level <= self.type_.max_level()).then_some(level)
+    }
+
     /// Format to standard Minecraft block state representation.
     pub fn to_block_state(&self) -> String {
         let name = self.type_.block_name();
-        if self.falling {
-            format!("{name}[falling=true,level={}]", self.level)
+        let level = if self.falling {
+            self.level + FALLING_LEVEL
         } else {
-            format!("{name}[level={}]", self.level)
-        }
+            self.level
+        };
+        format!("{name}[level={level}]")
     }
 
     /// Format to compact block state where non-falling source blocks omit properties.
@@ -192,10 +208,12 @@ impl FluidState {
     /// - `minecraft:water` or `water`
     /// - `minecraft:water[level=0]`
     /// - `minecraft:water[level=N]`
-    /// - `minecraft:water[falling=true,level=N]` or `minecraft:water[level=N,falling=true]`
     /// - `minecraft:lava` or `lava`
     /// - `minecraft:lava[level=0]`
     /// - `minecraft:lava[level=N]`
+    ///
+    /// `level` is `0..=15`; `8..=15` decode as falling. Any other property is
+    /// rejected because these blocks have none.
     pub fn from_block_state(s: &str) -> Option<Self> {
         let s = s.trim();
         let (raw_name, props_str) = match s.find('[') {
@@ -217,34 +235,29 @@ impl FluidState {
         };
 
         let mut level: u8 = 0;
-        let mut falling = false;
 
         if let Some(props) = props_str {
             for part in props.split(',') {
-                let part = part.trim();
-                if let Some((key, val)) = part.split_once('=') {
-                    let key = key.trim();
-                    let val = val.trim();
-                    match key {
-                        "level" => {
-                            level = val.parse().ok()?;
-                        }
-                        "falling" => {
-                            falling = val.parse().ok()?;
-                        }
-                        _ => {}
-                    }
+                let (key, val) = part.split_once('=')?;
+                if key.trim() != "level" {
+                    return None;
                 }
+                level = val.trim().parse().ok()?;
             }
         }
 
-        if level > 7 {
+        if level > MAX_BLOCK_STATE_LEVEL {
             return None;
         }
 
+        let falling = level >= FALLING_LEVEL;
         Some(Self {
             type_,
-            level,
+            level: if falling {
+                level - FALLING_LEVEL
+            } else {
+                level
+            },
             falling,
         })
     }
@@ -300,6 +313,30 @@ pub enum FlowOutcome {
     Empty,
 }
 
+/// Whether fluid at `pos` can actually descend. A source of the same fluid
+/// below is already full, so it does not take precedence over lateral flow.
+fn flows_down_from(world: &dyn FluidWorldView, pos: BlockPos, fluid_type: FluidType) -> bool {
+    let below = pos.down();
+    !world.is_solid(below)
+        && !world
+            .get_fluid(below)
+            .is_some_and(|fluid| fluid.type_ == fluid_type && fluid.is_source())
+}
+
+/// The state `fluid` at `neighbor` would give `pos` by horizontal flow, if any.
+fn horizontal_arrival(
+    world: &dyn FluidWorldView,
+    neighbor: BlockPos,
+    fluid: FluidState,
+    pos: BlockPos,
+) -> Option<FluidState> {
+    if !preferred_flow_directions(world, neighbor, fluid.type_).contains(&pos) {
+        return None;
+    }
+    let level = fluid.spread_level()?;
+    Some(FluidState::new(fluid.type_, level, false))
+}
+
 /// Calculates the horizontal neighbor positions that fluid at `origin` will spread towards,
 /// according to inward slope drop search and downward flow precedence.
 pub fn preferred_flow_directions(
@@ -307,9 +344,9 @@ pub fn preferred_flow_directions(
     origin: BlockPos,
     fluid_type: FluidType,
 ) -> Vec<BlockPos> {
-    // Downward flow takes precedence: if origin has open space below,
-    // fluid falls down and does NOT spread horizontally.
-    if !world.is_solid(origin.down()) {
+    // Downward flow takes precedence: if fluid can descend from origin,
+    // it falls down and does NOT spread horizontally.
+    if flows_down_from(world, origin, fluid_type) {
         return Vec::new();
     }
 
@@ -322,7 +359,7 @@ pub fn preferred_flow_directions(
         if world.is_solid(neighbor) {
             continue;
         }
-        if !world.is_solid(neighbor.down()) {
+        if flows_down_from(world, neighbor, fluid_type) {
             // Drop right at the neighbor! Distance is 1.
             drop_distances[i] = Some(1);
             continue;
@@ -352,7 +389,7 @@ pub fn preferred_flow_directions(
                     }
                     visited.push(next);
 
-                    if !world.is_solid(next.down()) {
+                    if flows_down_from(world, next, fluid_type) {
                         let drop_dist = dist + 1;
                         if drop_distances[i].is_none_or(|d| drop_dist < d) {
                             drop_distances[i] = Some(drop_dist);
@@ -436,17 +473,11 @@ pub fn check_fluid_collision(world: &dyn FluidWorldView, pos: BlockPos) -> Optio
 
         for &neighbor in &pos.horizontal_neighbors() {
             if let Some(fluid) = world.get_fluid(neighbor)
-                && world.is_solid(neighbor.down())
+                && horizontal_arrival(world, neighbor, fluid, pos).is_some()
             {
-                let preferred = preferred_flow_directions(world, neighbor, fluid.type_);
-                if preferred.contains(&pos) {
-                    let new_level = fluid.level + fluid.type_.flow_decay();
-                    if new_level <= fluid.type_.max_level() {
-                        match fluid.type_ {
-                            FluidType::Water => has_water_arrival = true,
-                            FluidType::Lava => has_lava_arrival = true,
-                        }
-                    }
+                match fluid.type_ {
+                    FluidType::Water => has_water_arrival = true,
+                    FluidType::Lava => has_lava_arrival = true,
                 }
             }
         }
@@ -463,14 +494,17 @@ pub fn check_fluid_collision(world: &dyn FluidWorldView, pos: BlockPos) -> Optio
 ///
 /// Follows standard Minecraft fluid dynamics:
 /// 1. Returns `None` if the cell is solid or converted by collision.
-/// 2. If cell has $\ge 2$ horizontally adjacent water sources AND a solid block below,
-///    creates an infinite water source (`level = 0`).
+/// 2. If cell has $\ge 2$ horizontally adjacent water sources AND a solid block or water
+///    source below, creates an infinite water source (`level = 0`).
 /// 3. Downward flow from `pos.up()` takes precedence over horizontal flow (`falling = true`).
 /// 4. Horizontal flow from neighbors:
-///    - Neighbors with open space below fall down and do not spread horizontally.
+///    - Neighbors that can descend fall down and do not spread horizontally.
 ///    - Neighbors perform inward slope search to prefer cliff/drop directions.
 ///    - Fluid decays by +1 level per block, up to max reach (7 for water, 3 for lava).
+///    - Falling neighbors spread at full strength, restarting reach at the foot of a fall.
 ///    - Lowest level (strongest fluid) among arriving neighbors wins.
+///    - A cell already holding fluid is fed only by that fluid; solidifying the other
+///      fluid is that cell's own collision.
 pub fn compute_fluid_spread(world: &dyn FluidWorldView, pos: BlockPos) -> Option<FluidState> {
     if world.is_solid(pos) {
         return None;
@@ -483,8 +517,12 @@ pub fn compute_fluid_spread(world: &dyn FluidWorldView, pos: BlockPos) -> Option
 
     // Infinite water source creation:
     // If a cell has `level > 0` (or air) and has >= 2 horizontally adjacent water source blocks (`level == 0`)
-    // AND has a solid block below, it converts into a water source (`level = 0`).
-    if world.is_solid(pos.down()) {
+    // AND has a solid block or water source below, it converts into a water source (`level = 0`).
+    let supported = world.is_solid(pos.down())
+        || world
+            .get_fluid(pos.down())
+            .is_some_and(|f| f.type_ == FluidType::Water && f.is_source());
+    if supported {
         let adjacent_water_sources = pos
             .horizontal_neighbors()
             .iter()
@@ -509,50 +547,26 @@ pub fn compute_fluid_spread(world: &dyn FluidWorldView, pos: BlockPos) -> Option
 
     // Downward flow from above takes precedence over horizontal flow.
     if let Some(above) = world.get_fluid(pos.up()) {
-        return Some(FluidState::new(above.type_, 1, true));
+        return Some(FluidState::new(above.type_, 0, true));
     }
 
-    // Horizontal flow from neighbors.
+    // Horizontal flow from neighbors. Two different fluids reaching an empty
+    // cell were already resolved above as a collision.
+    let current_type = world.get_fluid(pos).map(|fluid| fluid.type_);
     let mut best_state: Option<FluidState> = None;
 
     for &neighbor in &pos.horizontal_neighbors() {
         let Some(neighbor_fluid) = world.get_fluid(neighbor) else {
             continue;
         };
-
-        // Neighbor cannot spread horizontally if it has an open block below it.
-        // Downward flow takes precedence for that neighbor.
-        if !world.is_solid(neighbor.down()) {
+        if current_type.is_some_and(|fluid_type| fluid_type != neighbor_fluid.type_) {
             continue;
         }
-
-        // Check if neighbor's inward slope search allows spreading towards `pos`.
-        let preferred = preferred_flow_directions(world, neighbor, neighbor_fluid.type_);
-        if !preferred.contains(&pos) {
+        let Some(candidate) = horizontal_arrival(world, neighbor, neighbor_fluid, pos) else {
             continue;
-        }
-
-        // Calculate decayed level.
-        let new_level = neighbor_fluid.level + neighbor_fluid.type_.flow_decay();
-        if new_level > neighbor_fluid.type_.max_level() {
-            continue;
-        }
-
-        let candidate = FluidState::new(neighbor_fluid.type_, new_level, false);
-        match best_state {
-            Some(best) => {
-                if candidate.type_ == best.type_ {
-                    if candidate.level < best.level {
-                        best_state = Some(candidate);
-                    }
-                } else {
-                    // Different fluids meeting horizontally: cobblestone formation
-                    return None;
-                }
-            }
-            None => {
-                best_state = Some(candidate);
-            }
+        };
+        if best_state.is_none_or(|best| candidate.level < best.level) {
+            best_state = Some(candidate);
         }
     }
 
@@ -605,7 +619,10 @@ impl InMemoryFluidWorld {
         Self::default()
     }
 
+    /// Installs `fluid`, replacing whatever block occupied `pos`.
     pub fn set_fluid(&mut self, pos: BlockPos, fluid: FluidState) {
+        self.blocks.remove(&pos);
+        self.solids.insert(pos, false);
         self.fluids.insert(pos, fluid);
     }
 
@@ -613,21 +630,28 @@ impl InMemoryFluidWorld {
         self.fluids.remove(&pos);
     }
 
+    /// Marks `pos` solid or open, clearing any stored block identifier. A
+    /// solid cell cannot also hold fluid.
     pub fn set_solid(&mut self, pos: BlockPos, solid: bool) {
+        self.blocks.remove(&pos);
+        if solid {
+            self.fluids.remove(&pos);
+        }
         self.solids.insert(pos, solid);
     }
 
+    /// Replaces the block at `pos`. Fluid block states install that fluid, so
+    /// the cell's block, solidity, and fluid always describe the same state.
     pub fn set_block(&mut self, pos: BlockPos, block_id: impl Into<String>) {
         let id = block_id.into();
-        self.blocks.insert(pos, id.clone());
-        if id != BLOCK_AIR && id != BLOCK_WATER && id != BLOCK_LAVA {
-            self.solids.insert(pos, true);
-        } else {
-            self.solids.insert(pos, false);
-            if id == BLOCK_AIR {
-                self.fluids.remove(&pos);
-            }
+        if let Some(fluid) = FluidState::from_block_state(&id) {
+            self.set_fluid(pos, fluid);
+            return;
         }
+        let solid = id != BLOCK_AIR;
+        self.set_solid(pos, solid);
+        self.fluids.remove(&pos);
+        self.blocks.insert(pos, id);
     }
 
     /// Applies a simulation step to the given positions.
@@ -643,8 +667,6 @@ impl InMemoryFluidWorld {
                     self.set_fluid(pos, fluid);
                 }
                 FlowOutcome::Solidify(block_id) => {
-                    self.remove_fluid(pos);
-                    self.set_solid(pos, true);
                     self.set_block(pos, block_id);
                 }
                 FlowOutcome::Empty => {
