@@ -1,5 +1,9 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod experience;
+
+#[cfg(test)]
+mod tests_experience;
 #[cfg(test)]
 mod tests_interaction;
 
