@@ -220,10 +220,19 @@ const BATCH_START: u32 = 12;
 const BATCH_END: u32 = 11;
 const MAX_CHUNKS_PER_BATCH: usize = 16;
 const MAX_BATCH_BYTES: usize = 768 * 1024;
-// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves.
-const BLOCK_STATES: [u32; 19] = [
+// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves,
+// wood variants, sand/sandstone, snow blocks, short grass, snow layer, white carpet, tall grass halves.
+const BLOCK_STATES: [u32; 24] = [
     0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759,
+    2363, 8589, 14743, 14771, 14770,
 ];
+
+/// Every [`Block`] has an entry, so an index outside the table is a bug that
+/// must not reach the client as air.
+fn block_state_id(block_index: usize) -> u32 {
+    BLOCK_STATES[block_index]
+}
+
 const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
 const LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
@@ -704,6 +713,14 @@ fn block(chunk: &Chunk, x: usize, y: i32, z: usize) -> Block {
     }
 }
 
+/// Plants with no collision, which only `WORLD_SURFACE` captures.
+fn is_passable_plant(block: Block) -> bool {
+    matches!(
+        block,
+        Block::ShortGrass | Block::TallGrassLower | Block::TallGrassUpper
+    )
+}
+
 /// Pack fixed-width values without crossing a 64-bit word boundary.
 fn packed(values: &[u16], bits: usize) -> Vec<u64> {
     let per_word = 64 / bits;
@@ -733,6 +750,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
                         .find(|y| {
                             let b = block(chunk, x, *y, z);
                             b != Block::Air
+                                && (kind == 1 || !is_passable_plant(b))
                                 && (kind != 5
                                     || !matches!(
                                         b,
@@ -781,13 +799,13 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         palette.dedup();
         if palette.len() == 1 {
             sections.push(0);
-            put_varint(BLOCK_STATES[values[0] as usize], &mut sections);
+            put_varint(block_state_id(values[0] as usize), &mut sections);
         } else {
             let bits = (usize::BITS - (palette.len() - 1).leading_zeros()).max(4) as usize;
             sections.push(bits as u8);
             put_varint(palette.len() as u32, &mut sections);
             for value in &palette {
-                put_varint(BLOCK_STATES[*value as usize], &mut sections);
+                put_varint(block_state_id(*value as usize), &mut sections);
             }
             let indices: Vec<u16> = values
                 .iter()
@@ -830,14 +848,20 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         }
     }
     put_varint(LIGHT_SECTIONS as u32, &mut body);
-    // Direct vertical skylight, attenuated by leaves. No emitted light or full lateral solver yet.
+    // Direct vertical skylight, attenuated by leaves; plants and thin covers
+    // pass it unchanged. No emitted light or full lateral solver yet.
     let mut lights = vec![[0u8; 2048]; LIGHT_SECTIONS];
     for z in 0..16 {
         for x in 0..16 {
             let mut sky = 15u8;
             for y in (-80..336).rev() {
                 match block(chunk, x, y, z) {
-                    Block::Air => {}
+                    Block::Air
+                    | Block::ShortGrass
+                    | Block::SnowLayer
+                    | Block::Carpet
+                    | Block::TallGrassLower
+                    | Block::TallGrassUpper => {}
                     Block::Leaves
                     | Block::SpruceLeaves
                     | Block::AcaciaLeaves
@@ -1278,5 +1302,101 @@ mod tests {
             !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
             "generation should continue while awaiting the client"
         );
+    }
+
+    /// Reads skylight from the end of a framed chunk packet: 26 layers of a
+    /// two-byte `2048` length and 2048 bytes, then one byte for the empty block
+    /// light list. Layer 0 starts at y = -80; nibbles are low-first.
+    fn sky_at(packet: &[u8], x: usize, y: i32, z: usize) -> u8 {
+        let first_layer = packet.len() - 1 - 26 * 2050;
+        let layer = ((y + 80) / 16) as usize;
+        let data = first_layer + layer * 2050 + 2;
+        let index = (y.rem_euclid(16) as usize * 16 + z) * 16 + x;
+        (packet[data + index / 2] >> ((index % 2) * 4)) & 0x0f
+    }
+
+    fn encoded(chunk: &Chunk) -> Vec<u8> {
+        encode_chunk(chunk, Generator::new(1), &[0; 8])
+    }
+
+    #[test]
+    fn plants_and_thin_covers_pass_skylight() {
+        for block in [
+            Block::ShortGrass,
+            Block::TallGrassLower,
+            Block::TallGrassUpper,
+            Block::SnowLayer,
+            Block::Carpet,
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set_block(2, 10, 3, Block::Grass);
+            chunk.set_block(2, 11, 3, block);
+            let packet = encoded(&chunk);
+            assert_eq!(sky_at(&packet, 2, 12, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 11, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 10, 3), 0, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 9, 3), 0, "{block:?}");
+        }
+    }
+
+    #[test]
+    fn grass_is_only_in_the_world_surface_heightmap() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.set_block(0, 10, 0, Block::Grass);
+        let without_plant = encoded(&chunk);
+        chunk.set_block(0, 11, 0, Block::ShortGrass);
+        let with_plant = encoded(&chunk);
+
+        // 8 coordinate bytes, map size, then per type: id, length 37, longs.
+        // Column (0, 0) is the low 9 bits of each array's first big-endian long.
+        let first_height = |packet: &[u8], map_index: usize| {
+            let (_, frame_prefix) = read_varint(packet);
+            let body = frame_prefix + 1 + 8 + 1;
+            let entry = body + map_index * (2 + 37 * 8);
+            let word: [u8; 8] = packet[entry + 2..entry + 10].try_into().unwrap();
+            u64::from_be_bytes(word) & 0x1ff
+        };
+        // Floor top at y = 10 is stored as 10 + 1 + 64.
+        assert_eq!(first_height(&without_plant, 0), 75);
+        assert_eq!(first_height(&with_plant, 0), 76);
+        assert_eq!(first_height(&with_plant, 1), 75);
+        assert_eq!(first_height(&with_plant, 2), 75);
+    }
+
+    #[test]
+    fn new_block_variants_reach_the_chunk_palette() {
+        // Protocol state IDs from the official 26.3 blocks report, as VarInts.
+        for (block, id_bytes) in [
+            (Block::ShortGrass, [0xBB, 0x12]),
+            (Block::SnowLayer, [0x8D, 0x43]),
+            (Block::Carpet, [0x97, 0x73]),
+            (Block::TallGrassLower, [0xB3, 0x73]),
+            (Block::TallGrassUpper, [0xB2, 0x73]),
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        chunk.set_block(x, y, z, block);
+                    }
+                }
+            }
+            // 4096 non-air blocks, no fluid, single-value palette, state ID.
+            let section = [0x10, 0x00, 0x00, 0x00, 0x00, id_bytes[0], id_bytes[1]];
+            let packet = encoded(&chunk);
+            assert!(
+                packet.windows(section.len()).any(|bytes| bytes == section),
+                "{block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_block_state_ids_match_chunk_registry() {
+        assert_eq!(block_state_id(19), 2363); // ShortGrass
+        assert_eq!(block_state_id(20), 8589); // SnowLayer
+        assert_eq!(block_state_id(21), 14743); // Carpet
+        assert_eq!(block_state_id(22), 14771); // TallGrassLower
+        assert_eq!(block_state_id(23), 14770); // TallGrassUpper
     }
 }
