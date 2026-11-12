@@ -1,7 +1,7 @@
 //! World time progression and weather cycle state machine.
 //!
-//! Implements canonical Minecraft Java 26.3 diurnal cycles (`day_time`, `game_time`)
-//! and weather state machines (`Clear`, `Rain`, `Thunder`).
+//! Tracks the diurnal cycle (`day_time`, `game_time`) and a weather state machine
+//! (`Clear`, `Rain`, `Thunder`).
 //!
 //! # Diurnal Specification
 //!
@@ -11,9 +11,17 @@
 //! - **Sunset (18:00)**: Tick 12,000.
 //! - **Sleep Allowed**: Tick 12,542 to 23,458 (or whenever thundering).
 //! - **Midnight (00:00)**: Tick 18,000.
-//! - **Sunrise (05:45)**: Tick 23,000.
-//! - **Game Time**: Monotonic tick count representing world age.
+//! - **Sunrise (05:00)**: Tick 23,000.
+//! - **Game Time**: Monotonic tick count representing world age. Only simulated
+//!   ticks count, so a sleep skip leaves it unchanged.
 //! - **Day Time**: If negative in Java protocol packets, daylight cycle is paused (`doDaylightCycle = false`).
+//!
+//! # Weather Cycle
+//!
+//! When a weather interval expires the state moves `Clear` -> `Rain` -> `Thunder`
+//! -> `Clear` and takes its next duration from a [`WeatherSchedule`]. This is a
+//! deterministic RustMC schedule, not vanilla weather: vanilla's randomized
+//! intervals and its independent rain and thunder timers are not modelled.
 
 /// Total ticks in a single Minecraft day.
 pub const TICKS_PER_DAY: i64 = 24_000;
@@ -103,10 +111,8 @@ impl WorldTime {
     }
 
     /// Skips forward to the next morning (06:00 / tick 0 of the next diurnal cycle).
+    /// World age is unchanged because the skipped ticks were never simulated.
     pub fn skip_to_morning(&mut self) {
-        let current_day = self.day_time;
-        let delta = (TICKS_PER_DAY - current_day).rem_euclid(TICKS_PER_DAY);
-        self.game_time = self.game_time.saturating_add(delta);
         self.day_time = 0;
     }
 
@@ -141,6 +147,51 @@ impl WeatherKind {
     pub const fn is_thundering(self) -> bool {
         matches!(self, Self::Thunder)
     }
+
+    /// The weather that follows this one when its interval expires.
+    #[inline]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Clear => Self::Rain,
+            Self::Rain => Self::Thunder,
+            Self::Thunder => Self::Clear,
+        }
+    }
+}
+
+/// How long each weather kind lasts once the cycle enters it, in ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeatherSchedule {
+    pub clear_ticks: u32,
+    pub rain_ticks: u32,
+    pub thunder_ticks: u32,
+}
+
+impl WeatherSchedule {
+    /// Half a day per weather kind. A project default, not a vanilla interval.
+    pub const DEFAULT_TICKS: u32 = 12_000;
+
+    pub const fn new() -> Self {
+        Self {
+            clear_ticks: Self::DEFAULT_TICKS,
+            rain_ticks: Self::DEFAULT_TICKS,
+            thunder_ticks: Self::DEFAULT_TICKS,
+        }
+    }
+
+    pub const fn duration(&self, kind: WeatherKind) -> u32 {
+        match kind {
+            WeatherKind::Clear => self.clear_ticks,
+            WeatherKind::Rain => self.rain_ticks,
+            WeatherKind::Thunder => self.thunder_ticks,
+        }
+    }
+}
+
+impl Default for WeatherSchedule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Authoritative weather simulation state machine.
@@ -150,6 +201,7 @@ pub struct WeatherState {
     remaining_duration: u32,
     rain_level: f32,
     thunder_level: f32,
+    schedule: WeatherSchedule,
 }
 
 impl Default for WeatherState {
@@ -162,9 +214,10 @@ impl WeatherState {
     pub const fn new() -> Self {
         Self {
             kind: WeatherKind::Clear,
-            remaining_duration: 12_000,
+            remaining_duration: WeatherSchedule::DEFAULT_TICKS,
             rain_level: 0.0,
             thunder_level: 0.0,
+            schedule: WeatherSchedule::new(),
         }
     }
 
@@ -179,7 +232,14 @@ impl WeatherState {
             remaining_duration: duration,
             rain_level: rain,
             thunder_level: thunder,
+            schedule: WeatherSchedule::new(),
         }
+    }
+
+    /// Uses `schedule` for every interval after the current one.
+    pub const fn with_schedule(mut self, schedule: WeatherSchedule) -> Self {
+        self.schedule = schedule;
+        self
     }
 
     #[inline]
@@ -208,10 +268,13 @@ impl WeatherState {
         self.remaining_duration = duration;
     }
 
-    /// Steps the weather simulation by one tick, updating countdown and interpolating gradient levels.
+    /// Steps the weather simulation by one tick: counts down, enters the next
+    /// weather when the interval expires, and interpolates gradient levels.
     pub fn tick(&mut self) {
-        if self.remaining_duration > 0 {
-            self.remaining_duration -= 1;
+        self.remaining_duration = self.remaining_duration.saturating_sub(1);
+        if self.remaining_duration == 0 {
+            self.kind = self.kind.next();
+            self.remaining_duration = self.schedule.duration(self.kind);
         }
 
         // Smooth transition for rain level (rate: 0.01 per tick)

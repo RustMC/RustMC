@@ -36,8 +36,13 @@ fn test_skip_to_morning_jump() {
     // Sleep in bed skips to next morning (tick 0)
     time.skip_to_morning();
     assert_eq!(time.day_time(), 0);
-    assert_eq!(time.game_time(), 24_000);
+    assert_eq!(time.game_time(), 13_000, "skipped ticks never happened");
     assert!(time.is_day());
+
+    // The next simulated tick continues from the unchanged world age.
+    time.advance(1);
+    assert_eq!(time.game_time(), 13_001);
+    assert_eq!(time.day_time(), 1);
 }
 
 #[test]
@@ -64,14 +69,14 @@ fn test_weather_state_transitions_and_gradient() {
     assert_eq!(weather.thunder_level(), 0.0);
 
     // Set weather to rain
-    weather.set_weather(WeatherKind::Rain, 50);
+    weather.set_weather(WeatherKind::Rain, 500);
     assert_eq!(weather.kind(), WeatherKind::Rain);
 
     // After 10 ticks, rain level ramps up smoothly
     for _ in 0..10 {
         weather.tick();
     }
-    assert_eq!(weather.remaining_duration(), 40);
+    assert_eq!(weather.remaining_duration(), 490);
     assert!((weather.rain_level() - 0.1).abs() < 0.001);
     assert_eq!(weather.thunder_level(), 0.0);
 
@@ -80,4 +85,49 @@ fn test_weather_state_transitions_and_gradient() {
         weather.tick();
     }
     assert_eq!(weather.rain_level(), 1.0);
+}
+
+#[test]
+fn test_weather_cycle_advances_past_each_expiry() {
+    let schedule = WeatherSchedule {
+        clear_ticks: 3,
+        rain_ticks: 2,
+        thunder_ticks: 4,
+    };
+    let mut weather = WeatherState::from_kind(WeatherKind::Clear, 1).with_schedule(schedule);
+
+    let mut kinds = Vec::new();
+    for _ in 0..10 {
+        weather.tick();
+        kinds.push(weather.kind());
+    }
+    use WeatherKind::{Clear, Rain, Thunder};
+    assert_eq!(
+        kinds,
+        [
+            Rain, Rain, Thunder, Thunder, Thunder, Thunder, Clear, Clear, Clear, Rain
+        ]
+    );
+}
+
+#[test]
+fn test_finite_weather_expires_and_starts_the_next_interval() {
+    let mut rain = WeatherState::from_kind(WeatherKind::Rain, 1);
+    rain.tick();
+    assert_eq!(rain.kind(), WeatherKind::Thunder);
+    assert_eq!(rain.remaining_duration(), WeatherSchedule::DEFAULT_TICKS);
+
+    let mut clear = WeatherState::new();
+    for _ in 0..WeatherSchedule::DEFAULT_TICKS {
+        clear.tick();
+    }
+    assert_eq!(clear.kind(), WeatherKind::Rain);
+    assert_eq!(clear.remaining_duration(), WeatherSchedule::DEFAULT_TICKS);
+}
+
+#[test]
+fn test_zero_duration_expires_on_the_next_tick() {
+    let mut weather = WeatherState::from_kind(WeatherKind::Clear, 0);
+    weather.tick();
+    assert_eq!(weather.kind(), WeatherKind::Rain);
 }
