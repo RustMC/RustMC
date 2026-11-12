@@ -3,10 +3,14 @@
 //! Provides authoritative block entity state attachments indexed by [`BlockPos`],
 //! full mutable state for signs (front and back [`SignSide`] with lines, color,
 //! and glowing flags), and wire codecs for:
-//! - Java 26.3 `ClientboundBlockEntityDataPacket` (`0x07`): position, registry type ID 40,
-//!   and network NBT payload.
-//! - Java 26.3 `ServerboundUpdateSignPacket` (`0x33`): position, front/back selector,
+//! - Java 26.3 `ClientboundBlockEntityDataPacket` (`0x06`): position, block entity
+//!   type ID, and network NBT payload.
+//! - Java 26.3 `ServerboundUpdateSignPacket` (`0x3E`): position, front/back selector,
 //!   and 4 validated UTF-8 lines (capped at 384 bytes each).
+//!
+//! Packet IDs come from the official 26.3 server's packet report and block entity
+//! type IDs from its registry report (`minecraft:block_entity_type`), both produced
+//! with `java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --reports`.
 
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -19,17 +23,17 @@ pub const MAX_LINE_BYTES: usize = 384;
 /// Number of lines on one side of a sign.
 pub const LINES_PER_SIDE: usize = 4;
 
-/// Packet ID for clientbound Block Entity Data packet in Java 26.3.
-pub const PACKET_ID_BLOCK_ENTITY_DATA: u32 = 0x07;
+/// Play clientbound `minecraft:block_entity_data` in the 26.3 packet report.
+pub const PACKET_ID_BLOCK_ENTITY_DATA: u32 = 0x06;
 
-/// Packet ID for serverbound Update Sign packet in Java 26.3.
-pub const PACKET_ID_UPDATE_SIGN: u32 = 0x33;
+/// Play serverbound `minecraft:sign_update` in the 26.3 packet report.
+pub const PACKET_ID_UPDATE_SIGN: u32 = 0x3E;
 
-/// Java 26.3 block entity registry type IDs.
-pub const TYPE_ID_CHEST: u32 = 10;
-pub const TYPE_ID_FURNACE: u32 = 26;
-pub const TYPE_ID_HANGING_SIGN: u32 = 27;
-pub const TYPE_ID_SIGN: u32 = 40;
+/// `minecraft:block_entity_type` protocol IDs in the 26.3 registry report.
+pub const TYPE_ID_FURNACE: u32 = 0;
+pub const TYPE_ID_CHEST: u32 = 1;
+pub const TYPE_ID_SIGN: u32 = 7;
+pub const TYPE_ID_HANGING_SIGN: u32 = 8;
 
 /// Block entity type identifier strings.
 pub const TYPE_NAME_CHEST: &str = "minecraft:chest";
@@ -1083,7 +1087,7 @@ fn read_varint_slice(input: &[u8]) -> Result<(u32, usize), BlockEntityError> {
     Err(BlockEntityError::UnexpectedEof)
 }
 
-/// Java 26.3 Clientbound `BlockEntityDataPacket` (`0x07`).
+/// Java 26.3 Clientbound `BlockEntityDataPacket` (`0x06`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockEntityDataPacket {
     pub pos: BlockPos,
@@ -1143,7 +1147,7 @@ impl BlockEntityDataPacket {
         })
     }
 
-    /// Decodes from a framed packet (skipping frame length and packet ID `0x07`).
+    /// Decodes from a framed packet (skipping frame length and packet ID `0x06`).
     pub fn decode_framed(input: &[u8]) -> Result<Self, BlockEntityError> {
         let (frame_len, len_bytes) = read_varint_slice(input)?;
         let frame_payload = &input[len_bytes..];
@@ -1172,7 +1176,7 @@ impl BlockEntityDataPacket {
     }
 }
 
-/// Java 26.3 Serverbound `UpdateSignPacket` (`0x33`).
+/// Java 26.3 Serverbound `UpdateSignPacket` (`0x3E`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateSignPacket {
     pub pos: BlockPos,
@@ -1266,7 +1270,7 @@ impl UpdateSignPacket {
         })
     }
 
-    /// Decodes from a framed packet (skipping frame length and packet ID `0x33`).
+    /// Decodes from a framed packet (skipping frame length and packet ID `0x3E`).
     pub fn decode_framed(input: &[u8]) -> Result<Self, BlockEntityError> {
         let (frame_len, len_bytes) = read_varint_slice(input)?;
         let frame_payload = &input[len_bytes..];
@@ -1340,6 +1344,27 @@ impl From<SignError> for BlockEntityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hand-built wire fixtures: the IDs are the 26.3 report values, written
+    /// out independently of the module constants.
+    #[test]
+    fn sign_packets_use_the_26_3_wire_ids() {
+        let update = UpdateSignPacket::new(BlockPos::new(0, 64, 0), true, Default::default())
+            .unwrap()
+            .frame();
+        // Length 14, sign_update 62, packed position 64, front, four empty lines.
+        assert_eq!(update, [14, 62, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0]);
+
+        let data =
+            BlockEntityDataPacket::from_sign(BlockPos::new(0, 64, 0), &SignBlockEntity::new())
+                .frame();
+        // Two-byte length (the sign NBT exceeds 127 bytes), then block_entity_data 6,
+        // packed position, and minecraft:sign type 7.
+        assert!(data[0] & 0x80 != 0 && data[1] & 0x80 == 0);
+        assert_eq!(&data[2..12], &[6, 0, 0, 0, 0, 0, 0, 0, 64, 7]);
+        assert_eq!(BlockEntity::Chest.type_id(), 1);
+        assert_eq!(BlockEntity::Furnace.type_id(), 0);
+    }
 
     #[test]
     fn test_block_pos_packing_roundtrip() {
@@ -1668,7 +1693,7 @@ mod tests {
         sign_entry.set_color(true, DyeColor::Yellow).unwrap();
         sign_entry.set_glowing(true, true).unwrap();
 
-        // 5. Server encodes BlockEntityDataPacket (0x07) for observers
+        // 5. Server encodes BlockEntityDataPacket (0x06) for observers
         let sync_packet = BlockEntityDataPacket::from_sign(pos, sign_entry);
         let wire_sync_bytes = sync_packet.frame();
 
