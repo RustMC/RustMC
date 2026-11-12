@@ -243,7 +243,14 @@ impl TryFrom<u32> for PlayerActionStatus {
     }
 }
 
-/// Serverbound PlayerAction (ID `0x24` / 36) packet.
+/// Play serverbound `minecraft:player_action` in the official 26.3 packet report.
+pub const PLAYER_ACTION_ID: u32 = 41;
+/// Play serverbound `minecraft:use_item_on` in the official 26.3 packet report.
+pub const USE_ITEM_ON_ID: u32 = 66;
+/// Play clientbound `minecraft:block_changed_ack` in the official 26.3 packet report.
+pub const BLOCK_CHANGED_ACK_ID: u32 = 4;
+
+/// Serverbound PlayerAction (ID `0x29` / 41) packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerAction {
     pub status: PlayerActionStatus,
@@ -252,7 +259,7 @@ pub struct PlayerAction {
     pub sequence: u32,
 }
 
-/// Decodes a serverbound `PlayerAction` packet (ID `0x24` / 36).
+/// Decodes a serverbound `PlayerAction` packet (ID `0x29` / 41).
 pub fn decode_player_action(body: &[u8]) -> Result<PlayerAction, Error> {
     let Some((status_val, prefix)) = varint(body)? else {
         return Err(Error::Malformed);
@@ -305,7 +312,7 @@ pub fn encode_player_action(action: &PlayerAction) -> Vec<u8> {
     body
 }
 
-/// Serverbound UseItemOn (ID `0x38` / 56) packet.
+/// Serverbound UseItemOn (ID `0x42` / 66) packet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UseItemOn {
     pub hand: u32,
@@ -325,7 +332,7 @@ impl UseItemOn {
     }
 }
 
-/// Decodes a serverbound `UseItemOn` packet (ID `0x38` / 56).
+/// Decodes a serverbound `UseItemOn` packet (ID `0x42` / 66).
 pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     let Some((hand, prefix)) = varint(body)? else {
         return Err(Error::Malformed);
@@ -433,27 +440,27 @@ pub fn encode_use_item_on(action: &UseItemOn) -> Vec<u8> {
     body
 }
 
-/// Emits a framed `AcknowledgeBlockChange` packet (ID `0x05`).
+/// Emits a framed `AcknowledgeBlockChange` packet (ID `0x04`).
 pub fn acknowledge_block_change(sequence: u32) -> Vec<u8> {
     let mut body = Vec::new();
     put_varint(sequence, &mut body);
-    frame(0x05, &body)
+    frame(BLOCK_CHANGED_ACK_ID, &body)
 }
 
-/// Emits an unframed `AcknowledgeBlockChange` packet payload: `[0x05, varint(sequence)]`.
+/// Emits an unframed `AcknowledgeBlockChange` packet payload: `[0x04, varint(sequence)]`.
 pub fn acknowledge_block_change_packet(sequence: u32) -> Vec<u8> {
     let mut packet = Vec::new();
-    put_varint(0x05, &mut packet);
+    put_varint(BLOCK_CHANGED_ACK_ID, &mut packet);
     put_varint(sequence, &mut packet);
     packet
 }
 
-/// Decodes an unframed `AcknowledgeBlockChange` packet payload `[0x05, varint(sequence)]`.
+/// Decodes an unframed `AcknowledgeBlockChange` packet payload `[0x04, varint(sequence)]`.
 pub fn decode_acknowledge_block_change_packet(bytes: &[u8]) -> Result<u32, Error> {
     let Some((id, prefix)) = varint(bytes)? else {
         return Err(Error::Malformed);
     };
-    if id != 0x05 {
+    if id != BLOCK_CHANGED_ACK_ID {
         return Err(Error::Malformed);
     }
     let rest = &bytes[prefix..];
@@ -466,7 +473,7 @@ pub fn decode_acknowledge_block_change_packet(bytes: &[u8]) -> Result<u32, Error
     Ok(sequence)
 }
 
-/// Decodes a framed `AcknowledgeBlockChange` packet: `[varint(length), 0x05, varint(sequence)]`.
+/// Decodes a framed `AcknowledgeBlockChange` packet: `[varint(length), 0x04, varint(sequence)]`.
 pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
     let Some((len, prefix)) = varint(bytes)? else {
         return Err(Error::Malformed);
@@ -709,7 +716,7 @@ impl Session {
                             }
                             preview.pending_keepalive = None;
                         }
-                        36 => {
+                        PLAYER_ACTION_ID => {
                             let action = decode_player_action(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
                         }
@@ -725,12 +732,12 @@ impl Session {
                             // Observer posture commands have no world effect.
                         }
                         46 if body.is_empty() => {} // Punch has no world effect in the preview.
-                        56 => {
+                        USE_ITEM_ON_ID => {
                             let action = decode_use_item_on(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
                         }
                         63 if body == [0] => {} // Spectator action with no target.
-                        41 | 57 | 66 | 67 if !body.is_empty() => {
+                        57 | 67 if !body.is_empty() => {
                             // Creative inputs are bounded by the frame/session limits.
                             // The preview is immutable and does not apply them.
                         }
@@ -1251,19 +1258,19 @@ mod tests {
 
             // Test unframed packet payload round-trip
             let unframed = acknowledge_block_change_packet(seq);
-            assert_eq!(unframed[0], 0x05, "packet ID must be 0x05");
+            assert_eq!(unframed[0], 0x04, "packet ID must be 0x04");
             let decoded_unframed =
                 decode_acknowledge_block_change_packet(&unframed).expect("decode unframed ack");
             assert_eq!(decoded_unframed, seq);
         }
 
         // Exact byte boundary verification for sequence = 1 << 28:
-        // unframed is [0x05, 0x80, 0x80, 0x80, 0x80, 0x01] (6 bytes total).
+        // unframed is [0x04, 0x80, 0x80, 0x80, 0x80, 0x01] (6 bytes total).
         // decode_acknowledge_block_change must reject this unframed payload rather than
-        // misinterpreting 0x05 as frame length 5 and failing on packet ID.
+        // misinterpreting 0x04 as frame length 5 and failing on packet ID.
         let large_seq_unframed = acknowledge_block_change_packet(1 << 28);
         assert_eq!(large_seq_unframed.len(), 6);
-        assert_eq!(large_seq_unframed[0], 0x05);
+        assert_eq!(large_seq_unframed[0], 0x04);
         assert_eq!(
             decode_acknowledge_block_change_packet(&large_seq_unframed).unwrap(),
             1 << 28
@@ -1274,9 +1281,9 @@ mod tests {
         );
 
         // Test exact byte encoding for known sequences
-        assert_eq!(acknowledge_block_change_packet(0), vec![0x05, 0x00]);
-        assert_eq!(acknowledge_block_change_packet(1), vec![0x05, 0x01]);
-        assert_eq!(acknowledge_block_change_packet(128), vec![0x05, 0x80, 0x01]);
+        assert_eq!(acknowledge_block_change_packet(0), vec![0x04, 0x00]);
+        assert_eq!(acknowledge_block_change_packet(1), vec![0x04, 0x01]);
+        assert_eq!(acknowledge_block_change_packet(128), vec![0x04, 0x80, 0x01]);
 
         // Malformed AcknowledgeBlockChange
         assert_eq!(decode_acknowledge_block_change(&[]), Err(Error::Malformed));
@@ -1285,15 +1292,15 @@ mod tests {
             Err(Error::Malformed)
         );
         assert_eq!(
-            decode_acknowledge_block_change_packet(&[0x04, 0x01]),
+            decode_acknowledge_block_change_packet(&[0x05, 0x01]),
             Err(Error::Malformed)
-        ); // Wrong ID
+        ); // Wrong ID (block_destruction)
         assert_eq!(
-            decode_acknowledge_block_change_packet(&[0x05, 0x80]),
+            decode_acknowledge_block_change_packet(&[0x04, 0x80]),
             Err(Error::Malformed)
         ); // Truncated varint
         assert_eq!(
-            decode_acknowledge_block_change_packet(&[0x05, 0x01, 0x99]),
+            decode_acknowledge_block_change_packet(&[0x04, 0x01, 0x99]),
             Err(Error::Malformed)
         ); // Trailing byte
     }
@@ -1353,7 +1360,10 @@ mod tests {
             sequence: 12,
         };
         let responses = s
-            .receive(&frame(0x24, &encode_player_action(&action)), 4096)
+            .receive(
+                &frame(PLAYER_ACTION_ID, &encode_player_action(&action)),
+                4096,
+            )
             .unwrap();
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], acknowledge_block_change(12));
@@ -1371,7 +1381,7 @@ mod tests {
             sequence: 15,
         };
         let responses = s
-            .receive(&frame(0x38, &encode_use_item_on(&use_item)), 4096)
+            .receive(&frame(USE_ITEM_ON_ID, &encode_use_item_on(&use_item)), 4096)
             .unwrap();
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], acknowledge_block_change(15));
@@ -1380,7 +1390,7 @@ mod tests {
         let mut malformed_action = encode_player_action(&action);
         malformed_action.push(0xff); // Trailing byte
         assert_eq!(
-            s.receive(&frame(0x24, &malformed_action), 4096),
+            s.receive(&frame(PLAYER_ACTION_ID, &malformed_action), 4096),
             Err(Error::Malformed)
         );
 
@@ -1395,7 +1405,7 @@ mod tests {
         bad_cursor_use.push(0);
         put_varint(1, &mut bad_cursor_use);
         assert_eq!(
-            s.receive(&frame(0x38, &bad_cursor_use), 4096),
+            s.receive(&frame(USE_ITEM_ON_ID, &bad_cursor_use), 4096),
             Err(Error::Malformed)
         );
     }
