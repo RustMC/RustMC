@@ -126,9 +126,22 @@ struct Connection {
     /// Start of the current play-phase read window and bytes read within it.
     rate_window: Instant,
     rate_window_bytes: usize,
+    /// When the session entered play; the play lifetime counts from here.
+    play_started: Option<Instant>,
 }
 
 impl Connection {
+    /// Whether this connection has outlived its phase's limit. Before play the
+    /// limit counts from accept; in play it counts from entering play, so a
+    /// slow login never eats into the play lifetime.
+    fn lifetime_expired(&self, config: &ListenerConfig, playing: bool) -> bool {
+        let (start, limit_ms) = match self.play_started {
+            Some(started) if playing => (started, config.preview_session_lifetime_ms),
+            _ => (self.created, config.max_connection_lifetime_ms),
+        };
+        start.elapsed() >= Duration::from_millis(limit_ms)
+    }
+
     /// Bytes this connection may read now, and the per-call decode limit.
     ///
     /// Before play the whole session is capped. During play input is rate
@@ -496,6 +509,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         pending_chunk_since: None,
                         rate_window: Instant::now(),
                         rate_window_bytes: 0,
+                        play_started: None,
                     });
                     observe(event(
                         "connection_accepted",
@@ -528,14 +542,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         while index < connections.len() {
             let connection = &mut connections[index];
             let playing = connection.discovery.state() == discovery_java::State::Play;
-            let lifetime_ms = if playing {
-                config.preview_session_lifetime_ms
-            } else {
-                config.max_connection_lifetime_ms
-            };
             let (read_len, byte_limit) = connection.read_allowance(config, playing);
             let mut buffer = [0u8; READ_CHUNK];
-            let reason = if connection.created.elapsed() >= Duration::from_millis(lifetime_ms) {
+            let reason = if connection.lifetime_expired(config, playing) {
                 Some("lifetime_timeout")
             } else if read_len == 0 && !playing {
                 Some("read_limit")
@@ -557,6 +566,11 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         match connection.discovery.receive(&buffer[..count], byte_limit) {
                             Ok(replies) => {
                                 let state_after = connection.discovery.state();
+                                if state_after == discovery_java::State::Play
+                                    && connection.play_started.is_none()
+                                {
+                                    connection.play_started = Some(Instant::now());
+                                }
                                 if state_before != state_after {
                                     let milestone = match state_after {
                                         discovery_java::State::Configuration => {
@@ -740,6 +754,7 @@ mod tests {
             pending_chunk_since: None,
             rate_window: Instant::now(),
             rate_window_bytes: 0,
+            play_started: None,
         };
         (connection, client)
     }
@@ -775,6 +790,27 @@ mod tests {
         connection.rate_window = Instant::now() - READ_RATE_WINDOW;
         assert_eq!(connection.read_allowance(&config, true).0, READ_CHUNK);
         assert_eq!(connection.rate_window_bytes, 0);
+    }
+
+    #[test]
+    fn play_lifetime_counts_from_entering_play_not_from_accept() {
+        let config = ListenerConfig {
+            max_connection_lifetime_ms: 60_000,
+            preview_session_lifetime_ms: 10_000,
+            ..ListenerConfig::default()
+        };
+        let (mut connection, _client) = loopback_connection();
+        // Login and configuration took 30 s: past the play limit, within the
+        // pre-play limit.
+        connection.created = Instant::now() - Duration::from_secs(30);
+        assert!(!connection.lifetime_expired(&config, false));
+        connection.play_started = Some(Instant::now());
+        assert!(!connection.lifetime_expired(&config, true));
+        connection.play_started = Some(Instant::now() - Duration::from_secs(10));
+        assert!(connection.lifetime_expired(&config, true));
+        // Before play, the accept-time limit still applies.
+        connection.created = Instant::now() - Duration::from_secs(60);
+        assert!(connection.lifetime_expired(&config, false));
     }
 
     #[test]

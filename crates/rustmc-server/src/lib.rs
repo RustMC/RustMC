@@ -8,6 +8,7 @@ pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod java_packets;
 pub mod java_preview;
+mod java_wire;
 pub mod preview_cache;
 pub mod preview_data;
 pub mod runtime;

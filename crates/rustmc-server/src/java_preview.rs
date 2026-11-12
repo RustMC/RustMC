@@ -2,7 +2,7 @@
 //! IDs and field layouts: official 26.3 packet/block reports and codec metadata.
 
 use crate::{
-    discovery_java::{frame, put_string, put_varint},
+    java_wire::{frame, put_string, put_varint},
     preview_data::RegistryManifest,
     world::{Biome, Block, Chunk, Generator},
 };

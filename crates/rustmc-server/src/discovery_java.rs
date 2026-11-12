@@ -1,6 +1,7 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
+use crate::java_wire::{frame, put_string, put_varint};
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
@@ -63,35 +64,6 @@ fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
     } else {
         Ok(None)
     }
-}
-
-pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-pub(crate) fn frame(id: u32, body: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    put_varint(id, &mut packet);
-    packet.extend_from_slice(body);
-    let mut out = Vec::new();
-    put_varint(packet.len() as u32, &mut out);
-    out.extend(packet);
-    out
-}
-
-pub(crate) fn put_string(value: &str, out: &mut Vec<u8>) {
-    put_varint(value.len() as u32, out);
-    out.extend_from_slice(value.as_bytes());
 }
 
 fn read_string(input: &[u8]) -> Result<(&str, &[u8]), Error> {

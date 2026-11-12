@@ -39,7 +39,7 @@ pub mod registry;
 
 use std::collections::BTreeSet;
 
-use crate::discovery_java::{frame, put_varint};
+use crate::java_wire::{frame, put_varint};
 use crate::vanilla::generator::VanillaGenerator;
 
 pub use registry::{

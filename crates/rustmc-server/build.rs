@@ -10,7 +10,12 @@ use std::{
 };
 
 /// Directories and files whose contents shape preview chunk packets.
-const PACKET_SOURCES: &[&str] = &["src/vanilla", "src/chunk_adapter", "src/java_packets.rs"];
+const PACKET_SOURCES: &[&str] = &[
+    "src/vanilla",
+    "src/chunk_adapter",
+    "src/java_packets.rs",
+    "src/java_wire.rs",
+];
 
 fn collect(path: &Path, files: &mut Vec<PathBuf>) {
     if path.is_dir() {
