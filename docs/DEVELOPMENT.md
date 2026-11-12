@@ -27,10 +27,12 @@ Schema 1 requires `schema_version = 1` and `log_level` (`error`, `warn`, `info`,
 | `max_connections` | `8` | `1..=64` simultaneous accepted sockets |
 | `max_bytes_per_connection` | `4096` | `1..=65536` bytes read before closure |
 | `idle_timeout_ms` | `1000` | `10..=60000` ms without received data |
-| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms for discovery, or up to `3600000` ms for the opt-in local Java preview; must be at least idle timeout |
+| `max_connection_lifetime_ms` | `10000` | `10..=60000` ms for discovery, or up to `3600000` ms for the opt-in local Java preview; must be at least idle timeout. Applies until a preview client reaches play. |
 | `local_java_preview` | `false` | Boolean; enables the unauthenticated local Java 26.3 Creative terrain preview when a matching manifest is supplied. |
 | `preview_registry_manifest` | absent | Path to locally prepared, version-checked 26.3 registry identifier/tag metadata. Required for world entry. |
-| `preview_seed` | `0` | Integer `0..=9223372036854775807`, used only for original preview generation. |
+| `preview_seed` | `0` | Any signed 64-bit integer, like a vanilla seed. Non-negative seeds produce the same original preview terrain as before. |
+| `preview_session_lifetime_ms` | `600000` | Integer `10000..=3600000`; total lifetime of a preview connection once it reaches play. |
+| `preview_read_bytes_per_second` | `65536` | Integer `1024..=1048576`; client bytes read per second during play. Extra input waits in the socket (TCP backpressure) instead of closing the session. |
 | `preview_view_distance` | `4` | Integer `2..=32` chunks. Radius 32 permits up to 4,225 loaded chunk coordinates per client; only one batch is in flight, containing at most 16 chunks within a 768 KiB encoding budget. |
 | `preview_terrain` | `"preview"` | `"preview"` or `"experimental"`. Experimental selects the opt-in octave-noise terrain field (T1 groundwork); biome labels, surface blocks, and trees stay on the ADR-0013 preview rules. Neither option is vanilla generation. |
 | `vanilla_data_root` | absent | Operator-local Java 26.3 worldgen data root for a data-driven Overworld probe; requires the registry table, local preview, manifest, and `max_connections = 1`. |

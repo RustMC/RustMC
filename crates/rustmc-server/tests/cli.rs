@@ -334,6 +334,40 @@ mod runtime_cli {
     }
 
     #[test]
+    fn discovery_only_login_receives_a_reason_and_closes() {
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .write_all(&[8, 0, 0x89, 0x06, 1, b'x', 0x63, 0xdd, 2])
+            .unwrap();
+        let mut hello = vec![22, 0, 4];
+        hello.extend_from_slice(b"Test");
+        hello.extend_from_slice(&[7; 16]);
+        socket.write_all(&hello).unwrap();
+        let mut reply = Vec::new();
+        socket.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply[1], 0, "login_disconnect packet");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("{\"text\":\"RustMC is discovery-only; login is unavailable.\"}"));
+        server.stop();
+    }
+
+    #[test]
     fn binds_limits_times_out_and_stops_cleanly() {
         let dir = TempDir::new();
         let path = dir.file(&config(0));

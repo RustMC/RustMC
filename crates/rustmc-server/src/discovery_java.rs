@@ -1,11 +1,24 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
+use crate::java_packets::{configuration, handshake, intent, login, play, status};
+use crate::java_wire::{frame, put_string, put_varint};
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
 pub const VERSION: &str = "26.3";
 pub const MAX_FRAME: usize = 4096;
+/// Longest handshake host or known-pack string accepted, in bytes.
+const MAX_SHORT_STRING: usize = 255;
+/// Most known packs a client may list in its reply.
+const MAX_KNOWN_PACKS: u32 = 16;
+/// Vanilla offline-mode player names are 3 to 16 ASCII word characters.
+const PLAYER_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=16;
+const UUID_BYTES: usize = 16;
+
+/// Login refusals sent as a plain JSON text component; static ASCII only.
+const DISCOVERY_ONLY_REASON: &str = "RustMC is discovery-only; login is unavailable.";
+const VERSION_REASON: &str = "RustMC local preview requires Java 26.3 (protocol 777).";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -13,11 +26,16 @@ pub enum State {
     Status,
     Ping,
     Login,
+    /// Login was requested but is unavailable; the hello receives a reason.
+    LoginRefused(&'static str),
     LoginAcknowledgement,
     Configuration,
     ConfigurationData,
     Play,
+    /// Status exchange finished.
     Done,
+    /// A refusal reason was queued; the connection closes after it flushes.
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,41 +66,12 @@ fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
     }
 }
 
-pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-pub(crate) fn frame(id: u32, body: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    put_varint(id, &mut packet);
-    packet.extend_from_slice(body);
-    let mut out = Vec::new();
-    put_varint(packet.len() as u32, &mut out);
-    out.extend(packet);
-    out
-}
-
-pub(crate) fn put_string(value: &str, out: &mut Vec<u8>) {
-    put_varint(value.len() as u32, out);
-    out.extend_from_slice(value.as_bytes());
-}
-
 fn read_string(input: &[u8]) -> Result<(&str, &[u8]), Error> {
     let Some((length, prefix)) = varint(input)? else {
         return Err(Error::Malformed);
     };
     let length = length as usize;
-    if length > 255 || input.len() < prefix + length {
+    if length > MAX_SHORT_STRING || input.len() < prefix + length {
         return Err(Error::Malformed);
     }
     let value =
@@ -96,7 +85,7 @@ fn known_packs() -> Vec<u8> {
     for text in ["minecraft", "core", VERSION] {
         put_string(text, &mut body);
     }
-    frame(15, &body)
+    frame(configuration::clientbound::SELECT_KNOWN_PACKS, &body)
 }
 
 fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
@@ -107,14 +96,17 @@ fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
         put_string(entry, &mut body);
         body.push(0); // Entry definition comes from the negotiated core pack.
     }
-    frame(7, &body)
+    frame(configuration::clientbound::REGISTRY_DATA, &body)
 }
 
 fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
     let mut features = Vec::new();
     put_varint(1, &mut features);
     put_string("minecraft:vanilla", &mut features);
-    let mut packets = vec![frame(13, &features)];
+    let mut packets = vec![frame(
+        configuration::clientbound::UPDATE_ENABLED_FEATURES,
+        &features,
+    )];
     if let Some(manifest) = manifest {
         for (registry, entries) in &manifest.registries {
             packets.push(registry_data(registry, entries));
@@ -135,8 +127,8 @@ fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
             }
         }
     }
-    packets.push(frame(14, &tags));
-    packets.push(frame(3, &[]));
+    packets.push(frame(configuration::clientbound::UPDATE_TAGS, &tags));
+    packets.push(frame(configuration::clientbound::FINISH_CONFIGURATION, &[]));
     packets
 }
 
@@ -144,7 +136,7 @@ fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
     let Some((count, prefix)) = varint(body)? else {
         return Err(Error::Malformed);
     };
-    if count > 16 {
+    if count > MAX_KNOWN_PACKS {
         return Err(Error::Oversized);
     }
     let mut remaining = &body[prefix..];
@@ -173,9 +165,44 @@ fn status(local_preview: bool) -> Vec<u8> {
         "{{\"version\":{{\"name\":\"{VERSION}\",\"protocol\":{PROTOCOL}}},\"players\":{{\"max\":0,\"online\":0}},\"description\":{{\"text\":\"{description}\"}}}}"
     );
     let mut body = Vec::new();
-    put_varint(json.len() as u32, &mut body);
-    body.extend_from_slice(json.as_bytes());
-    frame(0, &body)
+    put_string(&json, &mut body);
+    frame(status::clientbound::STATUS_RESPONSE, &body)
+}
+
+/// Login-phase disconnect carrying a JSON text component.
+fn login_disconnect(reason: &'static str) -> Vec<u8> {
+    // Reasons are fixed ASCII constants without quotes or backslashes.
+    debug_assert!(reason.is_ascii() && !reason.contains(['"', '\\']));
+    let mut body = Vec::new();
+    put_string(&format!("{{\"text\":\"{reason}\"}}"), &mut body);
+    frame(login::clientbound::LOGIN_DISCONNECT, &body)
+}
+
+/// Validate a login `hello` body: player name followed by the client UUID.
+fn read_hello(body: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let Some((name_len, prefix)) = varint(body)? else {
+        return Err(Error::Malformed);
+    };
+    let name_len = name_len as usize;
+    if !PLAYER_NAME_LENGTH.contains(&name_len) || body.len() != prefix + name_len + UUID_BYTES {
+        return Err(Error::Malformed);
+    }
+    let name = &body[prefix..prefix + name_len];
+    if !name
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Err(Error::Malformed);
+    }
+    Ok((name, &body[prefix + name_len..]))
+}
+
+fn all_finite<const N: usize>(bytes: &[u8], decode: fn([u8; N]) -> f64) -> bool {
+    bytes
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .all(|v| decode(*v).is_finite())
 }
 
 pub struct Session {
@@ -237,12 +264,22 @@ impl Session {
         self.registry_manifest = Some(manifest);
         self
     }
+
+    /// Decode complete frames from `bytes`.
+    ///
+    /// Before play, `limit` caps the session's cumulative input. During play the
+    /// caller enforces a rate budget instead, so `limit` caps only one read.
     pub fn receive(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, Error> {
         self.bytes = self
             .bytes
             .checked_add(bytes.len())
             .ok_or(Error::Oversized)?;
-        if self.bytes > limit || self.input.len().saturating_add(bytes.len()) > MAX_FRAME + 5 {
+        let counted = if self.state == State::Play {
+            bytes.len()
+        } else {
+            self.bytes
+        };
+        if counted > limit || self.input.len().saturating_add(bytes.len()) > MAX_FRAME + 5 {
             return Err(Error::Oversized);
         }
         self.input.extend_from_slice(bytes);
@@ -263,188 +300,204 @@ impl Session {
             let Some((id, id_len)) = varint(&packet)? else {
                 return Err(Error::Malformed);
             };
-            let body = &packet[id_len..];
-            match (self.state, id) {
-                (State::Handshake, 0) => {
-                    let Some((version, n)) = varint(body)? else {
-                        return Err(Error::Malformed);
-                    };
-                    let body = &body[n..];
-                    let Some((host_len, n)) = varint(body)? else {
-                        return Err(Error::Malformed);
-                    };
-                    let host_len = host_len as usize;
-                    if host_len > 255 || body.len() < n + host_len + 2 {
-                        return Err(Error::Malformed);
-                    }
-                    if std::str::from_utf8(&body[n..n + host_len]).is_err() {
-                        return Err(Error::Malformed);
-                    }
-                    let rest = &body[n + host_len + 2..];
-                    let Some((next, n)) = varint(rest)? else {
-                        return Err(Error::Malformed);
-                    };
-                    if n != rest.len() {
-                        return Err(Error::WrongState);
-                    }
-                    self.state = match next {
-                        1 => State::Status,
-                        2 if self.local_preview && version == PROTOCOL as u32 => State::Login,
-                        _ => return Err(Error::WrongState),
-                    };
-                }
-                (State::Status, 0) if body.is_empty() => {
-                    responses.push(status(self.local_preview));
-                    self.state = State::Ping;
-                }
-                (State::Ping, 1) if body.len() == 8 => {
-                    responses.push(frame(1, body));
-                    self.state = State::Done;
-                }
-                (State::Login, 0) => {
-                    let Some((name_len, prefix)) = varint(body)? else {
-                        return Err(Error::Malformed);
-                    };
-                    let name_len = name_len as usize;
-                    if !(3..=16).contains(&name_len) || body.len() != prefix + name_len + 16 {
-                        return Err(Error::Malformed);
-                    }
-                    let name = &body[prefix..prefix + name_len];
-                    if !name
-                        .iter()
-                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                    {
-                        return Err(Error::Malformed);
-                    }
-                    // The client UUID is an opaque, unverified local-session value.
-                    let mut success = body[prefix + name_len..].to_vec();
-                    put_varint(name_len as u32, &mut success);
-                    success.extend_from_slice(name);
-                    put_varint(0, &mut success); // No profile properties or signed textures.
-                    // 26.3 appends a separate connection-scoped session UUID. This is
-                    // only a local identifier; it grants no authenticated identity.
-                    success.extend_from_slice(&self.session_id);
-                    responses.push(frame(2, &success));
-                    self.state = State::LoginAcknowledgement;
-                }
-                (State::LoginAcknowledgement, 3) if body.is_empty() => {
-                    self.state = State::Configuration;
-                    responses.push(known_packs());
-                }
-                (State::Configuration, 0 | 2) => {} // No effect; bounded by the frame cap.
-                (State::Configuration, 7) => {
-                    if !recognizes_core_pack(body)? {
-                        return Err(Error::WrongState);
-                    }
-                    self.state = State::ConfigurationData;
-                    if self.registry_manifest.is_some() {
-                        responses.extend(initial_configuration(self.registry_manifest.as_deref()));
-                    }
-                }
-                (State::ConfigurationData, 3) if body.is_empty() => {
-                    let manifest = self.registry_manifest.as_ref().ok_or(Error::WrongState)?;
-                    let preview = if let Some(source) = &self.vanilla_source {
-                        crate::java_preview::Preview::new_vanilla(
-                            self.preview_radius,
-                            manifest,
-                            source.clone(),
-                        )
-                    } else {
-                        crate::java_preview::Preview::new(
-                            self.preview_seed,
-                            self.preview_radius,
-                            self.preview_terrain,
-                            manifest,
-                        )
-                    }
-                    .ok_or(Error::Malformed)?;
-                    responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
-                    self.preview = Some(preview);
-                    self.state = State::Play;
-                }
-                (State::Play, id) => {
-                    let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
-                    match id {
-                        0 if body.len() == 33 && body[0] == 1 => {
-                            if !body[1..25]
-                                .as_chunks::<8>()
-                                .0
-                                .iter()
-                                .all(|v| f64::from_be_bytes(*v).is_finite())
-                                || !body[25..]
-                                    .as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .all(|v| f32::from_be_bytes(*v).is_finite())
-                            {
-                                return Err(Error::Malformed);
-                            }
-                            preview.teleport_acknowledged = true;
-                        }
-                        44 if body.is_empty() => preview.client_loaded = true,
-                        13 if body.is_empty() => {}
-                        30 | 31 if body.len() == (if id == 30 { 25 } else { 33 }) => {
-                            let xyz: Vec<f64> = body[..24]
-                                .as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|v| f64::from_be_bytes(*v))
-                                .collect();
-                            preview
-                                .move_to(xyz[0], xyz[1], xyz[2])
-                                .map_err(|_| Error::Malformed)?;
-                        }
-                        32 if body.len() == 9 => {}
-                        33 | 40 | 43 if body.len() == 1 => {}
-                        11 if body.len() == 4 => {
-                            let rate = f32::from_be_bytes(body.try_into().unwrap());
-                            if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
-                                return Err(Error::Malformed);
-                            }
-                            preview.awaiting_batch = false;
-                        }
-                        28 if body.len() == 8 => {
-                            let id = u64::from_be_bytes(body.try_into().unwrap());
-                            if preview.pending_keepalive != Some(id) {
-                                return Err(Error::Malformed);
-                            }
-                            preview.pending_keepalive = None;
-                        }
-                        42 => {
-                            let mut rest = body;
-                            for _ in 0..3 {
-                                let (_, n) = varint(rest)?.ok_or(Error::Malformed)?;
-                                rest = &rest[n..];
-                            }
-                            if !rest.is_empty() {
-                                return Err(Error::Malformed);
-                            }
-                            // Observer posture commands have no world effect.
-                        }
-                        46 if body.is_empty() => {} // Punch has no world effect in the preview.
-                        63 if body == [0] => {}     // Spectator action with no target.
-                        41 | 57 | 66 | 67 if !body.is_empty() => {
-                            // Creative inputs are bounded by the frame/session limits.
-                            // The preview is immutable and does not apply them.
-                        }
-                        54 if body.len() == 2 => {} // Selected hotbar slot is client-local here.
-                        14 | 22 => {} // Bounded information/custom payloads have no effect.
-                        _ => {
-                            eprintln!(
-                                "event=preview_unsupported_packet packet_id={id} bytes={}",
-                                body.len()
-                            );
-                            return Err(Error::WrongState);
-                        }
-                    }
-                }
-                (State::Configuration | State::ConfigurationData, _) => {
-                    return Err(Error::WrongState);
-                }
-                _ => return Err(Error::WrongState),
-            }
+            self.handle(id, &packet[id_len..], &mut responses)?;
         }
         Ok(responses)
+    }
+
+    fn handle(&mut self, id: u32, body: &[u8], responses: &mut Vec<Vec<u8>>) -> Result<(), Error> {
+        match (self.state, id) {
+            (State::Handshake, handshake::serverbound::INTENTION) => self.handshake(body)?,
+            (State::Status, status::serverbound::STATUS_REQUEST) if body.is_empty() => {
+                responses.push(status(self.local_preview));
+                self.state = State::Ping;
+            }
+            (State::Ping, status::serverbound::PING_REQUEST) if body.len() == 8 => {
+                responses.push(frame(status::clientbound::PONG_RESPONSE, body));
+                self.state = State::Done;
+            }
+            (State::LoginRefused(reason), login::serverbound::HELLO) => {
+                read_hello(body)?;
+                responses.push(login_disconnect(reason));
+                self.state = State::Refused;
+            }
+            (State::Login, login::serverbound::HELLO) => {
+                let (name, client_uuid) = read_hello(body)?;
+                // The client UUID is an opaque, unverified local-session value.
+                let mut success = client_uuid.to_vec();
+                put_varint(name.len() as u32, &mut success);
+                success.extend_from_slice(name);
+                put_varint(0, &mut success); // No profile properties or signed textures.
+                // 26.3 appends a separate connection-scoped session UUID. This is
+                // only a local identifier; it grants no authenticated identity.
+                success.extend_from_slice(&self.session_id);
+                responses.push(frame(login::clientbound::LOGIN_FINISHED, &success));
+                self.state = State::LoginAcknowledgement;
+            }
+            (State::LoginAcknowledgement, login::serverbound::LOGIN_ACKNOWLEDGED)
+                if body.is_empty() =>
+            {
+                self.state = State::Configuration;
+                responses.push(known_packs());
+            }
+            (
+                State::Configuration,
+                configuration::serverbound::CLIENT_INFORMATION
+                | configuration::serverbound::CUSTOM_PAYLOAD,
+            ) => {} // No effect; bounded by the frame cap.
+            (State::Configuration, configuration::serverbound::SELECT_KNOWN_PACKS) => {
+                if !recognizes_core_pack(body)? {
+                    return Err(Error::WrongState);
+                }
+                self.state = State::ConfigurationData;
+                if self.registry_manifest.is_some() {
+                    responses.extend(initial_configuration(self.registry_manifest.as_deref()));
+                }
+            }
+            (State::ConfigurationData, configuration::serverbound::FINISH_CONFIGURATION)
+                if body.is_empty() =>
+            {
+                self.start_play(responses)?
+            }
+            (State::Play, id) => self.play(id, body)?,
+            _ => return Err(Error::WrongState),
+        }
+        Ok(())
+    }
+
+    fn handshake(&mut self, body: &[u8]) -> Result<(), Error> {
+        let Some((version, n)) = varint(body)? else {
+            return Err(Error::Malformed);
+        };
+        let body = &body[n..];
+        let Some((host_len, n)) = varint(body)? else {
+            return Err(Error::Malformed);
+        };
+        let host_len = host_len as usize;
+        if host_len > MAX_SHORT_STRING || body.len() < n + host_len + 2 {
+            return Err(Error::Malformed);
+        }
+        if std::str::from_utf8(&body[n..n + host_len]).is_err() {
+            return Err(Error::Malformed);
+        }
+        let rest = &body[n + host_len + 2..];
+        let Some((next, n)) = varint(rest)? else {
+            return Err(Error::Malformed);
+        };
+        if n != rest.len() {
+            return Err(Error::WrongState);
+        }
+        self.state = match next {
+            intent::STATUS => State::Status,
+            intent::LOGIN if !self.local_preview => State::LoginRefused(DISCOVERY_ONLY_REASON),
+            intent::LOGIN if version != PROTOCOL as u32 => State::LoginRefused(VERSION_REASON),
+            intent::LOGIN => State::Login,
+            _ => return Err(Error::WrongState),
+        };
+        Ok(())
+    }
+
+    fn start_play(&mut self, responses: &mut Vec<Vec<u8>>) -> Result<(), Error> {
+        let manifest = self.registry_manifest.as_ref().ok_or(Error::WrongState)?;
+        let preview = if let Some(source) = &self.vanilla_source {
+            crate::java_preview::Preview::new_vanilla(self.preview_radius, manifest, source.clone())
+        } else {
+            crate::java_preview::Preview::new(
+                self.preview_seed,
+                self.preview_radius,
+                self.preview_terrain,
+                manifest,
+            )
+        }
+        .ok_or(Error::Malformed)?;
+        responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
+        self.preview = Some(preview);
+        self.state = State::Play;
+        Ok(())
+    }
+
+    fn play(&mut self, id: u32, body: &[u8]) -> Result<(), Error> {
+        use play::serverbound as sb;
+        let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
+        match id {
+            // Teleport ID 1 followed by position, velocity, and rotation.
+            sb::ACCEPT_TELEPORTATION if body.len() == 33 && body[0] == 1 => {
+                if !all_finite::<8>(&body[1..25], f64::from_be_bytes)
+                    || !all_finite::<4>(&body[25..], |v| f64::from(f32::from_be_bytes(v)))
+                {
+                    return Err(Error::Malformed);
+                }
+                preview.teleport_acknowledged = true;
+            }
+            sb::PLAYER_LOADED if body.is_empty() => preview.client_loaded = true,
+            sb::CLIENT_TICK_END if body.is_empty() => {}
+            sb::MOVE_PLAYER_POS | sb::MOVE_PLAYER_POS_ROT
+                if body.len() == (if id == sb::MOVE_PLAYER_POS { 25 } else { 33 }) =>
+            {
+                // `move_to` rejects non-finite and out-of-range coordinates.
+                let xyz: Vec<f64> = body[..24]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| f64::from_be_bytes(*v))
+                    .collect();
+                preview
+                    .move_to(xyz[0], xyz[1], xyz[2])
+                    .map_err(|_| Error::Malformed)?;
+            }
+            sb::MOVE_PLAYER_ROT if body.len() == 9 => {}
+            sb::MOVE_PLAYER_STATUS_ONLY | sb::PLAYER_ABILITIES | sb::PLAYER_INPUT
+                if body.len() == 1 => {}
+            sb::CHUNK_BATCH_RECEIVED if body.len() == 4 => {
+                let rate = f32::from_be_bytes(body.try_into().map_err(|_| Error::Malformed)?);
+                if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
+                    return Err(Error::Malformed);
+                }
+                preview.awaiting_batch = false;
+            }
+            sb::KEEP_ALIVE if body.len() == 8 => {
+                let id = u64::from_be_bytes(body.try_into().map_err(|_| Error::Malformed)?);
+                if preview.pending_keepalive != Some(id) {
+                    return Err(Error::Malformed);
+                }
+                preview.pending_keepalive = None;
+            }
+            sb::PLAYER_COMMAND => {
+                // Entity ID, action, and data: three VarInts with no world effect.
+                let mut rest = body;
+                for _ in 0..3 {
+                    let (_, n) = varint(rest)?.ok_or(Error::Malformed)?;
+                    rest = &rest[n..];
+                }
+                if !rest.is_empty() {
+                    return Err(Error::Malformed);
+                }
+            }
+            sb::PUNCH if body.is_empty() => {} // No world effect in the preview.
+            sb::SPECTATOR_ACTION if body == [0] => {} // No target.
+            sb::PLAYER_ACTION
+            | sb::SET_CREATIVE_MODE_SLOT
+            | sb::USE_ITEM_ON
+            | sb::USE_ITEM
+            | sb::PICK_ITEM_FROM_BLOCK
+            | sb::PICK_ITEM_FROM_ENTITY
+            | sb::CONTAINER_CLOSE
+                if !body.is_empty() =>
+            {
+                // Creative inputs are bounded by the frame/session limits.
+                // The preview is immutable and does not apply them.
+            }
+            sb::SET_CARRIED_ITEM if body.len() == 2 => {} // Client-local here.
+            sb::CLIENT_INFORMATION | sb::CUSTOM_PAYLOAD => {} // Bounded; no effect.
+            _ => {
+                eprintln!(
+                    "event=preview_unsupported_packet packet_id={id} bytes={}",
+                    body.len()
+                );
+                return Err(Error::WrongState);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -504,21 +557,47 @@ mod tests {
             Err(Error::Oversized)
         );
     }
+    fn hello(name: &[u8]) -> Vec<u8> {
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.extend_from_slice(&[7; 16]);
+        frame(login::serverbound::HELLO, &body)
+    }
+
+    fn assert_refused(mut session: Session, version: u32, reason: &str) {
+        let mut h = handshake(version);
+        *h.last_mut().unwrap() = 2;
+        assert!(session.receive(&h, 4096).unwrap().is_empty());
+        let reply = session.receive(&hello(b"Test"), 4096).unwrap();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0][1], login::clientbound::LOGIN_DISCONNECT as u8);
+        let text = String::from_utf8_lossy(&reply[0]);
+        assert!(text.contains(&format!("{{\"text\":\"{reason}\"}}")));
+        assert_eq!(session.state(), State::Refused);
+        // Nothing further is accepted after the refusal.
+        assert_eq!(
+            session.receive(&hello(b"Test"), 4096),
+            Err(Error::WrongState)
+        );
+    }
+
     #[test]
-    fn login_is_rejected() {
+    fn discovery_only_login_is_refused_with_a_reason() {
+        assert_refused(Session::default(), 777, DISCOVERY_ONLY_REASON);
+    }
+
+    #[test]
+    fn refused_login_still_validates_the_hello() {
         let mut h = handshake(777);
         *h.last_mut().unwrap() = 2;
-        assert_eq!(Session::default().receive(&h, 4096), Err(Error::WrongState));
+        let mut session = Session::default();
+        session.receive(&h, 4096).unwrap();
+        assert_eq!(session.receive(&hello(b"x!"), 4096), Err(Error::Malformed));
     }
 
     #[test]
     fn local_preview_login_is_version_gated_and_unverified() {
-        let mut old = handshake(766);
-        *old.last_mut().unwrap() = 2;
-        assert_eq!(
-            Session::new(true).receive(&old, 4096),
-            Err(Error::WrongState)
-        );
+        assert_refused(Session::new(true), 766, VERSION_REASON);
         let mut current = handshake(777);
         *current.last_mut().unwrap() = 2;
         let mut s = Session::new(true);
@@ -539,6 +618,74 @@ mod tests {
         }
         s.receive(&frame(7, &known), 4096).unwrap();
         assert_eq!(s.state(), State::ConfigurationData);
+    }
+
+    /// Drive a local preview session through login and configuration into play.
+    fn playing_session() -> Session {
+        let manifest = RegistryManifest {
+            tags: Vec::new(),
+            registries: vec![
+                (
+                    "minecraft:dimension_type".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:world_clock".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:worldgen/biome".into(),
+                    crate::world::Biome::ALL
+                        .iter()
+                        .map(|b| b.identifier().into())
+                        .collect(),
+                ),
+            ],
+        };
+        let mut s = Session::new(true).with_registry_manifest(Arc::new(manifest));
+        let mut h = handshake(777);
+        *h.last_mut().unwrap() = intent::LOGIN as u8;
+        s.receive(&h, 4096).unwrap();
+        s.receive(&hello(b"Test"), 4096).unwrap();
+        s.receive(&frame(login::serverbound::LOGIN_ACKNOWLEDGED, &[]), 4096)
+            .unwrap();
+        let mut known = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known);
+        }
+        s.receive(
+            &frame(configuration::serverbound::SELECT_KNOWN_PACKS, &known),
+            4096,
+        )
+        .unwrap();
+        s.receive(
+            &frame(configuration::serverbound::FINISH_CONFIGURATION, &[]),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(s.state(), State::Play);
+        s
+    }
+
+    #[test]
+    fn preview_ignores_creative_inputs_but_rejects_unknown_packets() {
+        use play::serverbound as sb;
+        let mut s = playing_session();
+        // Pick block (position + include-data flag), pick entity, close inventory.
+        let mut pick_block = 64i64.to_be_bytes().to_vec();
+        pick_block.push(0);
+        for (id, body) in [
+            (sb::PICK_ITEM_FROM_BLOCK, pick_block),
+            (sb::PICK_ITEM_FROM_ENTITY, vec![5, 0]),
+            (sb::CONTAINER_CLOSE, vec![0]),
+        ] {
+            assert_eq!(s.receive(&frame(id, &body), 4096), Ok(Vec::new()));
+        }
+        // play serverbound 34 is move_vehicle, which the preview never expects.
+        assert_eq!(
+            s.receive(&frame(34, &[0; 33]), 4096),
+            Err(Error::WrongState)
+        );
     }
 
     #[test]

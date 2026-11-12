@@ -6,7 +6,9 @@
 pub mod chunk_adapter;
 pub mod discovery_bedrock;
 pub mod discovery_java;
+pub mod java_packets;
 pub mod java_preview;
+mod java_wire;
 pub mod preview_cache;
 pub mod preview_data;
 pub mod runtime;
@@ -64,7 +66,17 @@ pub struct ListenerConfig {
     pub vanilla_cache_root: Option<std::path::PathBuf>,
     /// Parallel chunk builders for the opt-in vanilla preview.
     pub vanilla_generation_workers: usize,
+    /// Lifetime of a preview connection once it reaches play.
+    pub preview_session_lifetime_ms: u64,
+    /// Client bytes read per second during play; excess input waits in the
+    /// socket (TCP backpressure) instead of closing the session.
+    pub preview_read_bytes_per_second: usize,
 }
+
+/// Allowed `listener.preview_session_lifetime_ms` values.
+pub const PREVIEW_SESSION_LIFETIME_MS: std::ops::RangeInclusive<u64> = 10_000..=3_600_000;
+/// Allowed `listener.preview_read_bytes_per_second` values.
+pub const PREVIEW_READ_BYTES_PER_SECOND: std::ops::RangeInclusive<usize> = 1_024..=1_048_576;
 
 impl Default for ListenerConfig {
     fn default() -> Self {
@@ -84,6 +96,8 @@ impl Default for ListenerConfig {
             preview_seed: 0,
             preview_view_distance: 4,
             preview_terrain: world::Terrain::Preview,
+            preview_session_lifetime_ms: 600_000,
+            preview_read_bytes_per_second: 65_536,
         }
     }
 }
@@ -135,6 +149,8 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "vanilla_registry_table"
                 | "vanilla_cache_root"
                 | "vanilla_generation_workers"
+                | "preview_session_lifetime_ms"
+                | "preview_read_bytes_per_second"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -215,18 +231,23 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     if table.contains_key("vanilla_generation_workers") && vanilla_data_root.is_none() {
         return Err("`listener.vanilla_generation_workers` requires vanilla data paths".to_owned());
     }
-    if (preview_registry_manifest.is_some()
-        || table.contains_key("preview_seed")
-        || table.contains_key("preview_view_distance")
-        || table.contains_key("preview_terrain")
-        || vanilla_data_root.is_some()
-        || vanilla_registry_table.is_some())
-        && !local_java_preview
+    if !local_java_preview
+        && let Some(key) = [
+            "preview_registry_manifest",
+            "preview_seed",
+            "preview_view_distance",
+            "preview_terrain",
+            "preview_session_lifetime_ms",
+            "preview_read_bytes_per_second",
+            "vanilla_data_root",
+            "vanilla_registry_table",
+        ]
+        .into_iter()
+        .find(|key| table.contains_key(*key))
     {
-        return Err(
-            "`listener.preview_registry_manifest` requires `listener.local_java_preview = true`"
-                .to_owned(),
-        );
+        return Err(format!(
+            "`listener.{key}` requires `listener.local_java_preview = true`"
+        ));
     }
     if vanilla_data_root.is_some() && preview_registry_manifest.is_none() {
         return Err("vanilla preview requires `listener.preview_registry_manifest`".to_owned());
@@ -286,13 +307,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             1,
             20,
         )? as usize,
-        preview_seed: integer_field(
-            table,
-            "preview_seed",
-            defaults.preview_seed,
-            0,
-            i64::MAX as u64,
-        )?,
+        preview_seed: preview_seed(table)?,
         preview_view_distance: integer_field(
             table,
             "preview_view_distance",
@@ -301,7 +316,34 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             32,
         )? as u8,
         preview_terrain,
+        preview_session_lifetime_ms: integer_field(
+            table,
+            "preview_session_lifetime_ms",
+            defaults.preview_session_lifetime_ms,
+            *PREVIEW_SESSION_LIFETIME_MS.start(),
+            *PREVIEW_SESSION_LIFETIME_MS.end(),
+        )?,
+        preview_read_bytes_per_second: integer_field(
+            table,
+            "preview_read_bytes_per_second",
+            defaults.preview_read_bytes_per_second as u64,
+            *PREVIEW_READ_BYTES_PER_SECOND.start() as u64,
+            *PREVIEW_READ_BYTES_PER_SECOND.end() as u64,
+        )? as usize,
     })
+}
+
+/// World seeds use the full signed 64-bit range, like vanilla seeds. The value
+/// is stored as its two's-complement bit pattern; non-negative seeds keep
+/// their previous preview terrain.
+fn preview_seed(table: &toml::map::Map<String, toml::Value>) -> Result<u64, String> {
+    match table.get("preview_seed") {
+        None => Ok(ListenerConfig::default().preview_seed),
+        Some(value) => value
+            .as_integer()
+            .map(|seed| seed as u64)
+            .ok_or_else(|| "`listener.preview_seed` must be a 64-bit integer".to_owned()),
+    }
 }
 
 /// Parse and validate a configuration document without exposing raw values in errors.
@@ -482,6 +524,56 @@ mod tests {
         )
         .unwrap_err()
         .contains("local_java_preview"));
+    }
+
+    #[test]
+    fn preview_play_limits_default_validate_and_require_the_preview() {
+        let base =
+            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
+        let defaults = parse_config(base).unwrap().listener;
+        assert_eq!(defaults.preview_session_lifetime_ms, 600_000);
+        assert_eq!(defaults.preview_read_bytes_per_second, 65_536);
+        let custom = parse_config(&format!(
+            "{base}preview_session_lifetime_ms = 3600000\npreview_read_bytes_per_second = 1024\n"
+        ))
+        .unwrap()
+        .listener;
+        assert_eq!(custom.preview_session_lifetime_ms, 3_600_000);
+        assert_eq!(custom.preview_read_bytes_per_second, 1024);
+        for (field, value) in [
+            ("preview_session_lifetime_ms", "9999"),
+            ("preview_session_lifetime_ms", "3600001"),
+            ("preview_read_bytes_per_second", "1023"),
+            ("preview_read_bytes_per_second", "1048577"),
+        ] {
+            let error = parse_config(&format!("{base}{field} = {value}\n")).unwrap_err();
+            assert!(error.contains(field), "{field}={value}: {error}");
+        }
+        for field in [
+            "preview_session_lifetime_ms",
+            "preview_read_bytes_per_second",
+        ] {
+            let error = parse_config(&format!(
+                "schema_version = 1\nlog_level = 'info'\n[listener]\n{field} = 60000\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains(field) && error.contains("local_java_preview"));
+        }
+    }
+
+    #[test]
+    fn preview_seed_accepts_the_signed_vanilla_range() {
+        let base =
+            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
+        for seed in [i64::MIN, -1, 0, 2026, i64::MAX] {
+            let config = parse_config(&format!("{base}preview_seed = {seed}\n")).unwrap();
+            assert_eq!(config.listener.preview_seed as i64, seed);
+        }
+        assert!(
+            parse_config(&format!("{base}preview_seed = 'x'\n"))
+                .unwrap_err()
+                .contains("preview_seed")
+        );
     }
 
     #[test]
