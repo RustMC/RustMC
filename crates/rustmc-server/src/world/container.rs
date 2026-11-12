@@ -24,12 +24,22 @@ use std::fmt;
 /// Maximum item stack count in standard Minecraft inventory.
 pub const DEFAULT_MAX_STACK: u16 = 64;
 
+/// Armor slot an item can be worn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquipmentSlot {
+    Head,
+    Chest,
+    Legs,
+    Feet,
+}
+
 /// A stack of items occupying a container slot or floating on the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemStack {
     item_id: String,
     count: u16,
     max_stack: u16,
+    equipment: Option<EquipmentSlot>,
 }
 
 impl ItemStack {
@@ -46,7 +56,19 @@ impl ItemStack {
             item_id: item_id.into(),
             count: count.min(max_stack),
             max_stack,
+            equipment: None,
         })
+    }
+
+    /// Marks this item as wearable in `slot`; only such items enter armor slots.
+    pub fn with_equipment(mut self, slot: EquipmentSlot) -> Self {
+        self.equipment = Some(slot);
+        self
+    }
+
+    #[inline]
+    pub fn equipment(&self) -> Option<EquipmentSlot> {
+        self.equipment
     }
 
     #[inline]
@@ -88,6 +110,7 @@ impl ItemStack {
             item_id: self.item_id.clone(),
             count: take,
             max_stack: self.max_stack,
+            equipment: self.equipment,
         })
     }
 }
@@ -99,11 +122,54 @@ pub enum ContainerType {
     Chest9x3,
 }
 
+/// Player inventory window slot layout.
+mod player {
+    use std::ops::Range;
+    pub const RESULT: usize = 0;
+    pub const CRAFT_GRID: Range<usize> = 1..5;
+    pub const ARMOR: Range<usize> = 5..9;
+    pub const MAIN: Range<usize> = 9..36;
+    pub const HOTBAR: Range<usize> = 36..45;
+    pub const OFFHAND: usize = 45;
+    pub const STORAGE: Range<usize> = 9..45;
+}
+
+/// Slots in a 9x3 chest window before the 36 player inventory slots.
+const CHEST_SLOTS: usize = 27;
+
 impl ContainerType {
     pub const fn slot_count(self) -> usize {
         match self {
-            Self::PlayerInventory => 46,
-            Self::Chest9x3 => 63, // 27 chest slots + 36 player inventory slots
+            Self::PlayerInventory => player::OFFHAND + 1,
+            Self::Chest9x3 => CHEST_SLOTS + 36,
+        }
+    }
+}
+
+/// What a slot accepts when the player places items into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotRule {
+    /// Output only, such as the crafting result: items can be taken, not placed.
+    TakeOnly,
+    /// Holds one item wearable in this equipment slot.
+    Equipment(EquipmentSlot),
+    Any,
+}
+
+impl SlotRule {
+    fn accepts(self, stack: &ItemStack) -> bool {
+        match self {
+            Self::TakeOnly => false,
+            Self::Equipment(slot) => stack.equipment == Some(slot),
+            Self::Any => true,
+        }
+    }
+
+    /// Most items of `stack` this slot holds.
+    fn limit(self, stack: &ItemStack) -> u16 {
+        match self {
+            Self::Equipment(_) => 1,
+            Self::TakeOnly | Self::Any => stack.max_stack,
         }
     }
 }
@@ -199,6 +265,7 @@ impl ContainerWindow {
         self.slots.get(index).and_then(|s| s.as_ref())
     }
 
+    /// Sets a slot directly. An empty stack is stored as an empty slot.
     pub fn set_slot(
         &mut self,
         index: usize,
@@ -207,12 +274,27 @@ impl ContainerWindow {
         if index >= self.slots.len() {
             return Err(ContainerError::SlotOutOfRange);
         }
-        self.slots[index] = stack;
+        self.slots[index] = non_empty(stack);
         Ok(())
     }
 
+    /// Sets the cursor directly. An empty stack clears the cursor.
     pub fn set_cursor(&mut self, cursor: Option<ItemStack>) {
-        self.cursor = cursor;
+        self.cursor = non_empty(cursor);
+    }
+
+    fn rule(&self, index: usize) -> SlotRule {
+        if self.container_type != ContainerType::PlayerInventory {
+            return SlotRule::Any;
+        }
+        match index {
+            player::RESULT => SlotRule::TakeOnly,
+            5 => SlotRule::Equipment(EquipmentSlot::Head),
+            6 => SlotRule::Equipment(EquipmentSlot::Chest),
+            7 => SlotRule::Equipment(EquipmentSlot::Legs),
+            8 => SlotRule::Equipment(EquipmentSlot::Feet),
+            _ => SlotRule::Any,
+        }
     }
 
     /// Handles an authoritative window click transaction.
@@ -227,192 +309,40 @@ impl ContainerWindow {
         if client_state_id != self.state_id {
             return Err(ContainerError::StateMismatch);
         }
-
         let mut modified = Vec::new();
-
-        // Slot -999 indicates clicking outside the window (drops cursor items).
-        if slot_index == -999 {
+        if slot_index == OUTSIDE_WINDOW {
             match mode {
-                ClickMode::LeftClick => {
-                    let _dropped = self.cursor.take();
-                    self.state_id = self.state_id.wrapping_add(1);
-                    return Ok(WindowUpdate {
-                        window_id: self.window_id,
-                        state_id: self.state_id,
-                        modified_slots: modified,
-                        cursor: None,
-                    });
-                }
+                ClickMode::LeftClick => self.cursor = None,
                 ClickMode::RightClick => {
-                    if let Some(ref mut cur) = self.cursor {
-                        let _dropped = cur.split(1);
-                        if cur.count() == 0 {
-                            self.cursor = None;
-                        }
+                    if let Some(cursor) = &mut self.cursor {
+                        cursor.count -= 1;
                     }
-                    self.state_id = self.state_id.wrapping_add(1);
-                    return Ok(WindowUpdate {
-                        window_id: self.window_id,
-                        state_id: self.state_id,
-                        modified_slots: modified,
-                        cursor: self.cursor.clone(),
-                    });
+                    self.cursor = non_empty(self.cursor.take());
                 }
                 _ => return Err(ContainerError::InvalidSlotIndex),
             }
-        }
-
-        if slot_index < 0 || (slot_index as usize) >= self.slots.len() {
-            return Err(ContainerError::SlotOutOfRange);
-        }
-
-        let idx = slot_index as usize;
-
-        match mode {
-            ClickMode::LeftClick => {
-                match (self.cursor.take(), self.slots[idx].take()) {
-                    (None, None) => {}
-                    (Some(cur), None) => {
-                        // Place cursor stack into empty slot
-                        self.slots[idx] = Some(cur);
-                        modified.push((idx as u16, self.slots[idx].clone()));
+        } else {
+            let index = usize::try_from(slot_index)
+                .ok()
+                .filter(|index| *index < self.slots.len())
+                .ok_or(ContainerError::SlotOutOfRange)?;
+            match mode {
+                ClickMode::LeftClick => self.click(index, false),
+                ClickMode::RightClick => self.click(index, true),
+                ClickMode::ShiftClick => self.quick_move(index, &mut modified),
+                ClickMode::DropSingle => {
+                    if let Some(stack) = &mut self.slots[index] {
+                        stack.count -= 1;
                     }
-                    (None, Some(slot_stack)) => {
-                        // Pick up entire slot stack into cursor
-                        self.cursor = Some(slot_stack);
-                        self.slots[idx] = None;
-                        modified.push((idx as u16, None));
-                    }
-                    (Some(mut cur), Some(mut slot_stack)) => {
-                        if cur.can_stack_with(&slot_stack) {
-                            // Merge into slot stack up to max_stack
-                            let overflow = slot_stack.add(cur.count());
-                            if overflow > 0 {
-                                cur.count = overflow;
-                                self.cursor = Some(cur);
-                            } else {
-                                self.cursor = None;
-                            }
-                            self.slots[idx] = Some(slot_stack);
-                        } else {
-                            // Swap cursor stack and slot stack
-                            self.cursor = Some(slot_stack);
-                            self.slots[idx] = Some(cur);
-                        }
-                        modified.push((idx as u16, self.slots[idx].clone()));
-                    }
+                    self.slots[index] = non_empty(self.slots[index].take());
                 }
+                ClickMode::DropStack => self.slots[index] = None,
             }
-            ClickMode::RightClick => {
-                match (self.cursor.take(), self.slots[idx].take()) {
-                    (None, None) => {}
-                    (Some(mut cur), None) => {
-                        // Place 1 item from cursor into empty slot
-                        let placed = cur.split(1).unwrap();
-                        self.slots[idx] = Some(placed);
-                        if cur.count() > 0 {
-                            self.cursor = Some(cur);
-                        }
-                        modified.push((idx as u16, self.slots[idx].clone()));
-                    }
-                    (None, Some(mut slot_stack)) => {
-                        // Pick up half of slot stack into cursor
-                        let half = slot_stack.count().div_ceil(2);
-                        let picked = slot_stack.split(half);
-                        self.cursor = picked;
-                        if slot_stack.count() > 0 {
-                            self.slots[idx] = Some(slot_stack);
-                        } else {
-                            self.slots[idx] = None;
-                        }
-                        modified.push((idx as u16, self.slots[idx].clone()));
-                    }
-                    (Some(mut cur), Some(mut slot_stack)) => {
-                        if cur.can_stack_with(&slot_stack)
-                            && slot_stack.count() < slot_stack.max_stack()
-                        {
-                            // Place 1 item from cursor into slot
-                            cur.count -= 1;
-                            slot_stack.count += 1;
-                            self.slots[idx] = Some(slot_stack);
-                            if cur.count() > 0 {
-                                self.cursor = Some(cur);
-                            }
-                        } else {
-                            // Swap cursor stack and slot stack
-                            self.cursor = Some(slot_stack);
-                            self.slots[idx] = Some(cur);
-                        }
-                        modified.push((idx as u16, self.slots[idx].clone()));
-                    }
-                }
-            }
-            ClickMode::ShiftClick => {
-                // Quick-move between zones (container top slots <-> player inventory bottom slots)
-                if let Some(mut stack) = self.slots[idx].take() {
-                    let total = self.slots.len();
-                    let (target_start, target_end) =
-                        if self.container_type == ContainerType::PlayerInventory {
-                            // In player inventory: hotbar (36..45) <-> main inventory (9..36)
-                            if idx >= 36 { (9, 36) } else { (36, 45) }
-                        } else {
-                            // In chest: chest (0..27) <-> player inventory (27..63)
-                            if idx < 27 { (27, total) } else { (0, 27) }
-                        };
-
-                    // First pass: try merging into existing matching stacks
-                    for target_idx in target_start..target_end {
-                        if stack.count() == 0 {
-                            break;
-                        }
-                        if let Some(target_stack) = &mut self.slots[target_idx]
-                            && target_stack.can_stack_with(&stack)
-                        {
-                            let rem = target_stack.add(stack.count());
-                            stack.count = rem;
-                            modified.push((target_idx as u16, Some(target_stack.clone())));
-                        }
-                    }
-
-                    // Second pass: place remainder into first empty slot
-                    let mut remainder = if stack.count() > 0 {
-                        let mut rem = Some(stack);
-                        for target_idx in target_start..target_end {
-                            if self.slots[target_idx].is_none() {
-                                let placed = rem.take().unwrap();
-                                modified.push((target_idx as u16, Some(placed.clone())));
-                                self.slots[target_idx] = Some(placed);
-                                break;
-                            }
-                        }
-                        rem
-                    } else {
-                        None
-                    };
-
-                    self.slots[idx] = remainder.take();
-                    modified.push((idx as u16, self.slots[idx].clone()));
-                }
-            }
-            ClickMode::DropSingle => {
-                if let Some(mut stack) = self.slots[idx].take() {
-                    let _dropped = stack.split(1);
-                    if stack.count() > 0 {
-                        self.slots[idx] = Some(stack);
-                    }
-                    modified.push((idx as u16, self.slots[idx].clone()));
-                }
-            }
-            ClickMode::DropStack => {
-                if self.slots[idx].is_some() {
-                    let _dropped = self.slots[idx].take();
-                    modified.push((idx as u16, None));
-                }
+            if !matches!(mode, ClickMode::ShiftClick) {
+                modified.push((index as u16, self.slots[index].clone()));
             }
         }
-
         self.state_id = self.state_id.wrapping_add(1);
-
         Ok(WindowUpdate {
             window_id: self.window_id,
             state_id: self.state_id,
@@ -420,4 +350,144 @@ impl ContainerWindow {
             cursor: self.cursor.clone(),
         })
     }
+
+    /// A left (whole stack) or right (half or one item) click on a slot.
+    fn click(&mut self, index: usize, single: bool) {
+        let rule = self.rule(index);
+        match (self.cursor.take(), self.slots[index].take()) {
+            (None, None) => {}
+            (None, Some(mut stack)) => {
+                // Right-click takes the larger half; output slots give everything.
+                let take = if single && rule != SlotRule::TakeOnly {
+                    stack.count.div_ceil(2)
+                } else {
+                    stack.count
+                };
+                self.cursor = stack.split(take);
+                self.slots[index] = non_empty(Some(stack));
+            }
+            (Some(mut cursor), None) => {
+                if rule.accepts(&cursor) {
+                    let amount = if single { 1 } else { cursor.count };
+                    self.slots[index] = cursor.split(amount.min(rule.limit(&cursor)));
+                }
+                self.cursor = non_empty(Some(cursor));
+            }
+            (Some(mut cursor), Some(mut stack)) => {
+                if rule == SlotRule::TakeOnly {
+                    // Collect the output only when all of it fits on the cursor.
+                    if cursor.can_stack_with(&stack)
+                        && cursor.count + stack.count <= cursor.max_stack
+                    {
+                        cursor.count += stack.count;
+                    } else {
+                        self.slots[index] = Some(stack);
+                    }
+                    self.cursor = Some(cursor);
+                } else if cursor.can_stack_with(&stack) {
+                    let room = rule.limit(&stack).saturating_sub(stack.count);
+                    let moved = room.min(if single { 1 } else { cursor.count });
+                    stack.count += moved;
+                    cursor.count -= moved;
+                    self.slots[index] = Some(stack);
+                    self.cursor = non_empty(Some(cursor));
+                } else if rule.accepts(&cursor) && cursor.count <= rule.limit(&cursor) {
+                    self.slots[index] = Some(cursor);
+                    self.cursor = Some(stack);
+                } else {
+                    self.slots[index] = Some(stack);
+                    self.cursor = Some(cursor);
+                }
+            }
+        }
+    }
+
+    /// Shift-click: move a stack to the other zone of the window.
+    fn quick_move(&mut self, index: usize, modified: &mut Vec<(u16, Option<ItemStack>)>) {
+        let Some(mut stack) = self.slots[index].take() else {
+            return;
+        };
+        let total = self.slots.len();
+        let routes: Vec<(std::ops::Range<usize>, bool)> = match self.container_type {
+            ContainerType::Chest9x3 if index < CHEST_SLOTS => vec![(CHEST_SLOTS..total, true)],
+            ContainerType::Chest9x3 => vec![(0..CHEST_SLOTS, false)],
+            ContainerType::PlayerInventory => {
+                let armor = stack.equipment.map(|slot| {
+                    let at = player::ARMOR.start + slot as usize;
+                    (at..at + 1, false)
+                });
+                if index == player::RESULT {
+                    vec![(player::STORAGE, true)]
+                } else if player::CRAFT_GRID.contains(&index)
+                    || player::ARMOR.contains(&index)
+                    || index == player::OFFHAND
+                {
+                    vec![(player::STORAGE, false)]
+                } else if player::MAIN.contains(&index) {
+                    armor.into_iter().chain([(player::HOTBAR, false)]).collect()
+                } else {
+                    armor.into_iter().chain([(player::MAIN, false)]).collect()
+                }
+            }
+        };
+        for (range, reverse) in routes {
+            self.move_into(&mut stack, range, reverse, modified);
+            if stack.count == 0 {
+                break;
+            }
+        }
+        self.slots[index] = non_empty(Some(stack));
+        modified.push((index as u16, self.slots[index].clone()));
+    }
+
+    /// Merge into matching stacks, then fill empty slots, in slot order or reversed.
+    fn move_into(
+        &mut self,
+        stack: &mut ItemStack,
+        range: std::ops::Range<usize>,
+        reverse: bool,
+        modified: &mut Vec<(u16, Option<ItemStack>)>,
+    ) {
+        let order: Vec<usize> = if reverse {
+            range.rev().collect()
+        } else {
+            range.collect()
+        };
+        for &target in &order {
+            let rule = self.rule(target);
+            if let Some(existing) = &mut self.slots[target]
+                && existing.can_stack_with(stack)
+            {
+                let moved = rule
+                    .limit(existing)
+                    .saturating_sub(existing.count)
+                    .min(stack.count);
+                if moved > 0 {
+                    existing.count += moved;
+                    stack.count -= moved;
+                    modified.push((target as u16, Some(existing.clone())));
+                }
+            }
+            if stack.count == 0 {
+                return;
+            }
+        }
+        for &target in &order {
+            let rule = self.rule(target);
+            if self.slots[target].is_none() && rule.accepts(stack) {
+                self.slots[target] = stack.split(rule.limit(stack));
+                modified.push((target as u16, self.slots[target].clone()));
+            }
+            if stack.count == 0 {
+                return;
+            }
+        }
+    }
+}
+
+/// Slot index the client sends for a click outside the window.
+const OUTSIDE_WINDOW: i16 = -999;
+
+fn non_empty(stack: Option<ItemStack>) -> Option<ItemStack> {
+    stack.filter(|stack| stack.count > 0)
 }
