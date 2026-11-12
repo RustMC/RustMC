@@ -16,6 +16,15 @@ pub const PLAYER_HEIGHT: f64 = 1.8;
 pub const PLAYER_EYE_HEIGHT: f64 = 1.62;
 /// Interaction reach distance limit in blocks.
 pub const INTERACTION_REACH: f64 = 6.0;
+/// Largest absolute X or Z a player may occupy. An evaluation policy limit, not a vanilla
+/// claim, chosen so every accepted position has an exact cell and chunk coordinate.
+pub const MAX_HORIZONTAL_COORDINATE: f64 = 30_000_000.0;
+/// Largest absolute X or Z of an addressable cell: one past the player limit, so the
+/// envelope of a player standing at the limit is still addressable.
+pub const MAX_CELL_COORDINATE: i64 = 30_000_001;
+/// Widest interval [`crossed_cells`] enumerates, far above any player envelope, so a
+/// caller cannot request an unbounded allocation.
+pub const MAX_CROSSED_SPAN: f64 = 16.0;
 
 /// Numbered logical tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,25 +53,38 @@ impl CellCoord {
         Self { x, y, z }
     }
 
-    /// Owning chunk coordinate `(chunk_x, chunk_z)`.
-    pub fn chunk_coord(&self) -> (i32, i32) {
-        let side = CHUNK_SIDE as i64;
-        let cx = self.x.div_euclid(side);
-        let cz = self.z.div_euclid(side);
-        (
-            cx.try_into()
-                .unwrap_or(if cx < 0 { i32::MIN } else { i32::MAX }),
-            cz.try_into()
-                .unwrap_or(if cz < 0 { i32::MIN } else { i32::MAX }),
-        )
+    /// Whether X and Z lie within [`MAX_CELL_COORDINATE`].
+    pub const fn in_horizontal_bounds(&self) -> bool {
+        self.x.abs_diff(0) <= MAX_CELL_COORDINATE as u64
+            && self.z.abs_diff(0) <= MAX_CELL_COORDINATE as u64
     }
 
-    /// In-chunk local cell indices `(local_x, y, local_z)`.
+    /// Whether an intent may address this cell: horizontally in bounds and inside the world.
+    pub const fn is_addressable(&self) -> bool {
+        self.in_horizontal_bounds() && self.y >= 0 && self.y < WORLD_HEIGHT as i64
+    }
+
+    /// Owning chunk coordinate `(chunk_x, chunk_z)`, or `None` outside the horizontal bounds.
+    ///
+    /// Refusing here, rather than clamping, keeps distant cells from aliasing one chunk.
+    pub fn chunk_coord(&self) -> Option<(i32, i32)> {
+        if !self.in_horizontal_bounds() {
+            return None;
+        }
+        let side = CHUNK_SIDE as i64;
+        Some((
+            i32::try_from(self.x.div_euclid(side)).ok()?,
+            i32::try_from(self.z.div_euclid(side)).ok()?,
+        ))
+    }
+
+    /// In-chunk local cell indices `(local_x, y, local_z)`. A `y` outside the addressable
+    /// range maps to `usize::MAX`, which every chunk lookup refuses.
     pub fn chunk_local(&self) -> (usize, usize, usize) {
         let side = CHUNK_SIDE as i64;
         (
             self.x.rem_euclid(side) as usize,
-            self.y as usize,
+            usize::try_from(self.y).unwrap_or(usize::MAX),
             self.z.rem_euclid(side) as usize,
         )
     }
@@ -116,7 +138,7 @@ impl PartitionLayout {
     }
 
     pub fn parcel_for_cell(&self, cell: CellCoord) -> Option<ParcelId> {
-        self.parcel_for_chunk(cell.chunk_coord())
+        self.parcel_for_chunk(cell.chunk_coord()?)
     }
 
     pub fn chunk_assignments(&self) -> &BTreeMap<(i32, i32), ParcelId> {
@@ -449,9 +471,48 @@ pub enum PulseEvent {
 // Spatial & Geometric Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether `(x, y, z)` is a position a player may occupy: finite, within the horizontal
+/// limit, and with the whole standing envelope inside the world height.
+pub fn is_valid_player_position(x: f64, y: f64, z: f64) -> bool {
+    x.is_finite()
+        && y.is_finite()
+        && z.is_finite()
+        && x.abs() <= MAX_HORIZONTAL_COORDINATE
+        && z.abs() <= MAX_HORIZONTAL_COORDINATE
+        && y >= 0.0
+        && y + PLAYER_HEIGHT < WORLD_HEIGHT as f64
+}
+
+/// Refuses player state that the executors could not replay exactly.
+fn validate_player_state(player: &PlayerState) -> Result<(), RejectionReason> {
+    if is_valid_player_position(player.x, player.y, player.z)
+        && player.yaw.is_finite()
+        && player.pitch.is_finite()
+    {
+        Ok(())
+    } else {
+        Err(RejectionReason::OutOfBounds)
+    }
+}
+
+/// The cell containing a position. Callers pass only positions that passed
+/// [`is_valid_player_position`], for which every cast below is exact.
+fn floor_cell(x: f64, y: f64, z: f64) -> CellCoord {
+    CellCoord::new(x.floor() as i64, y.floor() as i64, z.floor() as i64)
+}
+
 /// Integer block cells whose interior the half-open interval `[lo, hi)` crosses.
+///
+/// Returns nothing for a non-finite interval, one wider than [`MAX_CROSSED_SPAN`], or one
+/// reaching past [`MAX_CELL_COORDINATE`], so the casts below are always exact.
 pub fn crossed_cells(lo: f64, hi: f64) -> Vec<i64> {
-    if !lo.is_finite() || !hi.is_finite() {
+    let limit = MAX_CELL_COORDINATE as f64;
+    if !lo.is_finite()
+        || !hi.is_finite()
+        || hi - lo > MAX_CROSSED_SPAN
+        || lo.abs() > limit
+        || hi.abs() > limit
+    {
         return Vec::new();
     }
     let first = lo.floor();
@@ -497,6 +558,11 @@ where
     let xs = crossed_cells(to_x - half_w, to_x + half_w);
     let zs = crossed_cells(to_z - half_w, to_z + half_w);
     let ys = crossed_cells(to_y, to_y + PLAYER_HEIGHT);
+
+    // An empty axis means an invalid interval, which must not read as a clear body.
+    if xs.is_empty() || ys.is_empty() || zs.is_empty() {
+        return Err(RejectionReason::OutOfBounds);
+    }
 
     for cy in ys {
         if cy < 0 || cy >= WORLD_HEIGHT as i64 {
@@ -607,8 +673,11 @@ impl ReferenceExecutor {
         self.chunks.insert((chunk.x, chunk.z), chunk);
     }
 
-    pub fn insert_player(&mut self, player: PlayerState) {
+    /// Adds a player, refusing a state whose position or rotation could not be replayed.
+    pub fn insert_player(&mut self, player: PlayerState) -> Result<(), RejectionReason> {
+        validate_player_state(&player)?;
         self.players.insert(player.player_id, player);
+        Ok(())
     }
 
     pub fn chunks(&self) -> &BTreeMap<(i32, i32), Chunk> {
@@ -632,14 +701,14 @@ impl ReferenceExecutor {
     }
 
     pub fn get_block(&self, cell: CellCoord) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let chunk = self.chunks.get(&chunk_coord)?;
         let (lx, y, lz) = cell.chunk_local();
         chunk.block(lx, y, lz)
     }
 
     fn set_block(&mut self, cell: CellCoord, block: Block) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let chunk = self.chunks.get_mut(&chunk_coord)?;
         let (lx, y, lz) = cell.chunk_local();
         chunk.set_block_raw(lx, y, lz, block)
@@ -654,11 +723,7 @@ impl ReferenceExecutor {
             self.layout = new_layout;
             // Update player parcel assignments based on current position
             for player in self.players.values_mut() {
-                let cell = CellCoord::new(
-                    player.x.floor() as i64,
-                    player.y.floor() as i64,
-                    player.z.floor() as i64,
-                );
+                let cell = floor_cell(player.x, player.y, player.z);
                 if let Some(new_parcel) = self.layout.parcel_for_cell(cell) {
                     player.parcel_id = new_parcel;
                 }
@@ -707,19 +772,12 @@ impl ReferenceExecutor {
             match admitted.intent {
                 IntentKind::Move { to_x, to_y, to_z } => {
                     let get_block = |cell: CellCoord| {
-                        let chunk = self.chunks.get(&cell.chunk_coord())?;
+                        let chunk = self.chunks.get(&cell.chunk_coord()?)?;
                         let (lx, y, lz) = cell.chunk_local();
                         chunk.block(lx, y, lz)
                     };
 
-                    if !to_x.is_finite()
-                        || !to_y.is_finite()
-                        || !to_z.is_finite()
-                        || to_x.abs() > 30_000_000.0
-                        || to_z.abs() > 30_000_000.0
-                        || to_y < 0.0
-                        || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
-                    {
+                    if !is_valid_player_position(to_x, to_y, to_z) {
                         self.event_log.push(PulseEvent::IntentRejected {
                             pulse_id: input.pulse_id,
                             player_id,
@@ -759,11 +817,7 @@ impl ReferenceExecutor {
                     player.z = to_z;
 
                     // Check parcel migration
-                    let target_cell = CellCoord::new(
-                        to_x.floor() as i64,
-                        to_y.floor() as i64,
-                        to_z.floor() as i64,
-                    );
+                    let target_cell = floor_cell(to_x, to_y, to_z);
                     if let Some(target_parcel) = self.layout.parcel_for_cell(target_cell)
                         && target_parcel != player.parcel_id
                     {
@@ -792,7 +846,7 @@ impl ReferenceExecutor {
                     target,
                     claimed_block,
                 } => {
-                    if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                    if !target.is_addressable() {
                         self.event_log.push(PulseEvent::IntentRejected {
                             pulse_id: input.pulse_id,
                             player_id,
@@ -855,7 +909,7 @@ impl ReferenceExecutor {
                     block,
                     claimed_block,
                 } => {
-                    if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                    if !target.is_addressable() {
                         self.event_log.push(PulseEvent::IntentRejected {
                             pulse_id: input.pulse_id,
                             player_id,
@@ -975,14 +1029,14 @@ impl Parcel {
     }
 
     pub fn get_block(&self, cell: CellCoord) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let chunk = self.chunks.get(&chunk_coord)?;
         let (lx, y, lz) = cell.chunk_local();
         chunk.block(lx, y, lz)
     }
 
     pub fn set_block(&mut self, cell: CellCoord, block: Block) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let chunk = self.chunks.get_mut(&chunk_coord)?;
         let (lx, y, lz) = cell.chunk_local();
         chunk.set_block_raw(lx, y, lz, block)
@@ -1014,21 +1068,10 @@ impl BoundaryCoordinator {
 
         match &admitted.intent {
             IntentKind::Move { to_x, to_y, to_z } => {
-                if !to_x.is_finite()
-                    || !to_y.is_finite()
-                    || !to_z.is_finite()
-                    || to_x.abs() > 30_000_000.0
-                    || to_z.abs() > 30_000_000.0
-                    || *to_y < 0.0
-                    || *to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
-                {
+                if !is_valid_player_position(*to_x, *to_y, *to_z) {
                     return false;
                 }
-                let target_cell = CellCoord::new(
-                    to_x.floor() as i64,
-                    to_y.floor() as i64,
-                    to_z.floor() as i64,
-                );
+                let target_cell = floor_cell(*to_x, *to_y, *to_z);
                 let target_parcel = layout.parcel_for_cell(target_cell);
                 if target_parcel != Some(player_parcel_id) {
                     return true; // Migration across parcel boundary
@@ -1120,12 +1163,15 @@ impl ParcelExecutor {
             .insert_chunk(chunk);
     }
 
-    pub fn insert_player(&mut self, player: PlayerState) {
+    /// Adds a player, refusing a state whose position or rotation could not be replayed.
+    pub fn insert_player(&mut self, player: PlayerState) -> Result<(), RejectionReason> {
+        validate_player_state(&player)?;
         let pid = player.parcel_id;
         self.parcels
             .entry(pid)
             .or_insert_with(|| Parcel::new(pid))
             .insert_player(player);
+        Ok(())
     }
 
     pub fn parcels(&self) -> &BTreeMap<ParcelId, Parcel> {
@@ -1165,14 +1211,14 @@ impl ParcelExecutor {
     }
 
     pub fn get_block(&self, cell: CellCoord) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let pid = self.layout.parcel_for_chunk(chunk_coord)?;
         let parcel = self.parcels.get(&pid)?;
         parcel.get_block(cell)
     }
 
     pub fn set_block(&mut self, cell: CellCoord, block: Block) -> Option<Block> {
-        let chunk_coord = cell.chunk_coord();
+        let chunk_coord = cell.chunk_coord()?;
         let pid = self.layout.parcel_for_chunk(chunk_coord)?;
         let parcel = self.parcels.get_mut(&pid)?;
         parcel.set_block(cell, block)
@@ -1214,11 +1260,7 @@ impl ParcelExecutor {
         for (pid, parcel) in &mut self.parcels {
             let mut remove_players = Vec::new();
             for (&pl_id, player) in &parcel.players {
-                let cell = CellCoord::new(
-                    player.x.floor() as i64,
-                    player.y.floor() as i64,
-                    player.z.floor() as i64,
-                );
+                let cell = floor_cell(player.x, player.y, player.z);
                 if let Some(target_pid) = new_layout.parcel_for_cell(cell)
                     && target_pid != *pid
                 {
@@ -1327,14 +1369,7 @@ impl ParcelExecutor {
             IntentKind::Move { to_x, to_y, to_z } => {
                 let get_block = |cell: CellCoord| parcel.get_block(cell);
 
-                if !to_x.is_finite()
-                    || !to_y.is_finite()
-                    || !to_z.is_finite()
-                    || to_x.abs() > 30_000_000.0
-                    || to_z.abs() > 30_000_000.0
-                    || to_y < 0.0
-                    || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
-                {
+                if !is_valid_player_position(to_x, to_y, to_z) {
                     event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1386,7 +1421,7 @@ impl ParcelExecutor {
                 target,
                 claimed_block,
             } => {
-                if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                if !target.is_addressable() {
                     event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1449,7 +1484,7 @@ impl ParcelExecutor {
                 block,
                 claimed_block,
             } => {
-                if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                if !target.is_addressable() {
                     event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1570,14 +1605,7 @@ impl ParcelExecutor {
 
         match admitted.intent {
             IntentKind::Move { to_x, to_y, to_z } => {
-                if !to_x.is_finite()
-                    || !to_y.is_finite()
-                    || !to_z.is_finite()
-                    || to_x.abs() > 30_000_000.0
-                    || to_z.abs() > 30_000_000.0
-                    || to_y < 0.0
-                    || to_y + PLAYER_HEIGHT >= WORLD_HEIGHT as f64
-                {
+                if !is_valid_player_position(to_x, to_y, to_z) {
                     self.event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1624,11 +1652,7 @@ impl ParcelExecutor {
                 player.y = to_y;
                 player.z = to_z;
 
-                let target_cell = CellCoord::new(
-                    to_x.floor() as i64,
-                    to_y.floor() as i64,
-                    to_z.floor() as i64,
-                );
+                let target_cell = floor_cell(to_x, to_y, to_z);
                 let target_parcel = self
                     .layout
                     .parcel_for_cell(target_cell)
@@ -1674,7 +1698,7 @@ impl ParcelExecutor {
                 target,
                 claimed_block,
             } => {
-                if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                if !target.is_addressable() {
                     self.event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -1745,7 +1769,7 @@ impl ParcelExecutor {
                 block,
                 claimed_block,
             } => {
-                if target.y < 0 || target.y >= WORLD_HEIGHT as i64 {
+                if !target.is_addressable() {
                     self.event_log.push(PulseEvent::IntentRejected {
                         pulse_id,
                         player_id,
@@ -2025,17 +2049,17 @@ mod tests {
 
         let p1_single = PlayerState::new(PlayerId(1), 4.0, 64.0, 4.0, ParcelId(0));
         let p2_single = PlayerState::new(PlayerId(2), 20.0, 64.0, 20.0, ParcelId(0));
-        ref_single.insert_player(p1_single.clone());
-        ref_single.insert_player(p2_single.clone());
-        single_exec.insert_player(p1_single);
-        single_exec.insert_player(p2_single);
+        ref_single.insert_player(p1_single.clone()).unwrap();
+        ref_single.insert_player(p2_single.clone()).unwrap();
+        single_exec.insert_player(p1_single).unwrap();
+        single_exec.insert_player(p2_single).unwrap();
 
         let p1_multi = PlayerState::new(PlayerId(1), 4.0, 64.0, 4.0, ParcelId(0));
         let p2_multi = PlayerState::new(PlayerId(2), 20.0, 64.0, 20.0, ParcelId(3));
-        ref_multi.insert_player(p1_multi.clone());
-        ref_multi.insert_player(p2_multi.clone());
-        multi_exec.insert_player(p1_multi);
-        multi_exec.insert_player(p2_multi);
+        ref_multi.insert_player(p1_multi.clone()).unwrap();
+        ref_multi.insert_player(p2_multi.clone()).unwrap();
+        multi_exec.insert_player(p1_multi).unwrap();
+        multi_exec.insert_player(p2_multi).unwrap();
 
         // Pulse 1: Player 1 moves, Player 2 breaks grass
         let pulse1 = PulseInput::new(PulseId(1)).with_intents(vec![
@@ -2153,8 +2177,8 @@ mod tests {
 
         // Player starts near chunk border in Chunk (0, 0), Parcel 0
         let player = PlayerState::new(PlayerId(42), 15.0, 64.0, 8.0, ParcelId(0));
-        ref_exec.insert_player(player.clone());
-        parcel_exec.insert_player(player);
+        ref_exec.insert_player(player.clone()).unwrap();
+        parcel_exec.insert_player(player).unwrap();
 
         // In same pulse: Move into Chunk (1, 0) Parcel 1, then place a block in Chunk (1, 0)
         let pulse = PulseInput::new(PulseId(1)).with_intents(vec![
@@ -2226,10 +2250,10 @@ mod tests {
         // Player 2 in Parcel 1 at x=18.0
         let p2 = PlayerState::new(PlayerId(2), 18.0, 64.0, 8.0, ParcelId(1));
 
-        ref_exec.insert_player(p1.clone());
-        ref_exec.insert_player(p2.clone());
-        parcel_exec.insert_player(p1);
-        parcel_exec.insert_player(p2);
+        ref_exec.insert_player(p1.clone()).unwrap();
+        ref_exec.insert_player(p2.clone()).unwrap();
+        parcel_exec.insert_player(p1).unwrap();
+        parcel_exec.insert_player(p2).unwrap();
 
         // Pulse 1: Player 2 attempts to place block at (16, 64, 8) which intersects Player 1 envelope
         let pulse1 = PulseInput::new(PulseId(1)).with_intents(vec![AdmittedIntent::new(
@@ -2322,10 +2346,10 @@ mod tests {
         // Player 2 in Parcel 1 at x=18.0 within reach of x=16
         let p2 = PlayerState::new(PlayerId(2), 18.0, 64.0, 8.0, ParcelId(1));
 
-        ref_exec.insert_player(p1.clone());
-        ref_exec.insert_player(p2.clone());
-        parcel_exec.insert_player(p1);
-        parcel_exec.insert_player(p2);
+        ref_exec.insert_player(p1.clone()).unwrap();
+        ref_exec.insert_player(p2.clone()).unwrap();
+        parcel_exec.insert_player(p1).unwrap();
+        parcel_exec.insert_player(p2).unwrap();
 
         // Both players submit BreakBlock claiming Stone on (16, 64, 8)
         let pulse = PulseInput::new(PulseId(1)).with_intents(vec![
@@ -2398,8 +2422,8 @@ mod tests {
         parcel_exec.insert_chunk(create_test_chunk(1, 0));
 
         let player = PlayerState::new(PlayerId(99), 17.0, 64.0, 8.0, ParcelId(0));
-        ref_exec.insert_player(player.clone());
-        parcel_exec.insert_player(player);
+        ref_exec.insert_player(player.clone()).unwrap();
+        parcel_exec.insert_player(player).unwrap();
 
         // Pulse 1: Place stone at (18, 64, 8) with sequence 1
         let pulse1 = PulseInput::new(PulseId(1)).with_intents(vec![AdmittedIntent::new(
@@ -2474,11 +2498,15 @@ mod tests {
 
         let mut ref_exec = ReferenceExecutor::new(layout.clone());
         ref_exec.insert_chunk(chunk0.clone());
-        ref_exec.insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)));
+        ref_exec
+            .insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)))
+            .unwrap();
 
         let mut parcel_exec = ParcelExecutor::new(layout.clone());
         parcel_exec.insert_chunk(chunk0);
-        parcel_exec.insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)));
+        parcel_exec
+            .insert_player(PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0)))
+            .unwrap();
 
         let nonfinite_cases = [
             (f64::NAN, 64.0, 8.0),
@@ -2527,5 +2555,228 @@ mod tests {
                 "case ({x}, {y}, {z}) should reject with OutOfBounds"
             );
         }
+    }
+
+    /// A reference and a two-parcel executor sharing chunks (0, 0) and (1, 0), split between
+    /// parcels 0 and 1, with player 1 standing in parcel 0.
+    fn two_parcel_executors() -> (ReferenceExecutor, ParcelExecutor) {
+        let mut layout = PartitionLayout::new();
+        layout.assign_chunk((0, 0), ParcelId(0));
+        layout.assign_chunk((1, 0), ParcelId(1));
+
+        let mut reference = ReferenceExecutor::new(layout.clone());
+        let mut parcel = ParcelExecutor::new(layout);
+        for chunk_x in 0..2 {
+            reference.insert_chunk(create_test_chunk(chunk_x, 0));
+            parcel.insert_chunk(create_test_chunk(chunk_x, 0));
+        }
+        let player = PlayerState::new(PlayerId(1), 8.0, 64.0, 8.0, ParcelId(0));
+        reference.insert_player(player.clone()).unwrap();
+        parcel.insert_player(player).unwrap();
+        (reference, parcel)
+    }
+
+    fn rejection_reasons(log: &[PulseEvent]) -> Vec<RejectionReason> {
+        log.iter()
+            .filter_map(|event| match event {
+                PulseEvent::IntentRejected { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunk_coord_refuses_cells_it_cannot_represent_instead_of_aliasing() {
+        assert_eq!(CellCoord::new(-1, 0, -17).chunk_coord(), Some((-1, -2)));
+        assert_eq!(
+            CellCoord::new(30_000_001, 0, -30_000_001).chunk_coord(),
+            Some((1_875_000, -1_875_001))
+        );
+
+        for x in [30_000_002, 1 << 40, 1 << 41, i64::MAX, i64::MIN] {
+            assert_eq!(CellCoord::new(x, 0, 0).chunk_coord(), None, "x = {x}");
+            assert_eq!(CellCoord::new(0, 0, x).chunk_coord(), None, "z = {x}");
+        }
+    }
+
+    #[test]
+    fn cell_addressability_covers_every_axis() {
+        assert!(CellCoord::new(30_000_001, 0, -30_000_001).is_addressable());
+        assert!(!CellCoord::new(30_000_002, 0, 0).is_addressable());
+        assert!(!CellCoord::new(0, 0, i64::MIN).is_addressable());
+        assert!(!CellCoord::new(0, -1, 0).is_addressable());
+        assert!(!CellCoord::new(0, WORLD_HEIGHT as i64, 0).is_addressable());
+        assert_eq!(CellCoord::new(0, -1, 0).chunk_local().1, usize::MAX);
+    }
+
+    #[test]
+    fn crossed_cells_is_bounded_for_any_input() {
+        assert_eq!(crossed_cells(0.7, 1.3), vec![0, 1]);
+        assert_eq!(crossed_cells(-0.3, 0.3), vec![-1, 0]);
+        assert_eq!(crossed_cells(1.0, 2.0), vec![1]);
+
+        for (lo, hi) in [
+            (f64::NAN, 1.0),
+            (0.0, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (-1.0e300, 1.0e300),
+            (-30_000_000.0, 30_000_000.0),
+            (0.0, 17.0),
+            (1.0e18, 1.0e18 + 1.0),
+        ] {
+            assert!(crossed_cells(lo, hi).is_empty(), "({lo}, {hi})");
+        }
+    }
+
+    #[test]
+    fn invalid_interval_never_reads_as_a_clear_body() {
+        let get_block = |_: CellCoord| Some(Block::Air);
+        assert_eq!(
+            validate_body_clear(&get_block, f64::NAN, 64.0, 8.0),
+            Err(RejectionReason::OutOfBounds)
+        );
+        assert_eq!(
+            validate_body_clear(&get_block, 1.0e300, 64.0, 8.0),
+            Err(RejectionReason::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn players_with_unreplayable_state_are_refused_by_both_executors() {
+        let (mut reference, mut parcel) = two_parcel_executors();
+
+        let mut bad_rotation = PlayerState::new(PlayerId(9), 8.0, 64.0, 8.0, ParcelId(0));
+        bad_rotation.yaw = f32::NAN;
+        let mut cases = vec![bad_rotation];
+        for (x, y, z) in [
+            (f64::NAN, 64.0, 8.0),
+            (8.0, f64::INFINITY, 8.0),
+            (8.0, 64.0, f64::NEG_INFINITY),
+            (30_000_000.5, 64.0, 8.0),
+            (8.0, 64.0, -1.0e300),
+            (8.0, -0.5, 8.0),
+            (8.0, WORLD_HEIGHT as f64, 8.0),
+        ] {
+            cases.push(PlayerState::new(PlayerId(9), x, y, z, ParcelId(0)));
+        }
+
+        for case in cases {
+            assert_eq!(
+                reference.insert_player(case.clone()),
+                Err(RejectionReason::OutOfBounds)
+            );
+            assert_eq!(
+                parcel.insert_player(case),
+                Err(RejectionReason::OutOfBounds)
+            );
+        }
+        assert!(!reference.players().contains_key(&PlayerId(9)));
+        assert!(!parcel.all_players().contains_key(&PlayerId(9)));
+        assert_execution_equivalent(&reference, &parcel);
+    }
+
+    #[test]
+    fn extreme_block_targets_cannot_alias_a_loaded_chunk() {
+        let (mut reference, mut parcel) = two_parcel_executors();
+
+        // Clamping would have mapped every target below onto this chunk.
+        let mut far_chunk = create_test_chunk(0, 0);
+        far_chunk.x = i32::MAX;
+        reference.insert_chunk(far_chunk.clone());
+        parcel.insert_chunk(far_chunk);
+
+        for x in [1 << 40, i64::MAX] {
+            let cell = CellCoord::new(x, 0, 0);
+            assert_eq!(reference.get_block(cell), None);
+            assert_eq!(parcel.get_block(cell), None);
+        }
+
+        let targets = [
+            CellCoord::new(i64::MAX, 64, 8),
+            CellCoord::new(i64::MIN, 64, 8),
+            CellCoord::new(8, 64, i64::MAX),
+            CellCoord::new(1 << 40, 64, 1 << 41),
+        ];
+        let mut intents = Vec::new();
+        for (index, target) in (0_u64..).zip(targets) {
+            intents.push(AdmittedIntent::new(
+                index * 2 + 1,
+                PlayerId(1),
+                index * 2 + 1,
+                IntentKind::BreakBlock {
+                    target,
+                    claimed_block: Block::Stone,
+                },
+            ));
+            intents.push(AdmittedIntent::new(
+                index * 2 + 2,
+                PlayerId(1),
+                index * 2 + 2,
+                IntentKind::PlaceBlock {
+                    target,
+                    block: Block::Stone,
+                    claimed_block: Block::Air,
+                },
+            ));
+        }
+        let pulse = PulseInput::new(PulseId(1)).with_intents(intents);
+        reference.step(pulse.clone());
+        parcel.step(pulse);
+
+        assert_execution_equivalent(&reference, &parcel);
+        assert_eq!(
+            rejection_reasons(reference.event_log()),
+            vec![RejectionReason::OutOfBounds; 8]
+        );
+    }
+
+    #[test]
+    fn invalid_moves_leave_partitioned_replay_equivalent_through_a_repartition() {
+        let (mut reference, mut parcel) = two_parcel_executors();
+
+        let bad_moves = [
+            (f64::NAN, 64.0, 8.0),
+            (f64::INFINITY, 64.0, 8.0),
+            (8.0, f64::NEG_INFINITY, 8.0),
+            (8.0, 64.0, f64::NAN),
+            (1.0e300, 64.0, 8.0),
+            (8.0, 64.0, -1.0e300),
+            (30_000_000.5, 64.0, 8.0),
+            (f64::MAX, f64::MAX, f64::MAX),
+        ];
+        let mut intents = Vec::new();
+        for (index, (to_x, to_y, to_z)) in (1_u64..).zip(bad_moves) {
+            intents.push(AdmittedIntent::new(
+                index,
+                PlayerId(1),
+                index,
+                IntentKind::Move { to_x, to_y, to_z },
+            ));
+        }
+        let pulse = PulseInput::new(PulseId(1)).with_intents(intents);
+        reference.step(pulse.clone());
+        parcel.step(pulse);
+
+        assert_eq!(
+            rejection_reasons(reference.event_log()),
+            vec![RejectionReason::OutOfBounds; 8]
+        );
+        assert_execution_equivalent(&reference, &parcel);
+
+        // Nothing was committed, so the player's position is untouched and exact.
+        let player = &reference.players()[&PlayerId(1)];
+        assert_eq!((player.x, player.y, player.z), (8.0, 64.0, 8.0));
+        assert_eq!(player.last_sequence, 8);
+
+        // A later repartition reads the stored position, which must still be valid.
+        let mut new_layout = PartitionLayout::new();
+        new_layout.assign_chunk((0, 0), ParcelId(1));
+        new_layout.assign_chunk((1, 0), ParcelId(0));
+        let pulse = PulseInput::new(PulseId(2)).with_layout(new_layout);
+        reference.step(pulse.clone());
+        parcel.step(pulse);
+
+        assert_execution_equivalent(&reference, &parcel);
+        assert_eq!(reference.players()[&PlayerId(1)].parcel_id, ParcelId(1));
     }
 }
