@@ -503,7 +503,13 @@ impl Session {
             }
             sb::PUNCH if body.is_empty() => {} // No world effect in the preview.
             sb::SPECTATOR_ACTION if body == [0] => {} // No target.
-            sb::PLAYER_ACTION | sb::SET_CREATIVE_MODE_SLOT | sb::USE_ITEM_ON | sb::USE_ITEM
+            sb::PLAYER_ACTION
+            | sb::SET_CREATIVE_MODE_SLOT
+            | sb::USE_ITEM_ON
+            | sb::USE_ITEM
+            | sb::PICK_ITEM_FROM_BLOCK
+            | sb::PICK_ITEM_FROM_ENTITY
+            | sb::CONTAINER_CLOSE
                 if !body.is_empty() =>
             {
                 // Creative inputs are bounded by the frame/session limits.
@@ -640,6 +646,74 @@ mod tests {
         }
         s.receive(&frame(7, &known), 4096).unwrap();
         assert_eq!(s.state(), State::ConfigurationData);
+    }
+
+    /// Drive a local preview session through login and configuration into play.
+    fn playing_session() -> Session {
+        let manifest = RegistryManifest {
+            tags: Vec::new(),
+            registries: vec![
+                (
+                    "minecraft:dimension_type".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:world_clock".into(),
+                    vec!["minecraft:overworld".into()],
+                ),
+                (
+                    "minecraft:worldgen/biome".into(),
+                    crate::world::Biome::ALL
+                        .iter()
+                        .map(|b| b.identifier().into())
+                        .collect(),
+                ),
+            ],
+        };
+        let mut s = Session::new(true).with_registry_manifest(Arc::new(manifest));
+        let mut h = handshake(777);
+        *h.last_mut().unwrap() = intent::LOGIN as u8;
+        s.receive(&h, 4096).unwrap();
+        s.receive(&hello(b"Test"), 4096).unwrap();
+        s.receive(&frame(login::serverbound::LOGIN_ACKNOWLEDGED, &[]), 4096)
+            .unwrap();
+        let mut known = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known);
+        }
+        s.receive(
+            &frame(configuration::serverbound::SELECT_KNOWN_PACKS, &known),
+            4096,
+        )
+        .unwrap();
+        s.receive(
+            &frame(configuration::serverbound::FINISH_CONFIGURATION, &[]),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(s.state(), State::Play);
+        s
+    }
+
+    #[test]
+    fn preview_ignores_creative_inputs_but_rejects_unknown_packets() {
+        use play::serverbound as sb;
+        let mut s = playing_session();
+        // Pick block (position + include-data flag), pick entity, close inventory.
+        let mut pick_block = 64i64.to_be_bytes().to_vec();
+        pick_block.push(0);
+        for (id, body) in [
+            (sb::PICK_ITEM_FROM_BLOCK, pick_block),
+            (sb::PICK_ITEM_FROM_ENTITY, vec![5, 0]),
+            (sb::CONTAINER_CLOSE, vec![0]),
+        ] {
+            assert_eq!(s.receive(&frame(id, &body), 4096), Ok(Vec::new()));
+        }
+        // play serverbound 34 is move_vehicle, which the preview never expects.
+        assert_eq!(
+            s.receive(&frame(34, &[0; 33]), 4096),
+            Err(Error::WrongState)
+        );
     }
 
     #[test]

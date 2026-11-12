@@ -6,6 +6,7 @@
 - Preview play sessions now use `preview_session_lifetime_ms` (default 600 s, as before) and a per-second read budget, `preview_read_bytes_per_second`, instead of fixed 600 s / 1 MiB caps that closed long sessions.
 - Cache writes no longer hold the cache lock during file I/O and fsync, so disk latency cannot stall the network loop.
 - Chunk workers can now be handed several requests per poll, and a worker that cannot load its inputs logs why.
+- The preview no longer disconnects a client that middle-clicks a block or entity or closes its inventory.
 - A login attempt on a discovery-only server or with the wrong protocol now receives a login disconnect with a reason instead of a silent close.
 - Java packet IDs now come from one module checked against the official 26.3 packet report; `preview_seed` accepts the full signed 64-bit range.
 - CI builds rustdoc with warnings denied.

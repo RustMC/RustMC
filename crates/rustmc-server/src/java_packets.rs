@@ -68,12 +68,15 @@ pub mod play {
         pub const CHUNK_BATCH_RECEIVED: u32 = 11;
         pub const CLIENT_TICK_END: u32 = 13;
         pub const CLIENT_INFORMATION: u32 = 14;
+        pub const CONTAINER_CLOSE: u32 = 19;
         pub const CUSTOM_PAYLOAD: u32 = 22;
         pub const KEEP_ALIVE: u32 = 28;
         pub const MOVE_PLAYER_POS: u32 = 30;
         pub const MOVE_PLAYER_POS_ROT: u32 = 31;
         pub const MOVE_PLAYER_ROT: u32 = 32;
         pub const MOVE_PLAYER_STATUS_ONLY: u32 = 33;
+        pub const PICK_ITEM_FROM_BLOCK: u32 = 36;
+        pub const PICK_ITEM_FROM_ENTITY: u32 = 37;
         pub const PLAYER_ABILITIES: u32 = 40;
         pub const PLAYER_ACTION: u32 = 41;
         pub const PLAYER_COMMAND: u32 = 42;
