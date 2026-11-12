@@ -2,8 +2,14 @@
 //!
 //! Provides encoders, decoders, and deterministic distance-based visual tracking for:
 //! - `SpawnEntityPacket` (ID 0x01 in Java 26.3 protocol 777)
-//! - `SetEntityDataPacket` (ID 0x58 in Java 26.3 protocol 777)
-//! - `RemoveEntitiesPacket` (ID 0x42 in Java 26.3 protocol 777)
+//! - `SetEntityDataPacket` (ID 0x65 in Java 26.3 protocol 777)
+//! - `RemoveEntitiesPacket` (ID 0x4E in Java 26.3 protocol 777)
+//!
+//! Packet IDs come from the 26.3 server's generated packet report. Layouts follow the
+//! public protocol reference for 26.3 / protocol 777:
+//! <https://minecraft.wiki/w/Java_Edition_protocol/Packets> (revision 3868170),
+//! <https://minecraft.wiki/w/Java_Edition_protocol/Data_types> (revision 3855787) and
+//! <https://minecraft.wiki/w/Java_Edition_protocol/Entity_metadata> (revision 3869248).
 //!
 //! # Protocol Specification
 //!
@@ -12,21 +18,26 @@
 //!   - `uuid`: 16 bytes (128-bit)
 //!   - `entity_type`: VarInt
 //!   - `position`: 3x f64 (X, Y, Z)
-//!   - `pitch`, `yaw`, `head_yaw`: angle bytes, quantized as `(angle * 256.0 / 360.0).floor() as u8`
-//!   - `data`: VarInt (velocity direction or item metadata)
-//!   - `velocity`: 3x i16, scaled in units of 1/8000 block/tick: `(v * 8000.0).clamp(-32768.0, 32767.0) as i16`
+//!   - `velocity`: LpVec3, written only as its one-byte zero form; see below
+//!   - `pitch`, `yaw`, `head_yaw`: angle bytes in steps of 1/256 of a turn
+//!   - `data`: VarInt, meaning dependent on the entity type
 //!
-//! - **SetEntityData** (0x58):
+//! - **SetEntityData** (0x65):
 //!   - `entity_id`: VarInt
 //!   - `metadata`: array of entries terminated by byte `0xFF`
 //!     - Index: `u8`
-//!     - Type: VarInt
-//!     - Value: Type-dependent payload (Byte, VarInt, Float, String, Chat, Slot, Bool, Rotations,
-//!       OptPosition, Direction, OptUUID, BlockState, NBT, Particle, VillagerData, OptVarInt, Pose)
+//!     - Type: VarInt, see [`MetadataValue::type_id`]
+//!     - Value: type-dependent payload
 //!
-//! - **RemoveEntities** (0x42):
+//! - **RemoveEntities** (0x4E):
 //!   - `count`: VarInt
 //!   - `entity_ids`: array of VarInt entity identifiers
+//!
+//! # Scope
+//!
+//! Nonzero LpVec3 velocity is not implemented. Its quantization parameters have no
+//! primary source yet, so spawned entities start at rest and a nonzero value is
+//! rejected on decode.
 //!
 //! # Visual Tracking
 //!
@@ -41,14 +52,23 @@ use std::fmt;
 /// Clientbound packet ID for Java 26.3 SpawnEntity (Play state 0x01).
 pub const PACKET_ID_SPAWN_ENTITY: u32 = 0x01;
 
-/// Clientbound packet ID for Java 26.3 SetEntityData (Play state 0x58).
-pub const PACKET_ID_SET_ENTITY_DATA: u32 = 0x58;
+/// Clientbound packet ID for Java 26.3 SetEntityData (Play state 0x65).
+pub const PACKET_ID_SET_ENTITY_DATA: u32 = 0x65;
 
-/// Clientbound packet ID for Java 26.3 RemoveEntities (Play state 0x42).
-pub const PACKET_ID_REMOVE_ENTITIES: u32 = 0x42;
+/// Clientbound packet ID for Java 26.3 RemoveEntities (Play state 0x4E).
+pub const PACKET_ID_REMOVE_ENTITIES: u32 = 0x4E;
 
 /// Sentinel byte terminating entity metadata collections in Java Edition protocol.
 pub const METADATA_TERMINATOR: u8 = 0xFF;
+
+/// Maximum UTF-16 length of a metadata String value.
+pub const MAX_METADATA_STRING_CHARS: usize = 32767;
+
+/// The one-byte LpVec3 form of a zero vector.
+const ZERO_LP_VEC3: u8 = 0x00;
+
+/// NBT tag ID for TAG_String, the form of a literal text component.
+const TAG_STRING: u8 = 8;
 
 /// Protocol direction constants.
 pub mod direction {
@@ -84,7 +104,8 @@ pub mod pose {
 
 /// Quantizes an angle in degrees into Minecraft's protocol angle byte (0..=255).
 ///
-/// Follows the official quantization formula: `(angle * 256.0 / 360.0).floor() as u8`.
+/// Quantizes with `(angle * 256.0 / 360.0).floor() as u8`, a RustMC rounding choice;
+/// the protocol defines only the 1/256-turn step.
 #[inline]
 pub fn angle_to_byte(angle: f64) -> u8 {
     let steps = (angle * 256.0 / 360.0).floor() as i64;
@@ -95,20 +116,6 @@ pub fn angle_to_byte(angle: f64) -> u8 {
 #[inline]
 pub fn byte_to_angle(byte: u8) -> f64 {
     f64::from(byte) * 360.0 / 256.0
-}
-
-/// Scales velocity in blocks/tick to protocol units of 1/8000 block/tick.
-///
-/// Follows the official scaling formula: `(v * 8000.0).clamp(-32768.0, 32767.0) as i16`.
-#[inline]
-pub fn velocity_to_fixed(v: f64) -> i16 {
-    (v * 8000.0).clamp(-32768.0, 32767.0) as i16
-}
-
-/// Converts protocol velocity units of 1/8000 block/tick back to blocks/tick.
-#[inline]
-pub fn velocity_from_fixed(fixed: i16) -> f64 {
-    f64::from(fixed) / 8000.0
 }
 
 /// Packs 3D block coordinates into a 64-bit integer following modern Java protocol.
@@ -144,6 +151,11 @@ pub enum EntityProtocolError {
     UnknownTypeId(i32),
     NonFiniteCoordinate,
     InvalidRadius,
+    InvalidBoolean(u8),
+    InvalidItemCount(i32),
+    StringTooLong { length: usize, max: usize },
+    UnsupportedTextComponent(u8),
+    UnsupportedVelocity,
     PlayerNotFound(i32),
     EntityNotFound(i32),
 }
@@ -172,6 +184,15 @@ impl fmt::Display for EntityProtocolError {
             }
             Self::NonFiniteCoordinate => write!(f, "coordinates contain non-finite float"),
             Self::InvalidRadius => write!(f, "view radius must be non-negative and finite"),
+            Self::InvalidBoolean(byte) => write!(f, "invalid boolean byte: 0x{byte:02X}"),
+            Self::InvalidItemCount(count) => write!(f, "invalid item count: {count}"),
+            Self::StringTooLong { length, max } => {
+                write!(f, "string length {length} exceeds maximum {max}")
+            }
+            Self::UnsupportedTextComponent(tag) => {
+                write!(f, "unsupported text component NBT tag: {tag}")
+            }
+            Self::UnsupportedVelocity => write!(f, "nonzero spawn velocity is not supported"),
             Self::PlayerNotFound(id) => write!(f, "player {id} not found in visual tracker"),
             Self::EntityNotFound(id) => write!(f, "entity {id} not found in visual tracker"),
         }
@@ -292,13 +313,12 @@ pub struct SpawnEntityPacket {
     pub yaw: u8,
     pub head_yaw: u8,
     pub data: i32,
-    pub velocity: [i16; 3],
 }
 
 impl SpawnEntityPacket {
     pub const PACKET_ID: u32 = PACKET_ID_SPAWN_ENTITY;
 
-    /// Creates a new `SpawnEntityPacket` with raw angle bytes and velocity units.
+    /// Creates a new `SpawnEntityPacket` at rest, with raw angle bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         entity_id: i32,
@@ -309,7 +329,6 @@ impl SpawnEntityPacket {
         yaw: u8,
         head_yaw: u8,
         data: i32,
-        velocity: [i16; 3],
     ) -> Result<Self, EntityProtocolError> {
         validate_coordinates(position)?;
         Ok(Self {
@@ -321,13 +340,12 @@ impl SpawnEntityPacket {
             yaw,
             head_yaw,
             data,
-            velocity,
         })
     }
 
-    /// Creates a new `SpawnEntityPacket` converting angles (in degrees) and velocities (in blocks/tick).
+    /// Creates a new `SpawnEntityPacket` at rest, converting angles in degrees.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_angles_and_velocity(
+    pub fn with_angles(
         entity_id: i32,
         uuid: [u8; 16],
         entity_type: i32,
@@ -336,24 +354,17 @@ impl SpawnEntityPacket {
         yaw_deg: f64,
         head_yaw_deg: f64,
         data: i32,
-        velocity_blocks_per_tick: [f64; 3],
     ) -> Result<Self, EntityProtocolError> {
-        validate_coordinates(position)?;
-        Ok(Self {
+        Self::new(
             entity_id,
             uuid,
             entity_type,
             position,
-            pitch: angle_to_byte(pitch_deg),
-            yaw: angle_to_byte(yaw_deg),
-            head_yaw: angle_to_byte(head_yaw_deg),
+            angle_to_byte(pitch_deg),
+            angle_to_byte(yaw_deg),
+            angle_to_byte(head_yaw_deg),
             data,
-            velocity: [
-                velocity_to_fixed(velocity_blocks_per_tick[0]),
-                velocity_to_fixed(velocity_blocks_per_tick[1]),
-                velocity_to_fixed(velocity_blocks_per_tick[2]),
-            ],
-        })
+        )
     }
 
     /// Encodes the packet payload (without outer packet length or packet ID frame).
@@ -364,13 +375,11 @@ impl SpawnEntityPacket {
         out.extend_from_slice(&self.position[0].to_be_bytes());
         out.extend_from_slice(&self.position[1].to_be_bytes());
         out.extend_from_slice(&self.position[2].to_be_bytes());
+        out.push(ZERO_LP_VEC3);
         out.push(self.pitch);
         out.push(self.yaw);
         out.push(self.head_yaw);
         write_varint(self.data, out);
-        out.extend_from_slice(&self.velocity[0].to_be_bytes());
-        out.extend_from_slice(&self.velocity[1].to_be_bytes());
-        out.extend_from_slice(&self.velocity[2].to_be_bytes());
     }
 
     /// Encodes the framed packet ready for network transmission.
@@ -418,9 +427,13 @@ impl SpawnEntityPacket {
         );
         cursor += 8;
 
-        if data.len() < cursor + 3 {
+        if data.len() < cursor + 4 {
             return Err(EntityProtocolError::UnexpectedEof);
         }
+        if data[cursor] != ZERO_LP_VEC3 {
+            return Err(EntityProtocolError::UnsupportedVelocity);
+        }
+        cursor += 1;
         let pitch = data[cursor];
         cursor += 1;
         let yaw = data[cursor];
@@ -430,28 +443,6 @@ impl SpawnEntityPacket {
 
         let (data_val, n) = read_varint(&data[cursor..])?;
         cursor += n;
-
-        if data.len() < cursor + 6 {
-            return Err(EntityProtocolError::UnexpectedEof);
-        }
-        let vx = i16::from_be_bytes(
-            data[cursor..cursor + 2]
-                .try_into()
-                .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-        );
-        cursor += 2;
-        let vy = i16::from_be_bytes(
-            data[cursor..cursor + 2]
-                .try_into()
-                .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-        );
-        cursor += 2;
-        let vz = i16::from_be_bytes(
-            data[cursor..cursor + 2]
-                .try_into()
-                .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-        );
-        cursor += 2;
 
         if cursor != data.len() {
             return Err(EntityProtocolError::TrailingData);
@@ -466,7 +457,6 @@ impl SpawnEntityPacket {
             yaw,
             head_yaw,
             data_val,
-            [vx, vy, vz],
         )
     }
 
@@ -495,7 +485,7 @@ impl SpawnEntityPacket {
 }
 
 // ---------------------------------------------------------------------------
-// RemoveEntitiesPacket (0x42)
+// RemoveEntitiesPacket (0x4E)
 // ---------------------------------------------------------------------------
 
 /// Clientbound packet for despawning entities in Java Edition 26.3 (protocol 777).
@@ -543,7 +533,8 @@ impl RemoveEntitiesPacket {
             return Err(EntityProtocolError::MalformedVarInt);
         }
         let count = count as usize;
-        let mut entity_ids = Vec::with_capacity(count);
+        // Each ID takes at least one byte, so this never trusts the claimed count.
+        let mut entity_ids = Vec::with_capacity(count.min(data.len() - cursor));
         for _ in 0..count {
             if cursor >= data.len() {
                 return Err(EntityProtocolError::UnexpectedEof);
@@ -583,71 +574,40 @@ impl RemoveEntitiesPacket {
 }
 
 // ---------------------------------------------------------------------------
-// Entity Metadata & SetEntityDataPacket (0x58)
+// Entity Metadata & SetEntityDataPacket (0x65)
 // ---------------------------------------------------------------------------
 
-/// Structured representation of item stack data within entity metadata slots.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// An item stack in entity metadata, limited to stacks with no data components.
+///
+/// The wire format is a VarInt count and, when positive, a VarInt item ID followed
+/// by the added and removed component counts. RustMC does not model components, so
+/// both counts are written as zero and a nonzero count is rejected on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SlotData {
-    pub present: bool,
     pub item_id: i32,
-    pub item_count: i8,
-    pub nbt: Vec<u8>,
+    pub count: i32,
 }
 
 impl SlotData {
     /// Creates an empty slot.
     pub const fn empty() -> Self {
         Self {
-            present: false,
             item_id: 0,
-            item_count: 0,
-            nbt: Vec::new(),
+            count: 0,
         }
     }
 
-    /// Creates a slot containing an item with count and no NBT.
-    pub fn item(item_id: i32, item_count: i8) -> Self {
-        Self {
-            present: true,
-            item_id,
-            item_count,
-            nbt: Vec::new(),
-        }
-    }
-
-    /// Creates a slot containing an item with count and custom NBT byte payload.
-    pub fn with_nbt(item_id: i32, item_count: i8, nbt: Vec<u8>) -> Self {
-        Self {
-            present: true,
-            item_id,
-            item_count,
-            nbt,
-        }
+    /// Creates a slot containing an item with no data components.
+    pub const fn item(item_id: i32, count: i32) -> Self {
+        Self { item_id, count }
     }
 }
 
-/// Particle configuration data within entity metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ParticleData {
-    pub particle_id: i32,
-    pub data: Vec<u8>,
-}
-
-impl ParticleData {
-    pub fn new(particle_id: i32) -> Self {
-        Self {
-            particle_id,
-            data: Vec::new(),
-        }
-    }
-
-    pub fn with_data(particle_id: i32, data: Vec<u8>) -> Self {
-        Self { particle_id, data }
-    }
-}
-
-/// Dynamic value types supported in Minecraft Java Edition entity metadata.
+/// Entity metadata values whose 26.3 layout RustMC can encode and decode exactly.
+///
+/// Other types, including particles whose payload depends on the particle type,
+/// are rejected by [`MetadataValue::decode`] rather than misread. Text components
+/// are limited to literal text, which the protocol sends as a TAG_String.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     Byte(i8),
@@ -655,6 +615,7 @@ pub enum MetadataValue {
     Float(f32),
     String(String),
     Chat(String),
+    OptChat(Option<String>),
     Slot(SlotData),
     Bool(bool),
     Rotations([f32; 3]),
@@ -662,8 +623,6 @@ pub enum MetadataValue {
     Direction(i32),
     OptUUID(Option<[u8; 16]>),
     BlockState(i32),
-    NBT(Vec<u8>),
-    Particle(ParticleData),
     VillagerData {
         villager_type: i32,
         profession: i32,
@@ -673,80 +632,160 @@ pub enum MetadataValue {
     Pose(i32),
 }
 
+/// Appends `value` as an anonymous TAG_String with modified UTF-8 content: UTF-16
+/// code units, U+0000 as `C0 80`, and each surrogate as three bytes.
+fn write_text_component(value: &str, out: &mut Vec<u8>) -> Result<(), EntityProtocolError> {
+    let mut encoded = Vec::with_capacity(value.len());
+    for unit in value.encode_utf16() {
+        match unit {
+            0x0001..=0x007F => encoded.push(unit as u8),
+            0x0000 | 0x0080..=0x07FF => {
+                encoded.push(0xC0 | (unit >> 6) as u8);
+                encoded.push(0x80 | (unit & 0x3F) as u8);
+            }
+            _ => {
+                encoded.push(0xE0 | (unit >> 12) as u8);
+                encoded.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                encoded.push(0x80 | (unit & 0x3F) as u8);
+            }
+        }
+    }
+    let length = u16::try_from(encoded.len()).map_err(|_| EntityProtocolError::StringTooLong {
+        length: encoded.len(),
+        max: usize::from(u16::MAX),
+    })?;
+    out.push(TAG_STRING);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend(encoded);
+    Ok(())
+}
+
+/// Reads an anonymous TAG_String text component, returning the bytes consumed.
+fn read_text_component(data: &[u8]) -> Result<(String, usize), EntityProtocolError> {
+    let (tag, rest) = data
+        .split_first()
+        .ok_or(EntityProtocolError::UnexpectedEof)?;
+    if *tag != TAG_STRING {
+        return Err(EntityProtocolError::UnsupportedTextComponent(*tag));
+    }
+    let (length, rest) = rest
+        .split_first_chunk::<2>()
+        .ok_or(EntityProtocolError::UnexpectedEof)?;
+    let length = usize::from(u16::from_be_bytes(*length));
+    let bytes = rest
+        .get(..length)
+        .ok_or(EntityProtocolError::UnexpectedEof)?;
+
+    let mut units = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        let first = bytes[index];
+        let next = |offset: usize| -> Result<u16, EntityProtocolError> {
+            match bytes.get(index + offset) {
+                Some(byte) if byte & 0xC0 == 0x80 => Ok(u16::from(byte & 0x3F)),
+                _ => Err(EntityProtocolError::InvalidUtf8),
+            }
+        };
+        let (unit, width) = match first {
+            0x01..=0x7F => (u16::from(first), 1),
+            0xC0..=0xDF => (u16::from(first & 0x1F) << 6 | next(1)?, 2),
+            0xE0..=0xEF => (u16::from(first & 0x0F) << 12 | next(1)? << 6 | next(2)?, 3),
+            _ => return Err(EntityProtocolError::InvalidUtf8),
+        };
+        units.push(unit);
+        index += width;
+    }
+    let text = String::from_utf16(&units).map_err(|_| EntityProtocolError::InvalidUtf8)?;
+    Ok((text, 3 + length))
+}
+
+fn read_bool(data: &[u8]) -> Result<bool, EntityProtocolError> {
+    match data.first() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(other) => Err(EntityProtocolError::InvalidBoolean(*other)),
+        None => Err(EntityProtocolError::UnexpectedEof),
+    }
+}
+
+fn read_f32(data: &[u8]) -> Result<f32, EntityProtocolError> {
+    let (bytes, _) = data
+        .split_first_chunk::<4>()
+        .ok_or(EntityProtocolError::UnexpectedEof)?;
+    Ok(f32::from_be_bytes(*bytes))
+}
+
 impl MetadataValue {
-    /// Returns the canonical VarInt type identifier for this metadata value.
+    /// Returns the 26.3 metadata type ID for this value.
     pub const fn type_id(&self) -> i32 {
         match self {
             Self::Byte(_) => 0,
             Self::VarInt(_) => 1,
-            Self::Float(_) => 2,
-            Self::String(_) => 3,
-            Self::Chat(_) => 4,
-            Self::Slot(_) => 5,
-            Self::Bool(_) => 6,
-            Self::Rotations(_) => 7,
-            Self::OptPosition(_) => 8,
-            Self::Direction(_) => 9,
-            Self::OptUUID(_) => 10,
-            Self::BlockState(_) => 11,
-            Self::NBT(_) => 12,
-            Self::Particle(_) => 13,
-            Self::VillagerData { .. } => 14,
-            Self::OptVarInt(_) => 15,
-            Self::Pose(_) => 16,
+            Self::Float(_) => 3,
+            Self::String(_) => 4,
+            Self::Chat(_) => 5,
+            Self::OptChat(_) => 6,
+            Self::Slot(_) => 7,
+            Self::Bool(_) => 8,
+            Self::Rotations(_) => 9,
+            Self::OptPosition(_) => 11,
+            Self::Direction(_) => 12,
+            Self::OptUUID(_) => 13,
+            Self::BlockState(_) => 14,
+            Self::VillagerData { .. } => 18,
+            Self::OptVarInt(_) => 19,
+            Self::Pose(_) => 20,
         }
     }
 
     /// Encodes the value bytes into the destination buffer.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EntityProtocolError> {
         match self {
             Self::Byte(v) => out.push(*v as u8),
-            Self::VarInt(v) => write_varint(*v, out),
+            Self::VarInt(v) | Self::Direction(v) | Self::BlockState(v) | Self::Pose(v) => {
+                write_varint(*v, out);
+            }
             Self::Float(v) => out.extend_from_slice(&v.to_be_bytes()),
-            Self::String(s) => write_string(s, out),
-            Self::Chat(s) => write_string(s, out),
+            Self::String(s) => {
+                let length = s.encode_utf16().count();
+                if length > MAX_METADATA_STRING_CHARS {
+                    return Err(EntityProtocolError::StringTooLong {
+                        length,
+                        max: MAX_METADATA_STRING_CHARS,
+                    });
+                }
+                write_string(s, out);
+            }
+            Self::Chat(s) => write_text_component(s, out)?,
+            Self::OptChat(None) => out.push(0x00),
+            Self::OptChat(Some(s)) => {
+                out.push(0x01);
+                write_text_component(s, out)?;
+            }
             Self::Slot(slot) => {
-                if !slot.present {
-                    out.push(0x00);
-                } else {
-                    out.push(0x01);
+                if slot.count < 0 {
+                    return Err(EntityProtocolError::InvalidItemCount(slot.count));
+                }
+                write_varint(slot.count, out);
+                if slot.count > 0 {
                     write_varint(slot.item_id, out);
-                    out.push(slot.item_count as u8);
-                    write_varint(slot.nbt.len() as i32, out);
-                    out.extend_from_slice(&slot.nbt);
+                    out.extend([0x00, 0x00]); // No components added or removed.
                 }
             }
-            Self::Bool(b) => out.push(if *b { 1 } else { 0 }),
+            Self::Bool(b) => out.push(u8::from(*b)),
             Self::Rotations(r) => {
-                out.extend_from_slice(&r[0].to_be_bytes());
-                out.extend_from_slice(&r[1].to_be_bytes());
-                out.extend_from_slice(&r[2].to_be_bytes());
-            }
-            Self::OptPosition(opt) => match opt {
-                None => out.push(0x00),
-                Some([x, y, z]) => {
-                    out.push(0x01);
-                    let packed = pack_position(*x, *y, *z);
-                    out.extend_from_slice(&packed.to_be_bytes());
+                for value in r {
+                    out.extend_from_slice(&value.to_be_bytes());
                 }
-            },
-            Self::Direction(dir) => write_varint(*dir, out),
-            Self::OptUUID(opt) => match opt {
-                None => out.push(0x00),
-                Some(uuid) => {
-                    out.push(0x01);
-                    out.extend_from_slice(uuid);
-                }
-            },
-            Self::BlockState(bs) => write_varint(*bs, out),
-            Self::NBT(nbt) => {
-                write_varint(nbt.len() as i32, out);
-                out.extend_from_slice(nbt);
             }
-            Self::Particle(p) => {
-                write_varint(p.particle_id, out);
-                write_varint(p.data.len() as i32, out);
-                out.extend_from_slice(&p.data);
+            Self::OptPosition(None) | Self::OptUUID(None) => out.push(0x00),
+            Self::OptPosition(Some([x, y, z])) => {
+                out.push(0x01);
+                out.extend_from_slice(&pack_position(*x, *y, *z).to_be_bytes());
+            }
+            Self::OptUUID(Some(uuid)) => {
+                out.push(0x01);
+                out.extend_from_slice(uuid);
             }
             Self::VillagerData {
                 villager_type,
@@ -757,230 +796,139 @@ impl MetadataValue {
                 write_varint(*profession, out);
                 write_varint(*level, out);
             }
-            Self::OptVarInt(opt) => match opt {
-                None => write_varint(0, out),
-                Some(v) => write_varint(v + 1, out),
-            },
-            Self::Pose(p) => write_varint(*p, out),
+            Self::OptVarInt(None) => write_varint(0, out),
+            Self::OptVarInt(Some(v)) => {
+                let raw = v
+                    .checked_add(1)
+                    .ok_or(EntityProtocolError::MalformedVarInt)?;
+                write_varint(raw, out);
+            }
         }
+        Ok(())
     }
 
-    /// Decodes a metadata value given its type ID.
+    /// Decodes a metadata value given its type ID, returning the bytes consumed.
     pub fn decode(type_id: i32, data: &[u8]) -> Result<(Self, usize), EntityProtocolError> {
-        let mut cursor = 0;
-        let val = match type_id {
+        Ok(match type_id {
             0 => {
-                if data.is_empty() {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let byte = data[0] as i8;
-                cursor += 1;
-                Self::Byte(byte)
+                let byte = *data.first().ok_or(EntityProtocolError::UnexpectedEof)?;
+                (Self::Byte(byte as i8), 1)
             }
             1 => {
                 let (v, n) = read_varint(data)?;
-                cursor += n;
-                Self::VarInt(v)
+                (Self::VarInt(v), n)
             }
-            2 => {
-                if data.len() < 4 {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let f = f32::from_be_bytes(
-                    data[0..4]
-                        .try_into()
-                        .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-                );
-                cursor += 4;
-                Self::Float(f)
-            }
-            3 => {
-                let (s, n) = read_string(data)?;
-                cursor += n;
-                Self::String(s.to_string())
-            }
+            3 => (Self::Float(read_f32(data)?), 4),
             4 => {
                 let (s, n) = read_string(data)?;
-                cursor += n;
-                Self::Chat(s.to_string())
+                let length = s.encode_utf16().count();
+                if length > MAX_METADATA_STRING_CHARS {
+                    return Err(EntityProtocolError::StringTooLong {
+                        length,
+                        max: MAX_METADATA_STRING_CHARS,
+                    });
+                }
+                (Self::String(s.to_string()), n)
             }
             5 => {
-                if data.is_empty() {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let present = data[0] != 0;
-                cursor += 1;
-                if !present {
-                    Self::Slot(SlotData::empty())
-                } else {
-                    let (item_id, n) = read_varint(&data[cursor..])?;
-                    cursor += n;
-                    if cursor >= data.len() {
-                        return Err(EntityProtocolError::UnexpectedEof);
-                    }
-                    let item_count = data[cursor] as i8;
-                    cursor += 1;
-                    let (nbt_len, n) = read_varint(&data[cursor..])?;
-                    cursor += n;
-                    if nbt_len < 0 {
-                        return Err(EntityProtocolError::MalformedVarInt);
-                    }
-                    let nbt_len = nbt_len as usize;
-                    if data.len() < cursor + nbt_len {
-                        return Err(EntityProtocolError::UnexpectedEof);
-                    }
-                    let nbt = data[cursor..cursor + nbt_len].to_vec();
-                    cursor += nbt_len;
-                    Self::Slot(SlotData {
-                        present: true,
-                        item_id,
-                        item_count,
-                        nbt,
-                    })
-                }
+                let (s, n) = read_text_component(data)?;
+                (Self::Chat(s), n)
             }
             6 => {
-                if data.is_empty() {
-                    return Err(EntityProtocolError::UnexpectedEof);
+                if read_bool(data)? {
+                    let (s, n) = read_text_component(&data[1..])?;
+                    (Self::OptChat(Some(s)), 1 + n)
+                } else {
+                    (Self::OptChat(None), 1)
                 }
-                let b = data[0] != 0;
-                cursor += 1;
-                Self::Bool(b)
             }
             7 => {
-                if data.len() < 12 {
-                    return Err(EntityProtocolError::UnexpectedEof);
+                let (count, mut cursor) = read_varint(data)?;
+                if count < 0 {
+                    return Err(EntityProtocolError::InvalidItemCount(count));
                 }
-                let rx = f32::from_be_bytes(
-                    data[0..4]
-                        .try_into()
-                        .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-                );
-                let ry = f32::from_be_bytes(
-                    data[4..8]
-                        .try_into()
-                        .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-                );
-                let rz = f32::from_be_bytes(
-                    data[8..12]
-                        .try_into()
-                        .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-                );
-                cursor += 12;
-                Self::Rotations([rx, ry, rz])
-            }
-            8 => {
-                if data.is_empty() {
-                    return Err(EntityProtocolError::UnexpectedEof);
+                if count == 0 {
+                    return Ok((Self::Slot(SlotData::empty()), cursor));
                 }
-                let present = data[0] != 0;
-                cursor += 1;
-                if !present {
-                    Self::OptPosition(None)
-                } else {
-                    if data.len() < cursor + 8 {
-                        return Err(EntityProtocolError::UnexpectedEof);
-                    }
-                    let packed = u64::from_be_bytes(
-                        data[cursor..cursor + 8]
-                            .try_into()
-                            .map_err(|_| EntityProtocolError::UnexpectedEof)?,
-                    );
-                    cursor += 8;
-                    Self::OptPosition(Some(unpack_position(packed)))
-                }
-            }
-            9 => {
-                let (dir, n) = read_varint(data)?;
+                let (item_id, n) = read_varint(&data[cursor..])?;
                 cursor += n;
-                Self::Direction(dir)
-            }
-            10 => {
-                if data.is_empty() {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let present = data[0] != 0;
-                cursor += 1;
-                if !present {
-                    Self::OptUUID(None)
-                } else {
-                    if data.len() < cursor + 16 {
-                        return Err(EntityProtocolError::UnexpectedEof);
+                for _ in 0..2 {
+                    let (components, n) = read_varint(&data[cursor..])?;
+                    cursor += n;
+                    if components != 0 {
+                        return Err(EntityProtocolError::UnknownTypeId(type_id));
                     }
-                    let mut uuid = [0u8; 16];
-                    uuid.copy_from_slice(&data[cursor..cursor + 16]);
-                    cursor += 16;
-                    Self::OptUUID(Some(uuid))
                 }
+                (Self::Slot(SlotData::item(item_id, count)), cursor)
+            }
+            8 => (Self::Bool(read_bool(data)?), 1),
+            9 => {
+                let mut rotation = [0.0; 3];
+                for (index, value) in rotation.iter_mut().enumerate() {
+                    *value = read_f32(data.get(index * 4..).unwrap_or_default())?;
+                }
+                (Self::Rotations(rotation), 12)
             }
             11 => {
-                let (bs, n) = read_varint(data)?;
-                cursor += n;
-                Self::BlockState(bs)
+                if read_bool(data)? {
+                    let (bytes, _) = data[1..]
+                        .split_first_chunk::<8>()
+                        .ok_or(EntityProtocolError::UnexpectedEof)?;
+                    let position = unpack_position(u64::from_be_bytes(*bytes));
+                    (Self::OptPosition(Some(position)), 9)
+                } else {
+                    (Self::OptPosition(None), 1)
+                }
             }
             12 => {
-                let (len, n) = read_varint(data)?;
-                cursor += n;
-                if len < 0 {
-                    return Err(EntityProtocolError::MalformedVarInt);
-                }
-                let len = len as usize;
-                if data.len() < cursor + len {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let nbt = data[cursor..cursor + len].to_vec();
-                cursor += len;
-                Self::NBT(nbt)
+                let (v, n) = read_varint(data)?;
+                (Self::Direction(v), n)
             }
             13 => {
-                let (particle_id, n1) = read_varint(data)?;
-                cursor += n1;
-                let (len, n2) = read_varint(&data[cursor..])?;
-                cursor += n2;
-                if len < 0 {
-                    return Err(EntityProtocolError::MalformedVarInt);
+                if read_bool(data)? {
+                    let (bytes, _) = data[1..]
+                        .split_first_chunk::<16>()
+                        .ok_or(EntityProtocolError::UnexpectedEof)?;
+                    (Self::OptUUID(Some(*bytes)), 17)
+                } else {
+                    (Self::OptUUID(None), 1)
                 }
-                let len = len as usize;
-                if data.len() < cursor + len {
-                    return Err(EntityProtocolError::UnexpectedEof);
-                }
-                let pdata = data[cursor..cursor + len].to_vec();
-                cursor += len;
-                Self::Particle(ParticleData {
-                    particle_id,
-                    data: pdata,
-                })
             }
             14 => {
+                let (v, n) = read_varint(data)?;
+                (Self::BlockState(v), n)
+            }
+            18 => {
                 let (villager_type, n1) = read_varint(data)?;
-                cursor += n1;
-                let (profession, n2) = read_varint(&data[cursor..])?;
-                cursor += n2;
-                let (level, n3) = read_varint(&data[cursor..])?;
-                cursor += n3;
-                Self::VillagerData {
-                    villager_type,
-                    profession,
-                    level,
-                }
+                let (profession, n2) = read_varint(&data[n1..])?;
+                let (level, n3) = read_varint(&data[n1 + n2..])?;
+                (
+                    Self::VillagerData {
+                        villager_type,
+                        profession,
+                        level,
+                    },
+                    n1 + n2 + n3,
+                )
             }
-            15 => {
+            19 => {
                 let (raw, n) = read_varint(data)?;
-                cursor += n;
-                if raw == 0 {
-                    Self::OptVarInt(None)
-                } else {
-                    Self::OptVarInt(Some(raw - 1))
+                match raw {
+                    0 => (Self::OptVarInt(None), n),
+                    raw => {
+                        let value = raw
+                            .checked_sub(1)
+                            .ok_or(EntityProtocolError::MalformedVarInt)?;
+                        (Self::OptVarInt(Some(value)), n)
+                    }
                 }
             }
-            16 => {
-                let (pose, n) = read_varint(data)?;
-                cursor += n;
-                Self::Pose(pose)
+            20 => {
+                let (v, n) = read_varint(data)?;
+                (Self::Pose(v), n)
             }
             other => return Err(EntityProtocolError::UnknownTypeId(other)),
-        };
-        Ok((val, cursor))
+        })
     }
 }
 
@@ -997,10 +945,10 @@ impl EntityMetadataEntry {
     }
 
     /// Encodes this entry into a byte vector: index (u8) + type (VarInt) + value.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EntityProtocolError> {
         out.push(self.index);
         write_varint(self.value.type_id(), out);
-        self.value.encode(out);
+        self.value.encode(out)
     }
 
     /// Decodes an entry given that the index `u8` has already been read.
@@ -1029,19 +977,20 @@ impl SetEntityDataPacket {
     }
 
     /// Encodes the packet payload (VarInt entity ID + metadata entries + 0xFF terminator).
-    pub fn encode_payload(&self, out: &mut Vec<u8>) {
+    pub fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), EntityProtocolError> {
         write_varint(self.entity_id, out);
         for entry in &self.metadata {
-            entry.encode(out);
+            entry.encode(out)?;
         }
         out.push(METADATA_TERMINATOR);
+        Ok(())
     }
 
     /// Encodes the framed packet.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, EntityProtocolError> {
         let mut payload = Vec::new();
-        self.encode_payload(&mut payload);
-        frame_packet(Self::PACKET_ID, &payload)
+        self.encode_payload(&mut payload)?;
+        Ok(frame_packet(Self::PACKET_ID, &payload))
     }
 
     /// Decodes the payload bytes for `SetEntityDataPacket`.
@@ -1114,7 +1063,6 @@ pub struct TrackedEntityState {
     pub yaw: u8,
     pub head_yaw: u8,
     pub data: i32,
-    pub velocity: [i16; 3],
     pub metadata: Vec<EntityMetadataEntry>,
 }
 
@@ -1130,7 +1078,6 @@ impl TrackedEntityState {
         yaw: u8,
         head_yaw: u8,
         data: i32,
-        velocity: [i16; 3],
     ) -> Result<Self, EntityProtocolError> {
         validate_coordinates(position)?;
         Ok(Self {
@@ -1142,7 +1089,6 @@ impl TrackedEntityState {
             yaw,
             head_yaw,
             data,
-            velocity,
             metadata: Vec::new(),
         })
     }
@@ -1158,7 +1104,6 @@ impl TrackedEntityState {
         yaw: u8,
         head_yaw: u8,
         data: i32,
-        velocity: [i16; 3],
         metadata: Vec<EntityMetadataEntry>,
     ) -> Result<Self, EntityProtocolError> {
         validate_coordinates(position)?;
@@ -1171,7 +1116,6 @@ impl TrackedEntityState {
             yaw,
             head_yaw,
             data,
-            velocity,
             metadata,
         })
     }
@@ -1187,7 +1131,6 @@ impl TrackedEntityState {
             yaw: self.yaw,
             head_yaw: self.head_yaw,
             data: self.data,
-            velocity: self.velocity,
         }
     }
 
@@ -1589,26 +1532,6 @@ mod tests {
     }
 
     #[test]
-    fn test_velocity_scaling_units_and_clamping() {
-        assert_eq!(velocity_to_fixed(0.0), 0);
-        assert_eq!(velocity_to_fixed(1.0), 8000);
-        assert_eq!(velocity_to_fixed(-1.0), -8000);
-        assert_eq!(velocity_to_fixed(0.5), 4000);
-        assert_eq!(velocity_to_fixed(-0.5), -4000);
-
-        // Precision round trip
-        assert_eq!(velocity_from_fixed(8000), 1.0);
-        assert_eq!(velocity_from_fixed(-8000), -1.0);
-        assert_eq!(velocity_from_fixed(4000), 0.5);
-
-        // Boundary clamp
-        assert_eq!(velocity_to_fixed(100.0), 32767);
-        assert_eq!(velocity_to_fixed(-100.0), -32768);
-        assert_eq!(velocity_to_fixed(4.095875), 32767);
-        assert_eq!(velocity_to_fixed(-4.096), -32768);
-    }
-
-    #[test]
     fn test_position_pack_unpack_roundtrip() {
         let test_cases = [
             [0, 0, 0],
@@ -1626,148 +1549,237 @@ mod tests {
     }
 
     #[test]
+    fn packet_ids_match_the_26_3_report() {
+        assert_eq!(PACKET_ID_SPAWN_ENTITY, 1);
+        assert_eq!(PACKET_ID_SET_ENTITY_DATA, 101);
+        assert_eq!(PACKET_ID_REMOVE_ENTITIES, 78);
+    }
+
+    // Wire fixtures below are written by hand from the protocol tables, not
+    // produced by this module's encoders.
+
+    fn spawn_fixture() -> Vec<u8> {
+        let mut bytes = vec![0x2A]; // Entity ID 42.
+        bytes.extend([0x12; 16]); // UUID.
+        bytes.push(0x64); // Type 100.
+        bytes.extend([0x40, 0x24, 0, 0, 0, 0, 0, 0]); // X 10.0.
+        bytes.extend([0x40, 0x50, 0, 0, 0, 0, 0, 0]); // Y 64.0.
+        bytes.extend([0xC0, 0x24, 0, 0, 0, 0, 0, 0]); // Z -10.0.
+        bytes.push(0x00); // Zero LpVec3 velocity comes before the angles.
+        bytes.extend([0x40, 0x80, 0xC0]); // Pitch, yaw, head yaw.
+        bytes.push(0x07); // Data comes last.
+        bytes
+    }
+
+    #[test]
     fn test_spawn_entity_packet_payload_and_framing() {
-        let uuid = [
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0x77, 0x88,
-        ];
         let packet = SpawnEntityPacket::new(
             42,
-            uuid,
-            100, // Zombie entity type
-            [123.456, 64.0, -789.012],
-            angle_to_byte(-45.0),
-            angle_to_byte(120.0),
-            angle_to_byte(115.0),
+            [0x12; 16],
+            100,
+            [10.0, 64.0, -10.0],
+            0x40,
+            0x80,
+            0xC0,
             7,
-            [8000, -4000, 16000],
         )
         .expect("valid coords");
 
-        // Payload round trip
+        let fixture = spawn_fixture();
         let mut payload = Vec::new();
         packet.encode_payload(&mut payload);
-        let decoded = SpawnEntityPacket::decode_payload(&payload).expect("decode payload");
-        assert_eq!(packet, decoded);
+        assert_eq!(payload, fixture);
+        assert_eq!(SpawnEntityPacket::decode_payload(&fixture).unwrap(), packet);
 
-        // Framed round trip
-        let framed = packet.encode();
-        let decoded_framed = SpawnEntityPacket::decode(&framed).expect("decode framed");
-        assert_eq!(packet, decoded_framed);
+        let mut framed = vec![fixture.len() as u8 + 1, 0x01];
+        framed.extend(&fixture);
+        assert_eq!(packet.encode(), framed);
+        assert_eq!(SpawnEntityPacket::decode(&framed).unwrap(), packet);
 
-        // Reject non-finite coordinates
-        assert!(
-            SpawnEntityPacket::new(1, uuid, 1, [f64::NAN, 0.0, 0.0], 0, 0, 0, 0, [0, 0, 0],)
-                .is_err()
+        assert!(SpawnEntityPacket::new(1, [0; 16], 1, [f64::NAN, 0.0, 0.0], 0, 0, 0, 0).is_err());
+        assert!(SpawnEntityPacket::decode_payload(&fixture[..fixture.len() - 1]).is_err());
+
+        let mut trailing = fixture.clone();
+        trailing.push(0x99);
+        assert_eq!(
+            SpawnEntityPacket::decode_payload(&trailing),
+            Err(EntityProtocolError::TrailingData)
         );
 
-        // Reject truncated packet
-        assert!(SpawnEntityPacket::decode_payload(&payload[..payload.len() - 5]).is_err());
+        // A nonzero LpVec3 has no model here and must not be misread as angles.
+        let mut moving = fixture;
+        moving[42] = 0x01;
+        assert_eq!(
+            SpawnEntityPacket::decode_payload(&moving),
+            Err(EntityProtocolError::UnsupportedVelocity)
+        );
 
-        // Reject trailing data
-        let mut bad_payload = payload.clone();
-        bad_payload.push(0x99);
-        assert!(matches!(
-            SpawnEntityPacket::decode_payload(&bad_payload),
-            Err(EntityProtocolError::TrailingData)
-        ));
-
-        // Reject wrong packet ID
-        let wrong_frame = frame_packet(0x99, &payload);
-        assert!(matches!(
-            SpawnEntityPacket::decode(&wrong_frame),
+        assert_eq!(
+            SpawnEntityPacket::decode(&[0x02, 0x7F, 0x00]),
             Err(EntityProtocolError::UnexpectedPacketId {
                 expected: 0x01,
-                received: 0x99
+                received: 0x7F
             })
-        ));
+        );
     }
 
     #[test]
     fn test_remove_entities_packet_payload_and_framing() {
-        let ids = vec![1, 2, 3, 1000, 20000];
-        let packet = RemoveEntitiesPacket::new(ids);
+        // Three IDs: 1, 300 and -1.
+        let payload = [0x03, 0x01, 0xAC, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        let packet = RemoveEntitiesPacket::new(vec![1, 300, -1]);
+        let mut encoded = Vec::new();
+        packet.encode_payload(&mut encoded);
+        assert_eq!(encoded, payload);
+        assert_eq!(
+            RemoveEntitiesPacket::decode_payload(&payload).unwrap(),
+            packet
+        );
 
-        let mut payload = Vec::new();
-        packet.encode_payload(&mut payload);
-        let decoded = RemoveEntitiesPacket::decode_payload(&payload).expect("decode payload");
-        assert_eq!(packet, decoded);
+        let mut framed = vec![0x0A, 0x4E];
+        framed.extend(payload);
+        assert_eq!(packet.encode(), framed);
+        assert_eq!(RemoveEntitiesPacket::decode(&framed).unwrap(), packet);
 
-        let framed = packet.encode();
-        let decoded_framed = RemoveEntitiesPacket::decode(&framed).expect("decode framed");
-        assert_eq!(packet, decoded_framed);
-
-        // Single entity helper
-        let single = RemoveEntitiesPacket::single(99);
-        assert_eq!(single.entity_ids, vec![99]);
-
-        // Empty entity removal
-        let empty = RemoveEntitiesPacket::new(vec![]);
-        let decoded_empty = RemoveEntitiesPacket::decode_payload(&{
-            let mut b = Vec::new();
-            empty.encode_payload(&mut b);
-            b
-        })
-        .expect("decode empty");
-        assert_eq!(empty, decoded_empty);
+        assert_eq!(
+            RemoveEntitiesPacket::decode_payload(&[0x02, 0x01]),
+            Err(EntityProtocolError::UnexpectedEof)
+        );
+        // A hostile count fails on the missing data without a huge reservation.
+        assert_eq!(
+            RemoveEntitiesPacket::decode_payload(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07]),
+            Err(EntityProtocolError::UnexpectedEof)
+        );
     }
 
     #[test]
-    fn test_set_entity_data_packet_all_17_metadata_types() {
-        let uuid = [0xAA; 16];
-        let entries = vec![
-            EntityMetadataEntry::new(0, MetadataValue::Byte(-12)),
-            EntityMetadataEntry::new(1, MetadataValue::VarInt(1337)),
-            EntityMetadataEntry::new(2, MetadataValue::Float(std::f32::consts::PI)),
-            EntityMetadataEntry::new(3, MetadataValue::String("RustMC-Zombie".to_string())),
-            EntityMetadataEntry::new(4, MetadataValue::Chat("{\"text\":\"Hello\"}".to_string())),
-            EntityMetadataEntry::new(5, MetadataValue::Slot(SlotData::empty())),
-            EntityMetadataEntry::new(
-                6,
-                MetadataValue::Slot(SlotData::with_nbt(276, 1, vec![0x0A, 0x00, 0x00])),
+    fn test_set_entity_data_uses_26_3_metadata_type_ids() {
+        let cases: Vec<(MetadataValue, Vec<u8>)> = vec![
+            (MetadataValue::Byte(-12), vec![0x00, 0xF4]),
+            (MetadataValue::VarInt(300), vec![0x01, 0xAC, 0x02]),
+            (
+                MetadataValue::Float(1.0),
+                vec![0x03, 0x3F, 0x80, 0x00, 0x00],
             ),
-            EntityMetadataEntry::new(7, MetadataValue::Bool(true)),
-            EntityMetadataEntry::new(8, MetadataValue::Rotations([15.0, 30.0, 45.0])),
-            EntityMetadataEntry::new(9, MetadataValue::OptPosition(None)),
-            EntityMetadataEntry::new(10, MetadataValue::OptPosition(Some([-10, 64, 25]))),
-            EntityMetadataEntry::new(11, MetadataValue::Direction(direction::NORTH)),
-            EntityMetadataEntry::new(12, MetadataValue::OptUUID(None)),
-            EntityMetadataEntry::new(13, MetadataValue::OptUUID(Some(uuid))),
-            EntityMetadataEntry::new(14, MetadataValue::BlockState(88)),
-            EntityMetadataEntry::new(15, MetadataValue::NBT(vec![0x00])),
-            EntityMetadataEntry::new(16, MetadataValue::Particle(ParticleData::new(12))),
-            EntityMetadataEntry::new(
-                17,
-                MetadataValue::Particle(ParticleData::with_data(15, vec![1, 2, 3])),
+            (
+                MetadataValue::String("ab".into()),
+                vec![0x04, 0x02, b'a', b'b'],
             ),
-            EntityMetadataEntry::new(
-                18,
+            (
+                MetadataValue::Chat("ab".into()),
+                vec![0x05, 0x08, 0x00, 0x02, b'a', b'b'],
+            ),
+            (MetadataValue::OptChat(None), vec![0x06, 0x00]),
+            (
+                MetadataValue::OptChat(Some("\u{1F600}".into())),
+                vec![
+                    0x06, 0x01, 0x08, 0x00, 0x06, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80,
+                ],
+            ),
+            (MetadataValue::Slot(SlotData::empty()), vec![0x07, 0x00]),
+            (
+                MetadataValue::Slot(SlotData::item(276, 3)),
+                vec![0x07, 0x03, 0x94, 0x02, 0x00, 0x00],
+            ),
+            (MetadataValue::Bool(true), vec![0x08, 0x01]),
+            (
+                MetadataValue::Rotations([1.0, 0.0, -2.0]),
+                vec![
+                    0x09, 0x3F, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                ],
+            ),
+            (MetadataValue::OptPosition(None), vec![0x0B, 0x00]),
+            (
+                // x=1 at bit 38, z=2 at bit 12, y=3 at bit 0.
+                MetadataValue::OptPosition(Some([1, 3, 2])),
+                vec![0x0B, 0x01, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x20, 0x03],
+            ),
+            (MetadataValue::Direction(direction::NORTH), vec![0x0C, 0x02]),
+            (MetadataValue::OptUUID(None), vec![0x0D, 0x00]),
+            (MetadataValue::BlockState(88), vec![0x0E, 0x58]),
+            (
                 MetadataValue::VillagerData {
-                    villager_type: 1,
-                    profession: 2,
-                    level: 3,
+                    villager_type: 2,
+                    profession: 9,
+                    level: 1,
                 },
+                vec![0x12, 0x02, 0x09, 0x01],
             ),
-            EntityMetadataEntry::new(19, MetadataValue::OptVarInt(None)),
-            EntityMetadataEntry::new(20, MetadataValue::OptVarInt(Some(42))),
-            EntityMetadataEntry::new(21, MetadataValue::Pose(pose::SNEAKING)),
+            (MetadataValue::OptVarInt(None), vec![0x13, 0x00]),
+            (MetadataValue::OptVarInt(Some(41)), vec![0x13, 0x2A]),
+            (MetadataValue::Pose(pose::SNEAKING), vec![0x14, 0x05]),
         ];
 
-        let packet = SetEntityDataPacket::new(1001, entries);
+        for (value, wire) in cases {
+            let mut payload = vec![0x05, 0x02]; // Entity 5, index 2.
+            payload.extend(&wire);
+            payload.push(0xFF);
 
-        // Payload round trip
-        let mut payload = Vec::new();
-        packet.encode_payload(&mut payload);
-        let decoded = SetEntityDataPacket::decode_payload(&payload).expect("decode payload");
-        assert_eq!(packet, decoded);
+            let packet = SetEntityDataPacket::new(5, vec![EntityMetadataEntry::new(2, value)]);
+            let mut encoded = Vec::new();
+            packet.encode_payload(&mut encoded).unwrap();
+            assert_eq!(encoded, payload);
+            assert_eq!(
+                SetEntityDataPacket::decode_payload(&payload).unwrap(),
+                packet
+            );
 
-        // Framed round trip
-        let framed = packet.encode();
-        let decoded_framed = SetEntityDataPacket::decode(&framed).expect("decode framed");
-        assert_eq!(packet, decoded_framed);
+            let mut framed = vec![payload.len() as u8 + 1, 0x65];
+            framed.extend(&payload);
+            assert_eq!(packet.encode().unwrap(), framed);
+            assert_eq!(SetEntityDataPacket::decode(&framed).unwrap(), packet);
+        }
+    }
 
-        // Reject missing terminator (0xFF)
-        assert!(SetEntityDataPacket::decode_payload(&payload[..payload.len() - 1]).is_err());
+    #[test]
+    fn test_metadata_rejects_what_it_cannot_represent() {
+        assert!(SetEntityDataPacket::decode_payload(&[0x05, 0x02, 0x08, 0x01]).is_err());
+
+        // VarLong, Particle and later types are not misread as neighbouring ones.
+        for type_id in [2, 10, 15, 16, 17, 21, 43] {
+            assert_eq!(
+                MetadataValue::decode(type_id, &[0; 16]),
+                Err(EntityProtocolError::UnknownTypeId(type_id))
+            );
+        }
+
+        // A compound text component is unsupported, never truncated.
+        assert_eq!(
+            MetadataValue::decode(5, &[0x0A, 0x00]),
+            Err(EntityProtocolError::UnsupportedTextComponent(0x0A))
+        );
+        // A slot with data components cannot be represented.
+        assert!(MetadataValue::decode(7, &[0x01, 0x05, 0x01, 0x00]).is_err());
+        assert_eq!(
+            MetadataValue::decode(8, &[0x02]),
+            Err(EntityProtocolError::InvalidBoolean(0x02))
+        );
+        assert_eq!(
+            MetadataValue::decode(5, &[0x08, 0x00, 0x04, 0xF0, 0x9F, 0x98, 0x80]),
+            Err(EntityProtocolError::InvalidUtf8)
+        );
+
+        let mut out = Vec::new();
+        assert!(
+            MetadataValue::OptVarInt(Some(i32::MAX))
+                .encode(&mut out)
+                .is_err()
+        );
+        assert!(
+            MetadataValue::Slot(SlotData::item(1, -1))
+                .encode(&mut out)
+                .is_err()
+        );
+        assert!(
+            MetadataValue::Chat("a".repeat(65536))
+                .encode(&mut out)
+                .is_err()
+        );
+        assert!(
+            MetadataValue::String("a".repeat(32768))
+                .encode(&mut out)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1779,13 +1791,11 @@ mod tests {
 
         // Register entity 1 at (10.0, 64.0, 10.0)
         let entity1 =
-            TrackedEntityState::new(1, uuid1, 20, [10.0, 64.0, 10.0], 0, 0, 0, 0, [0, 0, 0])
-                .unwrap();
+            TrackedEntityState::new(1, uuid1, 20, [10.0, 64.0, 10.0], 0, 0, 0, 0).unwrap();
 
         // Register entity 2 at (100.0, 64.0, 100.0)
         let entity2 =
-            TrackedEntityState::new(2, uuid2, 21, [100.0, 64.0, 100.0], 0, 0, 0, 0, [0, 0, 0])
-                .unwrap();
+            TrackedEntityState::new(2, uuid2, 21, [100.0, 64.0, 100.0], 0, 0, 0, 0).unwrap();
 
         tracker.add_entity(entity1).unwrap();
         tracker.add_entity(entity2).unwrap();
@@ -1879,8 +1889,7 @@ mod tests {
         let mut tracker = EntityVisualTracker::new();
 
         let uuid = [0x55; 16];
-        let entity =
-            TrackedEntityState::new(10, uuid, 1, [0.0, 0.0, 0.0], 0, 0, 0, 0, [0, 0, 0]).unwrap();
+        let entity = TrackedEntityState::new(10, uuid, 1, [0.0, 0.0, 0.0], 0, 0, 0, 0).unwrap();
         tracker.add_entity(entity).unwrap();
 
         // Player A at (20.0, 0.0, 0.0) with radius 15.0 -> out of range
