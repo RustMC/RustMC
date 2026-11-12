@@ -1,5 +1,10 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
+pub mod keepalive;
+
+#[cfg(test)]
+mod tests_keepalive;
+
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
