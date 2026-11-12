@@ -187,6 +187,12 @@ fn is_valid_coord(x: f64, y: f64, z: f64) -> bool {
         && (-1_000_000.0..=1_000_000.0).contains(&z)
 }
 
+/// Serverbound `player_abilities` carries only the flying flag (`0x02`).
+const ABILITIES_FLYING: u8 = 0x02;
+/// Serverbound `player_input` packs seven movement flags (forward, backward,
+/// left, right, jump, shift, sprint) into the low bits; the top bit is unused.
+const PLAYER_INPUT_FLAGS: u8 = 0x7f;
+
 fn is_valid_rotation(yaw: f32, pitch: f32) -> bool {
     yaw.is_finite() && pitch.is_finite() && (-90.0..=90.0).contains(&pitch)
 }
@@ -397,11 +403,9 @@ impl Session {
                                 return Err(Error::Malformed);
                             }
                             let rate = f32::from_be_bytes(body.try_into().unwrap());
-                            if !preview.awaiting_batch
-                                || !rate.is_finite()
-                                || rate <= 0.0
-                                || rate > 100.0
-                            {
+                            // Clients report any positive desired rate; large values
+                            // are valid on fast machines and only cap the batch size.
+                            if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
                                 return Err(Error::Malformed);
                             }
                             preview.awaiting_batch = false;
@@ -463,8 +467,13 @@ impl Session {
                                 return Err(Error::Malformed);
                             }
                         }
-                        40 | 43 => {
-                            if body.len() != 1 || !matches!(body[0], 0 | 1) {
+                        40 => {
+                            if body.len() != 1 || body[0] & !ABILITIES_FLYING != 0 {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        43 => {
+                            if body.len() != 1 || body[0] & !PLAYER_INPUT_FLAGS != 0 {
                                 return Err(Error::Malformed);
                             }
                         }
@@ -928,13 +937,15 @@ mod tests {
             );
         }
 
-        // Boolean-only packets (40, 43) reject any non-boolean byte (> 1)
+        // player_abilities carries only the flying flag; player_input uses seven flags.
+        for flags in [0x01, 0x04, 0x80, 0xff] {
+            assert_eq!(
+                enter_play_session().receive(&frame(40, &[flags]), 4096),
+                Err(Error::Malformed)
+            );
+        }
         assert_eq!(
-            enter_play_session().receive(&frame(40, &[2]), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(43, &[2]), 4096),
+            enter_play_session().receive(&frame(43, &[0x80]), 4096),
             Err(Error::Malformed)
         );
 
@@ -1117,11 +1128,13 @@ mod tests {
             s_batch.receive(&frame(11, &(-1.0f32).to_be_bytes()), 4096),
             Err(Error::Malformed)
         );
+        // A fast client may report a high desired rate; it is not malformed.
         let mut s_batch = enter_play_session();
         s_batch.preview.as_mut().unwrap().awaiting_batch = true;
-        assert_eq!(
-            s_batch.receive(&frame(11, &100.5f32.to_be_bytes()), 4096),
-            Err(Error::Malformed)
+        assert!(
+            s_batch
+                .receive(&frame(11, &1000.0f32.to_be_bytes()), 4096)
+                .is_ok()
         );
         let mut s_batch = enter_play_session();
         s_batch.preview.as_mut().unwrap().awaiting_batch = true;
@@ -1178,8 +1191,12 @@ mod tests {
                 .is_ok()
         );
         assert!(s.receive(&frame(33, &[1]), 4096).is_ok());
+        // Start and stop flying (abilities flag 0x02).
+        assert!(s.receive(&frame(40, &[0x02]), 4096).is_ok());
         assert!(s.receive(&frame(40, &[0]), 4096).is_ok());
-        assert!(s.receive(&frame(43, &[1]), 4096).is_ok());
+        // Forward, backward, left, right, jump, shift, and sprint together.
+        assert!(s.receive(&frame(43, &[0x7f]), 4096).is_ok());
+        assert!(s.receive(&frame(43, &[0x02]), 4096).is_ok());
         assert!(s.receive(&frame(44, &[]), 4096).is_ok());
         assert!(s.preview.as_ref().unwrap().client_loaded);
         assert!(s.receive(&frame(46, &[]), 4096).is_ok());
