@@ -64,17 +64,55 @@ fn test_keepalive_timeout_detection() {
 }
 
 #[test]
-fn test_disconnect_packet_encoding() {
-    let packet = DisconnectPayload::encode_disconnect_packet(0x00, "Server closed");
-    assert!(!packet.is_empty());
+fn login_disconnect_carries_a_json_text_component() {
+    let packet = DisconnectPayload::encode(DisconnectPhase::Login, "Bye").unwrap();
+    let json = br#"{"text":"Bye"}"#;
+    // Frame length, login_disconnect 0, string length, JSON.
+    let mut expected = vec![(2 + json.len()) as u8, 0, json.len() as u8];
+    expected.extend_from_slice(json);
+    assert_eq!(packet, expected);
+}
 
-    let json_text = DisconnectPayload::format_reason_json("Timed out: connection dropped");
-    assert_eq!(json_text, "{\"text\":\"Timed out: connection dropped\"}");
+#[test]
+fn configuration_and_play_disconnects_carry_an_nbt_string() {
+    for (phase, id) in [
+        (DisconnectPhase::Configuration, 2),
+        (DisconnectPhase::Play, 32),
+    ] {
+        let packet = DisconnectPayload::encode(phase, "Bye").unwrap();
+        // Frame length, packet ID, TAG_String, u16 length 3, "Bye".
+        assert_eq!(packet, [7, id, 8, 0, 3, b'B', b'y', b'e']);
+    }
+}
 
-    // Verify escaping
-    let json_escaped = DisconnectPayload::format_reason_json("Hello \"World\"\nNext line");
+#[test]
+fn nbt_reasons_use_modified_utf8() {
+    let packet = DisconnectPayload::encode(DisconnectPhase::Play, "a\0\u{1F600}").unwrap();
+    // 'a', NUL as C0 80, and U+1F600 as surrogates D83D DE00 in three bytes each.
     assert_eq!(
-        json_escaped,
-        "{\"text\":\"Hello \\\"World\\\"\\nNext line\"}"
+        &packet[3..],
+        &[0, 9, b'a', 0xc0, 0x80, 0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]
+    );
+    let too_long = "x".repeat(65_536);
+    assert_eq!(
+        DisconnectPayload::encode(DisconnectPhase::Play, &too_long),
+        Err(DisconnectError::ReasonTooLong)
+    );
+    assert!(DisconnectPayload::encode(DisconnectPhase::Login, &too_long).is_ok());
+}
+
+#[test]
+fn json_reasons_escape_every_control_character() {
+    assert_eq!(
+        DisconnectPayload::format_reason_json("Timed out: connection dropped"),
+        "{\"text\":\"Timed out: connection dropped\"}"
+    );
+    assert_eq!(
+        DisconnectPayload::format_reason_json("Hello \"World\"\nNext\\line"),
+        "{\"text\":\"Hello \\\"World\\\"\\nNext\\\\line\"}"
+    );
+    assert_eq!(
+        DisconnectPayload::format_reason_json("\0\u{8}\u{c}\u{1f}"),
+        "{\"text\":\"\\u0000\\u0008\\u000c\\u001f\"}"
     );
 }

@@ -9,10 +9,12 @@
 //!   Only one keep-alive challenge may be in-flight at any time per connection.
 //! - **Timeout Window**: If a client does not acknowledge the pending challenge within
 //!   15 seconds (300 ticks at 20 TPS), the connection is terminated with a timeout error.
-//! - **Disconnect Framing**: Disconnect packets carry formatted Chat Component JSON payloads
-//!   explaining the termination reason (e.g. timeout, kick, server shutdown).
+//! - **Disconnect Framing**: Login disconnects carry a JSON text component; configuration
+//!   and play disconnects carry a network NBT text component (26.3 protocol 777).
 
 use std::fmt;
+
+use super::put_varint;
 
 /// Default keep-alive timeout in server ticks (15 seconds = 300 ticks).
 pub const DEFAULT_TIMEOUT_TICKS: u64 = 300;
@@ -161,14 +163,46 @@ impl KeepAliveTracker {
     }
 }
 
-/// Disconnect reason packet framing generator.
+/// Connection phase whose disconnect packet carries a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectPhase {
+    Login,
+    Configuration,
+    Play,
+}
+
+impl DisconnectPhase {
+    /// Clientbound disconnect packet ID in the official 26.3 packet report:
+    /// `login_disconnect` (login 0), `disconnect` (configuration 2, play 32).
+    pub const fn packet_id(self) -> u32 {
+        match self {
+            Self::Login => 0,
+            Self::Configuration => 2,
+            Self::Play => 32,
+        }
+    }
+}
+
+/// NBT tag type of a string; a plain text component is a bare string tag.
+const TAG_STRING: u8 = 8;
+/// Largest modified UTF-8 payload an NBT string length prefix can describe.
+const MAX_NBT_STRING_BYTES: usize = u16::MAX as usize;
+
+/// Errors from encoding a disconnect reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectError {
+    /// The reason exceeds the 65,535-byte modified UTF-8 limit of an NBT string.
+    ReasonTooLong,
+}
+
+/// Disconnect reason packet encoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectPayload;
 
 impl DisconnectPayload {
-    /// Formats a plain text reason into a canonical JSON Chat Component payload.
+    /// Formats a plain text reason as a JSON text component, escaping every
+    /// character JSON requires (quotes, backslash, and all control characters).
     pub fn format_reason_json(reason: &str) -> String {
-        // Escape special JSON characters
         let mut escaped = String::with_capacity(reason.len() + 16);
         for c in reason.chars() {
             match c {
@@ -177,40 +211,61 @@ impl DisconnectPayload {
                 '\n' => escaped.push_str("\\n"),
                 '\r' => escaped.push_str("\\r"),
                 '\t' => escaped.push_str("\\t"),
+                c if c < ' ' => escaped.push_str(&format!("\\u{:04x}", u32::from(c))),
                 _ => escaped.push(c),
             }
         }
         format!("{{\"text\":\"{escaped}\"}}")
     }
 
-    /// Encodes a framed disconnect packet body: VarInt length + UTF-8 payload.
-    pub fn encode_disconnect_packet(packet_id: u32, reason: &str) -> Vec<u8> {
-        let json_reason = Self::format_reason_json(reason);
-        let reason_bytes = json_reason.as_bytes();
-
-        let mut payload = Vec::with_capacity(reason_bytes.len() + 10);
-        put_varint(packet_id, &mut payload);
-        put_varint(reason_bytes.len() as u32, &mut payload);
-        payload.extend_from_slice(reason_bytes);
-
+    /// Encodes a framed disconnect packet for `phase`.
+    ///
+    /// Login carries the reason as a JSON text component string. Configuration
+    /// and play carry an anonymous network NBT text component; a plain text
+    /// component is a single string tag in modified UTF-8.
+    pub fn encode(phase: DisconnectPhase, reason: &str) -> Result<Vec<u8>, DisconnectError> {
+        let mut payload = Vec::with_capacity(reason.len() + 8);
+        put_varint(phase.packet_id(), &mut payload);
+        match phase {
+            DisconnectPhase::Login => {
+                let json = Self::format_reason_json(reason);
+                put_varint(json.len() as u32, &mut payload);
+                payload.extend_from_slice(json.as_bytes());
+            }
+            DisconnectPhase::Configuration | DisconnectPhase::Play => {
+                let text = modified_utf8(reason);
+                if text.len() > MAX_NBT_STRING_BYTES {
+                    return Err(DisconnectError::ReasonTooLong);
+                }
+                payload.push(TAG_STRING);
+                payload.extend_from_slice(&(text.len() as u16).to_be_bytes());
+                payload.extend_from_slice(&text);
+            }
+        }
         let mut framed = Vec::with_capacity(payload.len() + 5);
         put_varint(payload.len() as u32, &mut framed);
         framed.extend_from_slice(&payload);
-        framed
+        Ok(framed)
     }
 }
 
-/// Writes a VarInt to a byte buffer.
-fn put_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
+/// Java's modified UTF-8: U+0000 becomes `C0 80` and supplementary characters
+/// are written as two three-byte surrogate encodings.
+fn modified_utf8(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for unit in text.encode_utf16() {
+        match unit {
+            0x0001..=0x007f => out.push(unit as u8),
+            0x0000 | 0x0080..=0x07ff => {
+                out.push(0xc0 | (unit >> 6) as u8);
+                out.push(0x80 | (unit & 0x3f) as u8);
+            }
+            _ => {
+                out.push(0xe0 | (unit >> 12) as u8);
+                out.push(0x80 | ((unit >> 6) & 0x3f) as u8);
+                out.push(0x80 | (unit & 0x3f) as u8);
+            }
         }
     }
+    out
 }
