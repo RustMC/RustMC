@@ -1,6 +1,9 @@
 //! Bounded loopback discovery supervisor with an opt-in local Java terrain preview.
 
-use crate::{ListenerConfig, discovery_bedrock, discovery_java, java_preview, preview_data};
+use crate::{
+    ListenerConfig, PREVIEW_READ_BYTES_PER_SECOND, PREVIEW_SESSION_LIFETIME_MS, discovery_bedrock,
+    discovery_java, java_preview, preview_data,
+};
 use std::{
     fmt,
     io::{self, Read, Write},
@@ -16,6 +19,12 @@ use std::{
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPT_BUDGET: usize = 32;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
+/// Largest single socket read; also the most input decoded per poll.
+const READ_CHUNK: usize = 4096;
+/// Window for the play-phase read rate budget.
+const READ_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Server GUID advertised in Bedrock unconnected pongs (ASCII "RUSTMC").
+const BEDROCK_SERVER_GUID: u64 = 0x5255_5354_4d43;
 
 /// Observable development-process states. `Bound` is not protocol or world readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +123,33 @@ struct Connection {
     last_activity: Instant,
     created: Instant,
     pending_chunk_since: Option<Instant>,
+    /// Start of the current play-phase read window and bytes read within it.
+    rate_window: Instant,
+    rate_window_bytes: usize,
+}
+
+impl Connection {
+    /// Bytes this connection may read now, and the per-call decode limit.
+    ///
+    /// Before play the whole session is capped. During play input is rate
+    /// limited; a spent budget pauses reading so TCP backpressure applies.
+    fn read_allowance(&mut self, config: &ListenerConfig, playing: bool) -> (usize, usize) {
+        if playing {
+            if self.rate_window.elapsed() >= READ_RATE_WINDOW {
+                self.rate_window = Instant::now();
+                self.rate_window_bytes = 0;
+            }
+            let remaining = config
+                .preview_read_bytes_per_second
+                .saturating_sub(self.rate_window_bytes);
+            (remaining.min(READ_CHUNK), READ_CHUNK)
+        } else {
+            let remaining = config
+                .max_bytes_per_connection
+                .saturating_sub(self.bytes_read);
+            (remaining.min(READ_CHUNK), config.max_bytes_per_connection)
+        }
+    }
 }
 
 fn event(
@@ -200,6 +236,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         })
             .contains(&config.max_connection_lifetime_ms)
         || config.idle_timeout_ms > config.max_connection_lifetime_ms
+        || !PREVIEW_SESSION_LIFETIME_MS.contains(&config.preview_session_lifetime_ms)
+        || !PREVIEW_READ_BYTES_PER_SECOND.contains(&config.preview_read_bytes_per_second)
     {
         observe(event(
             "failed",
@@ -260,12 +298,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
     let vanilla_source = if let (Some(data_root), Some(registry_table)) =
         (&config.vanilla_data_root, &config.vanilla_registry_table)
     {
-        let seed = i64::try_from(config.preview_seed).map_err(|_| {
-            RuntimeError::Bind(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "preview seed exceeds i64",
-            ))
-        })?;
+        // The configuration stores the signed seed's two's-complement bits.
+        let seed = config.preview_seed as i64;
         let generator = crate::vanilla::generator::VanillaGenerator::new(
             data_root,
             seed,
@@ -390,9 +424,11 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             let mut buffer = [0u8; discovery_bedrock::MAX_DATAGRAM + 1];
             match udp.recv_from(&mut buffer) {
                 Ok((length, peer)) => {
-                    if let Some(reply) =
-                        discovery_bedrock::pong(&buffer[..length], 0x525553544d43, address.port())
-                    {
+                    if let Some(reply) = discovery_bedrock::pong(
+                        &buffer[..length],
+                        BEDROCK_SERVER_GUID,
+                        address.port(),
+                    ) {
                         let _ = udp.send_to(&reply, peer);
                     }
                 }
@@ -458,6 +494,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         last_activity: Instant::now(),
                         created: Instant::now(),
                         pending_chunk_since: None,
+                        rate_window: Instant::now(),
+                        rate_window_bytes: 0,
                     });
                     observe(event(
                         "connection_accepted",
@@ -490,26 +528,30 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         while index < connections.len() {
             let connection = &mut connections[index];
             let playing = connection.discovery.state() == discovery_java::State::Play;
-            let byte_limit = if playing {
-                1024 * 1024
-            } else {
-                config.max_bytes_per_connection
-            };
             let lifetime_ms = if playing {
-                600_000
+                config.preview_session_lifetime_ms
             } else {
                 config.max_connection_lifetime_ms
             };
-            let remaining = byte_limit.saturating_sub(connection.bytes_read);
-            let mut buffer = [0u8; 4096];
-            let read_len = remaining.min(buffer.len());
+            let (read_len, byte_limit) = connection.read_allowance(config, playing);
+            let mut buffer = [0u8; READ_CHUNK];
             let reason = if connection.created.elapsed() >= Duration::from_millis(lifetime_ms) {
                 Some("lifetime_timeout")
+            } else if read_len == 0 && !playing {
+                Some("read_limit")
+            } else if read_len == 0 {
+                // Play-phase budget spent: leave input in the socket until the
+                // next window. Inactivity is not judged while throttled.
+                connection.last_activity = Instant::now();
+                None
             } else {
                 match connection.stream.read(&mut buffer[..read_len]) {
                     Ok(0) => Some("peer_closed"),
                     Ok(count) => {
                         connection.bytes_read += count;
+                        if playing {
+                            connection.rate_window_bytes += count;
+                        }
                         connection.last_activity = Instant::now();
                         let state_before = connection.discovery.state();
                         match connection.discovery.receive(&buffer[..count], byte_limit) {
@@ -544,13 +586,17 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                                 }
                                 if connection.pending.len() > MAX_PENDING_BYTES {
                                     Some("write_limit")
-                                } else if connection.bytes_read >= byte_limit {
+                                } else if state_after != discovery_java::State::Play
+                                    && connection.bytes_read >= byte_limit
+                                {
                                     Some("read_limit")
                                 } else {
                                     None
                                 }
                             }
-                            Err(_) if connection.bytes_read >= byte_limit => Some("read_limit"),
+                            Err(_) if !playing && connection.bytes_read >= byte_limit => {
+                                Some("read_limit")
+                            }
                             Err(_)
                                 if matches!(
                                     connection.discovery.state(),
@@ -617,10 +663,11 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             } else {
                 reason
             };
-            let reason = reason.or_else(|| {
-                (connection.discovery.state() == discovery_java::State::Done
-                    && connection.pending.is_empty())
-                .then_some("status_complete")
+            let reason = reason.or_else(|| match connection.discovery.state() {
+                _ if !connection.pending.is_empty() => None,
+                discovery_java::State::Done => Some("status_complete"),
+                discovery_java::State::Refused => Some("login_refused"),
+                _ => None,
             });
             if let Some(reason) = reason {
                 let connection = connections.swap_remove(index);
@@ -677,6 +724,75 @@ mod tests {
                 .iter()
                 .any(|event| event.reason == Some("invalid_limits"))
         );
+    }
+
+    fn loopback_connection() -> (Connection, TcpStream) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let connection = Connection {
+            stream,
+            discovery: discovery_java::Session::default(),
+            pending: Vec::new(),
+            bytes_read: 0,
+            last_activity: Instant::now(),
+            created: Instant::now(),
+            pending_chunk_since: None,
+            rate_window: Instant::now(),
+            rate_window_bytes: 0,
+        };
+        (connection, client)
+    }
+
+    #[test]
+    fn pre_play_reads_are_capped_for_the_whole_session() {
+        let config = ListenerConfig::default();
+        let (mut connection, _client) = loopback_connection();
+        assert_eq!(connection.read_allowance(&config, false), (4096, 4096));
+        connection.bytes_read = 4000;
+        assert_eq!(connection.read_allowance(&config, false), (96, 4096));
+        connection.bytes_read = 4096;
+        assert_eq!(connection.read_allowance(&config, false).0, 0);
+    }
+
+    #[test]
+    fn play_reads_pause_when_the_rate_window_is_spent_and_resume_after_it() {
+        let config = ListenerConfig {
+            preview_read_bytes_per_second: 5000,
+            ..ListenerConfig::default()
+        };
+        let (mut connection, _client) = loopback_connection();
+        // Total history does not matter during play; only the current window.
+        connection.bytes_read = 10 * 1024 * 1024;
+        assert_eq!(
+            connection.read_allowance(&config, true),
+            (READ_CHUNK, READ_CHUNK)
+        );
+        connection.rate_window_bytes = 4500;
+        assert_eq!(connection.read_allowance(&config, true).0, 500);
+        connection.rate_window_bytes = 5000;
+        assert_eq!(connection.read_allowance(&config, true).0, 0);
+        connection.rate_window = Instant::now() - READ_RATE_WINDOW;
+        assert_eq!(connection.read_allowance(&config, true).0, READ_CHUNK);
+        assert_eq!(connection.rate_window_bytes, 0);
+    }
+
+    #[test]
+    fn direct_invalid_play_limits_fail_before_binding() {
+        for config in [
+            ListenerConfig {
+                preview_session_lifetime_ms: 0,
+                ..ListenerConfig::default()
+            },
+            ListenerConfig {
+                preview_read_bytes_per_second: usize::MAX,
+                ..ListenerConfig::default()
+            },
+        ] {
+            let flag = AtomicBool::new(false);
+            let error = run_listener(&config, &flag, Instant::now(), |_| {}).unwrap_err();
+            assert_eq!(error.exit_code(), 4);
+        }
     }
 
     #[test]

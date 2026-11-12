@@ -20,6 +20,8 @@ const MAX_BYTES: u64 = 1_073_741_824;
 const MAX_INPUT_FILES: usize = 4_096;
 const MAX_INPUT_BYTES: u64 = 67_108_864;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Build-time hash of the sources that shape cached packets (see `build.rs`).
+const PACKET_SOURCE_FINGERPRINT: &str = env!("RUSTMC_PACKET_SOURCE_FINGERPRINT");
 
 #[derive(Debug, Default)]
 struct Budget {
@@ -134,7 +136,6 @@ impl PreviewCache {
                 "invalid packet size",
             ));
         }
-        let mut budget = self.budget.lock().expect("preview cache lock poisoned");
         let path = self.path(x, z);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temporary =
@@ -159,6 +160,11 @@ impl PreviewCache {
             let _ = fs::remove_file(&temporary);
             return result;
         }
+        // File I/O and fsync above run without the lock, so concurrent workers
+        // and scheduling hints (`contains`) never wait on disk. Each write uses
+        // a unique temporary file and an atomic rename; only the bookkeeping
+        // below is serialized.
+        let mut budget = self.budget.lock().expect("preview cache lock poisoned");
         if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
             let (_, old_size) = budget.files.remove(index).expect("index exists");
             budget.bytes -= old_size;
@@ -197,7 +203,9 @@ fn prune(budget: &mut Budget) -> io::Result<()> {
 
 fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
-    hasher.update(b"rustmc-preview-cache-v3:java-26.3:protocol-777");
+    hasher.update(b"rustmc-preview-cache:java-26.3:protocol-777");
+    // Generator and encoder sources, so code changes never reuse old packets.
+    hasher.update(PACKET_SOURCE_FINGERPRINT.as_bytes());
     hasher.update(seed.to_be_bytes());
     let mut paths = Vec::new();
     collect_files(data_root, &mut paths)?;

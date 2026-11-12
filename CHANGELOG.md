@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — preview runtime hardening
+
+- Fixed the preview chunk cache serving packets built by an older generator: its key now includes a build-time fingerprint of the generator and encoder sources.
+- Preview play sessions now use `preview_session_lifetime_ms` (default 600 s, as before) and a per-second read budget, `preview_read_bytes_per_second`, instead of fixed 600 s / 1 MiB caps that closed long sessions.
+- Cache writes no longer hold the cache lock during file I/O and fsync, so disk latency cannot stall the network loop.
+- Chunk workers can now be handed several requests per poll, and a worker that cannot load its inputs logs why.
+- A login attempt on a discovery-only server or with the wrong protocol now receives a login disconnect with a reason instead of a silent close.
+- Java packet IDs now come from one module checked against the official 26.3 packet report; `preview_seed` accepts the full signed 64-bit range.
+- CI builds rustdoc with warnings denied.
+
 ## Unreleased — opt-in Overworld terrain probe
 
 - Added bounded parallel generation of operator-provisioned Java 26.3 Overworld chunks behind an explicit loopback preview setting. The original terrain preview remains the default.
