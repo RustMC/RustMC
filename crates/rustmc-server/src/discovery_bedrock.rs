@@ -3,6 +3,11 @@
 //! Validates offline discovery pings, RakNet Open Connection Requests (1 and 2),
 //! and version compatibility. Connected frame sets (0x80..=0x8f) and subsequent
 //! game sessions are rejected at this offline boundary.
+//!
+//! Wire facts come from RakNet commit
+//! `1a169895a900c9fc4841c556e16514182b75faf8`: `BitStream::Write(SystemAddress)`
+//! for address encoding and the `ID_OPEN_CONNECTION_REQUEST_1` handler in
+//! `RakPeer.cpp` for MTU derivation. No Bedrock client has exercised this path.
 
 use std::net::SocketAddr;
 
@@ -13,34 +18,46 @@ pub const MIN_MTU: u16 = 576;
 pub const MAX_MTU: u16 = 1492;
 pub const MAX_DATAGRAM: usize = 1492;
 pub const MAX_PONG_DATAGRAM: usize = 512;
+/// IPv4 and UDP header bytes that a UDP payload length excludes from the MTU.
+/// RakNet applies one such allowance to every address family.
+pub const UDP_HEADER_SIZE: u16 = 28;
+/// `AF_INET6` as RakNet peers write it in a system address.
+const AF_INET6: u16 = 23;
 pub const MAGIC: [u8; 16] = [
     0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 ];
 
 /// Encodes a `SocketAddr` into RakNet system address wire representation.
+///
+/// IPv4 octets are bitwise complemented and the port is big-endian. IPv6 is a raw
+/// `sockaddr_in6` as a little-endian host lays it out: little-endian family and
+/// scope ID around the network-order port, flow info, and address.
 pub fn encode_system_address(addr: &SocketAddr) -> Vec<u8> {
     match addr {
         SocketAddr::V4(v4) => {
             let mut bytes = Vec::with_capacity(7);
             bytes.push(4);
-            bytes.extend_from_slice(&v4.ip().octets());
+            bytes.extend(v4.ip().octets().map(|octet| !octet));
             bytes.extend_from_slice(&v4.port().to_be_bytes());
             bytes
         }
         SocketAddr::V6(v6) => {
             let mut bytes = Vec::with_capacity(29);
             bytes.push(6);
-            bytes.extend_from_slice(&23u16.to_be_bytes()); // AF_INET6
+            bytes.extend_from_slice(&AF_INET6.to_le_bytes());
             bytes.extend_from_slice(&v6.port().to_be_bytes());
             bytes.extend_from_slice(&v6.flowinfo().to_be_bytes());
             bytes.extend_from_slice(&v6.ip().octets());
-            bytes.extend_from_slice(&v6.scope_id().to_be_bytes());
+            bytes.extend_from_slice(&v6.scope_id().to_le_bytes());
             bytes
         }
     }
 }
 
 /// Handle incoming UDP datagrams for Bedrock discovery and offline RakNet handshake with peer address.
+///
+/// Open Connection Reply 2 reports the client's address, so a request 2 without a
+/// `peer` gets no reply.
 pub fn handle_datagram_with_peer(
     input: &[u8],
     server_guid: u64,
@@ -83,8 +100,9 @@ pub fn handle_datagram_with_peer(
                 out.extend_from_slice(&server_guid.to_be_bytes());
                 Some(out)
             } else {
-                // Open Connection Reply 1 (0x06, 28 bytes) with MTU clamped to [576, 1492]
-                let mtu = (input.len() as u16).clamp(MIN_MTU, MAX_MTU);
+                // Open Connection Reply 1 (0x06, 28 bytes). The probe's MTU is its UDP payload
+                // plus header overhead, clamped to [576, 1492].
+                let mtu = (input.len() as u16 + UDP_HEADER_SIZE).clamp(MIN_MTU, MAX_MTU);
                 let mut out = Vec::with_capacity(28);
                 out.push(0x06);
                 out.extend_from_slice(&MAGIC);
@@ -103,33 +121,19 @@ pub fn handle_datagram_with_peer(
             if input[1..17] != MAGIC {
                 return None;
             }
-            let (addr_slice, mtu, client_guid) = if input.len() == 34 {
-                if input[17] != 4 {
-                    return None;
-                }
-                let addr = &input[17..24];
-                let mtu = u16::from_be_bytes([input[24], input[25]]);
-                let guid = u64::from_be_bytes(input[26..34].try_into().unwrap());
-                (addr, mtu, guid)
-            } else {
-                if input[17] != 6 {
-                    return None;
-                }
-                let addr = &input[17..46];
-                let mtu = u16::from_be_bytes([input[46], input[47]]);
-                let guid = u64::from_be_bytes(input[48..56].try_into().unwrap());
-                (addr, mtu, guid)
-            };
+            let (family, mtu_at) = if input.len() == 34 { (4, 24) } else { (6, 46) };
+            if input[17] != family {
+                return None;
+            }
+            let mtu = u16::from_be_bytes([input[mtu_at], input[mtu_at + 1]]);
+            let client_guid = u64::from_be_bytes(input[mtu_at + 2..].try_into().ok()?);
 
             if !(MIN_MTU..=MAX_MTU).contains(&mtu) || client_guid == 0 {
                 return None;
             }
 
-            // Client address in Reply 2 must be the peer's actual network address.
-            let encoded_client_addr = match peer {
-                Some(p) => encode_system_address(&p),
-                None => addr_slice.to_vec(),
-            };
+            // The request's own address field names the server, not the client.
+            let encoded_client_addr = encode_system_address(&peer?);
 
             // Open Connection Reply 2 (0x08)
             let mut out = Vec::with_capacity(1 + 16 + 8 + encoded_client_addr.len() + 2 + 1);
@@ -162,6 +166,7 @@ pub fn pong(input: &[u8], server_guid: u64, port: u16) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
 
     #[test]
     fn valid_ping_and_malformed_rejection() {
@@ -209,11 +214,11 @@ mod tests {
         // MTU clamped to MIN_MTU (576)
         assert_eq!(&reply_min[26..28], &MIN_MTU.to_be_bytes());
 
-        // Typical MTU request (e.g. 1200 bytes with zero padding)
+        // A 1200-byte MTU probe carries a 1172-byte UDP payload.
         let mut req_1200 = vec![0x05];
         req_1200.extend(MAGIC);
         req_1200.push(RAKNET_PROTOCOL_VERSION);
-        req_1200.resize(1200, 0x00);
+        req_1200.resize(1172, 0x00);
 
         let reply_1200 = pong(&req_1200, server_guid, 19132).expect("reply 1 1200");
         assert_eq!(reply_1200.len(), 28);
@@ -223,15 +228,20 @@ mod tests {
         assert_eq!(reply_1200[25], 0x00);
         assert_eq!(&reply_1200[26..28], &1200u16.to_be_bytes());
 
-        // Maximum MTU request (1492 bytes with zero padding)
+        // A 1492-byte MTU probe carries a 1464-byte UDP payload.
         let mut req_1492 = vec![0x05];
         req_1492.extend(MAGIC);
         req_1492.push(RAKNET_PROTOCOL_VERSION);
-        req_1492.resize(MAX_DATAGRAM, 0x00);
+        req_1492.resize(1464, 0x00);
 
         let reply_1492 = pong(&req_1492, server_guid, 19132).expect("reply 1 1492");
         assert_eq!(reply_1492.len(), 28);
-        assert_eq!(&reply_1492[26..28], &MAX_MTU.to_be_bytes());
+        assert_eq!(&reply_1492[26..28], &[0x05, 0xd4]);
+
+        // Larger payloads still clamp to the maximum.
+        req_1492.resize(MAX_DATAGRAM, 0x00);
+        let reply_max = pong(&req_1492, server_guid, 19132).expect("reply 1 max");
+        assert_eq!(&reply_max[26..28], &MAX_MTU.to_be_bytes());
     }
 
     #[test]
@@ -267,12 +277,19 @@ mod tests {
         req_v4.extend(client_guid.to_be_bytes());
         assert_eq!(req_v4.len(), 34);
 
-        let reply_v4 = pong(&req_v4, server_guid, 19132).expect("reply 2 v4");
+        // The reply names the UDP peer, not the address in the request.
+        let peer_v4: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+        let reply_v4 = handle_datagram_with_peer(&req_v4, server_guid, 19132, Some(peer_v4))
+            .expect("reply 2 v4");
         assert_eq!(reply_v4.len(), 35);
         assert_eq!(reply_v4[0], 0x08);
         assert_eq!(&reply_v4[1..17], &MAGIC);
         assert_eq!(&reply_v4[17..25], &server_guid.to_be_bytes());
-        assert_eq!(&reply_v4[25..32], &[4, 127, 0, 0, 1, 0x4a, 0xbc]);
+        assert_eq!(
+            &reply_v4[25..32],
+            &[0x04, 0x3f, 0x57, 0xfe, 0xcd, 0xd4, 0x31],
+            "complemented 192.168.1.50, big-endian port 54321"
+        );
         assert_eq!(&reply_v4[32..34], &1400u16.to_be_bytes());
         assert_eq!(reply_v4[34], 0x00);
 
@@ -286,24 +303,44 @@ mod tests {
         req_v6.extend(client_guid.to_be_bytes());
         assert_eq!(req_v6.len(), 56);
 
-        let reply_v6 = pong(&req_v6, server_guid, 19132).expect("reply 2 v6");
+        let peer_v6 = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+            19133,
+            0x0102_0304,
+            0x0a0b_0c0d,
+        ));
+        let reply_v6 = handle_datagram_with_peer(&req_v6, server_guid, 19132, Some(peer_v6))
+            .expect("reply 2 v6");
         assert_eq!(reply_v6.len(), 57);
         assert_eq!(reply_v6[0], 0x08);
         assert_eq!(&reply_v6[1..17], &MAGIC);
         assert_eq!(&reply_v6[17..25], &server_guid.to_be_bytes());
-        assert_eq!(&reply_v6[25..54], &req_v6[17..46]);
+        assert_eq!(
+            &reply_v6[25..54],
+            &[
+                0x06, // Version
+                0x17, 0x00, // Family 23, little-endian
+                0x4a, 0xbd, // Port 19133, big-endian
+                0x01, 0x02, 0x03, 0x04, // Flow info, big-endian
+                0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, // Address
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
+                0x0d, 0x0c, 0x0b, 0x0a, // Scope ID, little-endian
+            ]
+        );
         assert_eq!(&reply_v6[54..56], &1200u16.to_be_bytes());
         assert_eq!(reply_v6[56], 0x00);
 
-        // With explicit peer SocketAddr: Reply 2 encodes the peer's actual network address
-        let peer_v4: SocketAddr = "192.168.1.50:54321".parse().unwrap();
-        let reply_peer_v4 = handle_datagram_with_peer(&req_v4, server_guid, 19132, Some(peer_v4))
-            .expect("reply 2 peer v4");
-        assert_eq!(reply_peer_v4[0], 0x08);
+        // Without a known peer there is no client address to report.
+        assert!(pong(&req_v4, server_guid, 19132).is_none());
+        assert!(pong(&req_v6, server_guid, 19132).is_none());
+    }
+
+    #[test]
+    fn system_address_loopback_wire() {
+        let loopback: SocketAddr = "127.0.0.1:19132".parse().unwrap();
         assert_eq!(
-            &reply_peer_v4[25..32],
-            &[4, 192, 168, 1, 50, (54321 >> 8) as u8, (54321 & 0xff) as u8],
-            "Reply 2 must encode the actual UDP client peer address"
+            encode_system_address(&loopback),
+            [0x04, 0x80, 0xff, 0xff, 0xfe, 0x4a, 0xbc]
         );
     }
 

@@ -264,7 +264,8 @@ mod runtime_cli {
             0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
         ]);
         req1.push(11);
-        req1.resize(1200, 0);
+        // A 1200-byte MTU probe carries a 1172-byte UDP payload.
+        req1.resize(1172, 0);
         udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         udp.send_to(&req1, address).unwrap();
         let n = udp.recv(&mut buf).unwrap();
@@ -283,6 +284,12 @@ mod runtime_cli {
         let n = udp.recv(&mut buf).unwrap();
         assert_eq!(n, 35);
         assert_eq!(buf[0], 0x08);
+        // Reply 2 reports this socket: complemented 127.0.0.1, then its port.
+        assert_eq!(&buf[25..30], &[4, 0x80, 0xff, 0xff, 0xfe]);
+        assert_eq!(
+            &buf[30..32],
+            &udp.local_addr().unwrap().port().to_be_bytes()
+        );
         assert_eq!(&buf[32..34], &1200u16.to_be_bytes());
         server.stop();
         let rebound = UdpSocket::bind(address).unwrap();
