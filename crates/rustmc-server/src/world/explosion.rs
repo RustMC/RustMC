@@ -4,12 +4,18 @@
 //! and data specifications:
 //! - 1,352 raycasts originating from the explosion center directed toward all surface
 //!   points of a 16x16x16 cube normalized to unit direction vectors.
-//! - Stepwise power attenuation along each ray in 0.3-block increments:
-//!   `attenuation = (blast_resistance / 5.0 + 0.3) * 0.3` with fixed 0.225 decay per step.
+//! - Stepwise power attenuation along each ray in 0.3-block increments: a non-air
+//!   block costs `(blast_resistance + 0.3) * 0.3`, the block is destroyed if power
+//!   remains, and every step then decays by a further 0.225.
 //! - Aggregating destroyed non-air blocks into a unique coordinate set (`BTreeSet<[i32; 3]>`).
 //! - Entity exposure factor calculation via 3D bounding box raycasting to explosion origin.
 //! - Exposure-attenuated damage calculation:
-//!   `floor((1.0 - dist / radius) * exposure * 8.0 * power + 1.0)` where `radius = power * 2.0`.
+//!   `floor((impact² + impact) / 2 * 7 * diameter + 1)` where
+//!   `impact = (1 - dist / diameter) * exposure` and `diameter = power * 2`.
+//!
+//! These rules follow the published description of Java Edition explosions
+//! (<https://minecraft.wiki/w/Explosion>); they have not yet been compared with
+//! a 26.3 server.
 //! - Exposure-attenuated knockback vector calculation.
 
 use super::Block;
@@ -22,8 +28,14 @@ pub const RAY_COUNT: usize = 1352;
 /// Ray step distance along ray direction (0.3 blocks).
 pub const RAY_STEP_DISTANCE: f64 = 0.3;
 
-/// Constant power decay per step along an explosion ray.
-pub const RAY_POWER_DECAY_PER_STEP: f32 = 0.225;
+/// Constant power decay per step along an explosion ray (`0.3 * 0.75` in `f32`).
+pub const RAY_POWER_DECAY_PER_STEP: f32 = 0.225_000_01;
+
+/// Extra resistance every non-air block adds before scaling by the step length.
+const BLOCK_ATTENUATION_OFFSET: f32 = 0.3;
+
+/// Damage scale applied to `(impact² + impact) / 2 * diameter`.
+const DAMAGE_SCALE: f64 = 7.0;
 
 /// Mode of block destruction caused by an explosion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -444,15 +456,10 @@ impl Explosion {
 
     /// Computes the unique set of destroyed block coordinates using a custom jitter callback.
     ///
-    /// Stepwise algorithm:
-    /// - Shoot 1,352 surface rays around the explosion center.
-    /// - Initial ray power: `power * (0.7 + jitter)`.
-    /// - Step along ray in 0.3-block increments:
-    ///   - Query block blast resistance at current position.
-    ///   - `attenuation = (blast_resistance / 5.0 + 0.3) * 0.3`.
-    ///   - `power = power - attenuation - 0.225`.
-    ///   - If power > 0 and block is non-air: add position to destroyed set.
-    ///   - Continue stepping until power <= 0.0.
+    /// For each of the 1,352 rays, starting from `power * (0.7 + jitter)`:
+    /// - a non-air block at the current position costs `(resistance + 0.3) * 0.3`;
+    /// - if power remains, that block is destroyed;
+    /// - the position advances 0.3 blocks and power decays by a further 0.225.
     pub fn compute_block_destruction_with_jitter<W: ExplosionWorld, J: FnMut(usize) -> f32>(
         &self,
         world: &W,
@@ -461,184 +468,115 @@ impl Explosion {
         if !self.destruction_mode.destroys_blocks()
             || !self.power.is_finite()
             || self.power <= 0.0
-            || !self.center[0].is_finite()
-            || !self.center[1].is_finite()
-            || !self.center[2].is_finite()
+            || !self.center.iter().all(|v| v.is_finite())
         {
             return BTreeSet::new();
         }
 
-        let rays = generate_ray_directions();
         let mut destroyed = BTreeSet::new();
-
-        for (i, dir) in rays.into_iter().enumerate() {
+        for (i, dir) in generate_ray_directions().into_iter().enumerate() {
             let jitter = jitter_fn(i).clamp(0.0, 0.6);
             let mut ray_power = self.power * (0.7 + jitter);
-            let mut current_pos = self.center;
-
+            let mut position = self.center;
             while ray_power > 0.0 {
-                let block_pos = [
-                    current_pos[0].floor() as i32,
-                    current_pos[1].floor() as i32,
-                    current_pos[2].floor() as i32,
-                ];
-
-                let resistance = world.blast_resistance(block_pos).max(0.0);
-                let attenuation = (resistance / 5.0 + 0.3) * 0.3;
-                ray_power -= attenuation + RAY_POWER_DECAY_PER_STEP;
-
-                if ray_power > 0.0 && !world.is_air(block_pos) {
-                    destroyed.insert(block_pos);
+                let block = position.map(|v| v.floor() as i32);
+                if !world.is_air(block) {
+                    let resistance = world.blast_resistance(block).max(0.0);
+                    ray_power -= (resistance + BLOCK_ATTENUATION_OFFSET) * RAY_STEP_DISTANCE as f32;
+                    if ray_power > 0.0 {
+                        destroyed.insert(block);
+                    }
                 }
-
-                current_pos[0] += dir[0] * RAY_STEP_DISTANCE;
-                current_pos[1] += dir[1] * RAY_STEP_DISTANCE;
-                current_pos[2] += dir[2] * RAY_STEP_DISTANCE;
+                for axis in 0..3 {
+                    position[axis] += dir[axis] * RAY_STEP_DISTANCE;
+                }
+                ray_power -= RAY_POWER_DECAY_PER_STEP;
             }
         }
-
         destroyed
     }
 
-    /// Computes exposure of an entity bounding box to the explosion center using a 2x2x2 sample grid.
+    /// Fraction of sample points on an entity's box with a clear line to the centre.
+    ///
+    /// The grid spacing comes from the box size: `1 / (2 * extent + 1)` per axis,
+    /// stepping from 0 to 1 inclusive, with the X and Z grids centred in the box.
     /// Returns a factor in `[0.0, 1.0]`.
     pub fn compute_exposure<W: ExplosionWorld>(&self, world: &W, aabb: &AxisAlignedBB) -> f32 {
-        self.compute_exposure_samples(world, aabb, 2)
-    }
-
-    /// Computes exposure with a configurable number of sample points along each axis (e.g. 2 for 2x2x2, 3 for 3x3x3).
-    pub fn compute_exposure_samples<W: ExplosionWorld>(
-        &self,
-        world: &W,
-        aabb: &AxisAlignedBB,
-        samples_per_axis: usize,
-    ) -> f32 {
-        if !aabb.is_finite()
-            || !self.center[0].is_finite()
-            || !self.center[1].is_finite()
-            || !self.center[2].is_finite()
-        {
+        if !aabb.is_finite() || !self.center.iter().all(|v| v.is_finite()) {
             return 0.0;
         }
+        let step_x = 1.0 / ((aabb.max_x - aabb.min_x) * 2.0 + 1.0);
+        let step_y = 1.0 / ((aabb.max_y - aabb.min_y) * 2.0 + 1.0);
+        let step_z = 1.0 / ((aabb.max_z - aabb.min_z) * 2.0 + 1.0);
+        let offset_x = (1.0 - (1.0 / step_x).floor() * step_x) / 2.0;
+        let offset_z = (1.0 - (1.0 / step_z).floor() * step_z) / 2.0;
+        let lerp = |t: f64, min: f64, max: f64| min + t * (max - min);
 
-        let n = samples_per_axis.max(1);
-        let mut total_points = 0usize;
-        let mut visible_points = 0usize;
-
-        let margin_x = if (aabb.max_x - aabb.min_x) > 0.02 {
-            0.01
-        } else {
-            0.0
-        };
-        let margin_y = if (aabb.max_y - aabb.min_y) > 0.02 {
-            0.01
-        } else {
-            0.0
-        };
-        let margin_z = if (aabb.max_z - aabb.min_z) > 0.02 {
-            0.01
-        } else {
-            0.0
-        };
-
-        let start_x = aabb.min_x + margin_x;
-        let end_x = aabb.max_x - margin_x;
-        let start_y = aabb.min_y + margin_y;
-        let end_y = aabb.max_y - margin_y;
-        let start_z = aabb.min_z + margin_z;
-        let end_z = aabb.max_z - margin_z;
-
-        for step_x in 0..n {
-            let fx = if n == 1 {
-                0.5
-            } else {
-                step_x as f64 / (n - 1) as f64
-            };
-            let px = start_x + (end_x - start_x) * fx;
-
-            for step_y in 0..n {
-                let fy = if n == 1 {
-                    0.5
-                } else {
-                    step_y as f64 / (n - 1) as f64
-                };
-                let py = start_y + (end_y - start_y) * fy;
-
-                for step_z in 0..n {
-                    let fz = if n == 1 {
-                        0.5
-                    } else {
-                        step_z as f64 / (n - 1) as f64
-                    };
-                    let pz = start_z + (end_z - start_z) * fz;
-
-                    total_points += 1;
-                    if raycast_line_of_sight(world, [px, py, pz], self.center) {
-                        visible_points += 1;
+        let mut total = 0u32;
+        let mut visible = 0u32;
+        // Accumulated like the reference loop so the sample count matches it.
+        let mut fx = 0.0;
+        while fx <= 1.0 {
+            let mut fy = 0.0;
+            while fy <= 1.0 {
+                let mut fz = 0.0;
+                while fz <= 1.0 {
+                    let point = [
+                        lerp(fx, aabb.min_x, aabb.max_x) + offset_x,
+                        lerp(fy, aabb.min_y, aabb.max_y),
+                        lerp(fz, aabb.min_z, aabb.max_z) + offset_z,
+                    ];
+                    if raycast_line_of_sight(world, point, self.center) {
+                        visible += 1;
                     }
+                    total += 1;
+                    fz += step_z;
                 }
+                fy += step_y;
             }
+            fx += step_x;
         }
-
-        if total_points == 0 {
+        if total == 0 {
             0.0
         } else {
-            (visible_points as f32) / (total_points as f32)
+            visible as f32 / total as f32
         }
     }
 
     /// Computes damage and knockback applied to an entity position with a known exposure factor.
     ///
     /// Formulas:
-    /// - `radius = power * 2.0`
-    /// - `impact = (1.0 - dist / radius) * exposure`
-    /// - `damage = floor(impact * 8.0 * power + 1.0)` if `exposure > 0.0` and `dist < radius`, else `0.0`.
+    /// - `diameter = power * 2.0`
+    /// - `impact = (1.0 - dist / diameter) * exposure`
+    /// - `damage = floor((impact² + impact) / 2 * 7 * diameter + 1)` if `exposure > 0`
+    ///   and `dist < diameter`, else `0`.
     /// - `knockback = normalized_dir * impact`.
     pub fn compute_impact_at(&self, exposure: f32, entity_pos: [f64; 3]) -> EntityImpact {
-        let radius = self.radius();
-        if !exposure.is_finite()
-            || exposure <= 0.0
-            || radius <= 0.0
-            || !self.power.is_finite()
-            || self.power <= 0.0
+        let diameter = self.radius();
+        let none = |exposure: f32| EntityImpact {
+            exposure,
+            damage: 0.0,
+            knockback: [0.0, 0.0, 0.0],
+        };
+        if !exposure.is_finite() || exposure <= 0.0 || !self.power.is_finite() || self.power <= 0.0
         {
-            return EntityImpact {
-                exposure: exposure.clamp(0.0, 1.0),
-                damage: 0.0,
-                knockback: [0.0, 0.0, 0.0],
-            };
+            return none(exposure.clamp(0.0, 1.0));
         }
-
-        let dx = entity_pos[0] - self.center[0];
-        let dy = entity_pos[1] - self.center[1];
-        let dz = entity_pos[2] - self.center[2];
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-
-        if !dist.is_finite() || dist >= radius {
-            return EntityImpact {
-                exposure,
-                damage: 0.0,
-                knockback: [0.0, 0.0, 0.0],
-            };
+        let delta = [0, 1, 2].map(|axis| entity_pos[axis] - self.center[axis]);
+        let dist = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+        if !dist.is_finite() || dist >= diameter {
+            return none(exposure);
         }
-
-        let impact = (1.0 - dist / radius) * f64::from(exposure);
-        let raw_damage = (impact * 8.0 * f64::from(self.power) + 1.0).floor();
-        let damage = (raw_damage.max(0.0)) as f32;
-
+        let impact = (1.0 - dist / diameter) * f64::from(exposure);
+        let damage = ((impact * impact + impact) / 2.0 * DAMAGE_SCALE * diameter + 1.0).floor();
         let knockback = if dist > 1e-9 {
-            [
-                (dx / dist) * impact,
-                (dy / dist) * impact,
-                (dz / dist) * impact,
-            ]
+            delta.map(|d| d / dist * impact)
         } else {
             [0.0, 0.0, 0.0]
         };
-
         EntityImpact {
             exposure,
-            damage,
+            damage: damage.max(0.0) as f32,
             knockback,
         }
     }
@@ -800,10 +738,10 @@ mod tests {
             "visible entity must receive positive knockback away from center"
         );
 
-        // Expected damage for dist = 4.0, radius = 8.0, power = 4.0, exposure = 1.0:
+        // Expected damage for dist = 4.0, diameter = 8.0, power = 4.0, exposure = 1.0:
         // impact = (1.0 - 4.0 / 8.0) * 1.0 = 0.5
-        // damage = floor(0.5 * 8.0 * 4.0 + 1.0) = floor(17.0) = 17.0
-        assert_eq!(direct_impact.damage, 17.0);
+        // damage = floor((0.25 + 0.5) / 2 * 7 * 8 + 1) = floor(22.0) = 22.0
+        assert_eq!(direct_impact.damage, 22.0);
 
         // Place an obsidian wall between the explosion and the entity
         grid.fill_box([2, 60, -5], [2, 70, 5], Block::Obsidian);
@@ -897,6 +835,38 @@ mod tests {
         let res2 = exp2.compute_block_destruction(&grid);
 
         assert_eq!(res1, res2);
+    }
+
+    #[test]
+    fn a_blast_inside_solid_stone_destroys_only_its_own_block() {
+        let grid = BlockGrid::new().with_default_block(Block::Stone);
+        let blast = Explosion::new([0.5, 64.5, 0.5], 4.0);
+        // Jitter 0.3 gives every ray exactly the nominal power of 4.0.
+        let destroyed = blast.compute_block_destruction_with_jitter(&grid, |_| 0.3);
+        assert_eq!(destroyed, BTreeSet::from([[0, 64, 0]]));
+    }
+
+    #[test]
+    fn air_only_decays_by_the_fixed_step_cost() {
+        // Dirt 3.5 blocks away: with the fixed 0.225 per air step, rays still
+        // carry about 1.3 power when they arrive and dirt costs 0.24.
+        let mut grid = BlockGrid::new();
+        grid.set_block([4, 64, 0], Block::Dirt);
+        let blast = Explosion::new([0.5, 64.5, 0.5], 4.0);
+        let destroyed = blast.compute_block_destruction_with_jitter(&grid, |_| 0.3);
+        assert!(destroyed.contains(&[4, 64, 0]));
+    }
+
+    #[test]
+    fn a_ray_with_power_left_after_a_block_destroys_it_before_decay() {
+        // Power 0.2 at the origin: leaves (resistance 0.2) cost 0.15 and leave
+        // 0.05, less than the 0.225 step decay. The block is still destroyed
+        // because the hit is recorded before the decay.
+        let mut grid = BlockGrid::new();
+        grid.set_block([0, 64, 0], Block::Leaves);
+        let blast = Explosion::new([0.5, 64.5, 0.5], 0.2 / 0.7);
+        let destroyed = blast.compute_block_destruction_with_jitter(&grid, |_| 0.0);
+        assert_eq!(destroyed, BTreeSet::from([[0, 64, 0]]));
     }
 
     #[test]

@@ -220,9 +220,11 @@ const BATCH_START: u32 = 12;
 const BATCH_END: u32 = 11;
 const MAX_CHUNKS_PER_BATCH: usize = 16;
 const MAX_BATCH_BYTES: usize = 768 * 1024;
-// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves, obsidian.
+// Default states from the official 26.3 block report, in `Block` discriminant order
+// (air, bedrock, stone, dirt, grass block, ..., terracotta, obsidian).
 const BLOCK_STATES: [u32; 20] = [
-    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759, 189,
+    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759,
+    4925,
 ];
 const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
