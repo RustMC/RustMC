@@ -76,7 +76,8 @@ impl PreviewCache {
             }
             budget.files.push_back((path, size));
         }
-        prune(&mut budget)?;
+        let evicted = prune(&mut budget);
+        remove_evicted(evicted)?;
         Ok(Self {
             directory: Arc::new(directory),
             budget: Arc::new(Mutex::new(budget)),
@@ -160,20 +161,23 @@ impl PreviewCache {
             let _ = fs::remove_file(&temporary);
             return result;
         }
-        // File I/O and fsync above run without the lock, so concurrent workers
-        // and scheduling hints (`contains`) never wait on disk. Each write uses
-        // a unique temporary file and an atomic rename; only the bookkeeping
-        // below is serialized.
-        let mut budget = self.budget.lock().expect("preview cache lock poisoned");
-        if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
-            let (_, old_size) = budget.files.remove(index).expect("index exists");
-            budget.bytes -= old_size;
-        }
-        let size = (HEADER_BYTES + packet.len()) as u64;
-        budget.files.push_back((path, size));
-        budget.positions.insert((x, z));
-        budget.bytes += size;
-        prune(&mut budget)
+        // File I/O and fsync above, and eviction unlinks below, run without the
+        // lock, so concurrent workers and scheduling hints (`contains`) never
+        // wait on disk. Each write uses a unique temporary file and an atomic
+        // rename; only the bookkeeping in this block is serialized.
+        let evicted = {
+            let mut budget = self.budget.lock().expect("preview cache lock poisoned");
+            if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
+                let (_, old_size) = budget.files.remove(index).expect("index exists");
+                budget.bytes -= old_size;
+            }
+            let size = (HEADER_BYTES + packet.len()) as u64;
+            budget.files.push_back((path, size));
+            budget.positions.insert((x, z));
+            budget.bytes += size;
+            prune(&mut budget)
+        };
+        remove_evicted(evicted)
     }
 
     pub fn cached_count(&self) -> usize {
@@ -185,17 +189,25 @@ impl PreviewCache {
     }
 }
 
-fn prune(budget: &mut Budget) -> io::Result<()> {
+fn prune(budget: &mut Budget) -> Vec<PathBuf> {
+    let mut evicted = Vec::new();
     while budget.files.len() > MAX_FILES || budget.bytes > MAX_BYTES {
         let (path, size) = budget.files.pop_front().expect("over budget has files");
+        budget.bytes -= size;
+        if let Some(position) = packet_position(&path) {
+            budget.positions.remove(&position);
+        }
+        evicted.push(path);
+    }
+    evicted
+}
+
+fn remove_evicted(paths: Vec<PathBuf>) -> io::Result<()> {
+    for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        }
-        budget.bytes -= size;
-        if let Some(position) = packet_position(&path) {
-            budget.positions.remove(&position);
         }
     }
     Ok(())
@@ -403,6 +415,45 @@ mod tests {
                 .cached_count(),
             0
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_returns_evicted_paths_without_unlinking() {
+        let root = std::env::temp_dir().join(format!(
+            "rustmc-preview-cache-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let registry = root.join("registry.json");
+        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(&registry, b"registry-a").unwrap();
+        let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
+
+        let oldest = cache.path(0, 0);
+        let newest = cache.path(1, 0);
+        fs::write(&oldest, b"oldest-packet").unwrap();
+        fs::write(&newest, b"newest-packet").unwrap();
+
+        let mut budget = Budget {
+            files: VecDeque::from([(oldest.clone(), MAX_BYTES), (newest.clone(), 1)]),
+            positions: BTreeSet::from([(0, 0), (1, 0)]),
+            bytes: MAX_BYTES + 1,
+        };
+
+        let evicted = prune(&mut budget);
+        assert_eq!(evicted, vec![oldest.clone()]);
+        assert!(!budget.positions.contains(&(0, 0)));
+        assert!(budget.positions.contains(&(1, 0)));
+        assert_eq!(budget.bytes, 1);
+        assert!(oldest.exists());
+
+        remove_evicted(evicted).unwrap();
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 }
