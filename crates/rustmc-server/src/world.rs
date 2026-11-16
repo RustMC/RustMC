@@ -1,11 +1,16 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
 pub mod block_entity;
+pub mod interaction;
 
 pub use block_entity::*;
 
 #[cfg(test)]
 mod tests_interaction;
+#[cfg(test)]
+mod tests_player_interaction;
+
+pub use interaction::*;
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
