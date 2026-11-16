@@ -783,7 +783,7 @@ impl ShapelessRecipe {
     ///
     /// Requires that non-empty slots in the grid match the exact multiset of ingredients.
     /// Uses O(N log N) sorted multiset comparison when all ingredients are discrete items,
-    /// falling back to bipartite matching for multi-variant ingredients.
+    /// and augmenting-path bipartite matching for multi-variant ingredients.
     #[must_use]
     pub fn matches(&self, grid: &CraftingGrid) -> bool {
         let non_empty = grid.non_empty_items();
@@ -804,28 +804,44 @@ impl ShapelessRecipe {
             return expected == actual;
         }
 
-        let mut used = vec![false; non_empty.len()];
-        can_match_shapeless(0, &self.ingredients, &non_empty, &mut used)
+        has_perfect_matching(&self.ingredients, &non_empty)
     }
 }
 
-fn can_match_shapeless(
-    idx: usize,
+/// Whether every ingredient can be paired with a distinct item.
+///
+/// Augmenting-path bipartite matching: each ingredient searches once for a
+/// free item, displacing earlier pairings where they have an alternative, so
+/// the cost is bounded by ingredients x ingredients x items rather than the
+/// number of permutations.
+fn has_perfect_matching(ingredients: &[Ingredient], items: &[&ItemStack]) -> bool {
+    let mut owner: Vec<Option<usize>> = vec![None; items.len()];
+    (0..ingredients.len()).all(|ingredient| {
+        let mut visited = vec![false; items.len()];
+        assign_item(ingredient, ingredients, items, &mut owner, &mut visited)
+    })
+}
+
+/// Gives `ingredient` an item, moving the current owner elsewhere if needed.
+fn assign_item(
+    ingredient: usize,
     ingredients: &[Ingredient],
     items: &[&ItemStack],
-    used: &mut [bool],
+    owner: &mut [Option<usize>],
+    visited: &mut [bool],
 ) -> bool {
-    if idx == ingredients.len() {
-        return true;
-    }
-    let ingredient = &ingredients[idx];
-    for (i, &item) in items.iter().enumerate() {
-        if !used[i] && ingredient.matches(item) {
-            used[i] = true;
-            if can_match_shapeless(idx + 1, ingredients, items, used) {
-                return true;
-            }
-            used[i] = false;
+    for item in 0..items.len() {
+        if visited[item] || !ingredients[ingredient].matches(items[item]) {
+            continue;
+        }
+        visited[item] = true;
+        let free = match owner[item] {
+            None => true,
+            Some(current) => assign_item(current, ingredients, items, owner, visited),
+        };
+        if free {
+            owner[item] = Some(ingredient);
+            return true;
         }
     }
     false
@@ -1332,6 +1348,51 @@ mod tests {
         let non_mirroring_axe = axe_recipe.with_mirroring(false);
         assert!(non_mirroring_axe.matches(&left_axe));
         assert!(!non_mirroring_axe.matches(&right_axe));
+    }
+
+    #[test]
+    fn shapeless_multi_variant_mismatch_is_rejected_without_permuting() {
+        // Fifteen interchangeable plank ingredients and one stick against a grid
+        // of sixteen planks: no pairing exists, and trying every ordering of the
+        // planks would take 15! steps.
+        let planks = || Ingredient::any(["minecraft:oak_planks", "minecraft:birch_planks"]);
+        let mut ingredients: Vec<Ingredient> = (0..15).map(|_| planks()).collect();
+        ingredients.push(Ingredient::item("minecraft:stick"));
+        let recipe =
+            ShapelessRecipe::new(ingredients, ItemStack::new("minecraft:chest", 1)).unwrap();
+
+        let mut grid = CraftingGrid::new(4, 4).unwrap();
+        for row in 0..4 {
+            for col in 0..4 {
+                grid.set(col, row, Some(ItemStack::new("minecraft:oak_planks", 1)))
+                    .unwrap();
+            }
+        }
+        assert!(!recipe.matches(&grid));
+
+        grid.set(3, 3, Some(ItemStack::new("minecraft:stick", 1)))
+            .unwrap();
+        assert!(recipe.matches(&grid));
+    }
+
+    #[test]
+    fn shapeless_matching_reassigns_a_greedy_first_choice() {
+        // The first ingredient accepts either item but must yield the stick's
+        // only partner to the second ingredient.
+        let recipe = ShapelessRecipe::new(
+            vec![
+                Ingredient::any(["minecraft:coal", "minecraft:charcoal"]),
+                Ingredient::item("minecraft:coal"),
+            ],
+            ItemStack::new("minecraft:torch", 1),
+        )
+        .unwrap();
+        let mut grid = CraftingGrid::table_3x3();
+        grid.set(0, 0, Some(ItemStack::new("minecraft:coal", 1)))
+            .unwrap();
+        grid.set(1, 0, Some(ItemStack::new("minecraft:charcoal", 1)))
+            .unwrap();
+        assert!(recipe.matches(&grid));
     }
 
     #[test]
