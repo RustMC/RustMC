@@ -3,6 +3,18 @@
 //! Provides kinematics simulation for Minecraft projectiles (Arrows, Snowballs, Ender Pearls),
 //! including air/water drag, gravity, continuous swept raycasts across voxel blocks and entity
 //! bounding boxes, impact resolution, and damage scaling.
+//!
+//! # Sources
+//!
+//! Gravity and air drag follow the "Motion of entities" table on the community
+//! [Minecraft Wiki Entity page](https://minecraft.wiki/w/Entity), retrieved 13 November
+//! 2026, a secondary source not pinned to Java 26.3: arrows 0.05 and 0.99 (terminal
+//! 5.00 blocks/tick); eggs, snowballs, and ender pearls 0.03 and 0.99 (terminal 2.97).
+//! This module applies drag then gravity after moving, which reproduces the arrow
+//! terminal velocity but gives 3.0 for thrown items: the same table orders them
+//! "acceleration, drag, position" since Java 1.21.2. That ordering is not yet modelled.
+//! Water drag, the damage and critical formulas, knockback strengths, shake ticks, and
+//! the five-tick shooter grace period have no recorded source.
 
 use std::collections::{BTreeSet, HashSet};
 
