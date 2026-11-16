@@ -4,6 +4,7 @@
 //! The preview is unauthenticated and has no authoritative gameplay world.
 
 pub mod chunk_adapter;
+pub mod commands;
 pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod java_preview;
