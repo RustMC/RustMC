@@ -4,6 +4,13 @@
 //! material unit repairs (such as iron ingots or diamonds), item renaming with validation,
 //! prior work penalty escalation (`2*penalty + 1`), and state degradation progression
 //! (`Undamaged` -> `Chipped` -> `Damaged` -> `Broken`) with a 12% degradation chance.
+//!
+//! Sources: the level costs, the 40-level "Too Expensive!" cap, the 12%
+//! durability bonus, the 25%-per-unit material repair, the `2 * penalty + 1`
+//! prior work penalty, the 12% degradation chance, and the 50-character name
+//! limit follow the public minecraft.wiki `Anvil_mechanics` and `Anvil`
+//! articles; item durabilities follow the minecraft.wiki `Durability` article.
+//! Enchantment combination costs are not modelled.
 
 use std::fmt;
 
