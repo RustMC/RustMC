@@ -15,7 +15,14 @@
 //! 26.3 server, and the field layout from minecraft.wiki
 //! `Java_Edition_protocol/Packets` revision 3868170. Pickup reach, the permanent
 //! pickup delay, void despawn, and the merge survivor follow minecraft.wiki
-//! `Item_(entity)` revision 3816775.
+//! `Item_(entity)` revision 3816775. Gravity 0.04, drag 0.98 on both axes, and the
+//! per-tick order "acceleration, position, drag" follow the "Motion of entities" table on
+//! minecraft.wiki `Entity` (retrieved 13 November 2026), which gives 1.96 blocks/tick as
+//! the resulting terminal velocity: the stored velocity's fixed point, so each tick moves
+//! at most 2.0 blocks and the [`ITEM_TERMINAL_VELOCITY`] clamp only bounds abnormal input.
+//! All of these are secondary sources not pinned to Java 26.3. [`GROUND_FRICTION`] and
+//! [`STACK_MERGE_RADIUS`] have no recorded source; the wiki describes merging within a
+//! `0.5 x 0.25 x 0.5` box rather than a Euclidean radius.
 
 use crate::discovery_java::{frame, put_varint};
 use crate::world::{Block, CHUNK_SIDE, Chunk, WORLD_HEIGHT};
