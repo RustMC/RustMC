@@ -3,6 +3,9 @@
 
 use std::{collections::HashMap, error::Error, fmt, sync::Arc};
 
+// Shared Java wire encoders; only the decoders below are chat specific.
+use crate::discovery_java::{put_string, put_varint};
+
 // Packet IDs come from the 26.3 server's generated packet report. Layouts follow
 // the public protocol reference for 26.3 / protocol 777:
 // https://minecraft.wiki/w/Java_Edition_protocol/Packets (revision 3868170) and
@@ -131,21 +134,6 @@ impl Error for CommandError {}
 // Wire Codec Primitives
 // ============================================================================
 
-/// Encode a 32-bit unsigned integer as a VarInt into the output buffer.
-pub fn put_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
 /// Read a VarInt from input bytes, returning `(value, bytes_read)`.
 pub fn read_varint(input: &[u8]) -> Result<(u32, usize), ProtocolError> {
     let mut value = 0u32;
@@ -168,12 +156,6 @@ pub fn read_varint(input: &[u8]) -> Result<(u32, usize), ProtocolError> {
     }
 }
 
-/// Encode a string as a VarInt length prefix followed by UTF-8 bytes.
-pub fn put_string(value: &str, out: &mut Vec<u8>) {
-    put_varint(value.len() as u32, out);
-    out.extend_from_slice(value.as_bytes());
-}
-
 /// Read a string from input bytes, returning `(&str, bytes_read)`.
 pub fn read_string(input: &[u8]) -> Result<(&str, usize), ProtocolError> {
     let (length, prefix) = read_varint(input)?;
@@ -184,18 +166,6 @@ pub fn read_string(input: &[u8]) -> Result<(&str, usize), ProtocolError> {
     let s = std::str::from_utf8(&input[prefix..prefix + length])
         .map_err(|_| ProtocolError::InvalidUtf8)?;
     Ok((s, prefix + length))
-}
-
-/// Encapsulate a packet ID and payload into a standard Minecraft packet frame:
-/// `[VarInt(length), VarInt(packet_id), payload]`.
-pub fn frame(packet_id: u32, body: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    put_varint(packet_id, &mut packet);
-    packet.extend_from_slice(body);
-    let mut out = Vec::new();
-    put_varint(packet.len() as u32, &mut out);
-    out.extend(packet);
-    out
 }
 
 /// Unframe a standard Minecraft packet, returning `(packet_id, body_slice)`.
