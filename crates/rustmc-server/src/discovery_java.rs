@@ -1,5 +1,10 @@
 //! Bounded Java Edition 26.3 status and optional local login experiment.
 
+pub mod keepalive;
+
+#[cfg(test)]
+mod tests_keepalive;
+
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
@@ -484,6 +489,30 @@ pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
     decode_acknowledge_block_change_packet(&bytes[prefix..])
 }
 
+fn is_valid_coord(x: f64, y: f64, z: f64) -> bool {
+    x.is_finite()
+        && y.is_finite()
+        && z.is_finite()
+        && (-1_000_000.0..=1_000_000.0).contains(&x)
+        && (-64.0..=512.0).contains(&y)
+        && (-1_000_000.0..=1_000_000.0).contains(&z)
+}
+
+/// The trailing byte of every serverbound `move_player_*` packet packs
+/// on-ground (`0x01`) and horizontal-collision (`0x02`); other bits are unused.
+const MOVEMENT_FLAGS: u8 = 0x03;
+/// Hotbar slots selectable through serverbound `set_carried_item` (0 to 8).
+const HOTBAR_SLOTS: i16 = 9;
+/// Serverbound `player_abilities` carries only the flying flag (`0x02`).
+const ABILITIES_FLYING: u8 = 0x02;
+/// Serverbound `player_input` packs seven movement flags (forward, backward,
+/// left, right, jump, shift, sprint) into the low bits; the top bit is unused.
+const PLAYER_INPUT_FLAGS: u8 = 0x7f;
+
+fn is_valid_rotation(yaw: f32, pitch: f32) -> bool {
+    yaw.is_finite() && pitch.is_finite() && (-90.0..=90.0).contains(&pitch)
+}
+
 pub struct Session {
     state: State,
     input: Vec<u8>,
@@ -671,54 +700,113 @@ impl Session {
                 (State::Play, id) => {
                     let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
                     match id {
-                        0 if body.len() == 33 && body[0] == 1 => {
-                            if !body[1..25]
-                                .as_chunks::<8>()
-                                .0
-                                .iter()
-                                .all(|v| f64::from_be_bytes(*v).is_finite())
-                                || !body[25..]
-                                    .as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .all(|v| f32::from_be_bytes(*v).is_finite())
-                            {
+                        0 => {
+                            if body.len() != 33 || body[0] != 1 {
+                                return Err(Error::Malformed);
+                            }
+                            let x = f64::from_be_bytes(body[1..9].try_into().unwrap());
+                            let y = f64::from_be_bytes(body[9..17].try_into().unwrap());
+                            let z = f64::from_be_bytes(body[17..25].try_into().unwrap());
+                            let yaw = f32::from_be_bytes(body[25..29].try_into().unwrap());
+                            let pitch = f32::from_be_bytes(body[29..33].try_into().unwrap());
+                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
                                 return Err(Error::Malformed);
                             }
                             preview.teleport_acknowledged = true;
                         }
-                        44 if body.is_empty() => preview.client_loaded = true,
-                        13 if body.is_empty() => {}
-                        30 | 31 if body.len() == (if id == 30 { 25 } else { 33 }) => {
-                            let xyz: Vec<f64> = body[..24]
-                                .as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|v| f64::from_be_bytes(*v))
-                                .collect();
-                            preview
-                                .move_to(xyz[0], xyz[1], xyz[2])
-                                .map_err(|_| Error::Malformed)?;
-                        }
-                        32 if body.len() == 9 => {}
-                        33 | 40 | 43 if body.len() == 1 => {}
-                        11 if body.len() == 4 => {
+                        11 => {
+                            if body.len() != 4 {
+                                return Err(Error::Malformed);
+                            }
                             let rate = f32::from_be_bytes(body.try_into().unwrap());
+                            // Clients report any positive desired rate; large values
+                            // are valid on fast machines and only cap the batch size.
                             if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
                                 return Err(Error::Malformed);
                             }
                             preview.awaiting_batch = false;
                         }
-                        28 if body.len() == 8 => {
+                        13 => {
+                            if !body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        14 | 22 => {} // Bounded information/custom payloads have no effect.
+                        28 => {
+                            if body.len() != 8 {
+                                return Err(Error::Malformed);
+                            }
                             let id = u64::from_be_bytes(body.try_into().unwrap());
                             if preview.pending_keepalive != Some(id) {
                                 return Err(Error::Malformed);
                             }
                             preview.pending_keepalive = None;
                         }
+                        30 => {
+                            if body.len() != 25 || (body[24] & !MOVEMENT_FLAGS) != 0 {
+                                return Err(Error::Malformed);
+                            }
+                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
+                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
+                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
+                            if !is_valid_coord(x, y, z) {
+                                return Err(Error::Malformed);
+                            }
+                            preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
+                        }
+                        31 => {
+                            if body.len() != 33 || (body[32] & !MOVEMENT_FLAGS) != 0 {
+                                return Err(Error::Malformed);
+                            }
+                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
+                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
+                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
+                            let yaw = f32::from_be_bytes(body[24..28].try_into().unwrap());
+                            let pitch = f32::from_be_bytes(body[28..32].try_into().unwrap());
+                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
+                                return Err(Error::Malformed);
+                            }
+                            preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
+                        }
+                        32 => {
+                            if body.len() != 9 || (body[8] & !MOVEMENT_FLAGS) != 0 {
+                                return Err(Error::Malformed);
+                            }
+                            let yaw = f32::from_be_bytes(body[0..4].try_into().unwrap());
+                            let pitch = f32::from_be_bytes(body[4..8].try_into().unwrap());
+                            if !is_valid_rotation(yaw, pitch) {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        33 => {
+                            if body.len() != 1 || (body[0] & !MOVEMENT_FLAGS) != 0 {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        40 => {
+                            if body.len() != 1 || body[0] & !ABILITIES_FLYING != 0 {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        43 => {
+                            if body.len() != 1 || body[0] & !PLAYER_INPUT_FLAGS != 0 {
+                                return Err(Error::Malformed);
+                            }
+                        }
                         PLAYER_ACTION_ID => {
                             let action = decode_player_action(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
+                        }
+                        USE_ITEM_ON_ID => {
+                            let action = decode_use_item_on(body)?;
+                            responses.push(acknowledge_block_change(action.sequence));
+                        }
+                        57 | 67 => {
+                            if body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                            // Creative inputs are bounded by the frame/session limits.
+                            // The preview is immutable and does not apply them.
                         }
                         42 => {
                             let mut rest = body;
@@ -731,18 +819,34 @@ impl Session {
                             }
                             // Observer posture commands have no world effect.
                         }
-                        46 if body.is_empty() => {} // Punch has no world effect in the preview.
-                        USE_ITEM_ON_ID => {
-                            let action = decode_use_item_on(body)?;
-                            responses.push(acknowledge_block_change(action.sequence));
+                        44 => {
+                            if !body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                            preview.client_loaded = true;
                         }
-                        63 if body == [0] => {} // Spectator action with no target.
-                        57 | 67 if !body.is_empty() => {
-                            // Creative inputs are bounded by the frame/session limits.
-                            // The preview is immutable and does not apply them.
+                        46 => {
+                            if !body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                            // Punch has no world effect in the preview.
                         }
-                        54 if body.len() == 2 => {} // Selected hotbar slot is client-local here.
-                        14 | 22 => {} // Bounded information/custom payloads have no effect.
+                        54 => {
+                            if body.len() != 2 {
+                                return Err(Error::Malformed);
+                            }
+                            let slot = i16::from_be_bytes(body.try_into().unwrap());
+                            if !(0..HOTBAR_SLOTS).contains(&slot) {
+                                return Err(Error::Malformed);
+                            }
+                            // Selected hotbar slot is client-local here.
+                        }
+                        63 => {
+                            if body != [0] {
+                                return Err(Error::Malformed);
+                            }
+                            // Spectator action with no target.
+                        }
                         _ => {
                             eprintln!(
                                 "event=preview_unsupported_packet packet_id={id} bytes={}",
@@ -1305,9 +1409,8 @@ mod tests {
         ); // Trailing byte
     }
 
-    #[test]
-    fn test_session_play_state_action_packets() {
-        let manifest = Arc::new(RegistryManifest {
+    fn test_manifest() -> Arc<RegistryManifest> {
+        Arc::new(RegistryManifest {
             tags: Vec::new(),
             registries: vec![
                 (
@@ -1326,12 +1429,15 @@ mod tests {
                         .collect(),
                 ),
             ],
-        });
+        })
+    }
 
-        let mut s = Session::new(true).with_registry_manifest(manifest);
-        let mut h = handshake(PROTOCOL as u32);
-        *h.last_mut().unwrap() = 2; // Login state
-        s.receive(&h, 4096).unwrap();
+    fn enter_play_session() -> Session {
+        let mut current = handshake(777);
+        *current.last_mut().unwrap() = 2;
+        let mut s = Session::new(true).with_registry_manifest(test_manifest());
+        s.receive(&current, 4096).unwrap();
+        assert_eq!(s.state(), State::Login);
 
         let mut login = vec![4];
         login.extend_from_slice(b"Test");
@@ -1352,7 +1458,512 @@ mod tests {
         s.receive(&frame(3, &[]), 4096).unwrap();
         assert_eq!(s.state(), State::Play);
 
-        // 1. Send valid PlayerAction (ID 0x24 / 36) -> should emit AcknowledgeBlockChange
+        s
+    }
+
+    fn teleport_confirm(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+        let mut body = vec![1u8];
+        body.extend(x.to_be_bytes());
+        body.extend(y.to_be_bytes());
+        body.extend(z.to_be_bytes());
+        body.extend(yaw.to_be_bytes());
+        body.extend(pitch.to_be_bytes());
+        body
+    }
+
+    fn player_position(x: f64, y: f64, z: f64, on_ground: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(x.to_be_bytes());
+        body.extend(y.to_be_bytes());
+        body.extend(z.to_be_bytes());
+        body.push(on_ground);
+        body
+    }
+
+    fn player_pos_rot(x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(x.to_be_bytes());
+        body.extend(y.to_be_bytes());
+        body.extend(z.to_be_bytes());
+        body.extend(yaw.to_be_bytes());
+        body.extend(pitch.to_be_bytes());
+        body.push(on_ground);
+        body
+    }
+
+    fn player_rotation(yaw: f32, pitch: f32, on_ground: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(yaw.to_be_bytes());
+        body.extend(pitch.to_be_bytes());
+        body.push(on_ground);
+        body
+    }
+
+    #[test]
+    fn play_state_packet_validation_guards() {
+        // 1. NaN coordinate guards
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(f64::NAN, 64.0, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, f64::NAN, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, f64::NAN, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+
+        assert_eq!(
+            enter_play_session()
+                .receive(&frame(30, &player_position(f64::NAN, 64.0, 0.0, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(30, &player_position(0.0, f64::NAN, 0.0, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session()
+                .receive(&frame(30, &player_position(0.0, 64.0, f64::NAN, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(f64::NAN, 64.0, 0.0, 0.0, 0.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, f64::NAN, 0.0, 0.0, 0.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, f64::NAN, 0.0, 0.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+
+        // 2. Non-finite pitch guards
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, f32::NAN)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, f32::INFINITY)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, f32::NEG_INFINITY)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, f32::NAN, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, f32::INFINITY, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(32, &player_rotation(0.0, f32::NAN, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(32, &player_rotation(0.0, f32::INFINITY, 1)), 4096),
+            Err(Error::Malformed)
+        );
+
+        // 3. Pitch > 90.0 (and < -90.0) guards
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, 90.001)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, -90.001)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 91.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, -91.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(32, &player_rotation(0.0, 90.5, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(32, &player_rotation(0.0, -90.5, 1)), 4096),
+            Err(Error::Malformed)
+        );
+
+        // 4. On-ground and horizontal-collision flag bit validation (0..=3 valid)
+        for flag in [0, 1, 2, 3] {
+            let mut s = enter_play_session();
+            s.receive(&frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0)), 4096)
+                .unwrap();
+            assert!(
+                s.receive(&frame(30, &player_position(0.0, 64.0, 0.0, flag)), 4096)
+                    .is_ok()
+            );
+            assert!(
+                s.receive(
+                    &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, flag)),
+                    4096
+                )
+                .is_ok()
+            );
+            assert!(
+                s.receive(&frame(32, &player_rotation(0.0, 0.0, flag)), 4096)
+                    .is_ok()
+            );
+            assert!(s.receive(&frame(33, &[flag]), 4096).is_ok());
+        }
+
+        // Invalid flags (> 3, unknown bits set) are rejected as malformed
+        for invalid_flag in [4, 5, 8, 255] {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(30, &player_position(0.0, 64.0, 0.0, invalid_flag)),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(31, &player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, invalid_flag)),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session()
+                    .receive(&frame(32, &player_rotation(0.0, 0.0, invalid_flag)), 4096),
+                Err(Error::Malformed)
+            );
+            assert_eq!(
+                enter_play_session().receive(&frame(33, &[invalid_flag]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+
+        // player_abilities carries only the flying flag; player_input uses seven flags.
+        for flags in [0x01, 0x04, 0x80, 0xff] {
+            assert_eq!(
+                enter_play_session().receive(&frame(40, &[flags]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+        assert_eq!(
+            enter_play_session().receive(&frame(43, &[0x80]), 4096),
+            Err(Error::Malformed)
+        );
+
+        // 5. Trailing payload byte guards
+        let mut p0 = teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0);
+        p0.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(0, &p0), 4096),
+            Err(Error::Malformed)
+        );
+
+        let mut p11 = 1.0f32.to_be_bytes().to_vec();
+        p11.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(11, &p11), 4096),
+            Err(Error::Malformed)
+        );
+
+        assert_eq!(
+            enter_play_session().receive(&frame(13, &[0]), 4096),
+            Err(Error::Malformed)
+        );
+
+        let mut p28 = 1u64.to_be_bytes().to_vec();
+        p28.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(28, &p28), 4096),
+            Err(Error::Malformed)
+        );
+
+        let mut p30 = player_position(0.0, 64.0, 0.0, 1);
+        p30.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(30, &p30), 4096),
+            Err(Error::Malformed)
+        );
+
+        let mut p31 = player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, 1);
+        p31.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(31, &p31), 4096),
+            Err(Error::Malformed)
+        );
+
+        let mut p32 = player_rotation(0.0, 0.0, 1);
+        p32.push(0);
+        assert_eq!(
+            enter_play_session().receive(&frame(32, &p32), 4096),
+            Err(Error::Malformed)
+        );
+
+        assert_eq!(
+            enter_play_session().receive(&frame(33, &[1, 0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(40, &[0, 0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(43, &[1, 0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(44, &[0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(46, &[0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(54, &[0, 0, 0]), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(63, &[0, 0]), 4096),
+            Err(Error::Malformed)
+        );
+
+        // 6. Extreme coordinate guards
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(1_000_000.1, 64.0, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(-1_000_000.1, 64.0, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, -64.1, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 512.1, 0.0, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(0, &teleport_confirm(0.0, 64.0, 1_000_000.1, 0.0, 0.0)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(30, &player_position(1_000_001.0, 64.0, 0.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(30, &player_position(0.0, -65.0, 0.0, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(30, &player_position(0.0, 513.0, 0.0, 1)), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(
+                &frame(31, &player_pos_rot(0.0, 64.0, -1_000_001.0, 0.0, 0.0, 1)),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+
+        // 7. Invalid hotbar slot guards
+        assert_eq!(
+            enter_play_session().receive(&frame(54, &9i16.to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(54, &(-1i16).to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(54, &100i16.to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            enter_play_session().receive(&frame(54, &(-10i16).to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+
+        // Valid hotbar slots 0 and 8 succeed
+        assert!(
+            enter_play_session()
+                .receive(&frame(54, &0i16.to_be_bytes()), 4096)
+                .is_ok()
+        );
+        assert!(
+            enter_play_session()
+                .receive(&frame(54, &8i16.to_be_bytes()), 4096)
+                .is_ok()
+        );
+
+        // 8. Batch rate guards
+        let mut s_batch = enter_play_session();
+        s_batch.preview.as_mut().unwrap().awaiting_batch = true;
+        assert_eq!(
+            s_batch.receive(&frame(11, &0.0f32.to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        let mut s_batch = enter_play_session();
+        s_batch.preview.as_mut().unwrap().awaiting_batch = true;
+        assert_eq!(
+            s_batch.receive(&frame(11, &(-1.0f32).to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        // A fast client may report a high desired rate; it is not malformed.
+        let mut s_batch = enter_play_session();
+        s_batch.preview.as_mut().unwrap().awaiting_batch = true;
+        assert!(
+            s_batch
+                .receive(&frame(11, &1000.0f32.to_be_bytes()), 4096)
+                .is_ok()
+        );
+        let mut s_batch = enter_play_session();
+        s_batch.preview.as_mut().unwrap().awaiting_batch = true;
+        assert_eq!(
+            s_batch.receive(&frame(11, &f32::NAN.to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        let mut s_batch = enter_play_session();
+        s_batch.preview.as_mut().unwrap().awaiting_batch = true;
+        assert!(
+            s_batch
+                .receive(&frame(11, &50.0f32.to_be_bytes()), 4096)
+                .is_ok()
+        );
+
+        // 9. Keep alive guards
+        let mut s_keepalive = enter_play_session();
+        s_keepalive.preview.as_mut().unwrap().pending_keepalive = Some(12345);
+        assert_eq!(
+            s_keepalive.receive(&frame(28, &99999u64.to_be_bytes()), 4096),
+            Err(Error::Malformed)
+        );
+        assert!(
+            s_keepalive
+                .receive(&frame(28, &12345u64.to_be_bytes()), 4096)
+                .is_ok()
+        );
+
+        // 10. Unsupported unknown packet in Play state returns WrongState
+        assert_eq!(
+            enter_play_session().receive(&frame(99, &[]), 4096),
+            Err(Error::WrongState)
+        );
+
+        // 11. Valid play packets flow smoothly
+        let mut s = enter_play_session();
+        s.receive(&frame(0, &teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0)), 4096)
+            .unwrap();
+        assert!(s.preview.as_ref().unwrap().teleport_acknowledged);
+
+        assert!(
+            s.receive(&frame(30, &player_position(10.0, 64.0, 10.0, 1)), 4096)
+                .is_ok()
+        );
+        assert!(
+            s.receive(
+                &frame(31, &player_pos_rot(15.0, 64.0, 15.0, 90.0, 45.0, 0)),
+                4096
+            )
+            .is_ok()
+        );
+        assert!(
+            s.receive(&frame(32, &player_rotation(180.0, -45.0, 1)), 4096)
+                .is_ok()
+        );
+        assert!(s.receive(&frame(33, &[1]), 4096).is_ok());
+        // Start and stop flying (abilities flag 0x02).
+        assert!(s.receive(&frame(40, &[0x02]), 4096).is_ok());
+        assert!(s.receive(&frame(40, &[0]), 4096).is_ok());
+        // Forward, backward, left, right, jump, shift, and sprint together.
+        assert!(s.receive(&frame(43, &[0x7f]), 4096).is_ok());
+        assert!(s.receive(&frame(43, &[0x02]), 4096).is_ok());
+        assert!(s.receive(&frame(44, &[]), 4096).is_ok());
+        assert!(s.preview.as_ref().unwrap().client_loaded);
+        assert!(s.receive(&frame(46, &[]), 4096).is_ok());
+        assert!(s.receive(&frame(54, &4i16.to_be_bytes()), 4096).is_ok());
+        assert!(s.receive(&frame(63, &[0]), 4096).is_ok());
+    }
+
+    #[test]
+    fn test_session_play_state_action_packets() {
+        let mut s = enter_play_session();
+        // 1. Send valid PlayerAction (ID 0x29 / 41) -> should emit AcknowledgeBlockChange
         let action = PlayerAction {
             status: PlayerActionStatus::StartedDigging,
             pos: (10, 64, -20),
@@ -1368,7 +1979,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], acknowledge_block_change(12));
 
-        // 2. Send valid UseItemOn (ID 0x38 / 56) -> should emit AcknowledgeBlockChange
+        // 2. Send valid UseItemOn (ID 0x42 / 66) -> should emit AcknowledgeBlockChange
         let use_item = UseItemOn {
             hand: 0,
             pos: (10, 64, -20),
