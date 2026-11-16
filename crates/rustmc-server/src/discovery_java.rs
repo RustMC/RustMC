@@ -7,7 +7,7 @@ mod tests_keepalive;
 
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
 use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
-use crate::java_wire::{frame, put_string, put_varint};
+use crate::java_wire::{Malformed, frame, put_string, put_varint, read_string, read_varint};
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
@@ -17,6 +17,8 @@ pub const MAX_FRAME: usize = 4096;
 /// Vanilla offline-mode player names are 3 to 16 ASCII word characters.
 const PLAYER_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=16;
 const UUID_BYTES: usize = 16;
+/// Longest handshake host or known-pack string accepted, in bytes.
+const MAX_SHORT_STRING: usize = 255;
 /// Login refusals sent as a plain JSON text component; static ASCII only.
 const DISCOVERY_ONLY_REASON: &str = "RustMC is discovery-only; login is unavailable.";
 const VERSION_REASON: &str = "RustMC local preview requires Java 26.3 (protocol 777).";
@@ -46,38 +48,11 @@ pub enum Error {
     WrongState,
 }
 
-fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
-    let mut value = 0u32;
-    for (i, byte) in input.iter().take(5).enumerate() {
-        if i == 4 && byte & 0xf0 != 0 {
-            return Err(Error::Malformed);
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if byte & 0x80 == 0 {
-            if i > 0 && *byte == 0 {
-                return Err(Error::Malformed);
-            }
-            return Ok(Some((value, i + 1)));
-        }
+/// Maps wire-level decoding failures into [`Error::Malformed`].
+impl From<Malformed> for Error {
+    fn from(_: Malformed) -> Self {
+        Self::Malformed
     }
-    if input.len() >= 5 {
-        Err(Error::Malformed)
-    } else {
-        Ok(None)
-    }
-}
-
-fn read_string(input: &[u8]) -> Result<(&str, &[u8]), Error> {
-    let Some((length, prefix)) = varint(input)? else {
-        return Err(Error::Malformed);
-    };
-    let length = length as usize;
-    if length > 255 || input.len() < prefix + length {
-        return Err(Error::Malformed);
-    }
-    let value =
-        std::str::from_utf8(&input[prefix..prefix + length]).map_err(|_| Error::Malformed)?;
-    Ok((value, &input[prefix + length..]))
 }
 
 fn known_packs() -> Vec<u8> {
@@ -134,7 +109,7 @@ fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
 }
 
 fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
-    let Some((count, prefix)) = varint(body)? else {
+    let Some((count, prefix)) = read_varint(body)? else {
         return Err(Error::Malformed);
     };
     if count > 16 {
@@ -143,9 +118,9 @@ fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
     let mut remaining = &body[prefix..];
     let mut recognized = false;
     for _ in 0..count {
-        let (namespace, rest) = read_string(remaining)?;
-        let (id, rest) = read_string(rest)?;
-        let (version, rest) = read_string(rest)?;
+        let (namespace, rest) = read_string(remaining, MAX_SHORT_STRING)?;
+        let (id, rest) = read_string(rest, MAX_SHORT_STRING)?;
+        let (version, rest) = read_string(rest, MAX_SHORT_STRING)?;
         recognized |= namespace == "minecraft" && id == "core" && version == VERSION;
         remaining = rest;
     }
@@ -182,7 +157,7 @@ fn login_disconnect(reason: &'static str) -> Vec<u8> {
 
 /// Validate a login `hello` body: player name followed by the client UUID.
 fn read_hello(body: &[u8]) -> Result<(&[u8], &[u8]), Error> {
-    let Some((name_len, prefix)) = varint(body)? else {
+    let Some((name_len, prefix)) = read_varint(body)? else {
         return Err(Error::Malformed);
     };
     let name_len = name_len as usize;
@@ -282,7 +257,7 @@ pub struct PlayerAction {
 
 /// Decodes a serverbound `PlayerAction` packet (ID `0x29` / 41).
 pub fn decode_player_action(body: &[u8]) -> Result<PlayerAction, Error> {
-    let Some((status_val, prefix)) = varint(body)? else {
+    let Some((status_val, prefix)) = read_varint(body)? else {
         return Err(Error::Malformed);
     };
     let status = PlayerActionStatus::try_from(status_val)?;
@@ -307,7 +282,7 @@ pub fn decode_player_action(body: &[u8]) -> Result<PlayerAction, Error> {
     }
     rest = &rest[1..];
 
-    let Some((sequence, seq_len)) = varint(rest)? else {
+    let Some((sequence, seq_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
     };
     if seq_len != rest.len() {
@@ -355,7 +330,7 @@ impl UseItemOn {
 
 /// Decodes a serverbound `UseItemOn` packet (ID `0x42` / 66).
 pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
-    let Some((hand, prefix)) = varint(body)? else {
+    let Some((hand, prefix)) = read_varint(body)? else {
         return Err(Error::Malformed);
     };
     if hand > 1 {
@@ -373,7 +348,7 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     }
     rest = &rest[8..];
 
-    let Some((face, face_len)) = varint(rest)? else {
+    let Some((face, face_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
     };
     if face > 5 {
@@ -425,7 +400,7 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     // Pinned Java 26.3 (1.21.2+) ServerboundUseItemOnPacket schema:
     // hand: VarInt, pos: Position (i64), face: VarInt,
     // cursor: 3x f32, inside_block: Boolean (u8), world_border_hit: Boolean (u8), sequence: VarInt
-    let Some((sequence, seq_len)) = varint(rest)? else {
+    let Some((sequence, seq_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
     };
     if seq_len != rest.len() {
@@ -478,14 +453,14 @@ pub fn acknowledge_block_change_packet(sequence: u32) -> Vec<u8> {
 
 /// Decodes an unframed `AcknowledgeBlockChange` packet payload `[0x04, varint(sequence)]`.
 pub fn decode_acknowledge_block_change_packet(bytes: &[u8]) -> Result<u32, Error> {
-    let Some((id, prefix)) = varint(bytes)? else {
+    let Some((id, prefix)) = read_varint(bytes)? else {
         return Err(Error::Malformed);
     };
     if id != BLOCK_CHANGED_ACK_ID {
         return Err(Error::Malformed);
     }
     let rest = &bytes[prefix..];
-    let Some((sequence, seq_len)) = varint(rest)? else {
+    let Some((sequence, seq_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
     };
     if seq_len != rest.len() {
@@ -496,7 +471,7 @@ pub fn decode_acknowledge_block_change_packet(bytes: &[u8]) -> Result<u32, Error
 
 /// Decodes a framed `AcknowledgeBlockChange` packet: `[varint(length), 0x04, varint(sequence)]`.
 pub fn decode_acknowledge_block_change(bytes: &[u8]) -> Result<u32, Error> {
-    let Some((len, prefix)) = varint(bytes)? else {
+    let Some((len, prefix)) = read_varint(bytes)? else {
         return Err(Error::Malformed);
     };
     if prefix + len as usize != bytes.len() {
@@ -605,7 +580,7 @@ impl Session {
         }
         self.input.extend_from_slice(bytes);
         let mut responses = Vec::new();
-        while let Some((size, prefix)) = varint(&self.input)? {
+        while let Some((size, prefix)) = read_varint(&self.input)? {
             let size = size as usize;
             if size == 0 {
                 return Err(Error::Malformed);
@@ -618,28 +593,28 @@ impl Session {
             }
             let packet = self.input[prefix..prefix + size].to_vec();
             self.input.drain(..prefix + size);
-            let Some((id, id_len)) = varint(&packet)? else {
+            let Some((id, id_len)) = read_varint(&packet)? else {
                 return Err(Error::Malformed);
             };
             let body = &packet[id_len..];
             match (self.state, id) {
                 (State::Handshake, handshake::serverbound::INTENTION) => {
-                    let Some((version, n)) = varint(body)? else {
+                    let Some((version, n)) = read_varint(body)? else {
                         return Err(Error::Malformed);
                     };
                     let body = &body[n..];
-                    let Some((host_len, n)) = varint(body)? else {
+                    let Some((host_len, n)) = read_varint(body)? else {
                         return Err(Error::Malformed);
                     };
                     let host_len = host_len as usize;
-                    if host_len > 255 || body.len() < n + host_len + 2 {
+                    if host_len > MAX_SHORT_STRING || body.len() < n + host_len + 2 {
                         return Err(Error::Malformed);
                     }
                     if std::str::from_utf8(&body[n..n + host_len]).is_err() {
                         return Err(Error::Malformed);
                     }
                     let rest = &body[n + host_len + 2..];
-                    let Some((next, n)) = varint(rest)? else {
+                    let Some((next, n)) = read_varint(rest)? else {
                         return Err(Error::Malformed);
                     };
                     if n != rest.len() {
@@ -845,7 +820,7 @@ impl Session {
                         sb::PLAYER_COMMAND => {
                             let mut rest = body;
                             for _ in 0..3 {
-                                let (_, n) = varint(rest)?.ok_or(Error::Malformed)?;
+                                let (_, n) = read_varint(rest)?.ok_or(Error::Malformed)?;
                                 rest = &rest[n..];
                             }
                             if !rest.is_empty() {
