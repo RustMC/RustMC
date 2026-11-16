@@ -242,26 +242,31 @@ const MAX_BATCH_BYTES: usize = 768 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Default block state of each preview block in the official 26.3 block
 /// report, in `Block` discriminant order (checked by a unit test).
-const BLOCK_STATES: [(Block, u32); 19] = [
-    (Block::Air, 0),              // minecraft:air
-    (Block::Bedrock, 88),         // minecraft:bedrock
-    (Block::Stone, 1),            // minecraft:stone
-    (Block::Dirt, 10),            // minecraft:dirt
-    (Block::Grass, 9),            // minecraft:grass_block[snowy=false]
-    (Block::Log, 140),            // minecraft:oak_log[axis=y]
-    (Block::Leaves, 294),         // minecraft:oak_leaves (default state)
-    (Block::Sand, 121),           // minecraft:sand
-    (Block::Sandstone, 677),      // minecraft:sandstone
-    (Block::Snow, 8598),          // minecraft:snow_block
-    (Block::SpruceLog, 143),      // minecraft:spruce_log[axis=y]
-    (Block::SpruceLeaves, 322),   // minecraft:spruce_leaves (default state)
-    (Block::AcaciaLog, 152),      // minecraft:acacia_log[axis=y]
-    (Block::AcaciaLeaves, 406),   // minecraft:acacia_leaves (default state)
-    (Block::JungleLog, 149),      // minecraft:jungle_log[axis=y]
-    (Block::JungleLeaves, 378),   // minecraft:jungle_leaves (default state)
-    (Block::RedSand, 126),        // minecraft:red_sand
-    (Block::RedSandstone, 15094), // minecraft:red_sandstone
-    (Block::Terracotta, 14759),   // minecraft:terracotta
+const BLOCK_STATES: [(Block, u32); 24] = [
+    (Block::Air, 0),                // minecraft:air
+    (Block::Bedrock, 88),           // minecraft:bedrock
+    (Block::Stone, 1),              // minecraft:stone
+    (Block::Dirt, 10),              // minecraft:dirt
+    (Block::Grass, 9),              // minecraft:grass_block[snowy=false]
+    (Block::Log, 140),              // minecraft:oak_log[axis=y]
+    (Block::Leaves, 294),           // minecraft:oak_leaves (default state)
+    (Block::Sand, 121),             // minecraft:sand
+    (Block::Sandstone, 677),        // minecraft:sandstone
+    (Block::Snow, 8598),            // minecraft:snow_block
+    (Block::SpruceLog, 143),        // minecraft:spruce_log[axis=y]
+    (Block::SpruceLeaves, 322),     // minecraft:spruce_leaves (default state)
+    (Block::AcaciaLog, 152),        // minecraft:acacia_log[axis=y]
+    (Block::AcaciaLeaves, 406),     // minecraft:acacia_leaves (default state)
+    (Block::JungleLog, 149),        // minecraft:jungle_log[axis=y]
+    (Block::JungleLeaves, 378),     // minecraft:jungle_leaves (default state)
+    (Block::RedSand, 126),          // minecraft:red_sand
+    (Block::RedSandstone, 15094),   // minecraft:red_sandstone
+    (Block::Terracotta, 14759),     // minecraft:terracotta
+    (Block::ShortGrass, 2363),      // minecraft:short_grass
+    (Block::SnowLayer, 8589),       // minecraft:snow[layers=1]
+    (Block::Carpet, 14743),         // minecraft:white_carpet
+    (Block::TallGrassLower, 14771), // minecraft:tall_grass[half=lower]
+    (Block::TallGrassUpper, 14770), // minecraft:tall_grass[half=upper]
 ];
 
 fn block_state(index: u16) -> u32 {
@@ -748,6 +753,14 @@ fn block(chunk: &Chunk, x: usize, y: i32, z: usize) -> Block {
     }
 }
 
+/// Plants with no collision, which only `WORLD_SURFACE` captures.
+fn is_passable_plant(block: Block) -> bool {
+    matches!(
+        block,
+        Block::ShortGrass | Block::TallGrassLower | Block::TallGrassUpper
+    )
+}
+
 /// Pack fixed-width values without crossing a 64-bit word boundary.
 fn packed(values: &[u16], bits: usize) -> Vec<u64> {
     let per_word = 64 / bits;
@@ -777,6 +790,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
                         .find(|y| {
                             let b = block(chunk, x, *y, z);
                             b != Block::Air
+                                && (kind == 1 || !is_passable_plant(b))
                                 && (kind != 5
                                     || !matches!(
                                         b,
@@ -874,14 +888,20 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         }
     }
     put_varint(LIGHT_SECTIONS as u32, &mut body);
-    // Direct vertical skylight, attenuated by leaves. No emitted light or full lateral solver yet.
+    // Direct vertical skylight, attenuated by leaves; plants and thin covers
+    // pass it unchanged. No emitted light or full lateral solver yet.
     let mut lights = vec![[0u8; 2048]; LIGHT_SECTIONS];
     for z in 0..16 {
         for x in 0..16 {
             let mut sky = 15u8;
             for y in (-80..336).rev() {
                 match block(chunk, x, y, z) {
-                    Block::Air => {}
+                    Block::Air
+                    | Block::ShortGrass
+                    | Block::SnowLayer
+                    | Block::Carpet
+                    | Block::TallGrassLower
+                    | Block::TallGrassUpper => {}
                     Block::Leaves
                     | Block::SpruceLeaves
                     | Block::AcaciaLeaves
@@ -1352,5 +1372,106 @@ mod tests {
             !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
             "generation should continue while awaiting the client"
         );
+    }
+
+    /// Reads skylight from the end of a framed chunk packet: 26 layers of a
+    /// two-byte `2048` length and 2048 bytes, then one byte for the empty block
+    /// light list. Layer 0 starts at y = -80; nibbles are low-first.
+    fn sky_at(packet: &[u8], x: usize, y: i32, z: usize) -> u8 {
+        let first_layer = packet.len() - 1 - 26 * 2050;
+        let layer = ((y + 80) / 16) as usize;
+        let data = first_layer + layer * 2050 + 2;
+        let index = (y.rem_euclid(16) as usize * 16 + z) * 16 + x;
+        (packet[data + index / 2] >> ((index % 2) * 4)) & 0x0f
+    }
+
+    fn encoded(chunk: &Chunk) -> Vec<u8> {
+        encode_chunk(chunk, Generator::new(1), &[0; 8])
+    }
+
+    #[test]
+    fn plants_and_thin_covers_pass_skylight() {
+        for block in [
+            Block::ShortGrass,
+            Block::TallGrassLower,
+            Block::TallGrassUpper,
+            Block::SnowLayer,
+            Block::Carpet,
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set_block(2, 10, 3, Block::Grass);
+            chunk.set_block(2, 11, 3, block);
+            let packet = encoded(&chunk);
+            assert_eq!(sky_at(&packet, 2, 12, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 11, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 10, 3), 0, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 9, 3), 0, "{block:?}");
+        }
+    }
+
+    #[test]
+    fn grass_is_only_in_the_world_surface_heightmap() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.set_block(0, 10, 0, Block::Grass);
+        let without_plant = encoded(&chunk);
+        chunk.set_block(0, 11, 0, Block::ShortGrass);
+        let with_plant = encoded(&chunk);
+
+        // 8 coordinate bytes, map size, then per type: id, length 37, longs.
+        // Column (0, 0) is the low 9 bits of each array's first big-endian long.
+        let first_height = |packet: &[u8], map_index: usize| {
+            let (_, frame_prefix) = read_varint(packet);
+            let body = frame_prefix + 1 + 8 + 1;
+            let entry = body + map_index * (2 + 37 * 8);
+            let word: [u8; 8] = packet[entry + 2..entry + 10].try_into().unwrap();
+            u64::from_be_bytes(word) & 0x1ff
+        };
+        // Floor top at y = 10 is stored as 10 + 1 + 64.
+        assert_eq!(first_height(&without_plant, 0), 75);
+        assert_eq!(first_height(&with_plant, 0), 76);
+        assert_eq!(first_height(&with_plant, 1), 75);
+        assert_eq!(first_height(&with_plant, 2), 75);
+    }
+
+    #[test]
+    fn new_block_variants_reach_the_chunk_palette() {
+        // Protocol state IDs from the official 26.3 blocks report, as VarInts.
+        for (block, id_bytes) in [
+            (Block::ShortGrass, [0xBB, 0x12]),
+            (Block::SnowLayer, [0x8D, 0x43]),
+            (Block::Carpet, [0x97, 0x73]),
+            (Block::TallGrassLower, [0xB3, 0x73]),
+            (Block::TallGrassUpper, [0xB2, 0x73]),
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        chunk.set_block(x, y, z, block);
+                    }
+                }
+            }
+            // 4096 non-air blocks, no fluid, single-value palette, state ID.
+            let section = [0x10, 0x00, 0x00, 0x00, 0x00, id_bytes[0], id_bytes[1]];
+            let packet = encoded(&chunk);
+            assert!(
+                packet.windows(section.len()).any(|bytes| bytes == section),
+                "{block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_block_state_ids_match_chunk_registry() {
+        // Official 26.3 block report values, written out independently of the table.
+        for (block, state) in [
+            (Block::ShortGrass, 2363),
+            (Block::SnowLayer, 8589),
+            (Block::Carpet, 14743),
+            (Block::TallGrassLower, 14771),
+            (Block::TallGrassUpper, 14770),
+        ] {
+            assert_eq!(block_state(block as u16), state, "{block:?}");
+        }
     }
 }
