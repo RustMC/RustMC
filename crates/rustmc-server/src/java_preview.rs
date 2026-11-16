@@ -271,6 +271,9 @@ const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
 const LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
 const CREATIVE: u32 = 1;
+// Vanilla Java rejects move packets beyond these magnitudes.
+const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
+const MAX_VERTICAL_POSITION: f64 = 20_000_000.0;
 
 fn registry_id(manifest: &RegistryManifest, registry: &str, entry: &str) -> Option<u32> {
     manifest
@@ -426,9 +429,9 @@ impl Preview {
     /// Validate only observer coordinates; this is not survival movement validation.
     pub fn move_to(&mut self, x: f64, y: f64, z: f64) -> Result<(), &'static str> {
         if ![x, y, z].iter().all(|v| v.is_finite())
-            || x.abs() > 1_000_000.0
-            || z.abs() > 1_000_000.0
-            || !(-64.0..=512.0).contains(&y)
+            || x.abs() > MAX_HORIZONTAL_POSITION
+            || z.abs() > MAX_HORIZONTAL_POSITION
+            || y.abs() > MAX_VERTICAL_POSITION
         {
             return Err("invalid preview position");
         }
@@ -1229,6 +1232,29 @@ mod tests {
         assert!(!preview.sent.contains(&(0, 0))); // Old view was unloaded.
         assert!(preview.sent.len() <= MAX_CHUNKS_PER_BATCH);
         assert!(preview.move_to(f64::NAN, 80.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn move_to_accepts_vanilla_position_range() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+
+        preview.move_to(5_000_000.5, 1000.0, 0.5).unwrap();
+        assert_eq!(preview.center, (312_500, 0));
+
+        preview
+            .move_to(-30_000_000.0, -20_000_000.0, 30_000_000.0)
+            .unwrap();
+        assert_eq!(preview.center, (-1_875_000, 1_875_000));
+
+        for (x, y, z) in [
+            (30_000_000.5, 0.0, 0.0),
+            (0.0, 0.0, -30_000_000.5),
+            (0.0, 20_000_000.5, 0.0),
+            (0.0, -20_000_000.5, 0.0),
+        ] {
+            assert!(preview.move_to(x, y, z).is_err());
+        }
     }
 
     #[test]
