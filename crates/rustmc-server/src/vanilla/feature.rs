@@ -1662,7 +1662,6 @@ fn parse_block_predicate(value: Option<&Value>) -> BlockPredicate {
     }
 }
 
-/// Whether the given block matches any block in `valid_blocks` (or tag if prefixed by `#`).
 /// The block state a spring's fluid state places. The pack writes the fluid
 /// state, `{"id": "minecraft:water", "properties": {"falling": "true"}}`, but
 /// `falling` belongs to the fluid: the 26.3 block-state report gives
@@ -1685,6 +1684,7 @@ fn is_air_block(block: Option<&str>) -> bool {
     })
 }
 
+/// Whether the given block matches any block in `valid_blocks` (or tag if prefixed by `#`).
 fn is_valid_block(block: Option<&str>, valid_blocks: &[String], tags: &BlockTags) -> bool {
     let Some(block) = block else {
         return false;
