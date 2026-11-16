@@ -7,7 +7,10 @@ mod tests_keepalive;
 
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
 use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
-use crate::java_wire::{Malformed, frame, put_string, put_varint, read_string, read_varint};
+use crate::java_wire::{
+    WireError, frame, pack_block_position, put_string, put_varint, read_string, read_varint,
+    unpack_block_position,
+};
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
@@ -49,8 +52,8 @@ pub enum Error {
 }
 
 /// Maps wire-level decoding failures into [`Error::Malformed`].
-impl From<Malformed> for Error {
-    fn from(_: Malformed) -> Self {
+impl From<WireError> for Error {
+    fn from(_: WireError) -> Self {
         Self::Malformed
     }
 }
@@ -190,16 +193,13 @@ pub const MAX_BLOCK_XZ: i32 = 30_000_000;
 /// - y: 12-bit signed integer (bits 0..=11)
 #[inline]
 pub fn unpack_block_pos(packed: i64) -> (i32, i32, i32) {
-    let x = (packed >> 38) as i32;
-    let y = (packed << 52 >> 52) as i32;
-    let z = (packed << 26 >> 38) as i32;
-    (x, y, z)
+    unpack_block_position(packed)
 }
 
 /// Packs (x, y, z) coordinates into a 64-bit Minecraft Java block position.
 #[inline]
 pub fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
-    ((x as i64 & 0x3FF_FFFF) << 38) | ((z as i64 & 0x3FF_FFFF) << 12) | (y as i64 & 0xFFF)
+    pack_block_position(x, y, z)
 }
 
 /// Checks if block coordinates fall within the authoritative world bounds.

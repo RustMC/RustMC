@@ -31,6 +31,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::java_wire::{self, WireError, put_nbt_text, put_string, put_varint};
+
 /// Packet ID for clientbound PlayerInfoUpdate in Java Edition 26.3 (Play state 0x47 / 71).
 pub const PACKET_ID_PLAYER_INFO_UPDATE: u32 = 0x47;
 
@@ -510,121 +512,6 @@ impl PartialEq<&str> for PlayerDisplayName {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
     }
-}
-
-/// Encodes a UTF-8 string slice into Java Modified UTF-8 (MUTF-8) bytes.
-///
-/// In Java MUTF-8:
-/// - U+0000 is encoded as 2 bytes: `0xC0 0x80`.
-/// - 1-byte ASCII (U+0001..=U+007F), 2-byte (U+0080..=U+07FF), and 3-byte (U+0800..=U+FFFF)
-///   use standard UTF-8 encodings.
-/// - Supplementary code points (U+010000..=U+10FFFF) are encoded as a UTF-16 surrogate pair,
-///   each encoded as a 3-byte sequence (total 6 bytes).
-pub fn encode_mutf8(s: &str, out: &mut Vec<u8>) {
-    for c in s.chars() {
-        let cp = c as u32;
-        if cp == 0 {
-            out.push(0xC0);
-            out.push(0x80);
-        } else if cp <= 0x7F {
-            out.push(cp as u8);
-        } else if cp <= 0x7FF {
-            out.push((0xC0 | ((cp >> 6) & 0x1F)) as u8);
-            out.push((0x80 | (cp & 0x3F)) as u8);
-        } else if cp <= 0xFFFF {
-            out.push((0xE0 | ((cp >> 12) & 0x0F)) as u8);
-            out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
-            out.push((0x80 | (cp & 0x3F)) as u8);
-        } else {
-            let temp = cp - 0x10000;
-            let high = 0xD800 + (temp >> 10);
-            let low = 0xDC00 + (temp & 0x3FF);
-            // High surrogate (0xD800..=0xDBFF)
-            out.push((0xE0 | ((high >> 12) & 0x0F)) as u8);
-            out.push((0x80 | ((high >> 6) & 0x3F)) as u8);
-            out.push((0x80 | (high & 0x3F)) as u8);
-            // Low surrogate (0xDC00..=0xDFFF)
-            out.push((0xE0 | ((low >> 12) & 0x0F)) as u8);
-            out.push((0x80 | ((low >> 6) & 0x3F)) as u8);
-            out.push((0x80 | (low & 0x3F)) as u8);
-        }
-    }
-}
-
-/// Decodes Java Modified UTF-8 (MUTF-8) bytes into a Rust String.
-pub fn decode_mutf8(bytes: &[u8]) -> Result<String, ProtocolError> {
-    let mut s = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b1 = bytes[i];
-        if b1 == 0 {
-            return Err(ProtocolError::InvalidUtf8);
-        }
-        if b1 <= 0x7F {
-            s.push(b1 as char);
-            i += 1;
-        } else if b1 & 0xE0 == 0xC0 {
-            if i + 1 >= bytes.len() {
-                return Err(ProtocolError::InvalidUtf8);
-            }
-            let b2 = bytes[i + 1];
-            if b2 & 0xC0 != 0x80 {
-                return Err(ProtocolError::InvalidUtf8);
-            }
-            let cp = (((b1 & 0x1F) as u32) << 6) | ((b2 & 0x3F) as u32);
-            if b1 == 0xC0 && b2 == 0x80 {
-                s.push('\0');
-            } else if cp < 0x80 {
-                return Err(ProtocolError::InvalidUtf8);
-            } else {
-                let ch = char::from_u32(cp).ok_or(ProtocolError::InvalidUtf8)?;
-                s.push(ch);
-            }
-            i += 2;
-        } else if b1 & 0xF0 == 0xE0 {
-            if i + 2 >= bytes.len() {
-                return Err(ProtocolError::InvalidUtf8);
-            }
-            let b2 = bytes[i + 1];
-            let b3 = bytes[i + 2];
-            if (b2 & 0xC0 != 0x80) || (b3 & 0xC0 != 0x80) {
-                return Err(ProtocolError::InvalidUtf8);
-            }
-            let code =
-                (((b1 & 0x0F) as u32) << 12) | (((b2 & 0x3F) as u32) << 6) | ((b3 & 0x3F) as u32);
-
-            if (0xD800..=0xDBFF).contains(&code) {
-                if i + 5 >= bytes.len() {
-                    return Err(ProtocolError::InvalidUtf8);
-                }
-                let b4 = bytes[i + 3];
-                let b5 = bytes[i + 4];
-                let b6 = bytes[i + 5];
-                if (b4 & 0xF0 != 0xE0) || (b5 & 0xC0 != 0x80) || (b6 & 0xC0 != 0x80) {
-                    return Err(ProtocolError::InvalidUtf8);
-                }
-                let low = (((b4 & 0x0F) as u32) << 12)
-                    | (((b5 & 0x3F) as u32) << 6)
-                    | ((b6 & 0x3F) as u32);
-                if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(ProtocolError::InvalidUtf8);
-                }
-                let cp = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
-                let ch = char::from_u32(cp).ok_or(ProtocolError::InvalidUtf8)?;
-                s.push(ch);
-                i += 6;
-            } else if (0xDC00..=0xDFFF).contains(&code) || code < 0x800 {
-                return Err(ProtocolError::InvalidUtf8);
-            } else {
-                let ch = char::from_u32(code).ok_or(ProtocolError::InvalidUtf8)?;
-                s.push(ch);
-                i += 3;
-            }
-        } else {
-            return Err(ProtocolError::InvalidUtf8);
-        }
-    }
-    Ok(s)
 }
 
 /// Clientbound `PlayerInfoUpdate` packet (packet ID 0x47 in Java 26.3 protocol 777).
@@ -1152,18 +1039,7 @@ pub fn varint_len(value: u32) -> usize {
 
 /// Encodes a 32-bit signed integer as a canonical VarInt into `out`.
 pub fn write_varint(value: i32, out: &mut Vec<u8>) {
-    let mut u = value as u32;
-    loop {
-        let mut byte = (u & 0x7F) as u8;
-        u >>= 7;
-        if u != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if u == 0 {
-            break;
-        }
-    }
+    put_varint(value as u32, out);
 }
 
 /// Decodes a 32-bit signed integer from a canonical VarInt stream.
@@ -1171,23 +1047,11 @@ pub fn write_varint(value: i32, out: &mut Vec<u8>) {
 /// Rejects non-canonical encodings with superfluous trailing zero bytes (e.g. `[0x80, 0x00]`)
 /// and malformed sequences exceeding 5 bytes or containing illegal upper bits.
 pub fn read_varint(input: &[u8]) -> Result<(i32, usize), ProtocolError> {
-    let mut value = 0u32;
-    for (i, &byte) in input.iter().take(5).enumerate() {
-        if i == 4 && (byte & 0xF0) != 0 {
-            return Err(ProtocolError::MalformedVarInt);
-        }
-        value |= u32::from(byte & 0x7F) << (i * 7);
-        if (byte & 0x80) == 0 {
-            if i > 0 && byte == 0 {
-                return Err(ProtocolError::NonCanonicalVarInt);
-            }
-            return Ok((value as i32, i + 1));
-        }
-    }
-    if input.len() >= 5 {
-        Err(ProtocolError::MalformedVarInt)
-    } else {
-        Err(ProtocolError::UnexpectedEof)
+    match java_wire::read_varint(input) {
+        Ok(Some((value, bytes_read))) => Ok((value as i32, bytes_read)),
+        Ok(None) => Err(ProtocolError::UnexpectedEof),
+        Err(WireError::NonCanonicalVarInt) => Err(ProtocolError::NonCanonicalVarInt),
+        Err(_) => Err(ProtocolError::MalformedVarInt),
     }
 }
 
@@ -1227,8 +1091,7 @@ pub fn read_uuid(input: &[u8]) -> Result<([u8; 16], usize), ProtocolError> {
 
 /// Writes a VarInt-prefixed UTF-8 string into `out`.
 pub fn write_string(s: &str, out: &mut Vec<u8>) {
-    write_varint(s.len() as i32, out);
-    out.extend_from_slice(s.as_bytes());
+    put_string(s, out);
 }
 
 /// Rejects a collection or byte buffer longer than `max`.
@@ -1246,25 +1109,22 @@ fn check_chars(value: &str, max_chars: usize) -> Result<(), ProtocolError> {
 
 /// Reads a VarInt-prefixed UTF-8 string bounded by `max_chars`.
 pub fn read_string(input: &[u8], max_chars: usize) -> Result<(String, usize), ProtocolError> {
-    let (byte_len, offset) = read_varint(input)?;
-    if byte_len < 0 {
-        return Err(ProtocolError::MalformedVarInt);
-    }
-    let byte_len = byte_len as usize;
-    if byte_len > max_chars * 3 {
-        return Err(ProtocolError::StringTooLong {
-            length: byte_len,
+    let max_bytes = max_chars.saturating_mul(3).min(i32::MAX as usize);
+    let (s, rest) = java_wire::read_string(input, max_bytes).map_err(|err| match err {
+        WireError::Truncated => ProtocolError::UnexpectedEof,
+        WireError::VarIntTooLong => ProtocolError::MalformedVarInt,
+        WireError::NonCanonicalVarInt => ProtocolError::NonCanonicalVarInt,
+        WireError::TooLong { length, .. } if length > i32::MAX as usize => {
+            ProtocolError::MalformedVarInt
+        }
+        WireError::TooLong { length, .. } => ProtocolError::StringTooLong {
+            length,
             max: max_chars,
-        });
-    }
-    let total = offset + byte_len;
-    if input.len() < total {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-    let slice = &input[offset..total];
-    let s = std::str::from_utf8(slice).map_err(|_| ProtocolError::InvalidUtf8)?;
+        },
+        WireError::InvalidText => ProtocolError::InvalidUtf8,
+    })?;
     check_chars(s, max_chars)?;
-    Ok((s.to_owned(), total))
+    Ok((s.to_owned(), input.len() - rest.len()))
 }
 
 /// Writes a VarInt-prefixed byte array into `out`.
@@ -1311,12 +1171,10 @@ fn check_nbt_depth(depth: usize) -> Result<(), ProtocolError> {
 
 /// Reads a TAG_String payload: an unsigned 16-bit byte length and modified UTF-8.
 fn read_nbt_string(input: &[u8]) -> Result<(String, usize), ProtocolError> {
-    let (length, rest) = input
-        .split_first_chunk::<2>()
-        .ok_or(ProtocolError::UnexpectedEof)?;
-    let length = usize::from(u16::from_be_bytes(*length));
-    let bytes = rest.get(..length).ok_or(ProtocolError::UnexpectedEof)?;
-    Ok((decode_mutf8(bytes)?, 2 + length))
+    java_wire::read_nbt_string(input).map_err(|err| match err {
+        WireError::Truncated => ProtocolError::UnexpectedEof,
+        _ => ProtocolError::InvalidUtf8,
+    })
 }
 
 fn skip_nbt_payload(tag_type: u8, input: &[u8], depth: usize) -> Result<usize, ProtocolError> {
@@ -1469,17 +1327,10 @@ pub fn write_display_name_nbt(
     match name {
         PlayerDisplayName::Plain(text) => {
             check_chars(text, MAX_STRING_CHARS)?;
-            let mut encoded = Vec::with_capacity(text.len());
-            encode_mutf8(text, &mut encoded);
-            // The NBT limit applies to encoded bytes, not to the source string.
-            let byte_len =
-                u16::try_from(encoded.len()).map_err(|_| ProtocolError::StringTooLong {
-                    length: encoded.len(),
-                    max: u16::MAX as usize,
-                })?;
-            out.push(0x08); // TAG_String
-            out.extend_from_slice(&byte_len.to_be_bytes());
-            out.extend_from_slice(&encoded);
+            put_nbt_text(text, out).map_err(|err| match err {
+                WireError::TooLong { length, max } => ProtocolError::StringTooLong { length, max },
+                _ => ProtocolError::InvalidUtf8,
+            })?;
         }
         PlayerDisplayName::RawNbt { raw, .. } => {
             let (_, consumed) = read_display_name_nbt(raw, MAX_STRING_CHARS)?;

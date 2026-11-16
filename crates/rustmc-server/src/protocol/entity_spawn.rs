@@ -49,6 +49,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::java_wire::{
+    self, NBT_TAG_STRING, WireError, frame, pack_block_position, put_nbt_text, put_string,
+    put_varint, unpack_block_position,
+};
+
 /// Clientbound packet ID for Java 26.3 SpawnEntity (Play state 0x01).
 pub const PACKET_ID_SPAWN_ENTITY: u32 = 0x01;
 
@@ -66,9 +71,6 @@ pub const MAX_METADATA_STRING_CHARS: usize = 32767;
 
 /// The one-byte LpVec3 form of a zero vector.
 const ZERO_LP_VEC3: u8 = 0x00;
-
-/// NBT tag ID for TAG_String, the form of a literal text component.
-const TAG_STRING: u8 = 8;
 
 /// Protocol direction constants.
 pub mod direction {
@@ -126,16 +128,13 @@ pub fn byte_to_angle(byte: u8) -> f64 {
 /// - Y: 12 bits (bits 0..=11)
 #[inline]
 pub fn pack_position(x: i32, y: i32, z: i32) -> u64 {
-    (((x as i64 & 0x3FFFFFF) << 38) | ((z as i64 & 0x3FFFFFF) << 12) | (y as i64 & 0xFFF)) as u64
+    pack_block_position(x, y, z) as u64
 }
 
 /// Unpacks a 64-bit integer into 3D block coordinates (X, Y, Z).
 #[inline]
 pub fn unpack_position(val: u64) -> [i32; 3] {
-    let val = val as i64;
-    let x = (val >> 38) as i32;
-    let y = ((val << 52) >> 52) as i32;
-    let z = ((val << 26) >> 38) as i32;
+    let (x, y, z) = unpack_block_position(val as i64);
     [x, y, z]
 }
 
@@ -203,74 +202,38 @@ impl std::error::Error for EntityProtocolError {}
 
 /// Reads a VarInt from a byte slice.
 pub fn read_varint(input: &[u8]) -> Result<(i32, usize), EntityProtocolError> {
-    let mut value = 0u32;
-    for (i, &byte) in input.iter().take(5).enumerate() {
-        if i == 4 && (byte & 0xf0) != 0 {
-            return Err(EntityProtocolError::MalformedVarInt);
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if (byte & 0x80) == 0 {
-            if i > 0 && byte == 0 && value == 0 {
-                return Err(EntityProtocolError::MalformedVarInt);
-            }
-            return Ok((value as i32, i + 1));
-        }
-    }
-    if input.len() >= 5 {
-        Err(EntityProtocolError::MalformedVarInt)
-    } else {
-        Err(EntityProtocolError::UnexpectedEof)
+    match java_wire::read_varint(input) {
+        Ok(Some((value, bytes_read))) => Ok((value as i32, bytes_read)),
+        Ok(None) => Err(EntityProtocolError::UnexpectedEof),
+        Err(_) => Err(EntityProtocolError::MalformedVarInt),
     }
 }
 
 /// Writes a VarInt into a byte vector.
 pub fn write_varint(value: i32, out: &mut Vec<u8>) {
-    let mut v = value as u32;
-    loop {
-        let mut byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if v == 0 {
-            break;
-        }
-    }
+    put_varint(value as u32, out);
 }
 
 /// Reads a VarInt-prefixed UTF-8 string from a byte slice.
 pub fn read_string(input: &[u8]) -> Result<(&str, usize), EntityProtocolError> {
-    let (length, prefix_len) = read_varint(input)?;
-    if length < 0 {
-        return Err(EntityProtocolError::MalformedVarInt);
+    match java_wire::read_string(input, i32::MAX as usize) {
+        Ok((s, rest)) => Ok((s, input.len() - rest.len())),
+        Err(WireError::Truncated) => Err(EntityProtocolError::UnexpectedEof),
+        Err(
+            WireError::VarIntTooLong | WireError::NonCanonicalVarInt | WireError::TooLong { .. },
+        ) => Err(EntityProtocolError::MalformedVarInt),
+        Err(WireError::InvalidText) => Err(EntityProtocolError::InvalidUtf8),
     }
-    let length = length as usize;
-    let total_len = prefix_len + length;
-    if input.len() < total_len {
-        return Err(EntityProtocolError::UnexpectedEof);
-    }
-    let s = std::str::from_utf8(&input[prefix_len..total_len])
-        .map_err(|_| EntityProtocolError::InvalidUtf8)?;
-    Ok((s, total_len))
 }
 
 /// Writes a VarInt-prefixed UTF-8 string into a byte vector.
 pub fn write_string(s: &str, out: &mut Vec<u8>) {
-    write_varint(s.len() as i32, out);
-    out.extend_from_slice(s.as_bytes());
+    put_string(s, out);
 }
 
 /// Frames a packet payload with VarInt packet ID and prepends the VarInt packet length.
 pub fn frame_packet(id: u32, payload: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    write_varint(id as i32, &mut packet);
-    packet.extend_from_slice(payload);
-
-    let mut out = Vec::new();
-    write_varint(packet.len() as i32, &mut out);
-    out.extend(packet);
-    out
+    frame(id, payload)
 }
 
 /// Validates that 3D coordinates are finite (neither NaN nor Infinity).
@@ -635,29 +598,10 @@ pub enum MetadataValue {
 /// Appends `value` as an anonymous TAG_String with modified UTF-8 content: UTF-16
 /// code units, U+0000 as `C0 80`, and each surrogate as three bytes.
 fn write_text_component(value: &str, out: &mut Vec<u8>) -> Result<(), EntityProtocolError> {
-    let mut encoded = Vec::with_capacity(value.len());
-    for unit in value.encode_utf16() {
-        match unit {
-            0x0001..=0x007F => encoded.push(unit as u8),
-            0x0000 | 0x0080..=0x07FF => {
-                encoded.push(0xC0 | (unit >> 6) as u8);
-                encoded.push(0x80 | (unit & 0x3F) as u8);
-            }
-            _ => {
-                encoded.push(0xE0 | (unit >> 12) as u8);
-                encoded.push(0x80 | ((unit >> 6) & 0x3F) as u8);
-                encoded.push(0x80 | (unit & 0x3F) as u8);
-            }
-        }
-    }
-    let length = u16::try_from(encoded.len()).map_err(|_| EntityProtocolError::StringTooLong {
-        length: encoded.len(),
-        max: usize::from(u16::MAX),
-    })?;
-    out.push(TAG_STRING);
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend(encoded);
-    Ok(())
+    put_nbt_text(value, out).map_err(|err| match err {
+        WireError::TooLong { length, max } => EntityProtocolError::StringTooLong { length, max },
+        _ => EntityProtocolError::InvalidUtf8,
+    })
 }
 
 /// Reads an anonymous TAG_String text component, returning the bytes consumed.
@@ -665,38 +609,14 @@ fn read_text_component(data: &[u8]) -> Result<(String, usize), EntityProtocolErr
     let (tag, rest) = data
         .split_first()
         .ok_or(EntityProtocolError::UnexpectedEof)?;
-    if *tag != TAG_STRING {
+    if *tag != NBT_TAG_STRING {
         return Err(EntityProtocolError::UnsupportedTextComponent(*tag));
     }
-    let (length, rest) = rest
-        .split_first_chunk::<2>()
-        .ok_or(EntityProtocolError::UnexpectedEof)?;
-    let length = usize::from(u16::from_be_bytes(*length));
-    let bytes = rest
-        .get(..length)
-        .ok_or(EntityProtocolError::UnexpectedEof)?;
-
-    let mut units = Vec::with_capacity(length);
-    let mut index = 0;
-    while index < length {
-        let first = bytes[index];
-        let next = |offset: usize| -> Result<u16, EntityProtocolError> {
-            match bytes.get(index + offset) {
-                Some(byte) if byte & 0xC0 == 0x80 => Ok(u16::from(byte & 0x3F)),
-                _ => Err(EntityProtocolError::InvalidUtf8),
-            }
-        };
-        let (unit, width) = match first {
-            0x01..=0x7F => (u16::from(first), 1),
-            0xC0..=0xDF => (u16::from(first & 0x1F) << 6 | next(1)?, 2),
-            0xE0..=0xEF => (u16::from(first & 0x0F) << 12 | next(1)? << 6 | next(2)?, 3),
-            _ => return Err(EntityProtocolError::InvalidUtf8),
-        };
-        units.push(unit);
-        index += width;
-    }
-    let text = String::from_utf16(&units).map_err(|_| EntityProtocolError::InvalidUtf8)?;
-    Ok((text, 3 + length))
+    let (text, consumed) = java_wire::read_nbt_string(rest).map_err(|err| match err {
+        WireError::Truncated => EntityProtocolError::UnexpectedEof,
+        _ => EntityProtocolError::InvalidUtf8,
+    })?;
+    Ok((text, 1 + consumed))
 }
 
 fn read_bool(data: &[u8]) -> Result<bool, EntityProtocolError> {
@@ -1913,5 +1833,21 @@ mod tests {
         assert_eq!(shrink_events.len(), 1);
         assert!(shrink_events[0].is_despawn());
         assert!(!tracker.is_entity_visible_to_player(2, 10));
+    }
+
+    #[test]
+    fn test_varint_rejects_non_canonical_nonzero() {
+        assert_eq!(
+            read_varint(&[0x81, 0x00]),
+            Err(EntityProtocolError::MalformedVarInt)
+        );
+    }
+
+    #[test]
+    fn test_read_text_component_rejects_overlong_modified_utf8() {
+        assert_eq!(
+            read_text_component(&[8, 0, 2, 0xC1, 0x81]),
+            Err(EntityProtocolError::InvalidUtf8)
+        );
     }
 }
