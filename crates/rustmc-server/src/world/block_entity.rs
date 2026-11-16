@@ -15,7 +15,7 @@
 use rustc_hash::FxHashMap;
 use std::fmt;
 
-use crate::discovery_java::{frame, put_string, put_varint};
+use crate::java_wire::{frame, put_string, put_varint};
 
 /// Maximum byte length for a single sign text line (384 bytes UTF-8).
 pub const MAX_LINE_BYTES: usize = 384;
