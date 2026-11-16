@@ -4,6 +4,7 @@
 //! The preview is unauthenticated and has no authoritative gameplay world.
 
 pub mod bedrock;
+pub mod bedrock_chunk;
 pub mod bedrock_framing;
 pub mod chunk_adapter;
 pub mod commands;
