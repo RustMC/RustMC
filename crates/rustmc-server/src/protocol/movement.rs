@@ -6,13 +6,13 @@
 //! Under Minecraft Java Edition 26.3 (protocol 777), player movement updates are sent by
 //! the client in Play state across four movement packet variants and one teleport confirmation packet:
 //!
-//! - `MovePlayerPos` (0x1A): `x: f64, y: f64, z: f64, on_ground: bool`
-//! - `MovePlayerPosRot` (0x1B): `x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool`
-//! - `MovePlayerRot` (0x1C): `yaw: f32, pitch: f32, on_ground: bool`
-//! - `MovePlayerStatus` (0x1D): `on_ground: bool`
-//! - `AcceptTeleportation` (0x00): `teleport_id: i32` (VarInt)
+//! - `MovePlayerPos` (0x1E): `x: f64, y: f64, z: f64, on_ground: bool`
+//! - `MovePlayerPosRot` (0x1F): `x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool`
+//! - `MovePlayerRot` (0x20): `yaw: f32, pitch: f32, on_ground: bool`
+//! - `MovePlayerStatus` (0x21): `on_ground: bool`
+//! - `AcceptTeleportation` (0x00): `teleport_id: VarInt`, then the confirmed `x, y, z: f64` and `yaw, pitch: f32`
 //!
-//! The server coordinates player teleportation with clientbound `PlayerPositionSync` (0x40):
+//! The server coordinates player teleportation with clientbound `PlayerPositionSync` (0x49):
 //! - `teleport_id: VarInt`
 //! - `x: f64, y: f64, z: f64`
 //! - `dx: f64, dy: f64, dz: f64` (velocity)
@@ -359,7 +359,7 @@ pub fn calculate_displacement(x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f
     dx.mul_add(dx, dy.mul_add(dy, dz * dz)).sqrt()
 }
 
-/// Serverbound `MovePlayerPos` packet (0x1A): `x: f64, y: f64, z: f64, on_ground: bool`.
+/// Serverbound `MovePlayerPos` packet (0x1E): `x: f64, y: f64, z: f64, on_ground: bool`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovePlayerPos {
     pub x: f64,
@@ -431,13 +431,13 @@ impl MovePlayerPos {
         out
     }
 
-    /// Encodes a framed packet (length VarInt + packet ID 0x1A + payload).
+    /// Encodes a framed packet (length VarInt + packet ID 0x1E + payload).
     pub fn encode_framed(&self) -> Vec<u8> {
         frame_packet(Self::PACKET_ID, &self.encode())
     }
 }
 
-/// Serverbound `MovePlayerPosRot` packet (0x1B):
+/// Serverbound `MovePlayerPosRot` packet (0x1F):
 /// `x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovePlayerPosRot {
@@ -529,13 +529,13 @@ impl MovePlayerPosRot {
         out
     }
 
-    /// Encodes a framed packet (length VarInt + packet ID 0x1B + payload).
+    /// Encodes a framed packet (length VarInt + packet ID 0x1F + payload).
     pub fn encode_framed(&self) -> Vec<u8> {
         frame_packet(Self::PACKET_ID, &self.encode())
     }
 }
 
-/// Serverbound `MovePlayerRot` packet (0x1C): `yaw: f32, pitch: f32, on_ground: bool`.
+/// Serverbound `MovePlayerRot` packet (0x20): `yaw: f32, pitch: f32, on_ground: bool`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovePlayerRot {
     pub yaw: f32,
@@ -603,13 +603,13 @@ impl MovePlayerRot {
         out
     }
 
-    /// Encodes a framed packet (length VarInt + packet ID 0x1C + payload).
+    /// Encodes a framed packet (length VarInt + packet ID 0x20 + payload).
     pub fn encode_framed(&self) -> Vec<u8> {
         frame_packet(Self::PACKET_ID, &self.encode())
     }
 }
 
-/// Serverbound `MovePlayerStatus` packet (0x1D): `on_ground: bool`.
+/// Serverbound `MovePlayerStatus` packet (0x21): `on_ground: bool`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovePlayerStatus {
     pub on_ground: bool,
@@ -653,7 +653,7 @@ impl MovePlayerStatus {
         vec![encode_flags_byte(self.on_ground, self.horizontal_collision)]
     }
 
-    /// Encodes a framed packet (length VarInt + packet ID 0x1D + payload).
+    /// Encodes a framed packet (length VarInt + packet ID 0x21 + payload).
     pub fn encode_framed(&self) -> Vec<u8> {
         frame_packet(Self::PACKET_ID, &self.encode())
     }
@@ -787,7 +787,7 @@ pub fn decode_serverbound_movement_packet(
     }
 }
 
-/// Clientbound `PlayerPositionSync` packet (0x40 in Java 26.3):
+/// Clientbound `PlayerPositionSync` packet (0x49 in Java 26.3):
 /// Encodes `teleport_id: VarInt`, `x: f64, y: f64, z: f64`,
 /// `dx: f64, dy: f64, dz: f64` (velocity), `yaw: f32, pitch: f32`, `flags: i32`.
 #[derive(Debug, Clone, PartialEq)]
@@ -872,7 +872,7 @@ impl PlayerPositionSync {
         out.extend_from_slice(&self.flags.to_be_bytes());
     }
 
-    /// Encodes packet ID 0x40 plus the body bytes (unframed).
+    /// Encodes packet ID 0x49 plus the body bytes (unframed).
     pub fn encode_packet(&self) -> Vec<u8> {
         let mut packet = Vec::with_capacity(70);
         write_varint(Self::PACKET_ID, &mut packet);
@@ -880,7 +880,7 @@ impl PlayerPositionSync {
         packet
     }
 
-    /// Encodes an outer-framed packet (length VarInt + packet ID 0x40 + payload).
+    /// Encodes an outer-framed packet (length VarInt + packet ID 0x49 + payload).
     pub fn encode_framed(&self) -> Vec<u8> {
         let mut body = Vec::with_capacity(65);
         self.encode_body(&mut body);
