@@ -3,5 +3,6 @@
 //! Submodules are reached by path (`protocol::movement::...`); they are not
 //! glob re-exported because several define helpers with the same names.
 
+pub mod entity_spawn;
 pub mod movement;
 pub mod player_info;
