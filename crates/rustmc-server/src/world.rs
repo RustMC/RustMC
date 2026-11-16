@@ -2,10 +2,10 @@
 
 pub mod experience;
 
-#[cfg(test)]
-mod tests_experience;
 pub mod block_entity;
 pub mod interaction;
+#[cfg(test)]
+mod tests_experience;
 
 pub use block_entity::*;
 
