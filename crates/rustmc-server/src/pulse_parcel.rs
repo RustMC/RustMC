@@ -1,7 +1,7 @@
 //! M6 Pulse–Parcel Deterministic Replay & Partition Equivalence Evaluation.
 //!
-//! Provides the reference oracle (`ReferenceExecutor`) and parallel partitioned
-//! execution model (`ParcelExecutor`) evaluated under spatial partitioning,
+//! Provides the reference oracle (`ReferenceExecutor`) and partitioned
+//! execution model (`ParcelExecutor`, stepped sequentially) evaluated under spatial partitioning,
 //! dynamic repartitioning, cross-parcel boundary coordination, and player
 //! migration transfer points.
 
@@ -1121,10 +1121,10 @@ impl BoundaryCoordinator {
 }
 
 // ---------------------------------------------------------------------------
-// Parcel Executor (Spatially partitioned parallel execution model)
+// Parcel Executor (spatially partitioned model, stepped sequentially)
 // ---------------------------------------------------------------------------
 
-/// Parallel partitioned executor operating across independent parcels
+/// Partitioned executor operating across independent parcels, stepped sequentially
 /// with a deterministic cross-parcel boundary coordinator.
 #[derive(Debug, Clone)]
 pub struct ParcelExecutor {

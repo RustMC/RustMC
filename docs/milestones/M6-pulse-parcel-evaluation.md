@@ -1,6 +1,6 @@
 # M6 — Pulse–Parcel Deterministic Replay & Partition Equivalence Evaluation
 
-Status: **Evaluation slice implemented**. Under [ADR-0005](../decisions/ADR-0005.md) and [ARCHITECTURE](../ARCHITECTURE.md), parallel partitioned simulation must be evaluated strictly against a single-authoritative-writer reference executor. The initial slice in `crates/rustmc-server/src/pulse_parcel.rs` proves bit-for-bit replay equivalence across spatial partitioning, dynamic repartitioning, player migration epochs, cross-parcel boundary envelopes, and competing same-pulse edits.
+Status: **Evaluation slice implemented**. Under [ADR-0005](../decisions/ADR-0005.md) and [ARCHITECTURE](../ARCHITECTURE.md), parallel partitioned simulation must be evaluated strictly against a single-authoritative-writer reference executor. The initial slice in `crates/rustmc-server/src/pulse_parcel.rs` tests bit-for-bit replay equivalence on scripted scenarios across spatial partitioning, dynamic repartitioning, player migration epochs, cross-parcel boundary envelopes, and competing same-pulse edits.
 
 ## 1. Scope & Core Types
 
@@ -27,7 +27,7 @@ Data structures strictly use `BTreeMap` and `BTreeSet` (zero `HashMap` or `HashS
 The reference executor maintains a single flat authoritative state (`BTreeMap<(i32, i32), Chunk>` and `BTreeMap<PlayerId, PlayerState>`). It applies admitted intents sequentially in canonical `admission_order`, serving as the deterministic oracle.
 
 ### ParcelExecutor
-The parallel executor partitions chunks and player states across discrete `Parcel` instances. It supports:
+The partitioned executor partitions chunks and player states across discrete `Parcel` instances. It supports:
 - **Independent Parcel Stepping**: Intra-parcel actions execute within the parcel owner without synchronization overhead.
 - **Deterministic Boundary Coordinator**: Resolves cross-parcel actions, checks envelope intersections across parcel borders (`WouldEmbed`), and resolves competing same-pulse edits in canonical `admission_order` (`StaleClaim`).
 - **Committed Player Migration Transfer Point**: Transmits player ownership between parcels during cross-border movement, incrementing `epoch` and maintaining `PlayerId` so subsequent actions within the same pulse execute in the destination parcel.
@@ -51,7 +51,15 @@ Invalid coordinates are refused before they reach replay state, by the same chec
 
 These limits are evaluation policy, not vanilla claims.
 
-## 5. Test Suite
+## 5. Limits of This Evidence
+
+The `ParcelExecutor` runs every parcel sequentially on one thread. It models partition
+ownership, boundary coordination, and migration, but it does not exercise concurrent
+execution, recovery after a failed parcel, or realistic load. The ADR-0005 rejection
+criteria for those remain open, so this slice does not by itself justify adopting
+Pulse–Parcel.
+
+## 6. Test Suite
 
 Unit tests in `crates/rustmc-server/src/pulse_parcel.rs` pin the evaluation criteria, including:
 - `single_parcel_and_multi_parcel_layouts_match_reference_bit_for_bit`: 4-chunk 2x2 grid executed under single-parcel and 4-parcel layouts compared to the reference oracle.
