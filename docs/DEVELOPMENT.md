@@ -110,7 +110,7 @@ Exit codes: `0` clean stop or non-running success; `2` CLI usage; `3` configurat
 | `codeql` | `main` pushes, PRs, weekly schedule, manual | CodeQL analysis of the Rust sources and the workflow files; findings appear under Security > Code scanning (`security-events: write` is limited to this job) |
 | `workflow-audit` | changes under `.github/`, manual | `zizmor` audit of the workflows for excessive permissions, template injection, credential persistence, and unpinned actions |
 | `docs-links` | Markdown changes, manual | `lychee --offline` check that relative links and heading anchors in tracked Markdown resolve; external URLs are not fetched |
-| `release` | `v*` tag push | builds `rustmc-server` release binaries (Linux and Windows) with SHA-256 checksums and attaches them to a **draft** GitHub Release; publishing the draft is a manual owner action (`contents: write` is limited to this workflow) |
+| `release` | `v*` tag push | builds `rustmc-server` release binaries (Linux and Windows) with SHA-256 checksums and creates a **draft** GitHub Release with the `gh` CLI; publishing the draft is a manual owner action (`contents: write` is limited to the `draft` job) |
 
 `.github/dependabot.yml` opens weekly grouped PRs for Cargo and GitHub Actions updates.
 

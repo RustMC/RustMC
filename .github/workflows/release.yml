@@ -6,7 +6,7 @@ on:
   push:
     tags: ['v*']
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -50,9 +50,27 @@ jobs:
           $zip = "rustmc-server-$env:VERSION-$env:TARGET.zip"
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           Set-Content -Encoding ascii -Path "$zip.sha256" -Value "$hash  $zip"
-      - name: Create draft release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          draft: true
-          files: |
-            rustmc-server-*
+          name: rustmc-server-${{ matrix.target }}
+          path: rustmc-server-*
+          if-no-files-found: error
+  draft:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$TAG" --draft --verify-tag --title "$TAG" dist/*
