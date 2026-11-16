@@ -30,6 +30,15 @@ struct Budget {
     bytes: u64,
 }
 
+impl Budget {
+    fn remove_file_entry(&mut self, path: &Path) {
+        if let Some(index) = self.files.iter().position(|(stored, _)| stored == path) {
+            let (_, old_size) = self.files.remove(index).expect("index exists");
+            self.bytes -= old_size;
+        }
+    }
+}
+
 fn packet_position(path: &Path) -> Option<(i32, i32)> {
     let (x, z) = path.file_stem()?.to_str()?.split_once('.')?;
     Some((x.parse().ok()?, z.parse().ok()?))
@@ -100,13 +109,10 @@ impl PreviewCache {
         let path = self.path(x, z);
         {
             let mut budget = self.budget.lock().expect("preview cache lock poisoned");
-            if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
-                let (_, size) = budget.files.remove(index).expect("index exists");
-                budget.bytes -= size;
-            }
+            budget.remove_file_entry(&path);
             budget.positions.remove(&(x, z));
         }
-        // The entry is already forgotten from the budget; a failed unlink only leaves stale disk bytes.
+        // The entry is already out of the budget, so a failed delete only wastes disk space.
         let _ = fs::remove_file(&path);
     }
 
@@ -156,10 +162,7 @@ impl PreviewCache {
         // rename; only the bookkeeping in this block is serialized.
         let evicted = {
             let mut budget = self.budget.lock().expect("preview cache lock poisoned");
-            if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
-                let (_, old_size) = budget.files.remove(index).expect("index exists");
-                budget.bytes -= old_size;
-            }
+            budget.remove_file_entry(&path);
             let size = (HEADER_BYTES + packet.len()) as u64;
             budget.files.push_back((path, size));
             budget.positions.insert((x, z));
