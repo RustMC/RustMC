@@ -1,7 +1,11 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod experience;
+
 pub mod block_entity;
 pub mod interaction;
+#[cfg(test)]
+mod tests_experience;
 
 pub use block_entity::*;
 
