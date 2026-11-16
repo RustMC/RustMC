@@ -258,6 +258,39 @@ mod runtime_cli {
         assert!(udp.recv(&mut buf).is_err());
         udp.send_to(&vec![0u8; 513], address).unwrap();
         assert!(udp.recv(&mut buf).is_err());
+        // RakNet Open Connection Request 1 over live UDP socket
+        let mut req1 = vec![0x05];
+        req1.extend([
+            0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
+        ]);
+        req1.push(11);
+        // A 1200-byte MTU probe carries a 1172-byte UDP payload.
+        req1.resize(1172, 0);
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        udp.send_to(&req1, address).unwrap();
+        let n = udp.recv(&mut buf).unwrap();
+        assert_eq!(n, 28);
+        assert_eq!(buf[0], 0x06);
+        assert_eq!(&buf[26..28], &1200u16.to_be_bytes());
+        // RakNet Open Connection Request 2 over live UDP socket
+        let mut req2 = vec![0x07];
+        req2.extend([
+            0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
+        ]);
+        req2.extend([4, 127, 0, 0, 1, 0x4a, 0xec]);
+        req2.extend(1200u16.to_be_bytes());
+        req2.extend(0x4433_2211u64.to_be_bytes());
+        udp.send_to(&req2, address).unwrap();
+        let n = udp.recv(&mut buf).unwrap();
+        assert_eq!(n, 35);
+        assert_eq!(buf[0], 0x08);
+        // Reply 2 reports this socket: complemented 127.0.0.1, then its port.
+        assert_eq!(&buf[25..30], &[4, 0x80, 0xff, 0xff, 0xfe]);
+        assert_eq!(
+            &buf[30..32],
+            &udp.local_addr().unwrap().port().to_be_bytes()
+        );
+        assert_eq!(&buf[32..34], &1200u16.to_be_bytes());
         server.stop();
         let rebound = UdpSocket::bind(address).unwrap();
         drop(rebound);
