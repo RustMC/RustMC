@@ -7,6 +7,19 @@
 //!
 //! Subchunks support versions 8 and 9 with paletted block storages packing 4,096 block
 //! indices per storage layer into 32-bit little-endian words.
+//!
+//! Sources. The packet header (ID 58, chunk position as two compressed `int32`,
+//! compressed `int32` dimension, compressed `uint32` sub-chunk count, cache flag,
+//! `uint64` blob IDs, then the chunk data as a length-prefixed string) follows
+//! `LevelChunkPacketPayload.json` in Mojang's 1.26.51 schema (protocol 2193,
+//! release `v1.26.51` of <https://github.com/Mojang/bedrock-protocol-docs>,
+//! commit `8667debe0adad27de6c692c88942c489a1193206`). That schema leaves the
+//! chunk data opaque, so the sub-chunk, palette, and biome layouts here have no
+//! primary source and are unverified. The schema also lists the blob-ID array
+//! and `Client Request SubChunk Limit` without saying when they are present;
+//! this module writes blob IDs only with caching enabled and never writes the
+//! request limit, which a real client must confirm. No Bedrock client has
+//! exercised this code.
 
 use std::fmt;
 

@@ -1386,3 +1386,7 @@ short single runs do not show a speed change. The separate ground-cover draft
 has not been used to claim vegetation parity from these save-only numbers,
 and a four-family census is
 still only a selected slice of 26.3 vegetation.
+
+## Bedrock chunk packets
+
+`LevelChunkPacket` header field order and widths follow `LevelChunkPacketPayload.json` in Mojang's [1.26.51 schema](https://github.com/Mojang/bedrock-protocol-docs/releases/tag/v1.26.51) (commit `8667debe0adad27de6c692c88942c489a1193206`). That schema leaves the chunk data opaque, so the sub-chunk, block palette, and biome storage layouts have no primary source. They, and the presence rules for the blob-ID array and `Client Request SubChunk Limit`, stay unverified until a real 1.26.51 client loads a RustMC chunk.
