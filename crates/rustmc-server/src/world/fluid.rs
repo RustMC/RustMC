@@ -22,6 +22,15 @@
 //! - **Fluid Collisions**: Water touching lava source blocks creates `minecraft:obsidian`;
 //!   water touching flowing lava creates `minecraft:cobblestone`; lava flowing on top of water creates `minecraft:stone`.
 //!   Simultaneous horizontal arrival of water and lava at an empty cell creates `minecraft:cobblestone`.
+//! - **Reach and Search** (community Minecraft Wiki Water and Lava pages, retrieved 13 November
+//!   2026; secondary, not pinned to Java 26.3): water travels 7 blocks horizontally and looks
+//!   for a way down within 4 blocks; Overworld and End lava travels 3 blocks. New water sources
+//!   form between two or more sources; lava sources do not unless the `lavaSourceConversion`
+//!   game rule is enabled. The 2-block lava drop search has no recorded source, and the Nether
+//!   lava reach of 7 is not modelled.
+//! - **Tick Rates**: the same pages give water 1 block per 5 game ticks, and lava 1 block per
+//!   30 game ticks in the Overworld (10 in the Nether). This module computes one spread step per
+//!   [`FluidSimulator`] call and does not schedule by fluid type; the caller owns the cadence.
 
 use std::fmt;
 use std::str::FromStr;
