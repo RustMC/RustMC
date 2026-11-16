@@ -2,19 +2,30 @@
 //!
 //! Milestone M5 implementation providing coordinate delta sweeping along axes,
 //! step-height traversal over slabs/stairs, drag, gravity integration, and fall damage.
+//!
+//! # Sources
+//!
+//! The motion constants follow the "Motion of entities" table on the community
+//! [Minecraft Wiki Entity page](https://minecraft.wiki/w/Entity), retrieved 13 November
+//! 2026. That is a secondary source not pinned to Java 26.3; no primary source or
+//! client observation has been recorded. For players and other living entities it gives
+//! acceleration -0.08 blocks/tick², vertical drag 0.98, horizontal drag 0.91, terminal
+//! velocity 3.92 blocks/tick, and the per-tick order "position, acceleration, drag".
+//! Block slipperiness (ground friction), liquids, and Slow Falling are not modelled.
 
 use crate::world::{Block, CHUNK_SIDE, Chunk, WORLD_HEIGHT};
 
-/// Standard living entity gravity acceleration in blocks per tick.
+/// Living entity gravity acceleration in blocks per tick² (Entity page, see module docs).
 pub const GRAVITY: f64 = 0.08;
 
-/// Horizontal air drag damping factor per tick (preserves 98% of horizontal speed).
-pub const HORIZONTAL_AIR_DRAG: f64 = 0.98;
+/// Horizontal drag factor per tick for living entities (Entity page: 0.91).
+pub const HORIZONTAL_AIR_DRAG: f64 = 0.91;
 
-/// Vertical air drag damping factor per tick (preserves 98% of vertical speed).
+/// Vertical drag factor per tick for living entities (Entity page: 0.98).
 pub const VERTICAL_AIR_DRAG: f64 = 0.98;
 
-/// Terminal downward velocity bound in blocks per tick (-3.92 blocks/tick).
+/// Terminal downward velocity in blocks per tick (Entity page: 3.92). It is the fixed
+/// point of `v = (v - GRAVITY) * VERTICAL_AIR_DRAG`, so the clamp only guards rounding.
 pub const TERMINAL_VELOCITY: f64 = -3.92;
 
 /// Default step height for living entities (0.6 blocks, allowing smooth movement up slabs).
@@ -367,16 +378,16 @@ pub fn compute_fall_damage_f32(fall_distance: f32) -> f32 {
     }
 }
 
-/// Apply horizontal air drag, vertical air drag, gravity acceleration, and terminal velocity clamp.
+/// Apply gravity acceleration, then drag, then the terminal velocity clamp.
 ///
-/// Drag factors:
-/// - Horizontal velocity multiplied by 0.98.
-/// - Vertical velocity multiplied by 0.98, then subtracted by 0.08 blocks/tick.
-/// - Terminal velocity clamped: `v_y = max(v_y, -3.92)`.
+/// Acceleration precedes drag, as the Entity page orders it for living entities:
+/// - Horizontal velocity multiplied by [`HORIZONTAL_AIR_DRAG`].
+/// - Vertical velocity reduced by [`GRAVITY`], then multiplied by [`VERTICAL_AIR_DRAG`].
+/// - Terminal velocity clamped: `v_y = max(v_y, TERMINAL_VELOCITY)`.
 pub fn apply_air_drag_and_gravity(velocity: &mut [f64; 3]) {
     velocity[0] *= HORIZONTAL_AIR_DRAG;
     velocity[2] *= HORIZONTAL_AIR_DRAG;
-    velocity[1] = (velocity[1] * VERTICAL_AIR_DRAG) - GRAVITY;
+    velocity[1] = (velocity[1] - GRAVITY) * VERTICAL_AIR_DRAG;
     if velocity[1] < TERMINAL_VELOCITY {
         velocity[1] = TERMINAL_VELOCITY;
     }
@@ -641,10 +652,13 @@ impl PhysicsBody {
 
     /// Execute a discrete physics tick against the given collision world.
     ///
-    /// Applies drag, gravity, swept collision resolution, and fall damage calculations.
+    /// Moves by the current velocity with swept collision and fall damage, then applies
+    /// gravity and drag for the next tick: the Entity page's "position, acceleration,
+    /// drag" order for living entities.
     pub fn step<W: WorldCollisionView>(&mut self, world: &W) -> StepResult {
+        let result = self.move_collide(self.velocity, world);
         self.apply_drag_and_gravity();
-        self.move_collide(self.velocity, world)
+        result
     }
 }
 
@@ -657,20 +671,23 @@ mod tests {
         let mut body = PhysicsBody::player([0.0, 1000.0, 0.0]);
         let empty_world = Vec::<Aabb>::new();
 
-        // Tick 1: v_y = (0 * 0.98) - 0.08 = -0.08
+        // Tick 1 moves by the initial zero velocity, then v_y = (0 - 0.08) * 0.98.
         let res = body.step(&empty_world);
-        assert!((body.velocity[1] - -0.08).abs() < 1e-9);
-        assert!((body.position[1] - 999.92).abs() < 1e-9);
+        assert!((body.velocity[1] - -0.0784).abs() < 1e-12);
+        assert_eq!(body.position[1], 1000.0);
         assert!(!res.on_ground);
 
-        // Run until terminal velocity is reached
-        for _ in 0..250 {
-            body.step(&empty_world);
-            assert!(body.velocity[1] >= TERMINAL_VELOCITY);
-        }
+        // Tick 2 moves by -0.0784, then v_y = (-0.0784 - 0.08) * 0.98.
+        body.step(&empty_world);
+        assert!((body.position[1] - 999.9216).abs() < 1e-9);
+        assert!((body.velocity[1] - -0.155232).abs() < 1e-12);
 
-        // Must stay clamped at TERMINAL_VELOCITY (-3.92)
-        assert!((body.velocity[1] - TERMINAL_VELOCITY).abs() < 1e-6);
+        // Velocity approaches the 3.92 blocks/tick fixed point without overshooting it.
+        for _ in 0..1000 {
+            body.step(&empty_world);
+            assert!(body.velocity[1] >= -3.92);
+        }
+        assert!((body.velocity[1] - -3.92).abs() < 1e-6);
         assert!(!body.on_ground);
         assert!(body.fall_distance > 500.0);
     }
@@ -695,7 +712,8 @@ mod tests {
 
         assert!(landed);
         assert!((body.position[1] - 1.0).abs() < 1e-9);
-        assert_eq!(body.velocity[1], 0.0);
+        // The landing zeroes vertical velocity; gravity and drag then queue the next tick's.
+        assert!((body.velocity[1] - -0.0784).abs() < 1e-12);
         assert!(body.on_ground);
         // Fall from 5.0 to 1.0 is exactly 4.0 blocks: 4.0 - 3.0 = 1.0 damage
         assert_eq!(recorded_damage, 1);
@@ -704,7 +722,7 @@ mod tests {
         // Subsequent tick on ground stays resting at 1.0 with 0 damage
         let next_res = body.step(&world);
         assert!((body.position[1] - 1.0).abs() < 1e-9);
-        assert_eq!(body.velocity[1], 0.0);
+        assert!((body.velocity[1] - -0.0784).abs() < 1e-12);
         assert!(next_res.on_ground);
         assert_eq!(next_res.fall_damage, 0);
     }
@@ -847,7 +865,8 @@ mod tests {
         assert!(res.ceiling_collision);
         // Player top stopped at ceiling y = 3.0, so base pos[1] stopped at 3.0 - 1.8 = 1.2
         assert!((body.position[1] - 1.2).abs() < 1e-6);
-        assert_eq!(body.velocity[1], 0.0);
+        // The ceiling zeroes the rise; gravity and drag then queue the next tick's fall.
+        assert!((body.velocity[1] - -0.0784).abs() < 1e-12);
         assert!(!body.on_ground);
     }
 
