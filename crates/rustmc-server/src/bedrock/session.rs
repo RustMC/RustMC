@@ -1,4 +1,9 @@
 //! Bedrock session state machine and handshake lifecycle for protocol 2193 (1.26.51).
+//!
+//! Login is unauthenticated: the session records the identity a Login packet
+//! claims without verifying any JWT signature or certificate chain. Nothing in
+//! the runtime reaches this state machine yet, and it must gain chain
+//! verification before it accepts remote players.
 
 use crate::bedrock::packet::{
     BEDROCK_PROTOCOL_VERSION, BedrockIdentity, BedrockPacket, Login, NetworkSettings, PlayStatus,
@@ -248,6 +253,9 @@ impl BedrockSession {
     /// emits `PlayStatus(LoginSuccess)` and `ResourcePacksInfo`, and transitions to `ResourcePacks`.
     /// Rejects or transitions to `Disconnected` on version mismatch, out-of-order state,
     /// or a payload with no usable identity.
+    ///
+    /// `LoginSuccess` here means the payload parsed, not that the player was
+    /// authenticated: the claimed identity is stored unverified.
     pub fn handle_login(
         &mut self,
         login: impl Into<Login>,

@@ -132,7 +132,7 @@ pub fn put_bedrock_string(value: &str, out: &mut Vec<u8>) {
 pub fn read_bedrock_string(input: &[u8]) -> Result<(&str, usize), BedrockSessionError> {
     let (len, prefix) = read_varuint32(input)?;
     let len = len as usize;
-    if input.len() < prefix + len {
+    if input.len() - prefix < len {
         return Err(BedrockSessionError::MalformedPacket(
             "truncated string".to_string(),
         ));
@@ -481,6 +481,10 @@ impl Login {
     /// whose `chain` array holds JWTs. A real client's payload has not been checked
     /// against it. The result comes from the first token carrying `extraData`,
     /// because earlier certificates can hold only an `identityPublicKey`.
+    ///
+    /// No token signature, certificate chain, or expiry is checked, so the
+    /// returned identity is whatever the peer claims. It must not be used for
+    /// authorization until chain verification exists.
     pub fn extract_identity(&self) -> Result<BedrockIdentity, BedrockSessionError> {
         let mut reader = Reader::new(&self.payload);
         let len = u32::from_le_bytes(reader.array()?) as usize;
@@ -1127,7 +1131,7 @@ impl BedrockPacket {
     pub fn decode_framed(bytes: &[u8]) -> Result<(Self, usize), BedrockSessionError> {
         let (len, prefix) = read_varuint32(bytes)?;
         let len = len as usize;
-        if bytes.len() < prefix + len {
+        if bytes.len() - prefix < len {
             return Err(BedrockSessionError::MalformedPacket(
                 "truncated framed packet".to_string(),
             ));
