@@ -38,6 +38,8 @@ const BLOCK_XZ_MASK: i64 = (1_i64 << BLOCK_XZ_BITS) - 1;
 const BLOCK_Y_MASK: i64 = (1_i64 << BLOCK_Y_BITS) - 1;
 const BLOCK_Y_SIGN_EXTEND_SHIFT: u32 = i64::BITS - BLOCK_Y_BITS;
 const BLOCK_Z_SIGN_EXTEND_SHIFT: u32 = i64::BITS - BLOCK_XZ_BITS;
+/// Bits above the Z field, holding X; shifted out before sign-extending Z.
+const BLOCK_Z_HIGH_BITS: u32 = i64::BITS - BLOCK_X_SHIFT;
 
 /// Append `value` as a protocol VarInt: seven bits per byte, low bits first.
 pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
@@ -133,7 +135,8 @@ pub(crate) fn encode_modified_utf8(text: &str, out: &mut Vec<u8>) {
     }
 }
 
-/// Decode Java modified UTF-8, rejecting raw NULs, overlong encodings, 4-byte leads, and lone surrogates.
+/// Decode Java modified UTF-8, rejecting raw NULs, overlong encodings, 4-byte leads,
+/// and lone surrogates.
 pub(crate) fn decode_modified_utf8(bytes: &[u8]) -> Result<String, WireError> {
     let mut units = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -209,7 +212,7 @@ pub(crate) fn pack_block_position(x: i32, y: i32, z: i32) -> i64 {
 pub(crate) fn unpack_block_position(packed: i64) -> (i32, i32, i32) {
     let x = (packed >> BLOCK_X_SHIFT) as i32;
     let y = ((packed << BLOCK_Y_SIGN_EXTEND_SHIFT) >> BLOCK_Y_SIGN_EXTEND_SHIFT) as i32;
-    let z = ((packed << BLOCK_XZ_BITS) >> BLOCK_Z_SIGN_EXTEND_SHIFT) as i32;
+    let z = ((packed << BLOCK_Z_HIGH_BITS) >> BLOCK_Z_SIGN_EXTEND_SHIFT) as i32;
     (x, y, z)
 }
 
