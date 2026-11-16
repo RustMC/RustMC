@@ -187,6 +187,11 @@ fn is_valid_coord(x: f64, y: f64, z: f64) -> bool {
         && (-1_000_000.0..=1_000_000.0).contains(&z)
 }
 
+/// The trailing byte of every serverbound `move_player_*` packet packs
+/// on-ground (`0x01`) and horizontal-collision (`0x02`); other bits are unused.
+const MOVEMENT_FLAGS: u8 = 0x03;
+/// Hotbar slots selectable through serverbound `set_carried_item` (0 to 8).
+const HOTBAR_SLOTS: i16 = 9;
 /// Serverbound `player_abilities` carries only the flying flag (`0x02`).
 const ABILITIES_FLYING: u8 = 0x02;
 /// Serverbound `player_input` packs seven movement flags (forward, backward,
@@ -427,7 +432,7 @@ impl Session {
                             preview.pending_keepalive = None;
                         }
                         30 => {
-                            if body.len() != 25 || (body[24] & !0x03) != 0 {
+                            if body.len() != 25 || (body[24] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
@@ -439,7 +444,7 @@ impl Session {
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         31 => {
-                            if body.len() != 33 || (body[32] & !0x03) != 0 {
+                            if body.len() != 33 || (body[32] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
@@ -453,7 +458,7 @@ impl Session {
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         32 => {
-                            if body.len() != 9 || (body[8] & !0x03) != 0 {
+                            if body.len() != 9 || (body[8] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
                             let yaw = f32::from_be_bytes(body[0..4].try_into().unwrap());
@@ -463,7 +468,7 @@ impl Session {
                             }
                         }
                         33 => {
-                            if body.len() != 1 || (body[0] & !0x03) != 0 {
+                            if body.len() != 1 || (body[0] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
                         }
@@ -512,7 +517,7 @@ impl Session {
                                 return Err(Error::Malformed);
                             }
                             let slot = i16::from_be_bytes(body.try_into().unwrap());
-                            if !(0..=8).contains(&slot) {
+                            if !(0..HOTBAR_SLOTS).contains(&slot) {
                                 return Err(Error::Malformed);
                             }
                             // Selected hotbar slot is client-local here.
