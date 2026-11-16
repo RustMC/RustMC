@@ -4,6 +4,7 @@
 //! The preview is unauthenticated and has no authoritative gameplay world.
 
 pub mod chunk_adapter;
+pub mod commands;
 pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod java_packets;
@@ -11,6 +12,7 @@ pub mod java_preview;
 mod java_wire;
 pub mod preview_cache;
 pub mod preview_data;
+pub mod protocol;
 pub mod runtime;
 pub mod vanilla;
 pub mod world;

@@ -90,6 +90,7 @@ pub mod play {
         pub const USE_ITEM: u32 = 67;
     }
     pub mod clientbound {
+        pub const BLOCK_CHANGED_ACK: u32 = 4;
         pub const CHUNK_BATCH_FINISHED: u32 = 11;
         pub const CHUNK_BATCH_START: u32 = 12;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;

@@ -272,8 +272,8 @@ const SECTION_COUNT: usize = 24;
 const LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
 const CREATIVE: u32 = 1;
 // Vanilla Java rejects move packets beyond these magnitudes.
-const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
-const MAX_VERTICAL_POSITION: f64 = 20_000_000.0;
+pub(crate) const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
+pub(crate) const MAX_VERTICAL_POSITION: f64 = 20_000_000.0;
 
 fn registry_id(manifest: &RegistryManifest, registry: &str, entry: &str) -> Option<u32> {
     manifest
