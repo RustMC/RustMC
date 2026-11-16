@@ -958,3 +958,11 @@ fn test_empty_quoted_arguments_keep_their_arity() {
         GameMode::Survival
     );
 }
+
+#[test]
+fn give_item_saturates_instead_of_overflowing() {
+    let mut player = PlayerTarget::new("Alice", (0.0, 64.0, 0.0));
+    player.give_item("minecraft:stone", u32::MAX - 1);
+    player.give_item("stone", 6_400);
+    assert_eq!(player.item_count("minecraft:stone"), u32::MAX);
+}

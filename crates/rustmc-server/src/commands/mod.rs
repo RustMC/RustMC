@@ -9,6 +9,25 @@ mod tests;
 /// Maximum absolute coordinate value accepted by the coordinate parser/validator.
 pub const MAX_COORDINATE: f64 = 30_000_000.0;
 
+/// Ticks in one day-night cycle.
+///
+/// Source for this and the `/time set` presets below:
+/// <https://minecraft.wiki/w/Commands/time>.
+pub const TICKS_PER_DAY: u64 = 24_000;
+/// `/time set day`.
+pub const TIME_DAY: u64 = 1_000;
+/// `/time set noon`.
+pub const TIME_NOON: u64 = 6_000;
+/// `/time set night`.
+pub const TIME_NIGHT: u64 = 13_000;
+/// `/time set midnight`.
+pub const TIME_MIDNIGHT: u64 = 18_000;
+
+/// Largest `/give` count this dispatcher accepts: 100 stacks of 64.
+///
+/// Source: <https://minecraft.wiki/w/Commands/give>.
+pub const MAX_GIVE_COUNT: u32 = 6_400;
+
 /// A 1D coordinate component that can be absolute, relative (`~`), or local (`^`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Coordinate {
@@ -608,7 +627,9 @@ impl PlayerTarget {
         } else {
             format!("minecraft:{item}")
         };
-        *self.inventory.entry(key).or_insert(0) += count;
+        // Repeated gives must not overflow the tracked count.
+        let held = self.inventory.entry(key).or_insert(0);
+        *held = held.saturating_add(count);
     }
 }
 
@@ -1293,10 +1314,10 @@ fn handle_time(
                 ));
             }
             let new_time = match args[1].to_ascii_lowercase().as_str() {
-                "day" => 1000,
-                "noon" => 6000,
-                "night" => 13000,
-                "midnight" => 18000,
+                "day" => TIME_DAY,
+                "noon" => TIME_NOON,
+                "night" => TIME_NIGHT,
+                "midnight" => TIME_MIDNIGHT,
                 other => {
                     let val: i64 = other.parse().map_err(|_| {
                         CommandError::InvalidArgument(format!("Invalid time value '{other}'"))
@@ -1347,7 +1368,7 @@ fn handle_time(
             }
             match args[1].to_ascii_lowercase().as_str() {
                 "daytime" => {
-                    let val = dispatcher.time % 24000;
+                    let val = dispatcher.time % TICKS_PER_DAY;
                     Ok(format!("The time is {val}"))
                 }
                 "gametime" => {
@@ -1355,7 +1376,7 @@ fn handle_time(
                     Ok(format!("The time is {val}"))
                 }
                 "day" => {
-                    let val = dispatcher.time / 24000;
+                    let val = dispatcher.time / TICKS_PER_DAY;
                     Ok(format!("The time is {val}"))
                 }
                 other => Err(CommandError::InvalidArgument(format!(
@@ -1457,10 +1478,10 @@ fn handle_give(
                 "Count must be at least 1".to_string(),
             ));
         }
-        if parsed > 6400 {
-            return Err(CommandError::InvalidArgument(
-                "Count must not be larger than 6400".to_string(),
-            ));
+        if parsed > i64::from(MAX_GIVE_COUNT) {
+            return Err(CommandError::InvalidArgument(format!(
+                "Count must not be larger than {MAX_GIVE_COUNT}"
+            )));
         }
         parsed as u32
     } else {
