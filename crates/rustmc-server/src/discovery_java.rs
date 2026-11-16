@@ -5,12 +5,21 @@ pub mod keepalive;
 #[cfg(test)]
 mod tests_keepalive;
 
+use crate::java_packets::{configuration, handshake, intent, login, play, status};
+use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
+use crate::java_wire::{frame, put_string, put_varint};
 use crate::preview_data::RegistryManifest;
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
 pub const VERSION: &str = "26.3";
 pub const MAX_FRAME: usize = 4096;
+/// Vanilla offline-mode player names are 3 to 16 ASCII word characters.
+const PLAYER_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=16;
+const UUID_BYTES: usize = 16;
+/// Login refusals sent as a plain JSON text component; static ASCII only.
+const DISCOVERY_ONLY_REASON: &str = "RustMC is discovery-only; login is unavailable.";
+const VERSION_REASON: &str = "RustMC local preview requires Java 26.3 (protocol 777).";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -18,11 +27,16 @@ pub enum State {
     Status,
     Ping,
     Login,
+    /// Login was requested but is unavailable; the hello receives a reason.
+    LoginRefused(&'static str),
     LoginAcknowledgement,
     Configuration,
     ConfigurationData,
     Play,
+    /// Status exchange finished.
     Done,
+    /// A refusal reason was queued; the connection closes after it flushes.
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,35 +67,6 @@ fn varint(input: &[u8]) -> Result<Option<(u32, usize)>, Error> {
     }
 }
 
-pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-pub(crate) fn frame(id: u32, body: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    put_varint(id, &mut packet);
-    packet.extend_from_slice(body);
-    let mut out = Vec::new();
-    put_varint(packet.len() as u32, &mut out);
-    out.extend(packet);
-    out
-}
-
-pub(crate) fn put_string(value: &str, out: &mut Vec<u8>) {
-    put_varint(value.len() as u32, out);
-    out.extend_from_slice(value.as_bytes());
-}
-
 fn read_string(input: &[u8]) -> Result<(&str, &[u8]), Error> {
     let Some((length, prefix)) = varint(input)? else {
         return Err(Error::Malformed);
@@ -101,7 +86,7 @@ fn known_packs() -> Vec<u8> {
     for text in ["minecraft", "core", VERSION] {
         put_string(text, &mut body);
     }
-    frame(15, &body)
+    frame(configuration::clientbound::SELECT_KNOWN_PACKS, &body)
 }
 
 fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
@@ -112,14 +97,17 @@ fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
         put_string(entry, &mut body);
         body.push(0); // Entry definition comes from the negotiated core pack.
     }
-    frame(7, &body)
+    frame(configuration::clientbound::REGISTRY_DATA, &body)
 }
 
 fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
     let mut features = Vec::new();
     put_varint(1, &mut features);
     put_string("minecraft:vanilla", &mut features);
-    let mut packets = vec![frame(13, &features)];
+    let mut packets = vec![frame(
+        configuration::clientbound::UPDATE_ENABLED_FEATURES,
+        &features,
+    )];
     if let Some(manifest) = manifest {
         for (registry, entries) in &manifest.registries {
             packets.push(registry_data(registry, entries));
@@ -140,8 +128,8 @@ fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
             }
         }
     }
-    packets.push(frame(14, &tags));
-    packets.push(frame(3, &[]));
+    packets.push(frame(configuration::clientbound::UPDATE_TAGS, &tags));
+    packets.push(frame(configuration::clientbound::FINISH_CONFIGURATION, &[]));
     packets
 }
 
@@ -180,7 +168,35 @@ fn status(local_preview: bool) -> Vec<u8> {
     let mut body = Vec::new();
     put_varint(json.len() as u32, &mut body);
     body.extend_from_slice(json.as_bytes());
-    frame(0, &body)
+    frame(status::clientbound::STATUS_RESPONSE, &body)
+}
+
+/// Login-phase disconnect carrying a JSON text component.
+fn login_disconnect(reason: &'static str) -> Vec<u8> {
+    // Reasons are fixed ASCII constants without quotes or backslashes.
+    debug_assert!(reason.is_ascii() && !reason.contains(['"', '\\']));
+    let mut body = Vec::new();
+    put_string(&format!("{{\"text\":\"{reason}\"}}"), &mut body);
+    frame(login::clientbound::LOGIN_DISCONNECT, &body)
+}
+
+/// Validate a login `hello` body: player name followed by the client UUID.
+fn read_hello(body: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let Some((name_len, prefix)) = varint(body)? else {
+        return Err(Error::Malformed);
+    };
+    let name_len = name_len as usize;
+    if !PLAYER_NAME_LENGTH.contains(&name_len) || body.len() != prefix + name_len + UUID_BYTES {
+        return Err(Error::Malformed);
+    }
+    let name = &body[prefix..prefix + name_len];
+    if !name
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Err(Error::Malformed);
+    }
+    Ok((name, &body[prefix + name_len..]))
 }
 
 /// Authoritative Overworld vertical bounds (-64..=319).
@@ -249,11 +265,11 @@ impl TryFrom<u32> for PlayerActionStatus {
 }
 
 /// Play serverbound `minecraft:player_action` in the official 26.3 packet report.
-pub const PLAYER_ACTION_ID: u32 = 41;
+pub const PLAYER_ACTION_ID: u32 = play::serverbound::PLAYER_ACTION;
 /// Play serverbound `minecraft:use_item_on` in the official 26.3 packet report.
-pub const USE_ITEM_ON_ID: u32 = 66;
+pub const USE_ITEM_ON_ID: u32 = play::serverbound::USE_ITEM_ON;
 /// Play clientbound `minecraft:block_changed_ack` in the official 26.3 packet report.
-pub const BLOCK_CHANGED_ACK_ID: u32 = 4;
+pub const BLOCK_CHANGED_ACK_ID: u32 = play::clientbound::BLOCK_CHANGED_ACK;
 
 /// Serverbound PlayerAction (ID `0x29` / 41) packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,9 +509,9 @@ fn is_valid_coord(x: f64, y: f64, z: f64) -> bool {
     x.is_finite()
         && y.is_finite()
         && z.is_finite()
-        && (-1_000_000.0..=1_000_000.0).contains(&x)
-        && (-64.0..=512.0).contains(&y)
-        && (-1_000_000.0..=1_000_000.0).contains(&z)
+        && x.abs() <= MAX_HORIZONTAL_POSITION
+        && y.abs() <= MAX_VERTICAL_POSITION
+        && z.abs() <= MAX_HORIZONTAL_POSITION
 }
 
 /// The trailing byte of every serverbound `move_player_*` packet packs
@@ -577,7 +593,14 @@ impl Session {
             .bytes
             .checked_add(bytes.len())
             .ok_or(Error::Oversized)?;
-        if self.bytes > limit || self.input.len().saturating_add(bytes.len()) > MAX_FRAME + 5 {
+        // Before play `limit` caps the whole session; during play the caller
+        // enforces a rate budget, so it caps only this read.
+        let counted = if self.state == State::Play {
+            bytes.len()
+        } else {
+            self.bytes
+        };
+        if counted > limit || self.input.len().saturating_add(bytes.len()) > MAX_FRAME + 5 {
             return Err(Error::Oversized);
         }
         self.input.extend_from_slice(bytes);
@@ -600,7 +623,7 @@ impl Session {
             };
             let body = &packet[id_len..];
             match (self.state, id) {
-                (State::Handshake, 0) => {
+                (State::Handshake, handshake::serverbound::INTENTION) => {
                     let Some((version, n)) = varint(body)? else {
                         return Err(Error::Malformed);
                     };
@@ -623,51 +646,55 @@ impl Session {
                         return Err(Error::WrongState);
                     }
                     self.state = match next {
-                        1 => State::Status,
-                        2 if self.local_preview && version == PROTOCOL as u32 => State::Login,
+                        intent::STATUS => State::Status,
+                        intent::LOGIN if !self.local_preview => {
+                            State::LoginRefused(DISCOVERY_ONLY_REASON)
+                        }
+                        intent::LOGIN if version != PROTOCOL as u32 => {
+                            State::LoginRefused(VERSION_REASON)
+                        }
+                        intent::LOGIN => State::Login,
                         _ => return Err(Error::WrongState),
                     };
                 }
-                (State::Status, 0) if body.is_empty() => {
+                (State::Status, status::serverbound::STATUS_REQUEST) if body.is_empty() => {
                     responses.push(status(self.local_preview));
                     self.state = State::Ping;
                 }
-                (State::Ping, 1) if body.len() == 8 => {
-                    responses.push(frame(1, body));
+                (State::Ping, status::serverbound::PING_REQUEST) if body.len() == 8 => {
+                    responses.push(frame(status::clientbound::PONG_RESPONSE, body));
                     self.state = State::Done;
                 }
-                (State::Login, 0) => {
-                    let Some((name_len, prefix)) = varint(body)? else {
-                        return Err(Error::Malformed);
-                    };
-                    let name_len = name_len as usize;
-                    if !(3..=16).contains(&name_len) || body.len() != prefix + name_len + 16 {
-                        return Err(Error::Malformed);
-                    }
-                    let name = &body[prefix..prefix + name_len];
-                    if !name
-                        .iter()
-                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                    {
-                        return Err(Error::Malformed);
-                    }
+                (State::LoginRefused(reason), login::serverbound::HELLO) => {
+                    read_hello(body)?;
+                    responses.push(login_disconnect(reason));
+                    self.state = State::Refused;
+                }
+                (State::Login, login::serverbound::HELLO) => {
+                    let (name, client_uuid) = read_hello(body)?;
                     // The client UUID is an opaque, unverified local-session value.
-                    let mut success = body[prefix + name_len..].to_vec();
-                    put_varint(name_len as u32, &mut success);
+                    let mut success = client_uuid.to_vec();
+                    put_varint(name.len() as u32, &mut success);
                     success.extend_from_slice(name);
                     put_varint(0, &mut success); // No profile properties or signed textures.
                     // 26.3 appends a separate connection-scoped session UUID. This is
                     // only a local identifier; it grants no authenticated identity.
                     success.extend_from_slice(&self.session_id);
-                    responses.push(frame(2, &success));
+                    responses.push(frame(login::clientbound::LOGIN_FINISHED, &success));
                     self.state = State::LoginAcknowledgement;
                 }
-                (State::LoginAcknowledgement, 3) if body.is_empty() => {
+                (State::LoginAcknowledgement, login::serverbound::LOGIN_ACKNOWLEDGED)
+                    if body.is_empty() =>
+                {
                     self.state = State::Configuration;
                     responses.push(known_packs());
                 }
-                (State::Configuration, 0 | 2) => {} // No effect; bounded by the frame cap.
-                (State::Configuration, 7) => {
+                (
+                    State::Configuration,
+                    configuration::serverbound::CLIENT_INFORMATION
+                    | configuration::serverbound::CUSTOM_PAYLOAD,
+                ) => {} // No effect; bounded by the frame cap.
+                (State::Configuration, configuration::serverbound::SELECT_KNOWN_PACKS) => {
                     if !recognizes_core_pack(body)? {
                         return Err(Error::WrongState);
                     }
@@ -676,7 +703,9 @@ impl Session {
                         responses.extend(initial_configuration(self.registry_manifest.as_deref()));
                     }
                 }
-                (State::ConfigurationData, 3) if body.is_empty() => {
+                (State::ConfigurationData, configuration::serverbound::FINISH_CONFIGURATION)
+                    if body.is_empty() =>
+                {
                     let manifest = self.registry_manifest.as_ref().ok_or(Error::WrongState)?;
                     let preview = if let Some(source) = &self.vanilla_source {
                         crate::java_preview::Preview::new_vanilla(
@@ -698,9 +727,10 @@ impl Session {
                     self.state = State::Play;
                 }
                 (State::Play, id) => {
+                    use play::serverbound as sb;
                     let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
                     match id {
-                        0 => {
+                        sb::ACCEPT_TELEPORTATION => {
                             if body.len() != 33 || body[0] != 1 {
                                 return Err(Error::Malformed);
                             }
@@ -714,7 +744,7 @@ impl Session {
                             }
                             preview.teleport_acknowledged = true;
                         }
-                        11 => {
+                        sb::CHUNK_BATCH_RECEIVED => {
                             if body.len() != 4 {
                                 return Err(Error::Malformed);
                             }
@@ -726,13 +756,13 @@ impl Session {
                             }
                             preview.awaiting_batch = false;
                         }
-                        13 => {
+                        sb::CLIENT_TICK_END => {
                             if !body.is_empty() {
                                 return Err(Error::Malformed);
                             }
                         }
-                        14 | 22 => {} // Bounded information/custom payloads have no effect.
-                        28 => {
+                        sb::CLIENT_INFORMATION | sb::CUSTOM_PAYLOAD => {} // Bounded information/custom payloads have no effect.
+                        sb::KEEP_ALIVE => {
                             if body.len() != 8 {
                                 return Err(Error::Malformed);
                             }
@@ -742,7 +772,7 @@ impl Session {
                             }
                             preview.pending_keepalive = None;
                         }
-                        30 => {
+                        sb::MOVE_PLAYER_POS => {
                             if body.len() != 25 || (body[24] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
@@ -754,7 +784,7 @@ impl Session {
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
-                        31 => {
+                        sb::MOVE_PLAYER_POS_ROT => {
                             if body.len() != 33 || (body[32] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
@@ -768,7 +798,7 @@ impl Session {
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
-                        32 => {
+                        sb::MOVE_PLAYER_ROT => {
                             if body.len() != 9 || (body[8] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
@@ -778,17 +808,17 @@ impl Session {
                                 return Err(Error::Malformed);
                             }
                         }
-                        33 => {
+                        sb::MOVE_PLAYER_STATUS_ONLY => {
                             if body.len() != 1 || (body[0] & !MOVEMENT_FLAGS) != 0 {
                                 return Err(Error::Malformed);
                             }
                         }
-                        40 => {
+                        sb::PLAYER_ABILITIES => {
                             if body.len() != 1 || body[0] & !ABILITIES_FLYING != 0 {
                                 return Err(Error::Malformed);
                             }
                         }
-                        43 => {
+                        sb::PLAYER_INPUT => {
                             if body.len() != 1 || body[0] & !PLAYER_INPUT_FLAGS != 0 {
                                 return Err(Error::Malformed);
                             }
@@ -801,14 +831,18 @@ impl Session {
                             let action = decode_use_item_on(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
                         }
-                        57 | 67 => {
+                        sb::SET_CREATIVE_MODE_SLOT
+                        | sb::USE_ITEM
+                        | sb::PICK_ITEM_FROM_BLOCK
+                        | sb::PICK_ITEM_FROM_ENTITY
+                        | sb::CONTAINER_CLOSE => {
                             if body.is_empty() {
                                 return Err(Error::Malformed);
                             }
                             // Creative inputs are bounded by the frame/session limits.
                             // The preview is immutable and does not apply them.
                         }
-                        42 => {
+                        sb::PLAYER_COMMAND => {
                             let mut rest = body;
                             for _ in 0..3 {
                                 let (_, n) = varint(rest)?.ok_or(Error::Malformed)?;
@@ -819,19 +853,19 @@ impl Session {
                             }
                             // Observer posture commands have no world effect.
                         }
-                        44 => {
+                        sb::PLAYER_LOADED => {
                             if !body.is_empty() {
                                 return Err(Error::Malformed);
                             }
                             preview.client_loaded = true;
                         }
-                        46 => {
+                        sb::PUNCH => {
                             if !body.is_empty() {
                                 return Err(Error::Malformed);
                             }
                             // Punch has no world effect in the preview.
                         }
-                        54 => {
+                        sb::SET_CARRIED_ITEM => {
                             if body.len() != 2 {
                                 return Err(Error::Malformed);
                             }
@@ -841,7 +875,7 @@ impl Session {
                             }
                             // Selected hotbar slot is client-local here.
                         }
-                        63 => {
+                        sb::SPECTATOR_ACTION => {
                             if body != [0] {
                                 return Err(Error::Malformed);
                             }
@@ -922,21 +956,47 @@ mod tests {
             Err(Error::Oversized)
         );
     }
+    fn hello(name: &[u8]) -> Vec<u8> {
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.extend_from_slice(&[7; 16]);
+        frame(login::serverbound::HELLO, &body)
+    }
+
+    fn assert_refused(mut session: Session, version: u32, reason: &str) {
+        let mut h = handshake(version);
+        *h.last_mut().unwrap() = intent::LOGIN as u8;
+        assert!(session.receive(&h, 4096).unwrap().is_empty());
+        let reply = session.receive(&hello(b"Test"), 4096).unwrap();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0][1], login::clientbound::LOGIN_DISCONNECT as u8);
+        let text = String::from_utf8_lossy(&reply[0]);
+        assert!(text.contains(&format!("{{\"text\":\"{reason}\"}}")));
+        assert_eq!(session.state(), State::Refused);
+        // Nothing further is accepted after the refusal.
+        assert_eq!(
+            session.receive(&hello(b"Test"), 4096),
+            Err(Error::WrongState)
+        );
+    }
+
     #[test]
-    fn login_is_rejected() {
+    fn discovery_only_login_is_refused_with_a_reason() {
+        assert_refused(Session::default(), 777, DISCOVERY_ONLY_REASON);
+    }
+
+    #[test]
+    fn refused_login_still_validates_the_hello() {
         let mut h = handshake(777);
-        *h.last_mut().unwrap() = 2;
-        assert_eq!(Session::default().receive(&h, 4096), Err(Error::WrongState));
+        *h.last_mut().unwrap() = intent::LOGIN as u8;
+        let mut session = Session::default();
+        session.receive(&h, 4096).unwrap();
+        assert_eq!(session.receive(&hello(b"x!"), 4096), Err(Error::Malformed));
     }
 
     #[test]
     fn local_preview_login_is_version_gated_and_unverified() {
-        let mut old = handshake(766);
-        *old.last_mut().unwrap() = 2;
-        assert_eq!(
-            Session::new(true).receive(&old, 4096),
-            Err(Error::WrongState)
-        );
+        assert_refused(Session::new(true), 766, VERSION_REASON);
         let mut current = handshake(777);
         *current.last_mut().unwrap() = 2;
         let mut s = Session::new(true);
@@ -1782,60 +1842,31 @@ mod tests {
             Err(Error::Malformed)
         );
 
-        // 6. Extreme coordinate guards
+        // 6. Extreme coordinate guards: vanilla only rejects positions beyond
+        // +-30,000,000 horizontally and +-20,000,000 vertically.
+        let teleport = |x, y, z| {
+            enter_play_session().receive(&frame(0, &teleport_confirm(x, y, z, 0.0, 0.0)), 4096)
+        };
+        for (x, y, z) in [
+            (30_000_000.5, 64.0, 0.0),
+            (-30_000_000.5, 64.0, 0.0),
+            (0.0, 20_000_000.5, 0.0),
+            (0.0, -20_000_000.5, 0.0),
+            (0.0, 64.0, 30_000_000.5),
+        ] {
+            assert_eq!(teleport(x, y, z), Err(Error::Malformed), "{x} {y} {z}");
+        }
+        assert!(teleport(5_000_000.0, 1000.0, -5_000_000.0).is_ok());
         assert_eq!(
             enter_play_session().receive(
-                &frame(0, &teleport_confirm(1_000_000.1, 64.0, 0.0, 0.0, 0.0)),
+                &frame(30, &player_position(30_000_001.0, 64.0, 0.0, 1)),
                 4096
             ),
             Err(Error::Malformed)
         );
         assert_eq!(
             enter_play_session().receive(
-                &frame(0, &teleport_confirm(-1_000_000.1, 64.0, 0.0, 0.0, 0.0)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(0, &teleport_confirm(0.0, -64.1, 0.0, 0.0, 0.0)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(0, &teleport_confirm(0.0, 512.1, 0.0, 0.0, 0.0)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(0, &teleport_confirm(0.0, 64.0, 1_000_000.1, 0.0, 0.0)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(30, &player_position(1_000_001.0, 64.0, 0.0, 1)),
-                4096
-            ),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(30, &player_position(0.0, -65.0, 0.0, 1)), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(&frame(30, &player_position(0.0, 513.0, 0.0, 1)), 4096),
-            Err(Error::Malformed)
-        );
-        assert_eq!(
-            enter_play_session().receive(
-                &frame(31, &player_pos_rot(0.0, 64.0, -1_000_001.0, 0.0, 0.0, 1)),
+                &frame(31, &player_pos_rot(0.0, 64.0, -30_000_001.0, 0.0, 0.0, 1)),
                 4096
             ),
             Err(Error::Malformed)
