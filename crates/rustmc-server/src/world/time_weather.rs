@@ -9,12 +9,20 @@
 //! - **Day Start (06:00)**: Tick 0.
 //! - **Noon (12:00)**: Tick 6,000.
 //! - **Sunset (18:00)**: Tick 12,000.
-//! - **Sleep Allowed**: Tick 12,542 to 23,458 (or whenever thundering).
+//! - **Sleep Allowed (clear weather)**: Tick 12,542 to 23,459 inclusive. Rain (12,010 to
+//!   23,991) and thunder (any time) widen the window in vanilla; [`WorldTime::can_sleep_time`]
+//!   models only the clear-weather window.
 //! - **Midnight (00:00)**: Tick 18,000.
 //! - **Sunrise (05:00)**: Tick 23,000.
 //! - **Game Time**: Monotonic tick count representing world age. Only simulated
 //!   ticks count, so a sleep skip leaves it unchanged.
 //! - **Day Time**: If negative in Java protocol packets, daylight cycle is paused (`doDaylightCycle = false`).
+//!
+//! The day length, noon, sunset, midnight, sunrise, and bed ticks come from the community
+//! [Minecraft Wiki Daylight cycle page](https://minecraft.wiki/w/Daylight_cycle), retrieved
+//! 13 November 2026: beds become usable at 12,542 in clear weather (12,010 in rain) and stop
+//! being usable at 23,460 (23,992 in rain). That is a secondary source not pinned to Java
+//! 26.3. The 0.01 per-tick rain and thunder level ramp has no recorded source.
 //!
 //! # Weather Cycle
 //!
@@ -26,11 +34,12 @@
 /// Total ticks in a single Minecraft day.
 pub const TICKS_PER_DAY: i64 = 24_000;
 
-/// Tick at which night begins and players may sleep in beds.
+/// First tick at which beds are usable in clear weather (Daylight cycle page: 12,542).
 pub const SLEEP_START_TICK: i64 = 12_542;
 
-/// Tick at which night ends and players wake from beds.
-pub const SLEEP_END_TICK: i64 = 23_458;
+/// Last tick at which beds are usable in clear weather; the Daylight cycle page says they
+/// can no longer be used from 23,460.
+pub const SLEEP_END_TICK: i64 = 23_459;
 
 /// World diurnal and total time tracker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

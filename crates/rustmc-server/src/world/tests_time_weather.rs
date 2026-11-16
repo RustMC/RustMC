@@ -131,3 +131,12 @@ fn test_zero_duration_expires_on_the_next_tick() {
     weather.tick();
     assert_eq!(weather.kind(), WeatherKind::Rain);
 }
+
+#[test]
+fn test_clear_weather_sleep_window_edges() {
+    // Daylight cycle page: beds usable from 12542, no longer usable from 23460.
+    assert!(!WorldTime::from_times(0, 12_541, true).can_sleep_time());
+    assert!(WorldTime::from_times(0, 12_542, true).can_sleep_time());
+    assert!(WorldTime::from_times(0, 23_459, true).can_sleep_time());
+    assert!(!WorldTime::from_times(0, 23_460, true).can_sleep_time());
+}
