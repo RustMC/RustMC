@@ -14,8 +14,30 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
-/// Default total cooking duration in ticks for a standard smelting recipe (200 ticks = 10s).
+/// Default total cooking duration in ticks for a standard smelting recipe (minecraft.wiki `Smelting` rev 3829803: 200 ticks = 10s).
 pub const DEFAULT_COOKING_TOTAL_TIME: u16 = 200;
+
+/// Burn duration in ticks for coal and charcoal (minecraft.wiki `Smelting` rev 3829803: 1600 ticks = 8 smelts).
+const COAL_BURN_TIME: u16 = 1600;
+/// Burn duration in ticks for a lava bucket (minecraft.wiki `Smelting` rev 3829803: 20000 ticks = 100 smelts).
+const LAVA_BUCKET_BURN_TIME: u16 = 20_000;
+/// Burn duration in ticks for wooden planks and flammable logs/wood (minecraft.wiki `Smelting` rev 3829803: 300 ticks = 1.5 smelts).
+const WOOD_BURN_TIME: u16 = 300;
+/// Burn duration in ticks for flammable wooden slabs (minecraft.wiki `Smelting` rev 3829803: 150 ticks = 0.75 smelts).
+const WOODEN_SLAB_BURN_TIME: u16 = 150;
+/// Burn duration in ticks for sticks (minecraft.wiki `Smelting` rev 3829803: 100 ticks = 0.5 smelts).
+const STICK_BURN_TIME: u16 = 100;
+
+/// Experience yielded by smelting raw iron or iron ore (minecraft.wiki `Smelting` rev 3829803).
+const IRON_SMELT_XP: f32 = 0.7;
+/// Experience yielded by smelting raw gold or gold ore (minecraft.wiki `Smelting` rev 3829803).
+const GOLD_SMELT_XP: f32 = 1.0;
+/// Experience yielded by smelting raw copper or copper ore (minecraft.wiki `Smelting` rev 3829803).
+const COPPER_SMELT_XP: f32 = 0.7;
+/// Experience yielded by smelting cobblestone or sand (minecraft.wiki `Smelting` rev 3829803).
+const COMMON_SMELT_XP: f32 = 0.1;
+/// Experience yielded by cooking beef or porkchop (minecraft.wiki `Smelting` rev 3829803).
+const MEAT_SMELT_XP: f32 = 0.35;
 
 /// Slot indices matching standard Minecraft furnace container layouts.
 pub const INPUT_SLOT: usize = 0;
@@ -129,97 +151,78 @@ impl FuelRegistry {
 }
 
 /// Returns the standard vanilla fuel burn duration in ticks for a given item identifier.
+///
+/// Only real Java 26.3 item IDs from `registries.json` and the server's
+/// `logs_that_burn`, `planks`, `wooden_slabs`, and `bamboo_blocks` tags are
+/// accepted; crimson/warped non-flammable woods and unknown IDs return 0.
 #[must_use]
 pub fn fuel_burn_time(item_id: &str) -> u16 {
     let name = normalize_item_id(item_id);
     match name {
         // Coal and Charcoal: 1600 ticks (8 smelts)
-        "coal" | "charcoal" => 1600,
+        "coal" | "charcoal" => COAL_BURN_TIME,
 
         // Lava Bucket: 20000 ticks (100 smelts)
-        "lava_bucket" => 20000,
+        "lava_bucket" => LAVA_BUCKET_BURN_TIME,
 
         // Sticks: 100 ticks (0.5 smelts)
-        "stick" => 100,
+        "stick" => STICK_BURN_TIME,
 
-        // Wooden Slabs: 150 ticks
+        // Flammable wooden slabs (`#minecraft:wooden_slabs` excluding crimson/warped, plus bamboo_mosaic_slab): 150 ticks
         "oak_slab" | "spruce_slab" | "birch_slab" | "jungle_slab" | "acacia_slab"
-        | "dark_oak_slab" | "mangrove_slab" | "cherry_slab" | "bamboo_slab"
-        | "bamboo_mosaic_slab" => 150,
+        | "dark_oak_slab" | "pale_oak_slab" | "mangrove_slab" | "cherry_slab" | "bamboo_slab"
+        | "bamboo_mosaic_slab" | "poplar_slab" => WOODEN_SLAB_BURN_TIME,
 
-        // Wooden Planks: 300 ticks (1.5 smelts)
+        // Flammable wooden planks (`#minecraft:planks` excluding crimson/warped): 300 ticks (1.5 smelts)
         "oak_planks" | "spruce_planks" | "birch_planks" | "jungle_planks" | "acacia_planks"
-        | "dark_oak_planks" | "mangrove_planks" | "cherry_planks" | "bamboo_planks" => 300,
+        | "dark_oak_planks" | "pale_oak_planks" | "mangrove_planks" | "cherry_planks"
+        | "bamboo_planks" | "poplar_planks" => WOOD_BURN_TIME,
 
-        // Wooden Logs & Wood: 300 ticks (1.5 smelts)
+        // Flammable logs, wood, and bamboo blocks (`#minecraft:logs_that_burn` and `#minecraft:bamboo_blocks`): 300 ticks
         "oak_log"
         | "spruce_log"
         | "birch_log"
         | "jungle_log"
         | "acacia_log"
         | "dark_oak_log"
+        | "pale_oak_log"
         | "mangrove_log"
         | "cherry_log"
+        | "poplar_log"
         | "stripped_oak_log"
         | "stripped_spruce_log"
         | "stripped_birch_log"
         | "stripped_jungle_log"
         | "stripped_acacia_log"
         | "stripped_dark_oak_log"
+        | "stripped_pale_oak_log"
         | "stripped_mangrove_log"
         | "stripped_cherry_log"
+        | "stripped_poplar_log"
         | "oak_wood"
         | "spruce_wood"
         | "birch_wood"
         | "jungle_wood"
         | "acacia_wood"
         | "dark_oak_wood"
+        | "pale_oak_wood"
         | "mangrove_wood"
         | "cherry_wood"
+        | "poplar_wood"
         | "stripped_oak_wood"
         | "stripped_spruce_wood"
         | "stripped_birch_wood"
         | "stripped_jungle_wood"
         | "stripped_acacia_wood"
         | "stripped_dark_oak_wood"
+        | "stripped_pale_oak_wood"
         | "stripped_mangrove_wood"
         | "stripped_cherry_wood"
+        | "stripped_poplar_wood"
         | "bamboo_block"
-        | "stripped_bamboo_block" => 300,
+        | "stripped_bamboo_block" => WOOD_BURN_TIME,
 
-        _ => {
-            // The block tags `logs_that_burn` and `wooden_slabs` name these wood
-            // families. Crimson and warped are absent from `logs_that_burn`.
-            const NON_FLAMMABLE: [&str; 2] = ["crimson", "warped"];
-            const SLAB_WOODS: [&str; 11] = [
-                "oak_",
-                "spruce_",
-                "birch_",
-                "jungle_",
-                "acacia_",
-                "dark_oak_",
-                "pale_oak_",
-                "mangrove_",
-                "cherry_",
-                "bamboo_",
-                "poplar_",
-            ];
-            if NON_FLAMMABLE.iter().any(|wood| name.contains(wood)) {
-                0
-            } else if name.ends_with("_slab")
-                && SLAB_WOODS.iter().any(|wood| name.starts_with(wood))
-            {
-                150
-            } else if name.ends_with("_planks")
-                || ((name.ends_with("_log") || name.ends_with("_wood"))
-                    && !name.contains("stone")
-                    && !name.contains("copper"))
-            {
-                300
-            } else {
-                0
-            }
-        }
+        _ => 0,
     }
 }
 
@@ -313,34 +316,56 @@ impl SmeltingRecipeRegistry {
     /// - Raw Beef -> Cooked Beef (0.35 XP).
     /// - Raw Porkchop -> Cooked Porkchop (0.35 XP).
     pub fn new() -> Self {
-        const BUILTINS: [(&str, &str, f32); 17] = [
+        const BUILTINS: [(&str, &str, f32); 15] = [
             // Iron recipes
-            ("minecraft:raw_iron", "minecraft:iron_ingot", 0.7),
-            ("minecraft:iron_ore", "minecraft:iron_ingot", 0.7),
-            ("minecraft:deepslate_iron_ore", "minecraft:iron_ingot", 0.7),
+            ("minecraft:raw_iron", "minecraft:iron_ingot", IRON_SMELT_XP),
+            ("minecraft:iron_ore", "minecraft:iron_ingot", IRON_SMELT_XP),
+            (
+                "minecraft:deepslate_iron_ore",
+                "minecraft:iron_ingot",
+                IRON_SMELT_XP,
+            ),
             // Gold recipes
-            ("minecraft:raw_gold", "minecraft:gold_ingot", 1.0),
-            ("minecraft:gold_ore", "minecraft:gold_ingot", 1.0),
-            ("minecraft:deepslate_gold_ore", "minecraft:gold_ingot", 1.0),
-            ("minecraft:nether_gold_ore", "minecraft:gold_ingot", 1.0),
+            ("minecraft:raw_gold", "minecraft:gold_ingot", GOLD_SMELT_XP),
+            ("minecraft:gold_ore", "minecraft:gold_ingot", GOLD_SMELT_XP),
+            (
+                "minecraft:deepslate_gold_ore",
+                "minecraft:gold_ingot",
+                GOLD_SMELT_XP,
+            ),
+            (
+                "minecraft:nether_gold_ore",
+                "minecraft:gold_ingot",
+                GOLD_SMELT_XP,
+            ),
             // Copper recipes
-            ("minecraft:raw_copper", "minecraft:copper_ingot", 0.7),
-            ("minecraft:copper_ore", "minecraft:copper_ingot", 0.7),
+            (
+                "minecraft:raw_copper",
+                "minecraft:copper_ingot",
+                COPPER_SMELT_XP,
+            ),
+            (
+                "minecraft:copper_ore",
+                "minecraft:copper_ingot",
+                COPPER_SMELT_XP,
+            ),
             (
                 "minecraft:deepslate_copper_ore",
                 "minecraft:copper_ingot",
-                0.7,
+                COPPER_SMELT_XP,
             ),
             // Stone recipes
-            ("minecraft:cobblestone", "minecraft:stone", 0.1),
+            ("minecraft:cobblestone", "minecraft:stone", COMMON_SMELT_XP),
             // Glass recipes
-            ("minecraft:sand", "minecraft:glass", 0.1),
-            ("minecraft:red_sand", "minecraft:glass", 0.1),
-            // Food recipes (supports canonical beef and raw_beef alias)
-            ("minecraft:beef", "minecraft:cooked_beef", 0.35),
-            ("minecraft:raw_beef", "minecraft:cooked_beef", 0.35),
-            ("minecraft:porkchop", "minecraft:cooked_porkchop", 0.35),
-            ("minecraft:raw_porkchop", "minecraft:cooked_porkchop", 0.35),
+            ("minecraft:sand", "minecraft:glass", COMMON_SMELT_XP),
+            ("minecraft:red_sand", "minecraft:glass", COMMON_SMELT_XP),
+            // Food recipes (26.3 uses `minecraft:beef` and `minecraft:porkchop`, not `raw_*`)
+            ("minecraft:beef", "minecraft:cooked_beef", MEAT_SMELT_XP),
+            (
+                "minecraft:porkchop",
+                "minecraft:cooked_porkchop",
+                MEAT_SMELT_XP,
+            ),
         ];
 
         let mut registry = Self {
@@ -1000,40 +1025,55 @@ mod tests {
 
     #[test]
     fn test_non_26_3_generic_wood_ids_are_not_fuel() {
-        assert_eq!(fuel_burn_time("planks"), 0);
-        assert_eq!(fuel_burn_time("log"), 0);
-        assert_eq!(fuel_burn_time("wooden_slab"), 0);
+        for fake in [
+            "planks",
+            "log",
+            "wooden_slab",
+            "fake_planks",
+            "fake_log",
+            "fake_wood",
+            "petrified_oak_slab",
+        ] {
+            assert_eq!(fuel_burn_time(fake), 0, "{fake}");
+        }
         assert_eq!(fuel_burn_time("oak_planks"), 300);
         assert_eq!(fuel_burn_time("oak_log"), 300);
         assert_eq!(fuel_burn_time("oak_slab"), 150);
+        assert_eq!(fuel_burn_time("pale_oak_planks"), 300);
+        assert_eq!(fuel_burn_time("poplar_planks"), 300);
+        assert_eq!(fuel_burn_time("stripped_poplar_wood"), 300);
     }
 
     #[test]
     fn test_fuel_registry_validates_remainder_before_inserting() {
         let mut registry = FuelRegistry::new();
-        let previous = registry.burn_time("minecraft:magma");
+        let previous = registry.burn_time("minecraft:magma_block");
         assert_eq!(
-            registry.register("minecraft:magma", 100, Some("not an id".into())),
+            registry.register("minecraft:magma_block", 100, Some("not an id".into())),
             Err(ItemStackError::InvalidItem)
         );
-        assert_eq!(registry.burn_time("minecraft:magma"), previous);
+        assert_eq!(registry.burn_time("minecraft:magma_block"), previous);
 
         assert_eq!(
-            registry.register("minecraft:magma", 100, Some("minecraft:bucket".into())),
+            registry.register(
+                "minecraft:magma_block",
+                100,
+                Some("minecraft:bucket".into())
+            ),
             Ok(())
         );
-        assert_eq!(registry.burn_time("minecraft:magma"), 100);
+        assert_eq!(registry.burn_time("minecraft:magma_block"), 100);
         assert_eq!(
-            registry.remainder("minecraft:magma"),
+            registry.remainder("minecraft:magma_block"),
             Some(stack("minecraft:bucket", 1))
         );
         assert_eq!(
-            registry.register("minecraft:magma", 999, Some("not an id".into())),
+            registry.register("minecraft:magma_block", 999, Some("not an id".into())),
             Err(ItemStackError::InvalidItem)
         );
-        assert_eq!(registry.burn_time("minecraft:magma"), 100);
+        assert_eq!(registry.burn_time("minecraft:magma_block"), 100);
         assert_eq!(
-            registry.remainder("minecraft:magma"),
+            registry.remainder("minecraft:magma_block"),
             Some(stack("minecraft:bucket", 1))
         );
         assert_eq!(
@@ -1055,9 +1095,7 @@ mod tests {
             ("cobblestone", "minecraft:stone", 0.1),
             ("sand", "minecraft:glass", 0.1),
             ("beef", "minecraft:cooked_beef", 0.35),
-            ("raw_beef", "minecraft:cooked_beef", 0.35),
             ("porkchop", "minecraft:cooked_porkchop", 0.35),
-            ("raw_porkchop", "minecraft:cooked_porkchop", 0.35),
         ];
 
         for (input, expected_out, expected_xp) in recipes_to_test {
@@ -1072,6 +1110,8 @@ mod tests {
         }
 
         assert!(registry.find_recipe("diamond").is_none());
+        assert!(registry.find_recipe("raw_beef").is_none());
+        assert!(registry.find_recipe("raw_porkchop").is_none());
     }
 
     #[test]

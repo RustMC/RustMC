@@ -7,11 +7,12 @@
 //! 26.3 server; the field layout comes from minecraft.wiki
 //! `Java_Edition_protocol/Packets` revision 3868170.
 
+use crate::java_packets::play::clientbound::CONTAINER_SET_DATA;
 use crate::java_wire::{frame, put_varint, read_varint};
 use std::fmt;
 
-/// Java 26.3 Clientbound SetContainerData packet ID in the Play state.
-pub const SET_CONTAINER_DATA_PACKET_ID: u32 = 0x13;
+/// Java 26.3 Clientbound SetContainerData packet ID in the Play state (official 26.3 packets report: `minecraft:container_set_data` = 19).
+pub const SET_CONTAINER_DATA_PACKET_ID: u32 = CONTAINER_SET_DATA;
 
 /// Java 26.3 `SetContainerData` (0x13) Clientbound packet representation.
 ///
@@ -202,7 +203,9 @@ fn decode_set_container_data_framed(
         return Err(SetContainerDataError::Truncated);
     };
 
-    let total = len_prefix + length as usize;
+    let Some(total) = len_prefix.checked_add(length as usize) else {
+        return Err(SetContainerDataError::Oversized);
+    };
     if framed.len() < total {
         return Err(SetContainerDataError::Truncated);
     }
