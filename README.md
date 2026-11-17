@@ -37,10 +37,10 @@ The proposed shared-world baseline is Java-style gameplay with Bedrock client tr
 | `--run` local discovery listener | Bounded loopback TCP and UDP; process tests pass on Linux |
 | Java 26.3 status | Tested with a real client on 29 September 2026; server-list entry displayed |
 | Bedrock 1.26.51 discovery | Partial: synthetic UDP socket tests pass; real client not yet checked |
-| Java login and play | Partial opt-in Creative terrain preview: one real 26.3 client joined and rendered chunks; no authentication, authoritative actions, persistence, or shared multiplayer |
+| Java login and play | Partial opt-in Creative terrain preview: one real 26.3 client joined, rendered chunks, moved across chunk boundaries, disconnected, and rejoined; no authentication, authoritative actions, persistence, or shared multiplayer |
 | Bedrock login and play | Planned; no session or playable endpoint exists |
 | Original terrain preview | Seeded coordinate-derived terrain with eight labelled surface regions and trees; real 26.3 client rendered it at a configured 32-chunk view. An optional `preview_terrain = "experimental"` octave-noise height field exists as vanilla-generation groundwork. Neither option is vanilla generation parity |
-| Data-driven Overworld probe | Opt-in Java 26.3 local terrain path using operator-provisioned registry/worldgen data. A bounded packet cache can prepare nearby chunks before joining; cold generation remains slower and exact vanilla parity is unverified. No block edits or world saves. |
+| Data-driven Overworld probe | Opt-in Java 26.3 loopback terrain path using operator-provisioned registry/worldgen data; the original preview stays the default. On one strided seed-2026 sample it met the [feasibility spike](docs/research/vanilla-worldgen-feasibility.md)'s height, biome, top-block, and 3D substance gates (T1–T3); ore and blob stone placement is measured only as per-family block counts, vegetation, trees, and structures are not generated, and exact per-position vanilla parity is unverified. A real-client view of this path is not yet recorded. A bounded packet cache can prepare nearby chunks before joining; cold chunks can still take time to generate. No block edits or world saves. |
 | Players, inventory, and survival | Planned; no gameplay exists |
 | Pulse–Parcel parallel execution | Experimental design only |
 | Plugins | Deferred |

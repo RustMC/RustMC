@@ -8,6 +8,7 @@
 //! which keeps the assertions meaningful without committing Mojang data.
 
 use super::*;
+use crate::java_wire::read_varint;
 
 /// Locally invented registry sizes: 65,536 states derive a 16-bit direct
 /// palette and 128 biomes derive a 7-bit one, like the provisioned 26.3 tables.
@@ -196,15 +197,11 @@ impl<'a> Wire<'a> {
     }
 
     fn varint(&mut self) -> u32 {
-        let mut value = 0u32;
-        for shift in 0..5 {
-            let byte = self.byte();
-            value |= u32::from(byte & 0x7f) << (shift * 7);
-            if byte & 0x80 == 0 {
-                return value;
-            }
-        }
-        panic!("test VarInt is longer than five bytes");
+        let (value, len) = read_varint(&self.bytes[self.pos..])
+            .expect("malformed VarInt")
+            .expect("truncated VarInt");
+        self.pos += len;
+        value
     }
 
     fn remaining(&self) -> usize {

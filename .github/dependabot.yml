@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Wait a week before proposing a new release so that a compromised or
+    # yanked version is more likely to be caught upstream first.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo-minor-and-patch:
@@ -18,4 +22,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Wait a week before proposing a new release so that a compromised or
+    # yanked version is more likely to be caught upstream first.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
