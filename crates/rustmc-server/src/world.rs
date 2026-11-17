@@ -1,6 +1,7 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
 pub mod experience;
+pub mod physics;
 pub mod time_weather;
 
 pub mod block_entity;
@@ -18,6 +19,11 @@ mod tests_player_interaction;
 mod tests_time_weather;
 
 pub use interaction::*;
+
+pub use physics::{
+    Aabb, PhysicsBody, SimpleVoxelWorld, StepResult, WorldCollisionView, compute_fall_damage,
+    compute_fall_damage_f32,
+};
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
@@ -126,6 +132,14 @@ pub struct CellChange {
 impl CellChange {
     pub const fn new(x: usize, y: usize, z: usize, block: Block) -> Self {
         Self { x, y, z, block }
+    }
+}
+
+impl Block {
+    /// Whether this block represents a solid obstacle for collision sweeps.
+    #[inline]
+    pub const fn is_solid(self) -> bool {
+        !matches!(self, Block::Air)
     }
 }
 
