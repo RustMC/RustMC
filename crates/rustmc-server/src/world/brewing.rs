@@ -1113,23 +1113,16 @@ impl BrewingStandBlockEntity {
             return false;
         }
 
-        let Some(fuel) = self.slots[FUEL_SLOT].take() else {
-            return false;
-        };
-
-        if !items_equal(fuel.item_id(), "minecraft:blaze_powder") {
-            self.slots[FUEL_SLOT] = Some(fuel);
+        if !self.slots[FUEL_SLOT]
+            .as_ref()
+            .is_some_and(|fuel| items_equal(fuel.item_id(), "minecraft:blaze_powder"))
+        {
             return false;
         }
 
-        let (_, rest) = fuel
-            .stack
-            .split(1)
-            .expect("splitting 1 from a non-empty ItemStack succeeds");
-        self.slots[FUEL_SLOT] = rest.map(|stack| BrewingSlotItem {
-            stack,
-            potion_type: None,
-        });
+        if !consume_one_brewing_item(&mut self.slots[FUEL_SLOT]) {
+            return false;
+        }
         self.fuel_charges = FUEL_PER_BLAZE_POWDER.min(MAX_FUEL_CHARGES);
         true
     }
@@ -1182,16 +1175,7 @@ impl BrewingStandBlockEntity {
         }
 
         // Decrement ingredient count by 1 via ItemStack::split
-        if let Some(ing) = self.slots[INGREDIENT_SLOT].take() {
-            let (_, rest) = ing
-                .stack
-                .split(1)
-                .expect("splitting 1 from a non-empty ItemStack succeeds");
-            self.slots[INGREDIENT_SLOT] = rest.map(|stack| BrewingSlotItem {
-                stack,
-                potion_type: None,
-            });
-        }
+        consume_one_brewing_item(&mut self.slots[INGREDIENT_SLOT]);
 
         // Reset brew timer
         self.brew_time = 0;
@@ -1292,6 +1276,28 @@ impl BrewingStandBlockEntity {
             self.encode_container_data_framed(window_id, BrewingStandProperty::BrewTime),
             self.encode_container_data_framed(window_id, BrewingStandProperty::FuelCharges),
         ]
+    }
+}
+
+fn consume_one_brewing_item(slot: &mut Option<BrewingSlotItem>) -> bool {
+    let Some(BrewingSlotItem { stack, potion_type }) = slot.take() else {
+        return false;
+    };
+    match stack.split(1) {
+        Ok((_, rest)) => {
+            *slot = rest.map(|stack| BrewingSlotItem {
+                stack,
+                potion_type: None,
+            });
+            true
+        }
+        Err(unchanged) => {
+            *slot = Some(BrewingSlotItem {
+                stack: unchanged,
+                potion_type,
+            });
+            false
+        }
     }
 }
 
