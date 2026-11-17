@@ -1,5 +1,11 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod crafting;
+
+pub use crafting::{
+    CraftResult, CraftingError, CraftingGrid, GridBoundingBox, Ingredient, Recipe, RecipeRegistry,
+    ShapedRecipe, ShapelessRecipe, crafting_remainder,
+};
 pub mod container;
 
 #[cfg(test)]
