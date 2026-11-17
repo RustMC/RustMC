@@ -21,6 +21,7 @@
 //! the owner's seed-2026 save, the shortcut missed 7 of 2,401 columns;
 //! the exhaustive scan is therefore the default.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -119,7 +120,20 @@ struct ChunkView<'a> {
     chunk_x: i32,
     chunk_z: i32,
     chunk: &'a mut DecoratedChunk,
+    /// Undecorated neighbour columns already asked for by this chunk's pass.
+    halo: &'a RefCell<HaloColumns>,
 }
+
+/// The neighbour columns one chunk's decoration pass has read. A predicate
+/// that crosses the border asks for one row of a column that costs a full
+/// fill and carve, and the next candidate usually asks for the same column.
+/// Emptied at [`HALO_COLUMN_LIMIT`] so a pack of wide offsets cannot grow it
+/// past a fixed size.
+type HaloColumns = HashMap<(i32, i32), Rc<Vec<Option<String>>>>;
+
+/// The most neighbour columns one pass keeps, about a chunk's perimeter four
+/// rows deep.
+const HALO_COLUMN_LIMIT: usize = 256;
 
 /// The biomes present somewhere in one chunk's whole 4x4x4-cell volume,
 /// ascending and deduplicated. The reference runtime collects the palette of
@@ -582,6 +596,7 @@ impl VanillaGenerator {
         if steps.is_empty() {
             return chunk;
         }
+        let halo = RefCell::new(HaloColumns::new());
         for anchor_z in chunk_z - 1..=chunk_z + 1 {
             for anchor_x in chunk_x - 1..=chunk_x + 1 {
                 let region = self.region_biomes(anchor_x, anchor_z);
@@ -590,6 +605,7 @@ impl VanillaGenerator {
                     chunk_x,
                     chunk_z,
                     chunk: &mut chunk,
+                    halo: &halo,
                 };
                 for &step in &steps {
                     features.decorate_step(
@@ -1037,6 +1053,26 @@ impl DecorationTarget for ChunkView<'_> {
         self.chunk.name(self.chunk.blocks[at])
     }
 
+    fn read_block(&self, x: i32, y: i32, z: i32) -> Option<Cow<'_, str>> {
+        if y < self.generator.router.min_y || y > self.generator.max_y {
+            return None;
+        }
+        if self.writable(x, y, z) {
+            let named = self.block_at(x, y, z).unwrap_or("minecraft:air");
+            return Some(Cow::Borrowed(named));
+        }
+        let mut halo = self.halo.borrow_mut();
+        if halo.len() >= HALO_COLUMN_LIMIT && !halo.contains_key(&(x, z)) {
+            halo.clear();
+        }
+        let column = halo
+            .entry((x, z))
+            .or_insert_with(|| Rc::new(self.generator.base_column_ids(x, z)));
+        let row = (y - self.generator.router.min_y) as usize;
+        let named = column[row].as_deref().unwrap_or("minecraft:air");
+        Some(Cow::Owned(named.to_string()))
+    }
+
     fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
         if self.writable(x, y, z) {
             return match self.block_at(x, y, z) {
@@ -1438,6 +1474,63 @@ mod tests {
             }}"#
             ),
         );
+    }
+
+    /// A read past the chunk edge returns the neighbour's own terrain rather
+    /// than nothing, and the store of those columns stays bounded.
+    #[test]
+    fn read_block_sees_the_neighbouring_terrain_within_a_bounded_store() {
+        let root = scratch_root("halo");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/band.json"),
+            r#"{"type": "mul",
+                "left": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": -1.0,
+                    "to_coordinate": 8, "to_value": 1.0},
+                "right": {"type": "gradient", "axis": "y",
+                    "from_coordinate": 0, "from_value": 1.0,
+                    "to_coordinate": 48, "to_value": -1.0}}"#,
+        );
+        write(&worldgen.join("material_rule/root.json"), DESCENT_ROOT);
+        descent_pack_noise(&root);
+        descent_pack_settings(&root, "dry", "band", -1000, "root");
+        let generator = VanillaGenerator::new(&root, 2026, "testns:dry").expect("generator");
+        let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        let halo = RefCell::new(HaloColumns::new());
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: 0,
+            chunk_z: 0,
+            chunk: &mut chunk,
+            halo: &halo,
+        };
+        let expected = generator.column_ids(16, 3);
+        assert_eq!(
+            view.block_at(16, 22, 3),
+            None,
+            "the writable view stops here"
+        );
+        assert_eq!(
+            view.read_block(16, 22, 3).as_deref(),
+            expected[22].as_deref(),
+            "the neighbour's filled row"
+        );
+        assert_eq!(
+            view.read_block(16, 100, 3).as_deref(),
+            Some("minecraft:air"),
+            "the neighbour's open sky"
+        );
+        assert_eq!(
+            view.read_block(16, 100_000, 3),
+            None,
+            "outside the build volume"
+        );
+        for z in 0..(HALO_COLUMN_LIMIT as i32 + 8) {
+            view.read_block(16, 22, z);
+        }
+        assert!(halo.borrow().len() <= HALO_COLUMN_LIMIT);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// End-to-end material-rule descent on a fabricated pack whose
