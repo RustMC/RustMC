@@ -93,14 +93,15 @@ pub enum Block {
 }
 
 impl Block {
-    /// Blast resistance value according to vanilla Minecraft data specifications.
+    /// Java Edition blast resistance of this block, as listed in the
+    /// blast-resistance table at <https://minecraft.wiki/w/Explosion>.
     pub const fn blast_resistance(self) -> f32 {
         match self {
             Self::Air => 0.0,
             Self::Dirt => 0.5,
             Self::Stone => 6.0,
             Self::Obsidian => 1200.0,
-            Self::Bedrock => 3600000.0,
+            Self::Bedrock => 3_600_000.0,
             Self::Grass => 0.6,
             Self::Log | Self::SpruceLog | Self::AcaciaLog | Self::JungleLog => 2.0,
             Self::Leaves | Self::SpruceLeaves | Self::AcaciaLeaves | Self::JungleLeaves => 0.2,
@@ -205,7 +206,7 @@ impl Block {
 
 impl Block {
     /// Every block, in discriminant order (checked by a unit test).
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Air,
         Self::Bedrock,
         Self::Stone,
@@ -230,6 +231,7 @@ impl Block {
         Self::Carpet,
         Self::TallGrassLower,
         Self::TallGrassUpper,
+        Self::Obsidian,
     ];
 
     /// Decode a journalled block discriminant; unknown values are corrupt input.
@@ -1183,5 +1185,12 @@ mod tests {
             generator.biome(-192, -192),
             Generator::new(2027).biome(-192, -192)
         );
+    }
+
+    #[test]
+    fn obsidian_round_trips_and_has_expected_blast_resistance() {
+        assert_eq!(Block::from_u8(Block::Obsidian as u8), Some(Block::Obsidian));
+        assert_eq!(Block::Obsidian.blast_resistance(), 1200.0);
+        assert_eq!(Block::Bedrock.blast_resistance(), 3_600_000.0);
     }
 }
