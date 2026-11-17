@@ -258,6 +258,39 @@ mod runtime_cli {
         assert!(udp.recv(&mut buf).is_err());
         udp.send_to(&vec![0u8; 513], address).unwrap();
         assert!(udp.recv(&mut buf).is_err());
+        // RakNet Open Connection Request 1 over live UDP socket
+        let mut req1 = vec![0x05];
+        req1.extend([
+            0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
+        ]);
+        req1.push(11);
+        // A 1200-byte MTU probe carries a 1172-byte UDP payload.
+        req1.resize(1172, 0);
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        udp.send_to(&req1, address).unwrap();
+        let n = udp.recv(&mut buf).unwrap();
+        assert_eq!(n, 28);
+        assert_eq!(buf[0], 0x06);
+        assert_eq!(&buf[26..28], &1200u16.to_be_bytes());
+        // RakNet Open Connection Request 2 over live UDP socket
+        let mut req2 = vec![0x07];
+        req2.extend([
+            0, 255, 255, 0, 254, 254, 254, 254, 253, 253, 253, 253, 18, 52, 86, 120,
+        ]);
+        req2.extend([4, 127, 0, 0, 1, 0x4a, 0xec]);
+        req2.extend(1200u16.to_be_bytes());
+        req2.extend(0x4433_2211u64.to_be_bytes());
+        udp.send_to(&req2, address).unwrap();
+        let n = udp.recv(&mut buf).unwrap();
+        assert_eq!(n, 35);
+        assert_eq!(buf[0], 0x08);
+        // Reply 2 reports this socket: complemented 127.0.0.1, then its port.
+        assert_eq!(&buf[25..30], &[4, 0x80, 0xff, 0xff, 0xfe]);
+        assert_eq!(
+            &buf[30..32],
+            &udp.local_addr().unwrap().port().to_be_bytes()
+        );
+        assert_eq!(&buf[32..34], &1200u16.to_be_bytes());
         server.stop();
         let rebound = UdpSocket::bind(address).unwrap();
         drop(rebound);
@@ -330,6 +363,40 @@ mod runtime_cli {
         assert!(String::from_utf8_lossy(&reply[..count]).contains("minecraft"));
         socket.write_all(&[1, 127]).unwrap(); // Unsupported configuration packet.
         assert_eq!(socket.read(&mut reply).unwrap(), 0);
+        server.stop();
+    }
+
+    #[test]
+    fn discovery_only_login_receives_a_reason_and_closes() {
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .write_all(&[8, 0, 0x89, 0x06, 1, b'x', 0x63, 0xdd, 2])
+            .unwrap();
+        let mut hello = vec![22, 0, 4];
+        hello.extend_from_slice(b"Test");
+        hello.extend_from_slice(&[7; 16]);
+        socket.write_all(&hello).unwrap();
+        let mut reply = Vec::new();
+        socket.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply[1], 0, "login_disconnect packet");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("{\"text\":\"RustMC is discovery-only; login is unavailable.\"}"));
         server.stop();
     }
 
