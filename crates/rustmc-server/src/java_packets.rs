@@ -102,5 +102,6 @@ pub mod play {
         pub const PLAYER_POSITION: u32 = 73;
         pub const SET_CHUNK_CACHE_CENTER: u32 = 96;
         pub const SET_TIME: u32 = 115;
+        pub const TAKE_ITEM_ENTITY: u32 = 127;
     }
 }
