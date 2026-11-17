@@ -4,6 +4,7 @@
 //! shaped and shapeless recipe matching (with horizontal symmetry mirroring), recipe
 //! registry query, and ingredient consumption with crafting residual preservation.
 
+use crate::item::{DEFAULT_MAX_STACK, ItemStack};
 use std::fmt;
 
 /// Maximum allowable grid dimension (width or height) to prevent unbounded memory allocation.
@@ -12,25 +13,35 @@ pub const MAX_GRID_DIMENSION: usize = 16;
 /// Maximum allowable total slots in a recipe grid.
 pub const MAX_GRID_SLOTS: usize = MAX_GRID_DIMENSION * MAX_GRID_DIMENSION;
 
-/// Standard vanilla items and their known crafting remainders.
+/// Standard vanilla items and their documented crafting remainders.
 ///
-/// Under documented Minecraft crafting rules, consuming these items leaves behind
-/// their container/residual item (e.g. buckets or bottles).
+/// Sources:
+/// - `milk_bucket`, `water_bucket`, `lava_bucket`, `powder_snow_bucket` -> `minecraft:bucket`
+///   (minecraft.wiki `Bucket` / `Cake` / `Crafting`).
+/// - `honey_bottle` -> `minecraft:glass_bottle` (minecraft.wiki `Honey_Bottle` / `Sugar`).
 #[must_use]
-pub fn default_remainder(item_id: &str) -> Option<&'static str> {
-    match item_id {
+pub fn crafting_remainder(item: &str) -> Option<&'static str> {
+    match item {
         "minecraft:milk_bucket"
         | "minecraft:water_bucket"
         | "minecraft:lava_bucket"
         | "minecraft:powder_snow_bucket" => Some("minecraft:bucket"),
-        "minecraft:honey_bottle" | "minecraft:dragon_breath" | "minecraft:potion" => {
-            Some("minecraft:glass_bottle")
-        }
-        "minecraft:mushroom_stew"
-        | "minecraft:rabbit_stew"
-        | "minecraft:beetroot_soup"
-        | "minecraft:suspicious_stew" => Some("minecraft:bowl"),
+        "minecraft:honey_bottle" => Some("minecraft:glass_bottle"),
         _ => None,
+    }
+}
+
+/// Returns the standard Java Edition max stack size for crafting items and remainders.
+fn remainder_max_stack(item: &str) -> u16 {
+    match item {
+        // Unstackable buckets and bowls (minecraft.wiki `Bucket`).
+        "minecraft:milk_bucket"
+        | "minecraft:water_bucket"
+        | "minecraft:lava_bucket"
+        | "minecraft:powder_snow_bucket" => 1,
+        // 16-stackable containers and throwables (minecraft.wiki `Bucket`, `Honey_Bottle`, `Egg`).
+        "minecraft:bucket" | "minecraft:honey_bottle" | "minecraft:egg" => 16,
+        _ => DEFAULT_MAX_STACK,
     }
 }
 
@@ -92,66 +103,6 @@ impl fmt::Display for CraftingError {
 
 impl std::error::Error for CraftingError {}
 
-/// An item stack representing an item identifier, a count, and an optional crafting remainder.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ItemStack {
-    pub item: String,
-    pub count: u32,
-    pub remainder: Option<String>,
-}
-
-impl ItemStack {
-    /// Constructs a new `ItemStack`. If `item` has a known standard Minecraft crafting remainder
-    /// (e.g. milk bucket -> empty bucket), the remainder is automatically populated.
-    pub fn new(item: impl Into<String>, count: u32) -> Self {
-        let item = item.into();
-        let remainder = default_remainder(&item).map(str::to_owned);
-        Self {
-            item,
-            count,
-            remainder,
-        }
-    }
-
-    /// Sets or overrides the residual item returned when this stack is consumed in crafting.
-    #[must_use]
-    pub fn with_remainder(mut self, remainder: impl Into<String>) -> Self {
-        self.remainder = Some(remainder.into());
-        self
-    }
-
-    /// Clears any residual item for this stack.
-    #[must_use]
-    pub fn without_remainder(mut self) -> Self {
-        self.remainder = None;
-        self
-    }
-
-    /// Item identifier string (e.g. `"minecraft:iron_ingot"`).
-    #[must_use]
-    pub fn item(&self) -> &str {
-        &self.item
-    }
-
-    /// Item count in this stack.
-    #[must_use]
-    pub fn count(&self) -> u32 {
-        self.count
-    }
-
-    /// Residual item identifier returned when consumed, if any.
-    #[must_use]
-    pub fn remainder(&self) -> Option<&str> {
-        self.remainder.as_deref()
-    }
-
-    /// Returns `true` if count is zero.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-}
-
 /// An ingredient specification matching accepted item types in a crafting slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ingredient {
@@ -180,7 +131,7 @@ impl Ingredient {
     /// Returns `true` if the item stack satisfies this ingredient (non-empty and item id matches).
     #[must_use]
     pub fn matches(&self, stack: &ItemStack) -> bool {
-        stack.count >= 1 && self.matches_item(&stack.item)
+        stack.count() >= 1 && self.matches_item(stack.item())
     }
 
     /// Returns `true` if the item identifier is in the allowed set.
@@ -210,13 +161,13 @@ impl From<String> for Ingredient {
 
 impl From<ItemStack> for Ingredient {
     fn from(stack: ItemStack) -> Self {
-        Self::item(stack.item)
+        Self::item(stack.item())
     }
 }
 
 impl From<&ItemStack> for Ingredient {
     fn from(stack: &ItemStack) -> Self {
-        Self::item(stack.item.clone())
+        Self::item(stack.item())
     }
 }
 
@@ -318,18 +269,10 @@ impl CraftingGrid {
     #[must_use]
     pub fn get(&self, col: usize, row: usize) -> Option<&ItemStack> {
         let idx = self.index(col, row)?;
-        self.slots[idx].as_ref().filter(|s| !s.is_empty())
-    }
-
-    /// Gets a mutable reference to the item stack at `(col, row)`.
-    pub fn get_mut(&mut self, col: usize, row: usize) -> Option<&mut ItemStack> {
-        let idx = self.index(col, row)?;
-        self.slots[idx].as_mut().filter(|s| !s.is_empty())
+        self.slots[idx].as_ref()
     }
 
     /// Sets or clears the slot at `(col, row)`.
-    ///
-    /// Stacks with count 0 are normalized to empty (`None`).
     pub fn set(
         &mut self,
         col: usize,
@@ -339,7 +282,7 @@ impl CraftingGrid {
         let idx = self
             .index(col, row)
             .ok_or(CraftingError::OutOfBounds { col, row })?;
-        self.slots[idx] = item.filter(|s| !s.is_empty());
+        self.slots[idx] = item;
         Ok(())
     }
 
@@ -362,8 +305,7 @@ impl CraftingGrid {
         let idx = self
             .index(col, row)
             .ok_or(CraftingError::OutOfBounds { col, row })?;
-        let prev = self.slots[idx].take().filter(|s| !s.is_empty());
-        Ok(prev)
+        Ok(self.slots[idx].take())
     }
 
     /// Clears all slots in the grid.
@@ -374,27 +316,19 @@ impl CraftingGrid {
     /// Returns `true` if all slots in the grid are empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slots
-            .iter()
-            .all(|s| s.as_ref().is_none_or(ItemStack::is_empty))
+        self.slots.iter().all(Option::is_none)
     }
 
     /// Returns the number of non-empty slots in the grid.
     #[must_use]
     pub fn non_empty_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.as_ref().is_some_and(|stack| !stack.is_empty()))
-            .count()
+        self.slots.iter().filter(|s| s.is_some()).count()
     }
 
     /// Collects references to all non-empty item stacks in the grid.
     #[must_use]
     pub fn non_empty_items(&self) -> Vec<&ItemStack> {
-        self.slots
-            .iter()
-            .filter_map(|s| s.as_ref().filter(|stack| !stack.is_empty()))
-            .collect()
+        self.slots.iter().filter_map(Option::as_ref).collect()
     }
 
     /// Extracts the bounding box by trimming empty leading/trailing rows and columns.
@@ -461,22 +395,22 @@ impl CraftingGrid {
         let mut overflow_residuals = Vec::new();
 
         for slot in &mut self.slots {
-            if let Some(stack) = slot {
-                if stack.is_empty() {
-                    *slot = None;
-                    continue;
-                }
-                let remainder_item = stack.remainder.clone();
-                if stack.count <= 1 {
-                    if let Some(remainder) = remainder_item {
-                        *slot = Some(ItemStack::new(remainder, 1));
-                    } else {
-                        *slot = None;
-                    }
-                } else {
-                    stack.count -= 1;
-                    if let Some(remainder) = remainder_item {
-                        overflow_residuals.push(ItemStack::new(remainder, 1));
+            let Some(stack) = slot.take() else {
+                continue;
+            };
+            let (consumed, rest) = stack
+                .split(1)
+                .expect("splitting 1 from a non-empty ItemStack succeeds");
+            let remainder_stack = crafting_remainder(consumed.item()).map(|rem| {
+                ItemStack::try_new(rem, 1, remainder_max_stack(rem))
+                    .expect("documented crafting remainders are valid item IDs")
+            });
+            match rest {
+                None => *slot = remainder_stack,
+                Some(remaining) => {
+                    *slot = Some(remaining);
+                    if let Some(rem_stack) = remainder_stack {
+                        overflow_residuals.push(rem_stack);
                     }
                 }
             }
@@ -975,6 +909,11 @@ impl RecipeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item::ItemStackError;
+
+    fn stack(item: &str, count: u16) -> ItemStack {
+        ItemStack::try_new(item, count, remainder_max_stack(item)).unwrap()
+    }
 
     #[test]
     fn test_2x2_wood_planks_to_sticks() {
@@ -985,7 +924,7 @@ mod tests {
                 Some(Ingredient::item("minecraft:oak_planks")),
                 Some(Ingredient::item("minecraft:oak_planks")),
             ],
-            ItemStack::new("minecraft:stick", 4),
+            stack("minecraft:stick", 4),
         )
         .expect("valid stick recipe");
 
@@ -995,36 +934,36 @@ mod tests {
         // Test in column 0 of 2x2 grid
         let mut grid_col0 = CraftingGrid::inventory_2x2();
         grid_col0
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         grid_col0
-            .set_slot(0, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
 
         assert_eq!(
             registry.evaluate(&grid_col0),
-            Some(ItemStack::new("minecraft:stick", 4))
+            Some(stack("minecraft:stick", 4))
         );
         let craft_col0 = registry.craft(&mut grid_col0).expect("craft sticks");
-        assert_eq!(craft_col0.output, ItemStack::new("minecraft:stick", 4));
+        assert_eq!(craft_col0.output, stack("minecraft:stick", 4));
         assert!(craft_col0.residuals.is_empty());
         assert!(grid_col0.is_empty());
 
         // Test in column 1 of 2x2 grid
         let mut grid_col1 = CraftingGrid::inventory_2x2();
         grid_col1
-            .set_slot(1, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         grid_col1
-            .set_slot(1, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
 
         assert_eq!(
             registry.evaluate(&grid_col1),
-            Some(ItemStack::new("minecraft:stick", 4))
+            Some(stack("minecraft:stick", 4))
         );
         let craft_col1 = registry.craft(&mut grid_col1).expect("craft sticks");
-        assert_eq!(craft_col1.output, ItemStack::new("minecraft:stick", 4));
+        assert_eq!(craft_col1.output, stack("minecraft:stick", 4));
         assert!(craft_col1.residuals.is_empty());
         assert!(grid_col1.is_empty());
     }
@@ -1040,7 +979,7 @@ mod tests {
                 Some(Ingredient::item("minecraft:iron_ingot")),
                 Some(Ingredient::item("minecraft:iron_ingot")),
             ],
-            ItemStack::new("minecraft:iron_block", 1),
+            stack("minecraft:iron_block", 1),
         )
         .expect("valid iron block recipe");
 
@@ -1050,17 +989,17 @@ mod tests {
         let mut grid = CraftingGrid::inventory_2x2();
         for r in 0..2 {
             for c in 0..2 {
-                grid.set_slot(c, r, ItemStack::new("minecraft:iron_ingot", 1))
+                grid.set_slot(c, r, stack("minecraft:iron_ingot", 1))
                     .unwrap();
             }
         }
 
         assert_eq!(
             registry.evaluate(&grid),
-            Some(ItemStack::new("minecraft:iron_block", 1))
+            Some(stack("minecraft:iron_block", 1))
         );
         let result = registry.craft(&mut grid).expect("craft iron block");
-        assert_eq!(result.output, ItemStack::new("minecraft:iron_block", 1));
+        assert_eq!(result.output, stack("minecraft:iron_block", 1));
         assert!(grid.is_empty());
     }
 
@@ -1072,7 +1011,7 @@ mod tests {
                 ('#', Ingredient::item("minecraft:iron_ingot")),
                 ('|', Ingredient::item("minecraft:stick")),
             ],
-            ItemStack::new("minecraft:iron_pickaxe", 1),
+            stack("minecraft:iron_pickaxe", 1),
         )
         .expect("valid pickaxe recipe")
         .with_id("minecraft:iron_pickaxe");
@@ -1080,7 +1019,7 @@ mod tests {
         let chest_recipe = ShapedRecipe::from_pattern(
             &["###", "# #", "###"],
             &[('#', Ingredient::item("minecraft:oak_planks"))],
-            ItemStack::new("minecraft:chest", 1),
+            stack("minecraft:chest", 1),
         )
         .expect("valid chest recipe")
         .with_id("minecraft:chest");
@@ -1088,7 +1027,7 @@ mod tests {
         let furnace_recipe = ShapedRecipe::from_pattern(
             &["###", "# #", "###"],
             &[('#', Ingredient::item("minecraft:cobblestone"))],
-            ItemStack::new("minecraft:furnace", 1),
+            stack("minecraft:furnace", 1),
         )
         .expect("valid furnace recipe")
         .with_id("minecraft:furnace");
@@ -1101,30 +1040,27 @@ mod tests {
         // 1. Pickaxe
         let mut pickaxe_grid = CraftingGrid::table_3x3();
         pickaxe_grid
-            .set_slot(0, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(0, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         pickaxe_grid
-            .set_slot(1, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(1, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         pickaxe_grid
-            .set_slot(2, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(2, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         pickaxe_grid
-            .set_slot(1, 1, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 1, stack("minecraft:stick", 1))
             .unwrap();
         pickaxe_grid
-            .set_slot(1, 2, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 2, stack("minecraft:stick", 1))
             .unwrap();
 
         assert_eq!(
             registry.evaluate(&pickaxe_grid),
-            Some(ItemStack::new("minecraft:iron_pickaxe", 1))
+            Some(stack("minecraft:iron_pickaxe", 1))
         );
         let pickaxe_res = registry.craft(&mut pickaxe_grid).unwrap();
-        assert_eq!(
-            pickaxe_res.output,
-            ItemStack::new("minecraft:iron_pickaxe", 1)
-        );
+        assert_eq!(pickaxe_res.output, stack("minecraft:iron_pickaxe", 1));
         assert!(pickaxe_grid.is_empty());
 
         // 2. Chest
@@ -1133,17 +1069,17 @@ mod tests {
             for c in 0..3 {
                 if !(r == 1 && c == 1) {
                     chest_grid
-                        .set_slot(c, r, ItemStack::new("minecraft:oak_planks", 1))
+                        .set_slot(c, r, stack("minecraft:oak_planks", 1))
                         .unwrap();
                 }
             }
         }
         assert_eq!(
             registry.evaluate(&chest_grid),
-            Some(ItemStack::new("minecraft:chest", 1))
+            Some(stack("minecraft:chest", 1))
         );
         let chest_res = registry.craft(&mut chest_grid).unwrap();
-        assert_eq!(chest_res.output, ItemStack::new("minecraft:chest", 1));
+        assert_eq!(chest_res.output, stack("minecraft:chest", 1));
         assert!(chest_grid.is_empty());
 
         // 3. Furnace
@@ -1152,17 +1088,17 @@ mod tests {
             for c in 0..3 {
                 if !(r == 1 && c == 1) {
                     furnace_grid
-                        .set_slot(c, r, ItemStack::new("minecraft:cobblestone", 1))
+                        .set_slot(c, r, stack("minecraft:cobblestone", 1))
                         .unwrap();
                 }
             }
         }
         assert_eq!(
             registry.evaluate(&furnace_grid),
-            Some(ItemStack::new("minecraft:furnace", 1))
+            Some(stack("minecraft:furnace", 1))
         );
         let furnace_res = registry.craft(&mut furnace_grid).unwrap();
-        assert_eq!(furnace_res.output, ItemStack::new("minecraft:furnace", 1));
+        assert_eq!(furnace_res.output, stack("minecraft:furnace", 1));
         assert!(furnace_grid.is_empty());
     }
 
@@ -1172,7 +1108,7 @@ mod tests {
             1,
             1,
             vec![Some(Ingredient::item("minecraft:oak_log"))],
-            ItemStack::new("minecraft:oak_planks", 4),
+            stack("minecraft:oak_planks", 4),
         )
         .expect("valid planks recipe");
 
@@ -1183,12 +1119,11 @@ mod tests {
         for r in 0..2 {
             for c in 0..2 {
                 let mut grid = CraftingGrid::inventory_2x2();
-                grid.set_slot(c, r, ItemStack::new("minecraft:oak_log", 1))
-                    .unwrap();
+                grid.set_slot(c, r, stack("minecraft:oak_log", 1)).unwrap();
 
                 assert_eq!(
                     registry.evaluate(&grid),
-                    Some(ItemStack::new("minecraft:oak_planks", 4)),
+                    Some(stack("minecraft:oak_planks", 4)),
                     "offset 1x1 at ({c}, {r}) in 2x2 grid"
                 );
             }
@@ -1198,12 +1133,11 @@ mod tests {
         for r in 0..3 {
             for c in 0..3 {
                 let mut grid = CraftingGrid::table_3x3();
-                grid.set_slot(c, r, ItemStack::new("minecraft:oak_log", 1))
-                    .unwrap();
+                grid.set_slot(c, r, stack("minecraft:oak_log", 1)).unwrap();
 
                 assert_eq!(
                     registry.evaluate(&grid),
-                    Some(ItemStack::new("minecraft:oak_planks", 4)),
+                    Some(stack("minecraft:oak_planks", 4)),
                     "offset 1x1 at ({c}, {r}) in 3x3 grid"
                 );
             }
@@ -1217,16 +1151,16 @@ mod tests {
                 Some(Ingredient::item("minecraft:oak_planks")),
                 Some(Ingredient::item("minecraft:oak_planks")),
             ],
-            ItemStack::new("minecraft:stick", 4),
+            stack("minecraft:stick", 4),
         )
         .expect("valid stick recipe");
 
         for c in 0..3 {
             for r in 0..2 {
                 let mut grid = CraftingGrid::table_3x3();
-                grid.set_slot(c, r, ItemStack::new("minecraft:oak_planks", 1))
+                grid.set_slot(c, r, stack("minecraft:oak_planks", 1))
                     .unwrap();
-                grid.set_slot(c, r + 1, ItemStack::new("minecraft:oak_planks", 1))
+                grid.set_slot(c, r + 1, stack("minecraft:oak_planks", 1))
                     .unwrap();
 
                 assert!(
@@ -1243,29 +1177,29 @@ mod tests {
         let stairs_recipe = ShapedRecipe::from_pattern(
             &["#  ", "## ", "###"],
             &[('#', Ingredient::item("minecraft:oak_planks"))],
-            ItemStack::new("minecraft:oak_stairs", 4),
+            stack("minecraft:oak_stairs", 4),
         )
         .expect("valid stairs recipe");
 
         // Normal left-facing placement
         let mut left_stairs = CraftingGrid::table_3x3();
         left_stairs
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         left_stairs
-            .set_slot(0, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
         left_stairs
-            .set_slot(1, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
         left_stairs
-            .set_slot(0, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
         left_stairs
-            .set_slot(1, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
         left_stairs
-            .set_slot(2, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(2, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
 
         assert!(stairs_recipe.matches(&left_stairs));
@@ -1273,22 +1207,22 @@ mod tests {
         // Mirrored right-facing placement
         let mut right_stairs = CraftingGrid::table_3x3();
         right_stairs
-            .set_slot(2, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(2, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         right_stairs
-            .set_slot(1, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
         right_stairs
-            .set_slot(2, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(2, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
         right_stairs
-            .set_slot(0, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
         right_stairs
-            .set_slot(1, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
         right_stairs
-            .set_slot(2, 2, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(2, 2, stack("minecraft:oak_planks", 1))
             .unwrap();
 
         assert!(stairs_recipe.matches(&right_stairs));
@@ -1300,26 +1234,26 @@ mod tests {
                 ('#', Ingredient::item("minecraft:iron_ingot")),
                 ('|', Ingredient::item("minecraft:stick")),
             ],
-            ItemStack::new("minecraft:iron_axe", 1),
+            stack("minecraft:iron_axe", 1),
         )
         .expect("valid axe recipe");
 
         // Left-facing axe in 3x3 grid at col 0
         let mut left_axe = CraftingGrid::table_3x3();
         left_axe
-            .set_slot(0, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(0, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         left_axe
-            .set_slot(1, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(1, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         left_axe
-            .set_slot(0, 1, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(0, 1, stack("minecraft:iron_ingot", 1))
             .unwrap();
         left_axe
-            .set_slot(1, 1, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 1, stack("minecraft:stick", 1))
             .unwrap();
         left_axe
-            .set_slot(1, 2, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 2, stack("minecraft:stick", 1))
             .unwrap();
 
         assert!(axe_recipe.matches(&left_axe));
@@ -1327,19 +1261,19 @@ mod tests {
         // Right-facing axe in 3x3 grid at col 1
         let mut right_axe = CraftingGrid::table_3x3();
         right_axe
-            .set_slot(1, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(1, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         right_axe
-            .set_slot(2, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(2, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         right_axe
-            .set_slot(2, 1, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(2, 1, stack("minecraft:iron_ingot", 1))
             .unwrap();
         right_axe
-            .set_slot(1, 1, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 1, stack("minecraft:stick", 1))
             .unwrap();
         right_axe
-            .set_slot(1, 2, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 2, stack("minecraft:stick", 1))
             .unwrap();
 
         assert!(axe_recipe.matches(&right_axe));
@@ -1358,20 +1292,18 @@ mod tests {
         let planks = || Ingredient::any(["minecraft:oak_planks", "minecraft:birch_planks"]);
         let mut ingredients: Vec<Ingredient> = (0..15).map(|_| planks()).collect();
         ingredients.push(Ingredient::item("minecraft:stick"));
-        let recipe =
-            ShapelessRecipe::new(ingredients, ItemStack::new("minecraft:chest", 1)).unwrap();
+        let recipe = ShapelessRecipe::new(ingredients, stack("minecraft:chest", 1)).unwrap();
 
         let mut grid = CraftingGrid::new(4, 4).unwrap();
         for row in 0..4 {
             for col in 0..4 {
-                grid.set(col, row, Some(ItemStack::new("minecraft:oak_planks", 1)))
+                grid.set(col, row, Some(stack("minecraft:oak_planks", 1)))
                     .unwrap();
             }
         }
         assert!(!recipe.matches(&grid));
 
-        grid.set(3, 3, Some(ItemStack::new("minecraft:stick", 1)))
-            .unwrap();
+        grid.set(3, 3, Some(stack("minecraft:stick", 1))).unwrap();
         assert!(recipe.matches(&grid));
     }
 
@@ -1384,24 +1316,21 @@ mod tests {
                 Ingredient::any(["minecraft:coal", "minecraft:charcoal"]),
                 Ingredient::item("minecraft:coal"),
             ],
-            ItemStack::new("minecraft:torch", 1),
+            stack("minecraft:torch", 1),
         )
         .unwrap();
         let mut grid = CraftingGrid::table_3x3();
-        grid.set(0, 0, Some(ItemStack::new("minecraft:coal", 1)))
-            .unwrap();
-        grid.set(1, 0, Some(ItemStack::new("minecraft:charcoal", 1)))
+        grid.set(0, 0, Some(stack("minecraft:coal", 1))).unwrap();
+        grid.set(1, 0, Some(stack("minecraft:charcoal", 1)))
             .unwrap();
         assert!(recipe.matches(&grid));
     }
 
     #[test]
     fn test_shapeless_recipes_dye_and_mushroom_stew() {
-        let dye_recipe = ShapelessRecipe::from_items(
-            ["minecraft:dandelion"],
-            ItemStack::new("minecraft:yellow_dye", 1),
-        )
-        .expect("valid dye recipe");
+        let dye_recipe =
+            ShapelessRecipe::from_items(["minecraft:dandelion"], stack("minecraft:yellow_dye", 1))
+                .expect("valid dye recipe");
 
         let stew_recipe = ShapelessRecipe::from_items(
             [
@@ -1409,7 +1338,7 @@ mod tests {
                 "minecraft:brown_mushroom",
                 "minecraft:bowl",
             ],
-            ItemStack::new("minecraft:mushroom_stew", 1),
+            stack("minecraft:mushroom_stew", 1),
         )
         .expect("valid stew recipe");
 
@@ -1420,34 +1349,31 @@ mod tests {
         // Dye in slot (1, 1) of 2x2 grid
         let mut dye_grid = CraftingGrid::inventory_2x2();
         dye_grid
-            .set_slot(1, 1, ItemStack::new("minecraft:dandelion", 1))
+            .set_slot(1, 1, stack("minecraft:dandelion", 1))
             .unwrap();
         assert_eq!(
             registry.evaluate(&dye_grid),
-            Some(ItemStack::new("minecraft:yellow_dye", 1))
+            Some(stack("minecraft:yellow_dye", 1))
         );
 
         // Stew in arbitrary non-adjacent positions of 3x3 grid
         let mut stew_grid = CraftingGrid::table_3x3();
         stew_grid
-            .set_slot(0, 0, ItemStack::new("minecraft:bowl", 1))
+            .set_slot(0, 0, stack("minecraft:bowl", 1))
             .unwrap();
         stew_grid
-            .set_slot(2, 1, ItemStack::new("minecraft:red_mushroom", 1))
+            .set_slot(2, 1, stack("minecraft:red_mushroom", 1))
             .unwrap();
         stew_grid
-            .set_slot(1, 2, ItemStack::new("minecraft:brown_mushroom", 1))
+            .set_slot(1, 2, stack("minecraft:brown_mushroom", 1))
             .unwrap();
 
         assert_eq!(
             registry.evaluate(&stew_grid),
-            Some(ItemStack::new("minecraft:mushroom_stew", 1))
+            Some(stack("minecraft:mushroom_stew", 1))
         );
         let stew_res = registry.craft(&mut stew_grid).unwrap();
-        assert_eq!(
-            stew_res.output,
-            ItemStack::new("minecraft:mushroom_stew", 1)
-        );
+        assert_eq!(stew_res.output, stack("minecraft:mushroom_stew", 1));
         assert!(stew_grid.is_empty());
     }
 
@@ -1457,7 +1383,7 @@ mod tests {
             1,
             1,
             vec![Some(Ingredient::item("minecraft:oak_log"))],
-            ItemStack::new("minecraft:oak_planks", 4),
+            stack("minecraft:oak_planks", 4),
         )
         .unwrap();
 
@@ -1468,7 +1394,7 @@ mod tests {
                 Some(Ingredient::item("minecraft:oak_planks")),
                 Some(Ingredient::item("minecraft:oak_planks")),
             ],
-            ItemStack::new("minecraft:stick", 4),
+            stack("minecraft:stick", 4),
         )
         .unwrap();
 
@@ -1478,7 +1404,7 @@ mod tests {
                 ('#', Ingredient::item("minecraft:iron_ingot")),
                 ('|', Ingredient::item("minecraft:stick")),
             ],
-            ItemStack::new("minecraft:iron_pickaxe", 1),
+            stack("minecraft:iron_pickaxe", 1),
         )
         .unwrap();
 
@@ -1488,112 +1414,112 @@ mod tests {
                 "minecraft:brown_mushroom",
                 "minecraft:bowl",
             ],
-            ItemStack::new("minecraft:mushroom_stew", 1),
+            stack("minecraft:mushroom_stew", 1),
         )
         .unwrap();
 
         // 1. Surplus items in 1x1 recipe
         let mut grid_surplus_1x1 = CraftingGrid::inventory_2x2();
         grid_surplus_1x1
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_log", 1))
+            .set_slot(0, 0, stack("minecraft:oak_log", 1))
             .unwrap();
         grid_surplus_1x1
-            .set_slot(1, 1, ItemStack::new("minecraft:dirt", 1))
+            .set_slot(1, 1, stack("minecraft:dirt", 1))
             .unwrap();
         assert!(!planks_recipe.matches(&grid_surplus_1x1));
 
         // 2. Extra log in 1x1 recipe
         let mut grid_double_log = CraftingGrid::inventory_2x2();
         grid_double_log
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_log", 1))
+            .set_slot(0, 0, stack("minecraft:oak_log", 1))
             .unwrap();
         grid_double_log
-            .set_slot(1, 0, ItemStack::new("minecraft:oak_log", 1))
+            .set_slot(1, 0, stack("minecraft:oak_log", 1))
             .unwrap();
         assert!(!planks_recipe.matches(&grid_double_log));
 
         // 3. Surplus item in 2x2 sticks recipe
         let mut grid_surplus_sticks = CraftingGrid::inventory_2x2();
         grid_surplus_sticks
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         grid_surplus_sticks
-            .set_slot(0, 1, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 1, stack("minecraft:oak_planks", 1))
             .unwrap();
         grid_surplus_sticks
-            .set_slot(1, 0, ItemStack::new("minecraft:dirt", 1))
+            .set_slot(1, 0, stack("minecraft:dirt", 1))
             .unwrap();
         assert!(!stick_recipe.matches(&grid_surplus_sticks));
 
         // 4. Horizontal planks (wrong orientation for 1x2 stick recipe)
         let mut grid_horizontal_planks = CraftingGrid::inventory_2x2();
         grid_horizontal_planks
-            .set_slot(0, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(0, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         grid_horizontal_planks
-            .set_slot(1, 0, ItemStack::new("minecraft:oak_planks", 1))
+            .set_slot(1, 0, stack("minecraft:oak_planks", 1))
             .unwrap();
         assert!(!stick_recipe.matches(&grid_horizontal_planks));
 
         // 5. Incomplete pickaxe
         let mut grid_broken_pickaxe = CraftingGrid::table_3x3();
         grid_broken_pickaxe
-            .set_slot(0, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(0, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         grid_broken_pickaxe
-            .set_slot(1, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(1, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         // missing (2, 0) ingot
         grid_broken_pickaxe
-            .set_slot(1, 1, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 1, stack("minecraft:stick", 1))
             .unwrap();
         grid_broken_pickaxe
-            .set_slot(1, 2, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 2, stack("minecraft:stick", 1))
             .unwrap();
         assert!(!pickaxe_recipe.matches(&grid_broken_pickaxe));
 
         // 6. Wrong item in pickaxe (stone instead of iron ingot)
         let mut grid_wrong_item_pickaxe = CraftingGrid::table_3x3();
         grid_wrong_item_pickaxe
-            .set_slot(0, 0, ItemStack::new("minecraft:cobblestone", 1))
+            .set_slot(0, 0, stack("minecraft:cobblestone", 1))
             .unwrap();
         grid_wrong_item_pickaxe
-            .set_slot(1, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(1, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         grid_wrong_item_pickaxe
-            .set_slot(2, 0, ItemStack::new("minecraft:iron_ingot", 1))
+            .set_slot(2, 0, stack("minecraft:iron_ingot", 1))
             .unwrap();
         grid_wrong_item_pickaxe
-            .set_slot(1, 1, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 1, stack("minecraft:stick", 1))
             .unwrap();
         grid_wrong_item_pickaxe
-            .set_slot(1, 2, ItemStack::new("minecraft:stick", 1))
+            .set_slot(1, 2, stack("minecraft:stick", 1))
             .unwrap();
         assert!(!pickaxe_recipe.matches(&grid_wrong_item_pickaxe));
 
         // 7. Surplus item in shapeless stew
         let mut grid_surplus_stew = CraftingGrid::table_3x3();
         grid_surplus_stew
-            .set_slot(0, 0, ItemStack::new("minecraft:bowl", 1))
+            .set_slot(0, 0, stack("minecraft:bowl", 1))
             .unwrap();
         grid_surplus_stew
-            .set_slot(1, 0, ItemStack::new("minecraft:red_mushroom", 1))
+            .set_slot(1, 0, stack("minecraft:red_mushroom", 1))
             .unwrap();
         grid_surplus_stew
-            .set_slot(2, 0, ItemStack::new("minecraft:brown_mushroom", 1))
+            .set_slot(2, 0, stack("minecraft:brown_mushroom", 1))
             .unwrap();
         grid_surplus_stew
-            .set_slot(0, 1, ItemStack::new("minecraft:dirt", 1))
+            .set_slot(0, 1, stack("minecraft:dirt", 1))
             .unwrap();
         assert!(!stew_recipe.matches(&grid_surplus_stew));
 
         // 8. Missing item in shapeless stew
         let mut grid_missing_stew = CraftingGrid::table_3x3();
         grid_missing_stew
-            .set_slot(0, 0, ItemStack::new("minecraft:bowl", 1))
+            .set_slot(0, 0, stack("minecraft:bowl", 1))
             .unwrap();
         grid_missing_stew
-            .set_slot(1, 0, ItemStack::new("minecraft:red_mushroom", 1))
+            .set_slot(1, 0, stack("minecraft:red_mushroom", 1))
             .unwrap();
         assert!(!stew_recipe.matches(&grid_missing_stew));
 
@@ -1619,7 +1545,7 @@ mod tests {
                 ('E', Ingredient::item("minecraft:egg")),
                 ('W', Ingredient::item("minecraft:wheat")),
             ],
-            ItemStack::new("minecraft:cake", 1),
+            stack("minecraft:cake", 1),
         )
         .expect("valid cake recipe");
 
@@ -1628,42 +1554,36 @@ mod tests {
 
         let mut grid = CraftingGrid::table_3x3();
         // Row 0: milk buckets (with known default remainder "minecraft:bucket")
-        grid.set_slot(0, 0, ItemStack::new("minecraft:milk_bucket", 1))
+        grid.set_slot(0, 0, stack("minecraft:milk_bucket", 1))
             .unwrap();
-        grid.set_slot(1, 0, ItemStack::new("minecraft:milk_bucket", 1))
+        grid.set_slot(1, 0, stack("minecraft:milk_bucket", 1))
             .unwrap();
-        grid.set_slot(2, 0, ItemStack::new("minecraft:milk_bucket", 1))
+        grid.set_slot(2, 0, stack("minecraft:milk_bucket", 1))
             .unwrap();
 
         // Row 1: sugar, egg, sugar (with higher stack counts)
-        grid.set_slot(0, 1, ItemStack::new("minecraft:sugar", 10))
-            .unwrap();
-        grid.set_slot(1, 1, ItemStack::new("minecraft:egg", 16))
-            .unwrap();
-        grid.set_slot(2, 1, ItemStack::new("minecraft:sugar", 5))
-            .unwrap();
+        grid.set_slot(0, 1, stack("minecraft:sugar", 10)).unwrap();
+        grid.set_slot(1, 1, stack("minecraft:egg", 16)).unwrap();
+        grid.set_slot(2, 1, stack("minecraft:sugar", 5)).unwrap();
 
         // Row 2: wheat
-        grid.set_slot(0, 2, ItemStack::new("minecraft:wheat", 1))
-            .unwrap();
-        grid.set_slot(1, 2, ItemStack::new("minecraft:wheat", 1))
-            .unwrap();
-        grid.set_slot(2, 2, ItemStack::new("minecraft:wheat", 1))
-            .unwrap();
+        grid.set_slot(0, 2, stack("minecraft:wheat", 1)).unwrap();
+        grid.set_slot(1, 2, stack("minecraft:wheat", 1)).unwrap();
+        grid.set_slot(2, 2, stack("minecraft:wheat", 1)).unwrap();
 
         let craft_res = registry.craft(&mut grid).expect("craft cake");
-        assert_eq!(craft_res.output, ItemStack::new("minecraft:cake", 1));
+        assert_eq!(craft_res.output, stack("minecraft:cake", 1));
         assert!(craft_res.residuals.is_empty());
 
         // Check top row milk buckets turned into empty buckets in place!
-        assert_eq!(grid.get(0, 0), Some(&ItemStack::new("minecraft:bucket", 1)));
-        assert_eq!(grid.get(1, 0), Some(&ItemStack::new("minecraft:bucket", 1)));
-        assert_eq!(grid.get(2, 0), Some(&ItemStack::new("minecraft:bucket", 1)));
+        assert_eq!(grid.get(0, 0), Some(&stack("minecraft:bucket", 1)));
+        assert_eq!(grid.get(1, 0), Some(&stack("minecraft:bucket", 1)));
+        assert_eq!(grid.get(2, 0), Some(&stack("minecraft:bucket", 1)));
 
         // Check middle row counts decremented
-        assert_eq!(grid.get(0, 1), Some(&ItemStack::new("minecraft:sugar", 9)));
-        assert_eq!(grid.get(1, 1), Some(&ItemStack::new("minecraft:egg", 15)));
-        assert_eq!(grid.get(2, 1), Some(&ItemStack::new("minecraft:sugar", 4)));
+        assert_eq!(grid.get(0, 1), Some(&stack("minecraft:sugar", 9)));
+        assert_eq!(grid.get(1, 1), Some(&stack("minecraft:egg", 15)));
+        assert_eq!(grid.get(2, 1), Some(&stack("minecraft:sugar", 4)));
 
         // Check bottom row consumed to empty
         assert_eq!(grid.get(0, 2), None);
@@ -1673,18 +1593,50 @@ mod tests {
 
     #[test]
     fn test_stacked_residual_item_overflow() {
-        // Test when a slot has count > 1 with a remainder
+        // Test when a slot has count > 1 with a remainder (honey bottle stacks to 16)
         let mut grid = CraftingGrid::inventory_2x2();
-        grid.set_slot(0, 0, ItemStack::new("minecraft:milk_bucket", 3))
+        grid.set_slot(0, 0, stack("minecraft:honey_bottle", 3))
             .unwrap();
 
         let residuals = grid.consume_ingredients();
-        // Since count was 3 > 1, slot count becomes 2, and 1 bucket is returned as overflow residual
+        assert_eq!(grid.get(0, 0), Some(&stack("minecraft:honey_bottle", 2)));
+        assert_eq!(residuals, vec![stack("minecraft:glass_bottle", 1)]);
+
+        // Also verify stacked buckets when given a larger stack limit
+        let mut bucket_grid = CraftingGrid::inventory_2x2();
+        let stacked_milk =
+            ItemStack::try_new("minecraft:milk_bucket", 3, DEFAULT_MAX_STACK).unwrap();
+        bucket_grid.set_slot(0, 0, stacked_milk).unwrap();
+        let bucket_residuals = bucket_grid.consume_ingredients();
         assert_eq!(
-            grid.get(0, 0),
-            Some(&ItemStack::new("minecraft:milk_bucket", 2))
+            bucket_grid.get(0, 0),
+            Some(&ItemStack::try_new("minecraft:milk_bucket", 2, DEFAULT_MAX_STACK).unwrap())
         );
-        assert_eq!(residuals, vec![ItemStack::new("minecraft:bucket", 1)]);
+        assert_eq!(bucket_residuals, vec![stack("minecraft:bucket", 1)]);
+    }
+
+    #[test]
+    fn test_crafting_remainder_documented_cases() {
+        for bucket in [
+            "minecraft:milk_bucket",
+            "minecraft:water_bucket",
+            "minecraft:lava_bucket",
+            "minecraft:powder_snow_bucket",
+        ] {
+            assert_eq!(crafting_remainder(bucket), Some("minecraft:bucket"));
+        }
+        assert_eq!(
+            crafting_remainder("minecraft:honey_bottle"),
+            Some("minecraft:glass_bottle")
+        );
+        for non_remainder in [
+            "minecraft:oak_planks",
+            "minecraft:mushroom_stew",
+            "minecraft:potion",
+            "minecraft:dragon_breath",
+        ] {
+            assert_eq!(crafting_remainder(non_remainder), None, "{non_remainder}");
+        }
     }
 
     #[test]
@@ -1697,17 +1649,15 @@ mod tests {
             1,
             1,
             vec![Some(Ingredient::item("minecraft:oak_log"))],
-            ItemStack::new("minecraft:oak_planks", 4),
+            stack("minecraft:oak_planks", 4),
         )
         .unwrap()
         .with_id("recipe:planks");
 
-        let r2 = ShapelessRecipe::from_items(
-            ["minecraft:dandelion"],
-            ItemStack::new("minecraft:yellow_dye", 1),
-        )
-        .unwrap()
-        .with_id("recipe:dye");
+        let r2 =
+            ShapelessRecipe::from_items(["minecraft:dandelion"], stack("minecraft:yellow_dye", 1))
+                .unwrap()
+                .with_id("recipe:dye");
 
         registry.register(r1);
         registry.register(r2);
@@ -1731,20 +1681,19 @@ mod tests {
         assert_eq!(bbox.height, 0);
 
         let mut grid = CraftingGrid::table_3x3();
-        grid.set_slot(1, 2, ItemStack::new("minecraft:dirt", 1))
-            .unwrap();
+        grid.set_slot(1, 2, stack("minecraft:dirt", 1)).unwrap();
         let bbox = grid.bounding_box();
         assert!(!bbox.is_empty());
         assert_eq!(bbox.min_col, 1);
         assert_eq!(bbox.min_row, 2);
         assert_eq!(bbox.width, 1);
         assert_eq!(bbox.height, 1);
-        assert_eq!(bbox.get(0, 0), Some(&ItemStack::new("minecraft:dirt", 1)));
+        assert_eq!(bbox.get(0, 0), Some(&stack("minecraft:dirt", 1)));
 
         // Out of bounds get / set
         assert_eq!(grid.get(3, 0), None);
         assert!(matches!(
-            grid.set_slot(3, 0, ItemStack::new("minecraft:dirt", 1)),
+            grid.set_slot(3, 0, stack("minecraft:dirt", 1)),
             Err(CraftingError::OutOfBounds { col: 3, row: 0 })
         ));
 
@@ -1766,14 +1715,14 @@ mod tests {
 
         // Pattern validation errors
         assert!(matches!(
-            ShapedRecipe::from_pattern(&[], &[], ItemStack::new("minecraft:dirt", 1)),
+            ShapedRecipe::from_pattern(&[], &[], stack("minecraft:dirt", 1)),
             Err(CraftingError::EmptyRecipePattern)
         ));
         assert!(matches!(
             ShapedRecipe::from_pattern(
                 &["#", "##"],
                 &[('#', Ingredient::item("minecraft:dirt"))],
-                ItemStack::new("minecraft:dirt", 1)
+                stack("minecraft:dirt", 1)
             ),
             Err(CraftingError::InvalidPatternRowLength {
                 expected: 1,
@@ -1781,14 +1730,16 @@ mod tests {
             })
         ));
         assert!(matches!(
-            ShapedRecipe::from_pattern(&["#"], &[], ItemStack::new("minecraft:dirt", 1)),
+            ShapedRecipe::from_pattern(&["#"], &[], stack("minecraft:dirt", 1)),
             Err(CraftingError::UnknownKeyInPattern('#'))
         ));
 
-        // Zero count item stack is treated as empty
-        let zero_stack = ItemStack::new("minecraft:dirt", 0);
-        assert!(zero_stack.is_empty());
-        grid.set(1, 2, Some(zero_stack)).unwrap();
+        // Shared ItemStack rejects zero-count stacks; clear slot explicitly instead.
+        assert_eq!(
+            ItemStack::try_new("minecraft:dirt", 0, DEFAULT_MAX_STACK),
+            Err(ItemStackError::InvalidCount(0))
+        );
+        grid.set(1, 2, None).unwrap();
         assert!(grid.get(1, 2).is_none());
     }
 }

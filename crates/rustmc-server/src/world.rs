@@ -3,8 +3,8 @@
 pub mod crafting;
 
 pub use crafting::{
-    CraftResult, CraftingError, CraftingGrid, GridBoundingBox, Ingredient, ItemStack, Recipe,
-    RecipeRegistry, ShapedRecipe, ShapelessRecipe, default_remainder,
+    CraftResult, CraftingError, CraftingGrid, GridBoundingBox, Ingredient, Recipe, RecipeRegistry,
+    ShapedRecipe, ShapelessRecipe, crafting_remainder,
 };
 
 pub mod fluid;
