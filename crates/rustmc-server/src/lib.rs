@@ -11,6 +11,7 @@ pub mod commands;
 pub mod discovery_bedrock;
 pub mod discovery_java;
 pub mod entity;
+pub mod item;
 pub mod java_packets;
 
 pub mod java_preview;
