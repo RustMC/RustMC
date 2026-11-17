@@ -53,9 +53,18 @@ pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
 const TREE_REACH: i64 = 3;
 
+pub mod explosion;
+
+pub use explosion::{
+    AxisAlignedBB, BlockGrid, EntityImpact, Explosion, ExplosionDestructionMode, ExplosionWorld,
+    RAY_COUNT, RAY_POWER_DECAY_PER_STEP, RAY_STEP_DISTANCE, generate_ray_directions,
+    raycast_line_of_sight,
+};
+
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Block {
+    #[default]
     Air,
     Bedrock,
     Stone,
@@ -80,6 +89,35 @@ pub enum Block {
     Carpet,
     TallGrassLower,
     TallGrassUpper,
+    Obsidian,
+}
+
+impl Block {
+    /// Java Edition blast resistance of this block, as listed in the
+    /// blast-resistance table at <https://minecraft.wiki/w/Explosion>.
+    pub const fn blast_resistance(self) -> f32 {
+        match self {
+            Self::Air => 0.0,
+            Self::Dirt => 0.5,
+            Self::Stone => 6.0,
+            Self::Obsidian => 1200.0,
+            Self::Bedrock => 3_600_000.0,
+            Self::Grass => 0.6,
+            Self::Log | Self::SpruceLog | Self::AcaciaLog | Self::JungleLog => 2.0,
+            Self::Leaves | Self::SpruceLeaves | Self::AcaciaLeaves | Self::JungleLeaves => 0.2,
+            Self::Sand | Self::RedSand => 0.5,
+            Self::Sandstone | Self::RedSandstone => 0.8,
+            Self::Snow => 0.2,
+            Self::Terracotta => 4.2,
+            Self::ShortGrass | Self::TallGrassLower | Self::TallGrassUpper => 0.0,
+            Self::SnowLayer | Self::Carpet => 0.1,
+        }
+    }
+
+    /// Whether this block represents air.
+    pub const fn is_air(self) -> bool {
+        matches!(self, Self::Air)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +206,7 @@ impl Block {
 
 impl Block {
     /// Every block, in discriminant order (checked by a unit test).
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Air,
         Self::Bedrock,
         Self::Stone,
@@ -193,6 +231,7 @@ impl Block {
         Self::Carpet,
         Self::TallGrassLower,
         Self::TallGrassUpper,
+        Self::Obsidian,
     ];
 
     /// Decode a journalled block discriminant; unknown values are corrupt input.
@@ -1146,5 +1185,12 @@ mod tests {
             generator.biome(-192, -192),
             Generator::new(2027).biome(-192, -192)
         );
+    }
+
+    #[test]
+    fn obsidian_round_trips_and_has_expected_blast_resistance() {
+        assert_eq!(Block::from_u8(Block::Obsidian as u8), Some(Block::Obsidian));
+        assert_eq!(Block::Obsidian.blast_resistance(), 1200.0);
+        assert_eq!(Block::Bedrock.blast_resistance(), 3_600_000.0);
     }
 }
