@@ -233,21 +233,70 @@ pub enum StateProvider {
     /// `minecraft:weighted` — one uniform draw over the summed weights picks
     /// the entry, so the pick costs exactly one bounded draw.
     Weighted { entries: Vec<WeightedState> },
+    /// `minecraft:rule_based` — the first rule whose predicate holds at the
+    /// position supplies the state, and the fallback answers when none does.
+    /// The pack's sand and grass disks pick their state this way.
+    RuleBased {
+        fallback: Box<StateProvider>,
+        rules: Vec<RuleBasedEntry>,
+    },
     /// A provider shape without a runtime here. Named so the gap report can
     /// tell an unmodeled state apart from a feature that placed nothing.
     Unsupported { kind: String },
 }
 
+/// One rule of a `minecraft:rule_based` block-state provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleBasedEntry {
+    pub if_true: BlockPredicate,
+    pub then: StateProvider,
+}
+
 impl StateProvider {
-    /// Whether a provider shape has a runtime here.
+    /// Whether a provider shape, and every provider and predicate nested in
+    /// it, has a runtime here.
     pub fn is_modelable(&self) -> bool {
-        !matches!(self, Self::Unsupported { .. })
+        match self {
+            Self::Constant { .. } | Self::Weighted { .. } => true,
+            Self::RuleBased { fallback, rules } => {
+                fallback.is_modelable()
+                    && rules
+                        .iter()
+                        .all(|rule| rule.if_true.is_modelable() && rule.then.is_modelable())
+            }
+            Self::Unsupported { .. } => false,
+        }
     }
 
-    /// The state to place, drawn from the decoration stream. A constant
-    /// costs nothing and a weighted pick costs one bounded draw, matching
-    /// the draw-count discipline the count and height providers keep.
-    pub fn sample(&self, random: &mut DecorationRandom) -> Option<&str> {
+    /// Every state this provider can hand out, whichever rule or entry
+    /// picks it.
+    fn states(&self) -> Vec<&str> {
+        match self {
+            Self::Constant { state } => vec![state.as_str()],
+            Self::Weighted { entries } => {
+                entries.iter().map(|entry| entry.state.as_str()).collect()
+            }
+            Self::RuleBased { fallback, rules } => rules
+                .iter()
+                .flat_map(|rule| rule.then.states())
+                .chain(fallback.states())
+                .collect(),
+            Self::Unsupported { .. } => Vec::new(),
+        }
+    }
+
+    /// The state to place at `pos`, drawn from the decoration stream. A
+    /// constant costs nothing and a weighted pick costs one bounded draw,
+    /// matching the draw-count discipline the count and height providers
+    /// keep. A rule-based pick reads the terrain around `pos`, which costs no
+    /// draw, and then samples the provider the first passing rule names.
+    pub fn sample(
+        &self,
+        target: &dyn DecorationTarget,
+        pos: DecorationPos,
+        tags: &BlockTags,
+        random: &mut DecorationRandom,
+    ) -> Option<&str> {
         match self {
             Self::Constant { state } => Some(state.as_str()),
             Self::Weighted { entries } => {
@@ -264,6 +313,11 @@ impl StateProvider {
                 }
                 None
             }
+            Self::RuleBased { fallback, rules } => rules
+                .iter()
+                .find(|rule| rule.if_true.test(target, pos, tags))
+                .map_or(fallback.as_ref(), |rule| &rule.then)
+                .sample(target, pos, tags, random),
             // `is_modelable` gates this out before the feature runs.
             Self::Unsupported { .. } => None,
         }
@@ -345,13 +399,7 @@ impl BlockPredicate {
 impl StateProvider {
     /// Whether every state this provider can hand out has a ground rule.
     fn is_placeable(&self) -> bool {
-        match self {
-            Self::Constant { state } => plant_support::is_placeable(state),
-            Self::Weighted { entries } => entries
-                .iter()
-                .all(|entry| plant_support::is_placeable(&entry.state)),
-            Self::Unsupported { .. } => false,
-        }
+        self.is_modelable() && self.states().into_iter().all(plant_support::is_placeable)
     }
 }
 
@@ -373,6 +421,11 @@ pub struct OreTarget {
 /// wider patch would lose placements on grid-aligned chunks, so it stays
 /// unmodeled. This is a limit of the replay window, not a game rule.
 const MAX_PATCH_REACH: i32 = 16;
+
+/// The widest disk this runtime runs. A disk is bounded by the same replay
+/// window as a patch: centred on local 15 it reaches local 31 of the next
+/// chunk at this radius, and the pack's widest disk is 6.
+const MAX_DISK_RADIUS: i32 = MAX_PATCH_REACH;
 
 /// The most child attempts one patch may ask for: RustMC's work budget.
 const MAX_PATCH_TRIES: i64 = 256;
@@ -405,6 +458,21 @@ pub enum ConfiguredFeature {
     SimpleBlock {
         to_place: StateProvider,
     },
+    /// `minecraft:disk` — a flat circular disk of blocks replacing target blocks.
+    Disk {
+        state_provider: StateProvider,
+        target_predicate: BlockPredicate,
+        radius: RangeProvider,
+        half_height: i32,
+    },
+    /// `minecraft:spring_feature` — a single fluid source block placed in an enclosed pocket.
+    Spring {
+        state: String,
+        rock_count: i32,
+        hole_count: i32,
+        requires_block_below: bool,
+        valid_blocks: Vec<String>,
+    },
     Unsupported {
         kind: String,
     },
@@ -423,6 +491,17 @@ impl ConfiguredFeature {
                 feature.is_modelable() && self.patch_reach() <= MAX_PATCH_REACH
             }
             Self::SimpleBlock { to_place } => to_place.is_modelable() && to_place.is_placeable(),
+            Self::Disk {
+                state_provider,
+                target_predicate,
+                radius,
+                ..
+            } => {
+                state_provider.is_modelable()
+                    && target_predicate.is_modelable()
+                    && radius.is_modelable()
+            }
+            Self::Spring { .. } => true,
             Self::Unsupported { .. } => false,
         }
     }
@@ -522,8 +601,14 @@ impl RangeProvider {
         }
         let object = value.as_object()?;
         let anchored = |kind: &str| -> Option<Self> {
-            let min_inclusive = VerticalAnchor::from_value(object.get("min_inclusive")?)?;
-            let max_inclusive = VerticalAnchor::from_value(object.get("max_inclusive")?)?;
+            let min_val = object
+                .get("min_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("min_inclusive")))?;
+            let max_val = object
+                .get("max_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("max_inclusive")))?;
+            let min_inclusive = VerticalAnchor::from_value(min_val)?;
+            let max_inclusive = VerticalAnchor::from_value(max_val)?;
             // A count provider is a plain numeric range; only the height
             // decoration accepts anchors that resolve against the dimension.
             if !anchors_allowed
@@ -1261,6 +1346,33 @@ fn parse_state_provider(value: Option<&Value>) -> StateProvider {
                         StateProvider::Weighted { entries }
                     }
                 }
+                Some("minecraft:rule_based") => {
+                    // A rule that does not parse would let a later rule or the
+                    // fallback answer in its place, so it gates the provider.
+                    let rules: Option<Vec<RuleBasedEntry>> = object
+                        .get("rules")
+                        .and_then(Value::as_array)
+                        .map(|rules| {
+                            rules
+                                .iter()
+                                .map(|rule| {
+                                    let rule = rule.as_object()?;
+                                    Some(RuleBasedEntry {
+                                        if_true: parse_block_predicate(rule.get("if_true")),
+                                        then: parse_state_provider(Some(rule.get("then")?)),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match (rules, object.get("fallback")) {
+                        (Some(rules), Some(fallback)) => StateProvider::RuleBased {
+                            fallback: Box::new(parse_state_provider(Some(fallback))),
+                            rules,
+                        },
+                        _ => unsupported("minecraft:rule_based"),
+                    }
+                }
                 Some(other) => unsupported(other),
                 // No `type`: the direct block-state form.
                 None => state_from_object(object).map_or_else(
@@ -1516,8 +1628,107 @@ pub(crate) fn parse_configured_feature(
         "minecraft:simple_block" => Ok(ConfiguredFeature::SimpleBlock {
             to_place: parse_state_provider(body.get("to_place")),
         }),
+        "minecraft:disk" => parse_disk(body),
+        "minecraft:spring_feature" => parse_spring(body),
         _ => Ok(ConfiguredFeature::Unsupported { kind }),
     }
+}
+
+/// Parses a `minecraft:disk` configuration.
+fn parse_disk(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let half_height = body
+        .get("half_height")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| WorldgenError::Invalid("disk feature without half_height".to_string()))?;
+    let half_height = i32::try_from(half_height).map_err(|_| {
+        WorldgenError::Invalid(format!("disk half_height out of bounds: {half_height}"))
+    })?;
+    if !(0..=16).contains(&half_height) {
+        return Err(WorldgenError::Invalid(format!(
+            "disk half_height must be in 0..=16, got {half_height}"
+        )));
+    }
+    let radius_val = body
+        .get("radius")
+        .ok_or_else(|| WorldgenError::Invalid("disk feature without radius".to_string()))?;
+    let radius = RangeProvider::from_value(radius_val, false)
+        .ok_or_else(|| WorldgenError::Invalid("invalid disk radius provider".to_string()))?;
+    // An unsupported provider has no extrema and reports its own gap. A
+    // radius this runtime will not run keeps the pack loading as a gap,
+    // because a valid disk wider than the replay window is not an error.
+    if radius
+        .range(0, 0)
+        .is_some_and(|(min, max)| min < 0 || max > MAX_DISK_RADIUS)
+    {
+        return Ok(ConfiguredFeature::Unsupported {
+            kind: "minecraft:disk:radius".to_string(),
+        });
+    }
+    Ok(ConfiguredFeature::Disk {
+        state_provider: parse_state_provider(body.get("state_provider")),
+        target_predicate: parse_block_predicate(body.get("target")),
+        radius,
+        half_height,
+    })
+}
+
+/// Parses a `minecraft:spring_feature` configuration.
+fn parse_spring(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let state_val = body
+        .get("state")
+        .ok_or_else(|| WorldgenError::Invalid("spring feature without state".to_string()))?;
+    let Some(state) = spring_block_state(state_val) else {
+        return Ok(ConfiguredFeature::Unsupported {
+            kind: "minecraft:spring_feature:state".to_string(),
+        });
+    };
+    // The pack omits these on the features that keep the codec's default
+    // and writes `rock_count: 5, hole_count: 0` for the closed nether
+    // spring, so the two always sum to the five cells counted. The default
+    // itself is observed: in a stored seed-2026 save, among still water
+    // under a valid ceiling whose other sides are valid or flowing water,
+    // 716 sources have 4 valid sides and 1 opening and none have 3 and 2.
+    let count = |name: &str, default: i64| -> Option<i32> {
+        let value = match body.get(name) {
+            Some(value) => value.as_i64()?,
+            None => default,
+        };
+        (0..=5).contains(&value).then_some(value as i32)
+    };
+    let Some(rock_count) = count("rock_count", 4) else {
+        return Ok(ConfiguredFeature::Unsupported {
+            kind: "minecraft:spring_feature:rock_count".to_string(),
+        });
+    };
+    let Some(hole_count) = count("hole_count", 1) else {
+        return Ok(ConfiguredFeature::Unsupported {
+            kind: "minecraft:spring_feature:hole_count".to_string(),
+        });
+    };
+    let requires_block_below = body
+        .get("requires_block_below")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let valid_blocks = match body.get("valid_blocks") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => {
+            return Err(WorldgenError::Invalid(
+                "spring feature without valid_blocks".to_string(),
+            ));
+        }
+    };
+    Ok(ConfiguredFeature::Spring {
+        state,
+        rock_count,
+        hole_count,
+        requires_block_below,
+        valid_blocks,
+    })
 }
 
 /// Parses the configuration `minecraft:random_patch` and `minecraft:flower`
@@ -1567,6 +1778,19 @@ fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &Co
                 record_unmodeled_rule(counts, &target.predicate);
             }
         }
+        ConfiguredFeature::Disk {
+            state_provider,
+            target_predicate,
+            radius,
+            ..
+        } => {
+            record_unmodeled_provider(counts, state_provider);
+            record_unmodeled_predicates(counts, target_predicate);
+            if let RangeProvider::Unsupported { kind } = radius {
+                *counts.entry(format!("range:{kind}")).or_insert(0) += 1;
+            }
+        }
+        ConfiguredFeature::Spring { .. } => {}
         ConfiguredFeature::RandomPatch { feature: child, .. } => {
             if feature.patch_reach() > MAX_PATCH_REACH {
                 *counts
@@ -1663,28 +1887,188 @@ fn unmodeled_predicates(predicate: &BlockPredicate) -> Vec<&str> {
 /// configured type's own key would disappear from the report as soon as the
 /// type was modeled, and a `minecraft:simple_block` whose state comes from a
 /// provider this runtime does not resolve would look like no gap at all.
+/// A rule-based provider reports the predicates its rules cannot evaluate,
+/// keyed `predicate:<kind>`, alongside its nested providers.
 fn record_unmodeled_provider(counts: &mut HashMap<String, usize>, provider: &StateProvider) {
-    if let StateProvider::Unsupported { kind } = provider {
-        *counts.entry(format!("provider:{kind}")).or_insert(0) += 1;
+    match provider {
+        StateProvider::Unsupported { kind } => {
+            *counts.entry(format!("provider:{kind}")).or_insert(0) += 1;
+        }
+        StateProvider::RuleBased { fallback, rules } => {
+            for rule in rules {
+                record_unmodeled_predicates(counts, &rule.if_true);
+                record_unmodeled_provider(counts, &rule.then);
+            }
+            record_unmodeled_provider(counts, fallback);
+        }
+        StateProvider::Constant { .. } | StateProvider::Weighted { .. } => {}
+    }
+}
+
+/// Counts each predicate type a modeled configured feature nests without a
+/// runtime here, keyed `predicate:<kind>`.
+fn record_unmodeled_predicates(counts: &mut HashMap<String, usize>, predicate: &BlockPredicate) {
+    for kind in unmodeled_predicates(predicate) {
+        *counts.entry(format!("predicate:{kind}")).or_insert(0) += 1;
     }
 }
 
 /// Counts the states a `minecraft:simple_block` could write but has no ground
 /// rule for, keyed `state:<id>`, so the feature they gate is not a silent gap.
 fn record_unplaceable_states(counts: &mut HashMap<String, usize>, provider: &StateProvider) {
-    let states: Vec<&str> = match provider {
-        StateProvider::Constant { state } => vec![state],
-        StateProvider::Weighted { entries } => {
-            entries.iter().map(|entry| entry.state.as_str()).collect()
-        }
-        StateProvider::Unsupported { .. } => Vec::new(),
-    };
-    for state in states {
+    for state in provider.states() {
         if !plant_support::is_placeable(state) {
             *counts
                 .entry(format!("state:{}", base_block_id(state)))
                 .or_insert(0) += 1;
         }
+    }
+}
+
+/// The block state a spring's fluid state places. The pack writes the fluid
+/// state, `{"id": "minecraft:water", "properties": {"falling": "true"}}`, but
+/// `falling` belongs to the fluid: the 26.3 block-state report gives
+/// `minecraft:water` and `minecraft:lava` only a `level` property, so the
+/// document's name with its fluid properties would be an unknown block state.
+/// A still fluid is a source, whichever way `falling` reads, and a source is
+/// the block's default state. Any other fluid has no mapping here.
+fn spring_block_state(value: &Value) -> Option<String> {
+    let id = value.as_str().or_else(|| value.get("id")?.as_str())?;
+    matches!(id, "minecraft:water" | "minecraft:lava").then(|| id.to_string())
+}
+
+/// Whether a block read for a spring's neighbour check is air.
+fn is_air_block(block: Option<&str>) -> bool {
+    block.is_some_and(|block| {
+        matches!(
+            base_block_id(block),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
+    })
+}
+
+/// Whether the given block matches any block in `valid_blocks` (or tag if prefixed by `#`).
+fn is_valid_block(block: Option<&str>, valid_blocks: &[String], tags: &BlockTags) -> bool {
+    let Some(block) = block else {
+        return false;
+    };
+    let base = base_block_id(block);
+    valid_blocks.iter().any(|valid| {
+        if let Some(tag) = valid.strip_prefix('#') {
+            tags.contains(tag, base) || tags.contains(tag, block)
+        } else {
+            let valid_base = base_block_id(valid);
+            valid_base == base || valid == block
+        }
+    })
+}
+
+/// Places a circular disk feature around `pos`.
+#[allow(clippy::too_many_arguments)]
+fn place_disk(
+    target: &mut dyn DecorationTarget,
+    random: &mut DecorationRandom,
+    tags: &BlockTags,
+    state_provider: &StateProvider,
+    target_predicate: &BlockPredicate,
+    radius: &RangeProvider,
+    half_height: i32,
+    pos: DecorationPos,
+) -> usize {
+    let r = radius.sample(target.min_y(), target.height(), random);
+    if r < 0 || half_height < 0 {
+        return 0;
+    }
+    let mut placed = 0;
+    let r_sq = r * r;
+    // Each column finishes top to bottom before the next starts, so a provider
+    // that reads the block below sees it as the terrain left it, not as this
+    // disk rewrote it. A candidate outside the chunk is clipped before its
+    // provider runs; no pack disk has a provider that draws.
+    for dx in -r..=r {
+        let px = pos.x + dx;
+        for dz in -r..=r {
+            if dx * dx + dz * dz > r_sq {
+                continue;
+            }
+            let pz = pos.z + dz;
+            for dy in (-half_height..=half_height).rev() {
+                let py = pos.y + dy;
+                if !target.writable(px, py, pz) {
+                    continue;
+                }
+                let candidate_pos = DecorationPos {
+                    x: px,
+                    y: py,
+                    z: pz,
+                };
+                if !target_predicate.test(target, candidate_pos, tags) {
+                    continue;
+                }
+                let Some(state) = state_provider.sample(target, candidate_pos, tags, random) else {
+                    continue;
+                };
+                target.set_block(px, py, pz, state);
+                placed += 1;
+            }
+        }
+    }
+    placed
+}
+
+/// Places a fluid spring feature at `pos`: the ceiling must be valid, the block
+/// below too when the feature requires it, and the four sides and the block
+/// below must then hold exactly `rock_count` valid blocks and `hole_count` air
+/// cells. Neighbours past the chunk edge are read from the terrain, so a pocket
+/// on a border is judged as it would be anywhere else.
+#[allow(clippy::too_many_arguments)]
+fn place_spring(
+    target: &mut dyn DecorationTarget,
+    tags: &BlockTags,
+    state: &str,
+    rock_count: i32,
+    hole_count: i32,
+    requires_block_below: bool,
+    valid_blocks: &[String],
+    pos: DecorationPos,
+) -> usize {
+    if !target.writable(pos.x, pos.y, pos.z) {
+        return 0;
+    }
+    let valid = |target: &dyn DecorationTarget, x: i32, y: i32, z: i32| {
+        is_valid_block(target.read_block(x, y, z).as_deref(), valid_blocks, tags)
+    };
+    if !valid(target, pos.x, pos.y + 1, pos.z) {
+        return 0;
+    }
+    if requires_block_below && !valid(target, pos.x, pos.y - 1, pos.z) {
+        return 0;
+    }
+    if !target.is_air(pos.x, pos.y, pos.z) && !valid(target, pos.x, pos.y, pos.z) {
+        return 0;
+    }
+    let neighbors = [
+        (pos.x - 1, pos.y, pos.z),
+        (pos.x + 1, pos.y, pos.z),
+        (pos.x, pos.y, pos.z - 1),
+        (pos.x, pos.y, pos.z + 1),
+        (pos.x, pos.y - 1, pos.z),
+    ];
+    let mut rocks = 0i32;
+    let mut holes = 0i32;
+    for (nx, ny, nz) in neighbors {
+        let block = target.read_block(nx, ny, nz);
+        if is_valid_block(block.as_deref(), valid_blocks, tags) {
+            rocks += 1;
+        } else if is_air_block(block.as_deref()) {
+            holes += 1;
+        }
+    }
+    if rocks == rock_count && holes == hole_count {
+        target.set_block(pos.x, pos.y, pos.z, state);
+        1
+    } else {
+        0
     }
 }
 
@@ -2257,7 +2641,7 @@ fn place_simple_block(
     to_place: &StateProvider,
     pos: DecorationPos,
 ) -> usize {
-    let Some(state) = to_place.sample(random) else {
+    let Some(state) = to_place.sample(target, pos, tags, random) else {
         return 0;
     };
     if !target.writable(pos.x, pos.y, pos.z) || !target.is_air(pos.x, pos.y, pos.z) {
@@ -2390,6 +2774,37 @@ impl FeatureData {
                 ConfiguredFeature::SimpleBlock { to_place } => {
                     place_simple_block(target, random, &self.tags, to_place, pos)
                 }
+                ConfiguredFeature::Disk {
+                    state_provider,
+                    target_predicate,
+                    radius,
+                    half_height,
+                } => place_disk(
+                    target,
+                    random,
+                    &self.tags,
+                    state_provider,
+                    target_predicate,
+                    radius,
+                    *half_height,
+                    pos,
+                ),
+                ConfiguredFeature::Spring {
+                    state,
+                    rock_count,
+                    hole_count,
+                    requires_block_below,
+                    valid_blocks,
+                } => place_spring(
+                    target,
+                    &self.tags,
+                    state,
+                    *rock_count,
+                    *hole_count,
+                    *requires_block_below,
+                    valid_blocks,
+                    pos,
+                ),
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
@@ -4768,6 +5183,428 @@ mod tests {
         );
         for (key, count) in entries {
             println!("  {key} {count}");
+        }
+    }
+
+    #[test]
+    fn test_disk_feature_placement() {
+        // 1. Parsing official data pack disk schema
+        let disk_doc = json!({
+            "type": "minecraft:disk",
+            "half_height": 1,
+            "radius": {
+                "type": "minecraft:uniform",
+                "min_inclusive": 2,
+                "max_inclusive": 2
+            },
+            "state_provider": {
+                "id": "minecraft:clay"
+            },
+            "target": {
+                "type": "minecraft:matching_blocks",
+                "blocks": ["minecraft:dirt", "minecraft:clay"]
+            }
+        });
+        let parsed = parse_configured_feature(&disk_doc).expect("parses disk feature");
+        assert!(parsed.is_supported());
+        let ConfiguredFeature::Disk {
+            state_provider,
+            target_predicate,
+            radius,
+            half_height,
+        } = &parsed
+        else {
+            panic!("expected ConfiguredFeature::Disk");
+        };
+        assert_eq!(*half_height, 1);
+        assert_eq!(
+            *state_provider,
+            StateProvider::Constant {
+                state: "minecraft:clay".to_string()
+            }
+        );
+        assert!(target_predicate.is_modelable());
+        assert_eq!(
+            *radius,
+            RangeProvider::Uniform {
+                min_inclusive: VerticalAnchor::Absolute(2),
+                max_inclusive: VerticalAnchor::Absolute(2)
+            }
+        );
+
+        // 2. Placing disk in world
+        let mut target = TestTarget::new().write_anywhere();
+        // Fill an 11x11x5 volume around (8, 64, 8) with dirt
+        for y in 60..=68 {
+            for x in 3..=13 {
+                for z in 3..=13 {
+                    target.set_block(x, y, z, "minecraft:dirt");
+                }
+            }
+        }
+        // Place some stone inside the cylinder to ensure target predicate filters it out
+        target.set_block(8, 64, 8, "minecraft:stone");
+
+        let placed_feature = PlacedFeature {
+            id: "test:disk".to_string(),
+            feature: Rc::new(parsed),
+            modifiers: vec![],
+        };
+        let data = FeatureData::default();
+        let mut random = DecorationRandom::new(12345);
+        let origin = DecorationPos { x: 8, y: 64, z: 8 };
+        let written = data.run_chain(&mut target, &placed_feature, 0, origin, &mut random);
+
+        // Cylinder radius=2 (sq=4), half_height=1:
+        // dy in [-1, 0, 1] (3 layers).
+        // On each layer, dx in [-2..=2], dz in [-2..=2] with dx*dx + dz*dz <= 4:
+        // dx=0: dz in -2..=2 (5)
+        // dx=1, -1: dz in -1..=1 (3 each => 6)
+        // dx=2, -2: dz=0 (1 each => 2)
+        // Total points per layer: 5 + 6 + 2 = 13 points.
+        // For 3 layers: 13 * 3 = 39 candidate positions.
+        // But (8, 64, 8) is stone, so it is not replaced!
+        // Expected placed: 39 - 1 = 38!
+        assert_eq!(written, 38);
+        assert_eq!(target.block_at(8, 64, 8), Some("minecraft:stone"));
+        assert_eq!(target.block_at(8, 64, 9), Some("minecraft:clay"));
+        assert_eq!(target.block_at(8, 64, 10), Some("minecraft:clay"));
+        // (8, 64, 11) is dz=3 (outside radius=2), should still be dirt
+        assert_eq!(target.block_at(8, 64, 11), Some("minecraft:dirt"));
+        // y=66 is dy=2 (outside half_height=1), should still be dirt
+        assert_eq!(target.block_at(8, 66, 8), Some("minecraft:dirt"));
+
+        // 3. Rule-based disk placement
+        let rule_disk_doc = json!({
+            "type": "minecraft:disk",
+            "half_height": 0,
+            "radius": 1,
+            "state_provider": {
+                "type": "minecraft:rule_based",
+                "fallback": { "id": "minecraft:sand" },
+                "rules": [{
+                    "if_true": {
+                        "type": "minecraft:matching_blocks",
+                        "blocks": ["minecraft:air"],
+                        "offset": [0, -1, 0]
+                    },
+                    "then": { "id": "minecraft:sandstone" }
+                }]
+            },
+            "target": {
+                "type": "minecraft:matching_blocks",
+                "blocks": ["minecraft:dirt"]
+            }
+        });
+        let rule_feature = parse_configured_feature(&rule_disk_doc).expect("parses rule disk");
+        let placed_rule = PlacedFeature {
+            id: "test:rule_disk".to_string(),
+            feature: Rc::new(rule_feature),
+            modifiers: vec![],
+        };
+        // Setup target: (8, 64, 8) has air below it (8, 63, 8)
+        target.set_block(8, 64, 8, "minecraft:dirt");
+        target.set_block(8, 63, 8, "minecraft:air");
+        // (9, 64, 8) has dirt below it (9, 63, 8)
+        target.set_block(9, 64, 8, "minecraft:dirt");
+        target.set_block(9, 63, 8, "minecraft:stone");
+
+        let written_rule = data.run_chain(&mut target, &placed_rule, 0, origin, &mut random);
+        assert!(written_rule > 0);
+        // Position above air got sandstone:
+        assert_eq!(target.block_at(8, 64, 8), Some("minecraft:sandstone"));
+        // Position above stone got sand:
+        assert_eq!(target.block_at(9, 64, 8), Some("minecraft:sand"));
+    }
+
+    #[test]
+    fn test_spring_feature_placement() {
+        // 1. Parsing official data pack spring schema
+        let spring_doc = json!({
+            "type": "minecraft:spring_feature",
+            "state": {
+                "id": "minecraft:water",
+                "properties": {
+                    "falling": "true"
+                }
+            },
+            "valid_blocks": [
+                "minecraft:stone",
+                "minecraft:granite"
+            ],
+            "rock_count": 4,
+            "hole_count": 1,
+            "requires_block_below": true
+        });
+        let parsed = parse_configured_feature(&spring_doc).expect("parses spring feature");
+        assert!(parsed.is_supported());
+        let ConfiguredFeature::Spring {
+            state,
+            rock_count,
+            hole_count,
+            requires_block_below,
+            valid_blocks,
+        } = &parsed
+        else {
+            panic!("expected ConfiguredFeature::Spring");
+        };
+        assert_eq!(
+            state, "minecraft:water",
+            "the fluid state becomes its block state"
+        );
+        assert_eq!(*rock_count, 4);
+        assert_eq!(*hole_count, 1);
+        assert!(*requires_block_below);
+        assert_eq!(valid_blocks.len(), 2);
+
+        let placed_spring = PlacedFeature {
+            id: "test:spring".to_string(),
+            feature: Rc::new(parsed),
+            modifiers: vec![],
+        };
+        let data = FeatureData::default();
+        let mut random = DecorationRandom::new(999);
+        let origin = DecorationPos { x: 8, y: 64, z: 8 };
+        let pocket = |sides: [&str; 4], above: &str, below: &str| {
+            let mut target = TestTarget::new().write_anywhere();
+            target.set_block(8, 64, 8, "minecraft:air");
+            target.set_block(8, 65, 8, above);
+            target.set_block(8, 63, 8, below);
+            target.set_block(7, 64, 8, sides[0]);
+            target.set_block(9, 64, 8, sides[1]);
+            target.set_block(8, 64, 7, sides[2]);
+            target.set_block(8, 64, 9, sides[3]);
+            target
+        };
+        let stone = "minecraft:stone";
+        let air = "minecraft:air";
+        let obsidian = "minecraft:obsidian";
+        let mut run = |mut target: TestTarget| {
+            data.run_chain(&mut target, &placed_spring, 0, origin, &mut random)
+        };
+
+        // Three stone sides, the block below, and one opening.
+        assert_eq!(run(pocket([air, stone, stone, stone], stone, stone)), 1);
+        // A granite side counts through `valid_blocks`.
+        assert_eq!(
+            run(pocket(
+                [air, "minecraft:granite", stone, stone],
+                stone,
+                stone
+            )),
+            1
+        );
+        // The ceiling is a gate, not a count: open sky never passes, even
+        // though the five counted cells are exactly four rocks and one hole.
+        assert_eq!(run(pocket([air, stone, stone, stone], air, stone)), 0);
+        // A foreign ceiling fails the same way.
+        assert_eq!(run(pocket([air, stone, stone, stone], obsidian, stone)), 0);
+        // Only three valid cells below the ceiling: the ceiling does not top
+        // the count back up to four.
+        assert_eq!(run(pocket([air, obsidian, stone, stone], stone, stone)), 0);
+        // Counts are exact in both directions.
+        assert_eq!(run(pocket([stone, stone, stone, stone], stone, stone)), 0);
+        assert_eq!(run(pocket([air, air, stone, stone], stone, stone)), 0);
+        // The block below is required by default.
+        assert_eq!(run(pocket([air, stone, stone, stone], stone, air)), 0);
+    }
+
+    #[test]
+    fn a_spring_state_is_its_block_state_in_the_block_registry() {
+        let doc = |id: &str| {
+            json!({"type": "minecraft:spring_feature", "valid_blocks": "minecraft:stone",
+                "state": {"id": id, "properties": {"falling": "true"}}})
+        };
+        let state_of = |id: &str| match parse_configured_feature(&doc(id)).expect("parses") {
+            ConfiguredFeature::Spring { state, .. } => state,
+            other => panic!("expected a spring, got {other:?}"),
+        };
+        assert_eq!(state_of("minecraft:water"), "minecraft:water");
+        assert_eq!(state_of("minecraft:lava"), "minecraft:lava");
+        assert_eq!(
+            parse_configured_feature(&doc("minecraft:flowing_water")).expect("parses"),
+            ConfiguredFeature::Unsupported {
+                kind: "minecraft:spring_feature:state".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn spring_counts_outside_the_five_cells_are_gaps_not_defaults() {
+        let doc = json!({"type": "minecraft:spring_feature", "valid_blocks": "minecraft:stone",
+            "state": {"id": "minecraft:water"}, "rock_count": 4294967297_i64});
+        assert_eq!(
+            parse_configured_feature(&doc).expect("parses"),
+            ConfiguredFeature::Unsupported {
+                kind: "minecraft:spring_feature:rock_count".to_string()
+            }
+        );
+    }
+
+    /// A chunk corner: `block_at` stops at the chunk edge as the generator's
+    /// own view does, and `read_block` answers past it.
+    struct CornerPocket;
+
+    impl DecorationTarget for CornerPocket {
+        fn min_y(&self) -> i32 {
+            0
+        }
+        fn height(&self) -> i32 {
+            128
+        }
+        fn writable(&self, x: i32, _y: i32, z: i32) -> bool {
+            (x >> 4, z >> 4) == (0, 0)
+        }
+        fn block_at(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+            if !self.writable(x, y, z) {
+                return None;
+            }
+            Some(match (x, y, z) {
+                (15, 64, 15) | (15, 64, 14) => "minecraft:air",
+                _ => "minecraft:stone",
+            })
+        }
+        fn read_block(&self, x: i32, y: i32, z: i32) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(
+                self.block_at(x, y, z).unwrap_or("minecraft:stone"),
+            ))
+        }
+        fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
+            self.block_at(x, y, z) == Some("minecraft:air")
+        }
+        fn set_block(&mut self, _x: i32, _y: i32, _z: i32, _name: &str) {}
+        fn biome_at(&self, _x: i32, _y: i32, _z: i32) -> Option<String> {
+            None
+        }
+        fn ocean_floor_height(&self, _x: i32, _z: i32) -> i32 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_pocket_on_a_chunk_corner_reads_its_neighbours() {
+        let valid = vec!["minecraft:stone".to_string()];
+        let tags = BlockTags::default();
+        let corner = DecorationPos {
+            x: 15,
+            y: 64,
+            z: 15,
+        };
+        let placed = place_spring(
+            &mut CornerPocket,
+            &tags,
+            "minecraft:water",
+            4,
+            1,
+            true,
+            &valid,
+            corner,
+        );
+        assert_eq!(placed, 1, "east and south are stone in the next chunks");
+    }
+
+    fn disk_of(provider: Value, radius: Value, half_height: i32) -> PlacedFeature {
+        let document = json!({"type": "minecraft:disk", "half_height": half_height,
+            "radius": radius, "state_provider": provider,
+            "target": {"type": "minecraft:matching_blocks", "blocks": ["minecraft:stone"]}});
+        PlacedFeature {
+            id: "test:disk".to_string(),
+            feature: Rc::new(parse_configured_feature(&document).expect("parses")),
+            modifiers: vec![],
+        }
+    }
+
+    /// Stone below the candidate picks sand, anything else clay. Written in
+    /// column order, top first, every row still has the original stone under
+    /// it; a bottom-up walk would turn the upper rows to clay.
+    #[test]
+    fn a_disk_column_runs_top_down_before_the_next_column() {
+        let provider = json!({"type": "minecraft:rule_based",
+            "fallback": {"id": "minecraft:clay"},
+            "rules": [{"if_true": {"type": "minecraft:matching_blocks",
+                "blocks": ["minecraft:stone"], "offset": [0, -1, 0]},
+                "then": {"id": "minecraft:sand"}}]});
+        let disk = disk_of(provider, json!(0), 1);
+        let mut target = TestTarget::new().write_anywhere();
+        let data = FeatureData::default();
+        let mut random = DecorationRandom::new(5);
+        let origin = DecorationPos { x: 8, y: 64, z: 8 };
+        assert_eq!(
+            data.run_chain(&mut target, &disk, 0, origin, &mut random),
+            3
+        );
+        for y in 63..=65 {
+            assert_eq!(target.block_at(8, y, 8), Some("minecraft:sand"), "row {y}");
+        }
+    }
+
+    #[test]
+    fn a_zero_radius_disk_fills_its_centre_column() {
+        let disk = disk_of(json!({"id": "minecraft:clay"}), json!(0), 2);
+        let mut target = TestTarget::new().write_anywhere();
+        let data = FeatureData::default();
+        let mut random = DecorationRandom::new(5);
+        let origin = DecorationPos { x: 8, y: 64, z: 8 };
+        assert_eq!(
+            data.run_chain(&mut target, &disk, 0, origin, &mut random),
+            5
+        );
+        assert_eq!(target.blocks("minecraft:clay"), 5);
+        assert_eq!(target.block_at(9, 64, 8), Some("minecraft:stone"));
+    }
+
+    #[test]
+    fn a_radius_past_the_replay_window_is_a_gap() {
+        let doc = |radius: Value| {
+            json!({"type": "minecraft:disk", "half_height": 1, "radius": radius,
+                "state_provider": {"id": "minecraft:clay"},
+                "target": {"type": "minecraft:matching_blocks", "blocks": ["minecraft:stone"]}})
+        };
+        let gap = ConfiguredFeature::Unsupported {
+            kind: "minecraft:disk:radius".to_string(),
+        };
+        assert_eq!(parse_configured_feature(&doc(json!(50_000))).unwrap(), gap);
+        assert_eq!(
+            parse_configured_feature(&doc(
+                json!({"type": "minecraft:uniform", "min_inclusive": 2, "max_inclusive": 17})
+            ))
+            .unwrap(),
+            gap
+        );
+        assert_eq!(parse_configured_feature(&doc(json!(-1))).unwrap(), gap);
+        assert!(
+            parse_configured_feature(&doc(json!(16)))
+                .unwrap()
+                .is_supported()
+        );
+    }
+
+    /// Requires the operator-provisioned data pack. `spring_water` reaches the
+    /// runtime through modifiers this branch has. The disks parse, but their
+    /// placements still need `minecraft:heightmap` and
+    /// `minecraft:block_predicate_filter`, so they stay gated and report that.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn the_real_pack_reaches_springs_and_gates_disks() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = FeatureData::load(&root).expect("the provisioned pack loads");
+        for id in ["spring_water", "spring_lava", "spring_lava_frozen"] {
+            let placed = data
+                .placed
+                .get(&format!("minecraft:{id}"))
+                .expect("spring placement");
+            println!("{id} modelable: {}", placed.is_modelable());
+        }
+        assert!(data.placed["minecraft:spring_water"].is_modelable());
+        for id in ["disk_clay", "disk_gravel", "disk_sand"] {
+            let name = format!("minecraft:{id}");
+            assert!(data.configured[&name].is_supported(), "{id} is modeled");
+            assert!(
+                !data.placed[&name].is_modelable(),
+                "{id} needs placement modifiers from the ground-cover work"
+            );
         }
     }
 }
