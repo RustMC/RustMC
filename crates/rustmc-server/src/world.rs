@@ -1,5 +1,10 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod container;
+
+#[cfg(test)]
+mod tests_container;
+
 pub mod fluid;
 
 pub mod experience;
@@ -27,7 +32,6 @@ mod tests_entity_tracker;
 
 pub mod journal;
 pub use journal::{MAX_MUTATIONS_PER_TICK, WorldJournal};
-
 #[cfg(test)]
 mod tests_interaction;
 #[cfg(test)]
