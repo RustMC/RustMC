@@ -24,7 +24,7 @@
 //! [`STACK_MERGE_RADIUS`] have no recorded source; the wiki describes merging within a
 //! `0.5 x 0.25 x 0.5` box rather than a Euclidean radius.
 
-use crate::discovery_java::{frame, put_varint};
+use crate::java_wire::{frame, put_varint};
 use crate::world::{Block, CHUNK_SIDE, Chunk, WORLD_HEIGHT};
 use std::collections::HashSet;
 use std::fmt;
@@ -1672,7 +1672,7 @@ mod tests {
 
     #[test]
     fn test_chunk_collision_view() {
-        let mut chunk = Chunk::new(0, 0);
+        let mut chunk = Chunk::empty(0, 0);
         chunk.set_block(0, 0, 0, Block::Stone);
 
         // Item falling directly onto chunk block at (0, 0, 0)

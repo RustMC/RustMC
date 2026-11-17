@@ -1,7 +1,13 @@
-//! Entity mechanics, dropped item physics, and world interactions.
+//! Entity definitions, AI behavior systems, and dropped item mechanics.
 
+pub mod ai;
 pub mod item;
 
+pub use ai::{
+    DamageEvent, EntityEntry, EntityKind, Goal, GoalFlags, GoalSelector, LookAtPlayerGoal,
+    MAX_PENDING_DAMAGE_EVENTS, MeleeAttackGoal, MobEntity, NearestAttackableTargetGoal,
+    PrioritizedGoal, RandomStrollGoal, Vec3, WorldView, calculate_look_at, wrap_degrees,
+};
 pub use item::{
     AIR_DRAG_HORIZONTAL, AIR_DRAG_VERTICAL, Aabb, BLOCK_BREAK_PICKUP_DELAY, DESPAWN_TICKS,
     GROUND_FRICTION, ITEM_GRAVITY, ITEM_HEIGHT, ITEM_TERMINAL_VELOCITY, ITEM_WIDTH, ItemEntity,
