@@ -49,10 +49,17 @@ pub use fluid::{
 };
 
 pub mod brewing;
+pub mod container_data;
+pub mod furnace;
 
 pub use brewing::{
     BrewingRecipe, BrewingRecipeRegistry, BrewingStandBlockEntity, BrewingStandProperty, ItemStack,
-    SetContainerDataPacket,
+};
+pub use container_data::{
+    SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
+};
+pub use furnace::{
+    FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
 };
 
 pub const CHUNK_SIDE: usize = 16;
