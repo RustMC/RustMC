@@ -1,7 +1,11 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod fluid;
+
 pub mod experience;
 pub mod physics;
+#[cfg(test)]
+mod tests_fluid;
 pub mod time_weather;
 
 pub mod block_entity;
@@ -23,6 +27,10 @@ pub use interaction::*;
 pub use physics::{
     Aabb, PhysicsBody, SimpleVoxelWorld, StepResult, WorldCollisionView, compute_fall_damage,
     compute_fall_damage_f32,
+};
+
+pub use fluid::{
+    BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
 pub const CHUNK_SIDE: usize = 16;
