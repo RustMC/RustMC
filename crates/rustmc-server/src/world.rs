@@ -53,7 +53,8 @@ pub mod container_data;
 pub mod furnace;
 
 pub use brewing::{
-    BrewingRecipe, BrewingRecipeRegistry, BrewingStandBlockEntity, BrewingStandProperty, ItemStack,
+    BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
+    BrewingStandProperty, Potion,
 };
 pub use container_data::{
     SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
