@@ -8,16 +8,24 @@ Java Edition **26.3**, network protocol **777**, is the initial target. Mojang's
 
 Bedrock Edition **1.26.51**, network protocol **2193**, is the initial target. Mojang's [1.26.51 protocol release](https://github.com/Mojang/bedrock-protocol-docs/releases/tag/v1.26.51) states the network identifier. Mojang's [26.52 hotfix announcement](https://feedback.minecraft.net/hc/en-us/articles/49175370527501-Minecraft-Bedrock-Edition-26-52-Hotfix-Changelog) establishes that 26.52 is newer, but no matching stable Mojang protocol schema was published at this check. Choosing the latest version with a published stable protocol identifier keeps the first target auditable. No claim of 26.52 compatibility follows from 1.26.51 discovery.
 
-These identifiers select discovery responses only. Java's handshake carries a client protocol number, so mismatches can receive a status naming 777; Bedrock's unconnected ping carries no game network version, so discovery cannot authenticate or reject a client version. Neither route enables login or play. The Java 26.3 status path was observed with the owner's client; Bedrock ping behavior still requires a real-client check.
+These identifiers select discovery responses only. Java's handshake carries a client protocol number, so mismatches can receive a status naming 777. Bedrock's unconnected ping carries no game network version, while the initial offline RakNet handshake (Open Connection Request 1) verifies RakNet protocol version 11 and rejects mismatches with Incompatible Protocol Version (`0x19`), followed by Open Connection Request 2 (`0x07` -> `0x08`) MTU negotiation. Connected frame sets (`0x80..=0x8f`), online RakNet reliability, session management, and game login remain unimplemented and are dropped at the offline boundary. Neither route enables login or play. The Java 26.3 status path was observed with the owner's client; Bedrock ping and offline handshake behavior still require a real-client check.
 
 | Area | Java 26.3 | Bedrock 1.26.51 | Current evidence |
 | --- | --- | --- | --- |
-| Discovery | tested: 26.3 server-list status and ping | partial: UDP ping/pong synthetic socket test | Java 26.3 client showed `RustMC discovery only; login unavailable` and `0/0` with a green connection indicator on 29 September 2026; RustMC logged completed status exchanges. Bedrock real-client observation remains open. |
+| Discovery | tested: 26.3 server-list status and ping | partial: UDP ping/pong and offline RakNet handshake guard (Open Connection Request/Reply 1 & 2, Incompatible Protocol Version 0x19) synthetic socket test | Java 26.3 client showed `RustMC discovery only; login unavailable` and `0/0` with a green connection indicator on 29 September 2026; RustMC logged completed status exchanges. Bedrock synthetic tests cover unconnected ping/pong, MTU clamping/negotiation, version mismatch guard, and frame set drops; real-client observation remains open. |
 | Connection and authentication | partial: opt-in loopback Creative terrain preview; configuration and initial play rendered in a real client, no authentication or authoritative gameplay | planned | A real Java 26.3 client accepted the local core-pack registry and tag exchange, entered Creative preview play, and visibly rendered original chunks on 29 September 2026. No account authentication or gameplay state exists. |
 | Rules and update ordering | planned | planned translation; native parity unknown | None |
 | Inventory, commands, recipes, interactions | planned | planned translation | None |
 | Generation and seed behavior | partial: original preview plus an opt-in, operator-provisioned data-driven Overworld probe | unknown | Determinism, packet parity tests, and local client observation; the probe now runs the placement stage's ore and blob stone families over pack-derived rules, with per-family block counts measured against the owner's save, but it still lacks the placement stage's vegetation and tree families, structures, and exact per-position vanilla world-generation parity. Its disk cache stores immutable preview packets, not world edits. |
 | Save/import/export | planned | unknown | None |
 | Cross-edition translation differences | not applicable | planned | None |
+
+The T4 oracle's `flowers` row counts selected small-flower block names; its
+historical measurements used an older definition, so their values are not
+interchangeable with current rows. Neither is a count of all flowering
+vegetation. The census also reports `wildflowers`, `bushes`, and
+`tall_flowers` as separate block-row
+families. These are measurement categories, not evidence that their placement
+or behavior is implemented.
 
 The proposed shared world uses Java-style game rules. Bedrock support would translate client actions and results; it does not promise identical edition mechanics. The discovery version targets are selected; the gameplay rules baseline still needs owner approval. The matrix must grow into versioned feature entries backed by black-box observations and tests. The default loopback process answers discovery only. With explicit local preview configuration, Java 26.3 can inspect immutable generated chunks; it has no authenticated, persistent, or shared gameplay world.
