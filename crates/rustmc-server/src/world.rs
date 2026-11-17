@@ -50,9 +50,9 @@ pub use fluid::{
 
 pub mod events;
 pub use events::{
-    AcknowledgeBlockChangePacket, BlockBreakEvent, BlockBreakOutcome, BlockFace, BlockPlaceEvent,
+    AcknowledgeBlockChangePacket, BlockBreakEvent, BlockBreakOutcome, BlockPlaceEvent,
     BlockPlaceOutcome, BlockUpdatePacket, BreakRollback, Cancellable, ContainerSetSlotPacket,
-    Event, EventBus, EventPriority, InteractAction, InteractionHand, ItemStack, PlaceRollback,
+    DispatchError, Event, EventBus, EventPriority, InteractAction, InteractionHand, PlaceRollback,
     PlayerInteractEvent, UnresolvedItemId, apply_block_break, apply_block_place, rollback_break,
     rollback_break_explicit, rollback_break_with_ack, rollback_place, rollback_place_explicit,
     rollback_place_with_ack,
@@ -211,38 +211,6 @@ impl Block {
             Some(Self::ALL[value as usize])
         } else {
             None
-        }
-    }
-}
-
-impl Block {
-    /// Protocol-777 default block state ID for Java 26.3 preview.
-    pub const fn default_state_id(self) -> u32 {
-        match self {
-            Self::Air => 0,
-            Self::Bedrock => 88,
-            Self::Stone => 1,
-            Self::Dirt => 10,
-            Self::Grass => 9,
-            Self::Log => 140,
-            Self::Leaves => 294,
-            Self::Sand => 121,
-            Self::Sandstone => 677,
-            Self::Snow => 8598,
-            Self::SpruceLog => 143,
-            Self::SpruceLeaves => 322,
-            Self::AcaciaLog => 152,
-            Self::AcaciaLeaves => 406,
-            Self::JungleLog => 149,
-            Self::JungleLeaves => 378,
-            Self::RedSand => 126,
-            Self::RedSandstone => 15094,
-            Self::Terracotta => 14759,
-            Self::ShortGrass => 2363,
-            Self::SnowLayer => 8589,
-            Self::Carpet => 14743,
-            Self::TallGrassLower => 14771,
-            Self::TallGrassUpper => 14770,
         }
     }
 }

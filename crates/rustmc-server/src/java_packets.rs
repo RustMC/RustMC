@@ -91,8 +91,10 @@ pub mod play {
     }
     pub mod clientbound {
         pub const BLOCK_CHANGED_ACK: u32 = 4;
+        pub const BLOCK_UPDATE: u32 = 8;
         pub const CHUNK_BATCH_FINISHED: u32 = 11;
         pub const CHUNK_BATCH_START: u32 = 12;
+        pub const CONTAINER_SET_SLOT: u32 = 20;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;
         pub const GAME_EVENT: u32 = 39;
         pub const KEEP_ALIVE: u32 = 45;
