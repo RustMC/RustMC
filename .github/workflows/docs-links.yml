@@ -1,0 +1,27 @@
+name: docs-links
+# Checks that relative links and heading anchors in tracked Markdown resolve.
+# External URLs are not fetched, so results do not depend on other sites.
+on:
+  push:
+    branches: ['**']
+    paths: ['**/*.md', '.github/workflows/docs-links.yml']
+  pull_request:
+    paths: ['**/*.md', '.github/workflows/docs-links.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: docs-links-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lychee:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node.js 24
+        with:
+          persist-credentials: false
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --no-progress './**/*.md'
+          fail: true
