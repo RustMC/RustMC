@@ -1687,6 +1687,8 @@ mod tests {
     #[test]
     #[ignore = "requires operator-provisioned local data"]
     fn smoke_column_ids_splits_deepslate_and_fires_veins() {
+        const SPRING_WATER: &str = "minecraft:water";
+        const SPRING_LAVA: &str = "minecraft:lava";
         let root = std::env::var("RUSTMC_VANILLA_DATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
@@ -1739,11 +1741,14 @@ mod tests {
                         if before == id.as_deref() {
                             continue;
                         }
-                        // A row the pass did change: it can only change one its
-                        // target test accepts.
+                        // A row the pass did change: a vein recolors only rows its
+                        // target test accepts, and a spring is the one feature that
+                        // fills an unset (cave air) row, with its fluid's block.
+                        let spring_fill = before.is_none()
+                            && matches!(id.as_deref(), Some(SPRING_WATER | SPRING_LAVA));
                         assert!(
-                            before
-                                .is_some_and(|before| tags
+                            spring_fill
+                                || before.is_some_and(|before| tags
                                     .contains("minecraft:base_stone_overworld", before)),
                             "({x}, {z}) row {y}: the placement stage wrote {id:?} onto {before:?}"
                         );
@@ -1751,10 +1756,17 @@ mod tests {
                     assert_eq!(
                         ids.iter()
                             .zip(base.iter())
-                            .filter(|(after, before)| after.is_some() != before.is_some())
+                            .filter(|(after, before)| {
+                                after.is_some() != before.is_some()
+                                    && !(before.is_none()
+                                        && matches!(
+                                            after.as_deref(),
+                                            Some(SPRING_WATER | SPRING_LAVA)
+                                        ))
+                            })
                             .count(),
                         0,
-                        "({x}, {z}): a vein cannot create or remove a row, only recolor one"
+                        "({x}, {z}): only a spring may create a row, and nothing may remove one"
                     );
                 }
             }
