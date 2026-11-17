@@ -29,6 +29,7 @@ use super::plant_support;
 
 use crate::vanilla::random::DecorationRandom;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, stem, walk_json};
+use crate::world::Direction;
 
 /// One block-replacement rule test, as the data pack writes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +343,17 @@ pub enum BlockPredicate {
         blocks: Vec<String>,
         offset: (i32, i32, i32),
     },
+    /// `minecraft:matching_fluids` — the fluid carried by the block state at
+    /// `pos + offset` matches one of `fluids` (or a `#` fluid tag).
+    MatchingFluids {
+        fluids: Vec<String>,
+        offset: (i32, i32, i32),
+    },
+    /// `minecraft:inside_world_bounds` — tests whether `pos + offset` lies within
+    /// the buildable vertical range `[min_y, min_y + height)`.
+    InsideWorldBounds { offset: (i32, i32, i32) },
+    /// `minecraft:true` — always succeeds.
+    True,
     /// `minecraft:any_of` — at least one nested test passes.
     AnyOf(Vec<BlockPredicate>),
     /// `minecraft:all_of` — every nested test passes.
@@ -388,6 +400,24 @@ impl BlockPredicate {
                         .iter()
                         .any(|candidate| base_block_id(candidate) == block)
                 }),
+            Self::MatchingFluids { fluids, offset } => target
+                .read_block(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
+                .is_some_and(|block| {
+                    let fluid = fluid_from_block_state(&block);
+                    let base = base_block_id(&block);
+                    fluids.iter().any(|candidate| {
+                        if let Some(tag) = candidate.strip_prefix('#') {
+                            tags.contains(tag, fluid) || tags.contains(tag, base)
+                        } else {
+                            candidate == fluid
+                        }
+                    })
+                }),
+            Self::InsideWorldBounds { offset } => {
+                let ty = pos.y + offset.1;
+                ty >= target.min_y() && ty < target.min_y() + target.height()
+            }
+            Self::True => true,
             Self::AnyOf(rules) => rules.iter().any(|rule| rule.test(target, pos, tags)),
             Self::AllOf(rules) => rules.iter().all(|rule| rule.test(target, pos, tags)),
             Self::Not(rule) => !rule.test(target, pos, tags),
@@ -400,6 +430,48 @@ impl StateProvider {
     /// Whether every state this provider can hand out has a ground rule.
     fn is_placeable(&self) -> bool {
         self.is_modelable() && self.states().into_iter().all(plant_support::is_placeable)
+    }
+}
+
+/// Extracts one property value from a rendered block state string `id[k1=v1,k2=v2]`.
+fn block_state_property<'a>(state: &'a str, key: &str) -> Option<&'a str> {
+    let (_, rest) = state.split_once('[')?;
+    let props = rest.strip_suffix(']').unwrap_or(rest);
+    for pair in props.split(',') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k.trim() == key {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+/// Derives the fluid identifier (`minecraft:fluid` registry) carried by a block
+/// state from its `waterlogged` / `level` state properties (from 26.3 `blocks.json`)
+/// and base fluid block identity (`minecraft:water` / `minecraft:lava`), without a
+/// hard-coded plant block list.
+fn fluid_from_block_state(state: &str) -> &'static str {
+    if block_state_property(state, "waterlogged") == Some("true") {
+        return "minecraft:water";
+    }
+    match base_block_id(state) {
+        "minecraft:water" => {
+            if block_state_property(state, "level").is_some_and(|lvl| lvl != "0") {
+                "minecraft:flowing_water"
+            } else {
+                "minecraft:water"
+            }
+        }
+        "minecraft:lava" => {
+            if block_state_property(state, "level").is_some_and(|lvl| lvl != "0") {
+                "minecraft:flowing_lava"
+            } else {
+                "minecraft:lava"
+            }
+        }
+        _ => "minecraft:empty",
     }
 }
 
@@ -680,6 +752,22 @@ pub enum PlacementModifier {
     /// `minecraft:block_predicate_filter` — keep the candidate only if the
     /// predicate holds around it.
     BlockPredicateFilter { predicate: BlockPredicate },
+    /// `minecraft:surface_relative_threshold_filter` — keeps the candidate when
+    /// `pos.y - ocean_floor_height` lies inside `[min_inclusive, max_inclusive]`.
+    SurfaceRelativeThresholdFilter {
+        heightmap: String,
+        min_inclusive: i32,
+        max_inclusive: i32,
+    },
+    /// `minecraft:environment_scan` — walks along `direction_of_search` up to
+    /// `max_steps` while `allowed_search_condition` holds, advancing on the
+    /// first position where `target_condition` holds.
+    EnvironmentScan {
+        direction_of_search: Direction,
+        max_steps: i32,
+        target_condition: BlockPredicate,
+        allowed_search_condition: Option<BlockPredicate>,
+    },
     /// A decoration without a runtime here. Named, never skipped silently.
     Unsupported { kind: String },
 }
@@ -772,6 +860,19 @@ impl PlacedFeature {
                 PlacementModifier::Count { count } => count.is_modelable(),
                 PlacementModifier::HeightRange { height } => height.is_modelable(),
                 PlacementModifier::BlockPredicateFilter { predicate } => predicate.is_modelable(),
+                PlacementModifier::SurfaceRelativeThresholdFilter { heightmap, .. } => {
+                    heightmap == "OCEAN_FLOOR_WG"
+                }
+                PlacementModifier::EnvironmentScan {
+                    target_condition,
+                    allowed_search_condition,
+                    ..
+                } => {
+                    target_condition.is_modelable()
+                        && allowed_search_condition
+                            .as_ref()
+                            .is_none_or(BlockPredicate::is_modelable)
+                }
                 _ => true,
             })
     }
@@ -1468,6 +1569,34 @@ fn parse_block_predicate(value: Option<&Value>) -> BlockPredicate {
                 None => unsupported(kind),
             }
         }
+        "minecraft:matching_fluids" => {
+            let fluids: Vec<String> = match object.get("fluids") {
+                Some(Value::Array(list)) => list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect(),
+                Some(Value::String(single)) => vec![single.to_string()],
+                _ => Vec::new(),
+            };
+            let count = object
+                .get("fluids")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(1);
+            if fluids.is_empty() || fluids.len() != count {
+                return unsupported(kind);
+            }
+            match parse_block_offset(object) {
+                Some(offset) => BlockPredicate::MatchingFluids { fluids, offset },
+                None => unsupported(kind),
+            }
+        }
+        "minecraft:inside_world_bounds" => match parse_block_offset(object) {
+            Some(offset) => BlockPredicate::InsideWorldBounds { offset },
+            None => unsupported(kind),
+        },
+        "minecraft:true" => BlockPredicate::True,
         // An empty conjunction would accept every position and an empty
         // disjunction is a no-op, so neither is read as a filter at all.
         "minecraft:any_of" | "minecraft:all_of" => {
@@ -1860,6 +1989,35 @@ fn record_unmodeled_modifiers(counts: &mut HashMap<String, usize>, placed: &Plac
                     }
                 }
             }
+            PlacementModifier::SurfaceRelativeThresholdFilter { heightmap, .. }
+                if heightmap != "OCEAN_FLOOR_WG" =>
+            {
+                let key =
+                    format!("placement:minecraft:surface_relative_threshold_filter:{heightmap}");
+                if seen.insert(key.clone()) {
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+            }
+            PlacementModifier::EnvironmentScan {
+                target_condition,
+                allowed_search_condition,
+                ..
+            } => {
+                let mut kinds = unmodeled_predicates(target_condition);
+                if let Some(allowed) = allowed_search_condition {
+                    kinds.extend(unmodeled_predicates(allowed));
+                }
+                for kind in kinds {
+                    for key in [
+                        "placement:minecraft:environment_scan".to_string(),
+                        format!("predicate:{kind}"),
+                    ] {
+                        if seen.insert(key.clone()) {
+                            *counts.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2238,9 +2396,98 @@ fn parse_placement_modifier(
         "minecraft:block_predicate_filter" => Ok(PlacementModifier::BlockPredicateFilter {
             predicate: parse_block_predicate(entry.get("predicate")),
         }),
+        "minecraft:surface_relative_threshold_filter" => {
+            let heightmap = entry
+                .get("heightmap")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorldgenError::Invalid(format!(
+                        "{id}: surface_relative_threshold_filter missing heightmap"
+                    ))
+                })?
+                .to_string();
+            let min_inclusive = match entry.get("min_inclusive") {
+                Some(v) => v
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        WorldgenError::Invalid(format!(
+                            "{id}: surface_relative_threshold_filter invalid min_inclusive"
+                        ))
+                    })?,
+                None => i32::MIN,
+            };
+            let max_inclusive = match entry.get("max_inclusive") {
+                Some(v) => v
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        WorldgenError::Invalid(format!(
+                            "{id}: surface_relative_threshold_filter invalid max_inclusive"
+                        ))
+                    })?,
+                None => i32::MAX,
+            };
+            Ok(PlacementModifier::SurfaceRelativeThresholdFilter {
+                heightmap,
+                min_inclusive,
+                max_inclusive,
+            })
+        }
+        "minecraft:environment_scan" => {
+            let dir_str = entry
+                .get("direction_of_search")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorldgenError::Invalid(format!(
+                        "{id}: environment_scan missing direction_of_search"
+                    ))
+                })?;
+            let direction_of_search = parse_direction_name(dir_str).ok_or_else(|| {
+                WorldgenError::Invalid(format!(
+                    "{id}: environment_scan invalid direction {dir_str}"
+                ))
+            })?;
+            let max_steps = entry
+                .get("max_steps")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{id}: environment_scan missing max_steps"))
+                })?;
+            // Minecraft's EnvironmentScanFilter codec accepts `max_steps` in `1..=32`.
+            if !(1..=32).contains(&max_steps) {
+                return Err(WorldgenError::Invalid(format!(
+                    "{id}: environment_scan max_steps must be in 1..=32, got {max_steps}"
+                )));
+            }
+            let target_condition = parse_block_predicate(entry.get("target_condition"));
+            let allowed_search_condition = entry
+                .get("allowed_search_condition")
+                .map(|cond| parse_block_predicate(Some(cond)));
+            Ok(PlacementModifier::EnvironmentScan {
+                direction_of_search,
+                max_steps,
+                target_condition,
+                allowed_search_condition,
+            })
+        }
         other => Ok(PlacementModifier::Unsupported {
             kind: other.to_string(),
         }),
+    }
+}
+
+/// Parses vanilla's `Direction` codec name (`down`/`up`/`north`/`south`/`west`/`east`).
+fn parse_direction_name(name: &str) -> Option<Direction> {
+    match name {
+        "down" | "DOWN" => Some(Direction::Down),
+        "up" | "UP" => Some(Direction::Up),
+        "north" | "NORTH" => Some(Direction::North),
+        "south" | "SOUTH" => Some(Direction::South),
+        "west" | "WEST" => Some(Direction::West),
+        "east" | "EAST" => Some(Direction::East),
+        _ => None,
     }
 }
 
@@ -2853,6 +3100,59 @@ impl FeatureData {
                 // `is_modelable` long before this point.
                 if predicate.test(target, pos, &self.tags) {
                     self.run_chain(target, placed, index + 1, pos, random)
+                } else {
+                    0
+                }
+            }
+            PlacementModifier::SurfaceRelativeThresholdFilter {
+                heightmap,
+                min_inclusive,
+                max_inclusive,
+            } => {
+                if heightmap != "OCEAN_FLOOR_WG" {
+                    return 0;
+                }
+                let surface_y = target.ocean_floor_height(pos.x, pos.z);
+                let delta = i64::from(pos.y) - i64::from(surface_y);
+                if delta >= i64::from(*min_inclusive) && delta <= i64::from(*max_inclusive) {
+                    self.run_chain(target, placed, index + 1, pos, random)
+                } else {
+                    0
+                }
+            }
+            PlacementModifier::EnvironmentScan {
+                direction_of_search,
+                max_steps,
+                target_condition,
+                allowed_search_condition,
+            } => {
+                if let Some(allowed) = allowed_search_condition
+                    && !allowed.test(target, pos, &self.tags)
+                {
+                    return 0;
+                }
+                let (dx, dy, dz) = direction_of_search.unit_vector();
+                let mut cur = pos;
+                let mut step = 0;
+                while step < *max_steps {
+                    if target_condition.test(target, cur, &self.tags) {
+                        return self.run_chain(target, placed, index + 1, cur, random);
+                    }
+                    cur.x += dx;
+                    cur.y += dy;
+                    cur.z += dz;
+                    if cur.y < target.min_y() || cur.y >= target.min_y() + target.height() {
+                        return 0;
+                    }
+                    if let Some(allowed) = allowed_search_condition
+                        && !allowed.test(target, cur, &self.tags)
+                    {
+                        break;
+                    }
+                    step += 1;
+                }
+                if target_condition.test(target, cur, &self.tags) {
+                    self.run_chain(target, placed, index + 1, cur, random)
                 } else {
                     0
                 }
@@ -5606,5 +5906,237 @@ mod tests {
                 "{id} needs placement modifiers from the ground-cover work"
             );
         }
+    }
+
+    #[test]
+    fn matching_fluids_derives_from_properties_and_tags_without_plant_list() {
+        let mut tags = BlockTags::default();
+        tags.entries.insert(
+            "minecraft:water".to_string(),
+            vec![
+                "minecraft:water".to_string(),
+                "minecraft:flowing_water".to_string(),
+            ],
+        );
+
+        let mut target = TestTarget::new().with_ground(60).write_anywhere();
+        target.set_block(0, 60, 0, "minecraft:stone");
+        target.set_block(0, 61, 0, "minecraft:water");
+        target.set_block(0, 62, 0, "minecraft:water[level=3]");
+        target.set_block(0, 63, 0, "minecraft:lava[level=0]");
+        target.set_block(0, 64, 0, "minecraft:lava[level=5]");
+        target.set_block(0, 65, 0, "minecraft:chest[facing=north,waterlogged=true]");
+        target.set_block(0, 66, 0, "minecraft:chest[facing=north,waterlogged=false]");
+        target.set_block(0, 67, 0, "minecraft:seagrass");
+        target.set_block(0, 68, 0, "minecraft:air");
+
+        let still_water = BlockPredicate::MatchingFluids {
+            fluids: vec!["minecraft:water".to_string()],
+            offset: (0, 0, 0),
+        };
+        let flowing_water = BlockPredicate::MatchingFluids {
+            fluids: vec!["minecraft:flowing_water".to_string()],
+            offset: (0, 0, 0),
+        };
+        let still_lava = BlockPredicate::MatchingFluids {
+            fluids: vec!["minecraft:lava".to_string()],
+            offset: (0, 0, 0),
+        };
+        let flowing_lava = BlockPredicate::MatchingFluids {
+            fluids: vec!["minecraft:flowing_lava".to_string()],
+            offset: (0, 0, 0),
+        };
+        let empty = BlockPredicate::MatchingFluids {
+            fluids: vec!["minecraft:empty".to_string()],
+            offset: (0, 0, 0),
+        };
+        let tagged_water = BlockPredicate::MatchingFluids {
+            fluids: vec!["#minecraft:water".to_string()],
+            offset: (0, 0, 0),
+        };
+
+        assert!(still_water.test(&target, DecorationPos { x: 0, y: 61, z: 0 }, &tags));
+        assert!(!still_water.test(&target, DecorationPos { x: 0, y: 62, z: 0 }, &tags));
+        assert!(flowing_water.test(&target, DecorationPos { x: 0, y: 62, z: 0 }, &tags));
+        assert!(tagged_water.test(&target, DecorationPos { x: 0, y: 61, z: 0 }, &tags));
+        assert!(tagged_water.test(&target, DecorationPos { x: 0, y: 62, z: 0 }, &tags));
+
+        // Waterlogged property drives matching without special-casing block IDs.
+        assert!(still_water.test(&target, DecorationPos { x: 0, y: 65, z: 0 }, &tags));
+        assert!(!still_water.test(&target, DecorationPos { x: 0, y: 66, z: 0 }, &tags));
+        assert!(empty.test(&target, DecorationPos { x: 0, y: 66, z: 0 }, &tags));
+
+        // Bare plant without `waterlogged=true` or tag membership stays empty (no hard-coded plant list).
+        assert!(!still_water.test(&target, DecorationPos { x: 0, y: 67, z: 0 }, &tags));
+        assert!(empty.test(&target, DecorationPos { x: 0, y: 67, z: 0 }, &tags));
+        assert!(empty.test(&target, DecorationPos { x: 0, y: 68, z: 0 }, &tags));
+        assert!(empty.test(&target, DecorationPos { x: 0, y: 60, z: 0 }, &tags));
+
+        assert!(still_lava.test(&target, DecorationPos { x: 0, y: 63, z: 0 }, &tags));
+        assert!(!still_lava.test(&target, DecorationPos { x: 0, y: 64, z: 0 }, &tags));
+        assert!(flowing_lava.test(&target, DecorationPos { x: 0, y: 64, z: 0 }, &tags));
+
+        let offset_water = parse_block_predicate(Some(&json!({
+            "type": "minecraft:matching_fluids",
+            "offset": [0, 1, 0],
+            "fluids": "minecraft:water"
+        })));
+        assert_eq!(
+            offset_water,
+            BlockPredicate::MatchingFluids {
+                fluids: vec!["minecraft:water".to_string()],
+                offset: (0, 1, 0),
+            }
+        );
+        assert!(offset_water.test(&target, DecorationPos { x: 0, y: 60, z: 0 }, &tags));
+    }
+
+    #[test]
+    fn surface_relative_threshold_filter_enforces_ocean_floor_bounds() {
+        let ore = stone_replacement("minecraft:gold_ore", 16, 0.0);
+        let modifier = parse_placement_modifier(
+            "test:surface",
+            0,
+            &json!({
+                "type": "minecraft:surface_relative_threshold_filter",
+                "heightmap": "OCEAN_FLOOR_WG",
+                "min_inclusive": -13,
+                "max_inclusive": -5
+            }),
+        )
+        .unwrap();
+        let placed = PlacedFeature {
+            id: "test:surface".to_string(),
+            feature: Rc::clone(&ore),
+            modifiers: vec![modifier],
+        };
+        assert!(placed.is_modelable());
+        let data = FeatureData::default();
+        let mut random = DecorationRandom::new(2026);
+
+        for (y, should_place) in [(46, false), (47, true), (50, true), (55, true), (56, false)] {
+            let mut target = TestTarget::new().with_ground(60).write_anywhere();
+            let count = data.run_chain(
+                &mut target,
+                &placed,
+                0,
+                DecorationPos { x: 0, y, z: 0 },
+                &mut random,
+            );
+            assert_eq!(
+                count > 0,
+                should_place,
+                "y={y} against ocean_floor=60: count={count}"
+            );
+        }
+
+        // Other heightmaps are gated as unmodeled instead of reading ocean_floor_height.
+        let other = parse_placement_modifier(
+            "test:other",
+            0,
+            &json!({
+                "type": "minecraft:surface_relative_threshold_filter",
+                "heightmap": "WORLD_SURFACE_WG",
+                "max_inclusive": -5
+            }),
+        )
+        .unwrap();
+        let gated = PlacedFeature {
+            id: "test:other".to_string(),
+            feature: ore,
+            modifiers: vec![other],
+        };
+        assert!(!gated.is_modelable());
+    }
+
+    #[test]
+    fn environment_scan_walks_direction_and_enforces_allowed_and_max_steps() {
+        let ore = stone_replacement("minecraft:diamond_ore", 16, 0.0);
+        let tags = vegetation_tags();
+        let data = FeatureData {
+            tags,
+            ..FeatureData::default()
+        };
+        let mut random = DecorationRandom::new(42);
+
+        let scan_up = parse_placement_modifier(
+            "test:scan_up",
+            0,
+            &json!({
+                "type": "minecraft:environment_scan",
+                "direction_of_search": "up",
+                "max_steps": 4,
+                "target_condition": {
+                    "type": "minecraft:matching_blocks",
+                    "blocks": "minecraft:stone"
+                },
+                "allowed_search_condition": {
+                    "type": "minecraft:matching_block_tag",
+                    "tag": "minecraft:air"
+                }
+            }),
+        )
+        .unwrap();
+        let placed_up = PlacedFeature {
+            id: "test:scan_up".to_string(),
+            feature: Rc::clone(&ore),
+            modifiers: vec![scan_up],
+        };
+        assert!(placed_up.is_modelable());
+
+        let mut target = TestTarget::new().write_anywhere();
+        target.set_block(0, 50, 0, "minecraft:air");
+        target.set_block(0, 51, 0, "minecraft:air");
+        target.set_block(0, 52, 0, "minecraft:air");
+        target.set_block(0, 53, 0, "minecraft:stone");
+        assert!(
+            data.run_chain(
+                &mut target,
+                &placed_up,
+                0,
+                DecorationPos { x: 0, y: 50, z: 0 },
+                &mut random
+            ) > 0
+        );
+        assert!(target.blocks("minecraft:diamond_ore") > 0);
+
+        // Fails immediately if start position violates `allowed_search_condition`.
+        let mut blocked_start = TestTarget::new().write_anywhere();
+        blocked_start.set_block(0, 50, 0, "minecraft:water");
+        blocked_start.set_block(0, 51, 0, "minecraft:stone");
+        assert_eq!(
+            data.run_chain(
+                &mut blocked_start,
+                &placed_up,
+                0,
+                DecorationPos { x: 0, y: 50, z: 0 },
+                &mut random
+            ),
+            0
+        );
+
+        // Unmodeled target predicate inside environment_scan gates the placement and reports a gap.
+        let unmodeled_scan = parse_placement_modifier(
+            "test:scan_gap",
+            0,
+            &json!({
+                "type": "minecraft:environment_scan",
+                "direction_of_search": "down",
+                "max_steps": 4,
+                "target_condition": { "type": "minecraft:solid" }
+            }),
+        )
+        .unwrap();
+        let placed_gap = PlacedFeature {
+            id: "test:scan_gap".to_string(),
+            feature: ore,
+            modifiers: vec![unmodeled_scan],
+        };
+        assert!(!placed_gap.is_modelable());
+        let mut gaps = HashMap::new();
+        record_unmodeled_modifiers(&mut gaps, &placed_gap);
+        assert_eq!(gaps.get("placement:minecraft:environment_scan"), Some(&1));
+        assert_eq!(gaps.get("predicate:minecraft:minecraft:solid"), None);
+        assert_eq!(gaps.get("predicate:minecraft:solid"), Some(&1));
     }
 }
