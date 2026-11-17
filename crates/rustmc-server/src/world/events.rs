@@ -111,7 +111,7 @@ pub struct BlockBreakEvent {
     pub block: Block,
     pub tool: Option<ItemStack>,
     pub drops: Vec<ItemStack>,
-    pub is_cancelled: bool,
+    is_cancelled: bool,
 }
 
 impl BlockBreakEvent {
@@ -195,7 +195,7 @@ pub struct BlockPlaceEvent {
     pub placed_against: BlockPos,
     pub placed_block: Block,
     pub item_in_hand: Option<ItemStack>,
-    pub is_cancelled: bool,
+    is_cancelled: bool,
 }
 
 impl BlockPlaceEvent {
@@ -274,7 +274,7 @@ pub struct PlayerInteractEvent {
     pub face: Option<Direction>,
     pub hand: InteractionHand,
     pub action: InteractAction,
-    pub is_cancelled: bool,
+    is_cancelled: bool,
 }
 
 impl PlayerInteractEvent {
@@ -911,19 +911,33 @@ pub fn apply_block_break(
     }
 }
 
+/// Inputs for [`apply_block_place`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPlaceRequest {
+    pub player_id: u32,
+    pub placed_pos: BlockPos,
+    pub placed_against: BlockPos,
+    pub placed_block: Block,
+    pub item_in_hand: Option<ItemStack>,
+    pub inventory_slot: i16,
+    pub sequence: Option<i32>,
+}
+
 /// Authoritative block place execution pipeline.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_block_place(
     bus: &EventBus,
     chunk: &mut Chunk,
-    player_id: u32,
-    placed_pos: BlockPos,
-    placed_against: BlockPos,
-    placed_block: Block,
-    item_in_hand: Option<ItemStack>,
-    inventory_slot: i16,
-    sequence: Option<i32>,
+    request: BlockPlaceRequest,
 ) -> Result<BlockPlaceOutcome, PlaceRollback> {
+    let BlockPlaceRequest {
+        player_id,
+        placed_pos,
+        placed_against,
+        placed_block,
+        item_in_hand,
+        inventory_slot,
+        sequence,
+    } = request;
     let Some(existing) = owned_cell(chunk, placed_pos) else {
         return Err(PlaceRollback {
             block_update: None,
@@ -1445,13 +1459,15 @@ mod tests {
             let rollback = apply_block_place(
                 &bus,
                 &mut chunk,
-                1,
-                pos,
-                BlockPos::new(0, 64, 0),
-                Block::Dirt,
-                Some(stack("minecraft:dirt", 5)),
-                36,
-                Some(9),
+                BlockPlaceRequest {
+                    player_id: 1,
+                    placed_pos: pos,
+                    placed_against: BlockPos::new(0, 64, 0),
+                    placed_block: Block::Dirt,
+                    item_in_hand: Some(stack("minecraft:dirt", 5)),
+                    inventory_slot: 36,
+                    sequence: Some(9),
+                },
             )
             .expect_err("unowned cell");
             assert_eq!(rollback.block_update, None);
@@ -1473,13 +1489,15 @@ mod tests {
         let rollback = apply_block_place(
             &bus,
             &mut chunk,
-            1,
-            BlockPos::new(0, 64, 0),
-            BlockPos::new(0, 63, 0),
-            Block::Dirt,
-            Some(stack("minecraft:dirt", 5)),
-            36,
-            None,
+            BlockPlaceRequest {
+                player_id: 1,
+                placed_pos: BlockPos::new(0, 64, 0),
+                placed_against: BlockPos::new(0, 63, 0),
+                placed_block: Block::Dirt,
+                item_in_hand: Some(stack("minecraft:dirt", 5)),
+                inventory_slot: 36,
+                sequence: None,
+            },
         )
         .expect_err("occupied cell");
 
@@ -1501,13 +1519,15 @@ mod tests {
         apply_block_place(
             &bus,
             &mut chunk,
-            1,
-            BlockPos::new(0, 65, 0),
-            BlockPos::new(0, 64, 0),
-            Block::Dirt,
-            None,
-            36,
-            None,
+            BlockPlaceRequest {
+                player_id: 1,
+                placed_pos: BlockPos::new(0, 65, 0),
+                placed_against: BlockPos::new(0, 64, 0),
+                placed_block: Block::Dirt,
+                item_in_hand: None,
+                inventory_slot: 36,
+                sequence: None,
+            },
         )
         .expect_err("nothing to place");
         assert_eq!(chunk.block(0, 65, 0), Some(Block::Air));
@@ -1608,13 +1628,15 @@ mod tests {
         let outcome = apply_block_place(
             &bus,
             &mut chunk,
-            1,
-            BlockPos::new(2, 65, 2),
-            BlockPos::new(2, 64, 2),
-            Block::Sandstone,
-            Some(stack("minecraft:sandstone", 5)),
-            37,
-            None,
+            BlockPlaceRequest {
+                player_id: 1,
+                placed_pos: BlockPos::new(2, 65, 2),
+                placed_against: BlockPos::new(2, 64, 2),
+                placed_block: Block::Sandstone,
+                item_in_hand: Some(stack("minecraft:sandstone", 5)),
+                inventory_slot: 37,
+                sequence: None,
+            },
         )
         .expect("place allowed");
 
@@ -1628,13 +1650,15 @@ mod tests {
         let err = apply_block_place(
             &bus,
             &mut chunk,
-            1,
-            BlockPos::new(3, 65, 3),
-            BlockPos::new(3, 64, 3),
-            Block::Sandstone,
-            Some(stack("minecraft:sandstone", 4)),
-            37,
-            None,
+            BlockPlaceRequest {
+                player_id: 1,
+                placed_pos: BlockPos::new(3, 65, 3),
+                placed_against: BlockPos::new(3, 64, 3),
+                placed_block: Block::Sandstone,
+                item_in_hand: Some(stack("minecraft:sandstone", 4)),
+                inventory_slot: 37,
+                sequence: None,
+            },
         )
         .expect_err("place cancelled");
 
@@ -1730,5 +1754,44 @@ mod tests {
         }
 
         assert_eq!(actions_seen.lock().unwrap().clone(), actions.to_vec());
+    }
+
+    #[test]
+    fn cancelled_place_event_cannot_be_uncancelled_by_later_or_monitor_listeners() {
+        let bus = EventBus::new();
+        let later_non_monitor_ran = Arc::new(AtomicUsize::new(0));
+
+        bus.register_place(EventPriority::Low, |event| {
+            event.cancel();
+        });
+
+        let same_priority_ran = Arc::clone(&later_non_monitor_ran);
+        bus.register_place(EventPriority::Low, move |event| {
+            same_priority_ran.fetch_add(1, Ordering::SeqCst);
+            event.uncancel();
+        });
+
+        let highest_ran = Arc::clone(&later_non_monitor_ran);
+        bus.register_place(EventPriority::Highest, move |event| {
+            highest_ran.fetch_add(1, Ordering::SeqCst);
+            event.set_cancelled(false);
+        });
+
+        bus.register_place(EventPriority::Monitor, |event| {
+            assert!(event.is_cancelled());
+            event.uncancel();
+        });
+
+        let mut event = BlockPlaceEvent::new(
+            1,
+            BlockPos::new(0, 65, 0),
+            BlockPos::new(0, 64, 0),
+            Block::Dirt,
+            Some(stack("minecraft:dirt", 1)),
+        );
+        bus.dispatch_place(&mut event).unwrap();
+
+        assert_eq!(later_non_monitor_ran.load(Ordering::SeqCst), 0);
+        assert!(event.is_cancelled());
     }
 }
