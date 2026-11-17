@@ -1272,7 +1272,11 @@ pub enum CensusFamily {
     Leaves,
     Saplings,
     Grasses,
+    /// Selected small-flower names; the legacy report also included pitcher plants.
     Flowers,
+    Wildflowers,
+    Bushes,
+    TallFlowers,
     Cactus,
     SugarCane,
 }
@@ -1311,12 +1315,15 @@ impl CensusFamily {
             Self::Saplings => "saplings",
             Self::Grasses => "grasses",
             Self::Flowers => "flowers",
+            Self::Wildflowers => "wildflowers",
+            Self::Bushes => "bushes",
+            Self::TallFlowers => "tall_flowers",
             Self::Cactus => "cactus",
             Self::SugarCane => "sugar_cane",
         }
     }
 
-    pub fn all() -> [Self; 33] {
+    pub fn all() -> [Self; 36] {
         [
             Self::Stone,
             Self::Deepslate,
@@ -1349,6 +1356,9 @@ impl CensusFamily {
             Self::Saplings,
             Self::Grasses,
             Self::Flowers,
+            Self::Wildflowers,
+            Self::Bushes,
+            Self::TallFlowers,
             Self::Cactus,
             Self::SugarCane,
         ]
@@ -1386,15 +1396,27 @@ pub fn census_family(base_name: &str) -> Option<CensusFamily> {
         "andesite" => CensusFamily::Andesite,
         "tuff" => CensusFamily::Tuff,
         "short_grass" | "tall_grass" | "grass" | "fern" | "large_fern" => CensusFamily::Grasses,
+        "wildflowers" => CensusFamily::Wildflowers,
+        "bush" | "firefly_bush" => CensusFamily::Bushes,
+        "rose_bush" | "lilac" | "peony" | "sunflower" | "pitcher_plant" => {
+            CensusFamily::TallFlowers
+        }
         "cactus" => CensusFamily::Cactus,
         "sugar_cane" => CensusFamily::SugarCane,
         "dandelion" | "poppy" | "blue_orchid" | "allium" | "azure_bluet" | "red_tulip"
         | "orange_tulip" | "white_tulip" | "pink_tulip" | "oxeye_daisy" | "cornflower"
-        | "lily_of_the_valley" | "with_rose" | "torchflower" | "pitcher_plant" => {
-            CensusFamily::Flowers
-        }
+        | "lily_of_the_valley" | "wither_rose" | "torchflower" => CensusFamily::Flowers,
         other => {
-            if other.ends_with("_log") || other.ends_with("_stem") || other.ends_with("hyphae") {
+            if other.ends_with("_log")
+                || matches!(
+                    other,
+                    "crimson_stem"
+                        | "warped_stem"
+                        | "stripped_crimson_stem"
+                        | "stripped_warped_stem"
+                )
+                || other.ends_with("hyphae")
+            {
                 CensusFamily::Logs
             } else if other.ends_with("_leaves") || other.ends_with("foliage") {
                 CensusFamily::Leaves
@@ -2368,6 +2390,29 @@ mod tests {
             census_family("minecraft:poppy"),
             Some(CensusFamily::Flowers)
         );
+        for (name, family) in [
+            ("minecraft:wildflowers", CensusFamily::Wildflowers),
+            ("minecraft:bush", CensusFamily::Bushes),
+            ("minecraft:firefly_bush", CensusFamily::Bushes),
+            ("minecraft:rose_bush", CensusFamily::TallFlowers),
+            ("minecraft:lilac", CensusFamily::TallFlowers),
+            ("minecraft:peony", CensusFamily::TallFlowers),
+            ("minecraft:sunflower", CensusFamily::TallFlowers),
+            ("minecraft:pitcher_plant", CensusFamily::TallFlowers),
+            ("minecraft:wither_rose", CensusFamily::Flowers),
+            ("minecraft:crimson_stem", CensusFamily::Logs),
+            ("minecraft:stripped_warped_stem", CensusFamily::Logs),
+        ] {
+            assert_eq!(census_family(name), Some(family), "{name}");
+        }
+        assert_eq!(
+            census_family(base_block_name("minecraft:wildflowers[flower_amount=4]")),
+            Some(CensusFamily::Wildflowers)
+        );
+        assert_eq!(
+            census_family(base_block_name("minecraft:rose_bush[half=upper]")),
+            Some(CensusFamily::TallFlowers)
+        );
         assert_eq!(census_family("minecraft:stone"), Some(CensusFamily::Stone));
         assert_eq!(
             census_family("minecraft:granite"),
@@ -2378,6 +2423,11 @@ mod tests {
         assert_eq!(census_family("minecraft:grass_block"), None);
         assert_eq!(census_family("minecraft:cobblestone"), None);
         assert_eq!(census_family("minecraft:tuff_bricks"), None);
+        assert_eq!(census_family("minecraft:big_dripleaf_stem"), None);
+        assert_eq!(census_family("minecraft:mushroom_stem"), None);
+        assert_eq!(census_family("minecraft:pumpkin_stem"), None);
+        assert_eq!(census_family("minecraft:attached_melon_stem"), None);
+        assert_eq!(census_family("minecraft:azalea"), None);
     }
 
     #[test]
