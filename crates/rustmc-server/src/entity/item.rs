@@ -22,13 +22,13 @@
 //! default block slipperiness `0.6` follows minecraft.wiki `Slipperiness`, giving
 //! `GROUND_FRICTION = 0.6 * 0.98 = 0.588`.
 
-use crate::item::{ItemStack, ItemStackError};
+use crate::item::ItemStack;
 use crate::java_packets::play::clientbound::TAKE_ITEM_ENTITY;
 use crate::java_wire::{frame, put_varint, read_varint};
+use crate::world::inventory::PlayerInventory;
 use crate::world::physics::{
     Aabb, DEFAULT_PLAYER_HEIGHT, DEFAULT_PLAYER_WIDTH, WorldCollisionView, collide_and_sweep,
 };
-use std::fmt;
 
 /// Lifetime of a dropped item in ticks before despawning (minecraft.wiki `Item_(entity)` rev 3816775: 6000 ticks = 5m).
 pub const DESPAWN_TICKS: u32 = 6000;
@@ -81,15 +81,6 @@ pub const STACK_MERGE_EXPAND_HORIZONTAL: f64 = 0.5;
 /// Vertical box expansion for item stack merge search (minecraft.wiki `Item_(entity)` rev 3816775: 0.25 blocks).
 pub const STACK_MERGE_EXPAND_VERTICAL: f64 = 0.25;
 
-/// Total number of player inventory slots (9 hotbar + 27 main inventory).
-pub const TOTAL_SLOT_COUNT: usize = 36;
-
-/// Number of hotbar slots (slots 0..=8).
-pub const HOTBAR_SLOT_COUNT: usize = 9;
-
-/// Number of main inventory slots (slots 9..=35).
-pub const MAIN_SLOT_COUNT: usize = 27;
-
 /// Java 26.3 clientbound `minecraft:take_item_entity` packet ID (official 26.3 packets report: 127).
 pub const TAKE_ITEM_ENTITY_PACKET_ID: u32 = TAKE_ITEM_ENTITY;
 
@@ -98,192 +89,6 @@ const EPSILON: f64 = 1e-7;
 
 /// Velocity threshold below which near-zero speeds are clamped to zero.
 const VELOCITY_REST_THRESHOLD: f64 = 1e-6;
-
-/// Errors returned by inventory transactions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InventoryError {
-    /// Slot index is outside the valid inventory range `0..=35`.
-    InvalidSlot(u8),
-    /// Slot index is outside the valid hotbar range `0..=8`.
-    InvalidHotbarSlot(u8),
-    /// Stack validation failed.
-    InvalidStack(ItemStackError),
-    /// Held slot does not contain enough items.
-    InsufficientItems { requested: u16, available: u16 },
-    /// Inventory has no available space to accept items.
-    InventoryFull,
-}
-
-impl fmt::Display for InventoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidSlot(slot) => write!(f, "inventory slot {slot} is out of bounds (0..=35)"),
-            Self::InvalidHotbarSlot(slot) => {
-                write!(f, "hotbar slot {slot} is out of bounds (0..=8)")
-            }
-            Self::InvalidStack(err) => write!(f, "invalid item stack: {err}"),
-            Self::InsufficientItems {
-                requested,
-                available,
-            } => {
-                write!(
-                    f,
-                    "insufficient items: requested {requested}, but only {available} available"
-                )
-            }
-            Self::InventoryFull => write!(f, "inventory has no available space"),
-        }
-    }
-}
-
-impl std::error::Error for InventoryError {}
-
-/// Player inventory managing 36 slots (9 hotbar + 27 main inventory).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayerInventory {
-    slots: [Option<ItemStack>; TOTAL_SLOT_COUNT],
-    held_slot: u8,
-    revision: u64,
-}
-
-impl Default for PlayerInventory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PlayerInventory {
-    /// Construct an empty player inventory.
-    pub const fn new() -> Self {
-        Self {
-            slots: [const { None }; TOTAL_SLOT_COUNT],
-            held_slot: 0,
-            revision: 0,
-        }
-    }
-
-    /// The currently active held hotbar slot (`0..=8`).
-    pub const fn held_slot(&self) -> u8 {
-        self.held_slot
-    }
-
-    /// Select an active hotbar slot (`0..=8`).
-    pub fn set_held_slot(&mut self, slot: u8) -> Result<(), InventoryError> {
-        if slot >= HOTBAR_SLOT_COUNT as u8 {
-            return Err(InventoryError::InvalidHotbarSlot(slot));
-        }
-        self.held_slot = slot;
-        Ok(())
-    }
-
-    /// Monotonic revision counter tracking inventory mutations.
-    pub const fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Reference to all 36 slots.
-    pub fn slots(&self) -> &[Option<ItemStack>] {
-        &self.slots
-    }
-
-    /// Reference to a specific slot if valid.
-    pub fn get_slot(&self, slot: u8) -> Option<&ItemStack> {
-        if (slot as usize) < TOTAL_SLOT_COUNT {
-            self.slots[slot as usize].as_ref()
-        } else {
-            None
-        }
-    }
-
-    /// Assign an item stack directly to a specific slot.
-    pub fn set_slot(&mut self, slot: u8, stack: Option<ItemStack>) -> Result<(), InventoryError> {
-        if (slot as usize) >= TOTAL_SLOT_COUNT {
-            return Err(InventoryError::InvalidSlot(slot));
-        }
-        self.slots[slot as usize] = stack;
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
-        Ok(())
-    }
-
-    /// Attempt to insert an item stack into inventory slots:
-    /// 1. Top up existing compatible partial stacks (`count < max_stack`) across slots 0..36.
-    /// 2. Place remainder into empty slots across slots 0..36.
-    ///
-    /// Returns the number of items successfully accepted by the inventory.
-    pub fn insert_stack(&mut self, stack: &ItemStack) -> u16 {
-        let mut remaining = stack.count();
-
-        // Pass 1: top up compatible partial stacks
-        for slot in &mut self.slots {
-            if remaining == 0 {
-                break;
-            }
-            if let Some(existing) = slot
-                && existing.can_stack_with(stack)
-                && existing.count() < existing.max_stack()
-            {
-                remaining = existing.add(remaining);
-            }
-        }
-
-        // Pass 2: fill empty slots
-        for slot in &mut self.slots {
-            if remaining == 0 {
-                break;
-            }
-            if slot.is_none() {
-                let to_add = remaining.min(stack.max_stack());
-                let new_stack = ItemStack::try_new(stack.item(), to_add, stack.max_stack())
-                    .expect("sub-stack from validated ItemStack is valid");
-                *slot = Some(new_stack);
-                remaining -= to_add;
-            }
-        }
-
-        let collected = stack.count() - remaining;
-        if collected > 0 {
-            self.revision = self
-                .revision
-                .checked_add(1)
-                .expect("inventory revision overflow");
-        }
-        collected
-    }
-
-    /// Transactional method to grant items, returning the unplaced remainder count or `InventoryFull`.
-    pub fn grant_item(
-        &mut self,
-        item: impl Into<String>,
-        count: u16,
-        max_stack: u16,
-    ) -> Result<u16, InventoryError> {
-        let stack =
-            ItemStack::try_new(item, count, max_stack).map_err(InventoryError::InvalidStack)?;
-        let placed = self.insert_stack(&stack);
-        if placed == 0 {
-            return Err(InventoryError::InventoryFull);
-        }
-        Ok(count - placed)
-    }
-
-    /// Total count of matching items held across all slots.
-    pub fn total_count_of(&self, item: &str) -> u32 {
-        self.slots
-            .iter()
-            .flatten()
-            .filter(|s| s.item() == item)
-            .map(|s| u32::from(s.count()))
-            .sum()
-    }
-
-    /// Check if all 36 inventory slots are currently empty.
-    pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none)
-    }
-}
 
 /// Java Edition clientbound `minecraft:take_item_entity` packet payload (packet ID 127 / 0x7F).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -670,14 +475,20 @@ impl ItemEntity {
         if !self.can_merge_with(other) {
             return false;
         }
-        let other_stack = other.stack.take().expect("checked in can_merge_with");
-        let self_stack = self.stack.as_mut().expect("checked in can_merge_with");
-        let overflow = self_stack.add(other_stack.count());
-        debug_assert_eq!(overflow, 0);
-        other.mark_dead();
-        self.age = self.age.min(other.age);
-        self.pickup_delay = self.pickup_delay.max(other.pickup_delay);
-        true
+        match (self.stack.as_mut(), other.stack.take()) {
+            (Some(self_stack), Some(other_stack)) => {
+                let overflow = self_stack.add(other_stack.count());
+                debug_assert_eq!(overflow, 0);
+                other.mark_dead();
+                self.age = self.age.min(other.age);
+                self.pickup_delay = self.pickup_delay.max(other.pickup_delay);
+                true
+            }
+            (_, taken_other) => {
+                other.stack = taken_other;
+                false
+            }
+        }
     }
 
     /// Whether this item touches the pickup box around `collector_hitbox`.
@@ -705,24 +516,38 @@ impl ItemEntity {
         if !self.can_pickup() || !self.in_pickup_reach(player_box) {
             return ItemPickupResult::none(self.count());
         }
-        let Some(stack) = self.stack.as_ref() else {
+        let Some(owned_stack) = self.stack.take() else {
             return ItemPickupResult::none(0);
         };
 
-        let collected = inventory.insert_stack(stack);
+        let total_count = owned_stack.count();
+        let item_name = owned_stack.item().to_owned();
+        let remaining = match inventory.grant_item(owned_stack.clone()) {
+            Ok(remaining) => remaining,
+            Err(_) => {
+                self.stack = Some(owned_stack);
+                return ItemPickupResult::none(total_count);
+            }
+        };
+
+        let collected = total_count.saturating_sub(remaining);
         if collected == 0 {
-            return ItemPickupResult::none(self.count());
+            self.stack = Some(owned_stack);
+            return ItemPickupResult::none(total_count);
         }
 
-        let item_name = stack.item().to_owned();
-        let owned_stack = self.stack.take().expect("stack is present");
-        let (_, rest) = owned_stack
-            .split(collected)
-            .expect("collected count is in 1..=stack.count()");
-        let remaining = rest.as_ref().map_or(0, ItemStack::count);
-        self.stack = rest;
         if remaining == 0 {
             self.mark_dead();
+        } else {
+            match owned_stack.split(collected) {
+                Ok((_, rest)) => {
+                    self.stack = rest;
+                }
+                Err(unchanged) => {
+                    self.stack = Some(unchanged);
+                    return ItemPickupResult::none(total_count);
+                }
+            }
         }
 
         let packet = TakeItemEntityPacket::new(self.id, player_id, u32::from(collected));
@@ -1035,6 +860,15 @@ mod tests {
         assert!(!item1.can_merge_with(&item1));
     }
 
+    fn total_count_of(inv: &PlayerInventory, item: &str) -> u32 {
+        inv.slots()
+            .iter()
+            .flatten()
+            .filter(|s| s.item() == item)
+            .map(|s| u32::from(s.count()))
+            .sum()
+    }
+
     #[test]
     fn test_pickup_delay_guard() {
         let mut inv = PlayerInventory::new();
@@ -1053,7 +887,7 @@ mod tests {
         assert_eq!(res.collected_count, 0);
         assert_eq!(res.remaining_count, 8);
         assert!(res.event.is_none());
-        assert_eq!(inv.total_count_of("minecraft:gold_ingot"), 0);
+        assert_eq!(total_count_of(&inv, "minecraft:gold_ingot"), 0);
 
         for _ in 0..PLAYER_DROP_PICKUP_DELAY {
             item.tick_lifecycle();
@@ -1065,7 +899,7 @@ mod tests {
         assert_eq!(res.collected_count, 8);
         assert_eq!(res.remaining_count, 0);
         assert!(item.is_dead());
-        assert_eq!(inv.total_count_of("minecraft:gold_ingot"), 8);
+        assert_eq!(total_count_of(&inv, "minecraft:gold_ingot"), 8);
     }
 
     #[test]
@@ -1117,6 +951,14 @@ mod tests {
         assert_eq!(res2.collected_count, 0);
         assert_eq!(res2.remaining_count, 6);
         assert!(res2.event.is_none());
+        assert!(item.is_alive());
+
+        inv.set_slot(0, None).unwrap();
+        let res3 = item.try_collect_at(99, [0.0, 1.0, 0.0], &mut inv);
+        assert_eq!(res3.collected_count, 6);
+        assert_eq!(res3.remaining_count, 0);
+        assert!(item.is_dead());
+        assert_eq!(inv.get_slot(0).unwrap().count(), 6);
     }
 
     #[test]
@@ -1235,7 +1077,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].count, 25);
         assert_eq!(manager.count(), 0);
-        assert_eq!(inv.total_count_of("minecraft:redstone"), 25);
+        assert_eq!(total_count_of(&inv, "minecraft:redstone"), 25);
     }
 
     #[test]
