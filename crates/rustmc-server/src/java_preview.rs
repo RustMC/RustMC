@@ -2,7 +2,7 @@
 //! IDs and field layouts: official 26.3 packet/block reports and codec metadata.
 
 use crate::{
-    discovery_java::{frame, put_string, put_varint},
+    java_wire::{frame, put_string, put_varint},
     preview_data::RegistryManifest,
     world::{Biome, Block, Chunk, Generator},
 };
@@ -67,7 +67,8 @@ struct VanillaWorker {
 impl VanillaWorker {
     fn new(source: VanillaSource) -> Self {
         let capacity = source.workers;
-        let (requests, rx) = mpsc::sync_channel::<ChunkRequest>(0);
+        // `in_flight` never exceeds `capacity`, so neither channel can grow past it.
+        let (requests, rx) = mpsc::sync_channel::<ChunkRequest>(capacity);
         let (tx, results) = mpsc::sync_channel(capacity);
         let rx = Arc::new(Mutex::new(rx));
         let current_center = Arc::new(AtomicU64::new(packed_center((0, 0))));
@@ -78,19 +79,9 @@ impl VanillaWorker {
                 let source = source.clone();
                 let current_center = Arc::clone(&current_center);
                 thread::spawn(move || {
-                    let Ok(generator) = crate::vanilla::generator::VanillaGenerator::new(
-                        &source.data_root,
-                        source.seed,
-                        "minecraft:overworld",
-                    ) else {
-                        return;
-                    };
-                    let Ok(text) = std::fs::read_to_string(&source.registry_table) else {
-                        return;
-                    };
-                    let Ok(tables) =
-                        crate::chunk_adapter::registry::RegistryTables::from_provisioned(&text)
-                    else {
+                    let Some((generator, tables)) = load_worker_inputs(&source) else {
+                        // Dropping this worker's senders lets the preview observe
+                        // a disconnected pool and close the session explicitly.
                         return;
                     };
                     loop {
@@ -199,6 +190,36 @@ impl VanillaWorker {
     }
 }
 
+/// Load one worker's generator and registry tables. Runtime preflight already
+/// validated these inputs, so a failure here means they changed on disk.
+fn load_worker_inputs(
+    source: &VanillaSource,
+) -> Option<(
+    crate::vanilla::generator::VanillaGenerator,
+    crate::chunk_adapter::registry::RegistryTables,
+)> {
+    let loaded = crate::vanilla::generator::VanillaGenerator::new(
+        &source.data_root,
+        source.seed,
+        "minecraft:overworld",
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|generator| {
+        let text =
+            std::fs::read_to_string(&source.registry_table).map_err(|error| error.to_string())?;
+        crate::chunk_adapter::registry::RegistryTables::from_provisioned(&text)
+            .map(|tables| (generator, tables))
+            .map_err(|error| error.to_string())
+    });
+    match loaded {
+        Ok(inputs) => Some(inputs),
+        Err(error) => {
+            eprintln!("event=vanilla_worker_start_failed error={error:?}");
+            None
+        }
+    }
+}
+
 impl Drop for VanillaWorker {
     fn drop(&mut self) {
         self.requests.take();
@@ -208,26 +229,56 @@ impl Drop for VanillaWorker {
     }
 }
 
-const LOGIN: u32 = 50;
-const POSITION: u32 = 73;
-const CHUNK: u32 = 46;
-const CACHE_CENTER: u32 = 96;
-const FORGET_CHUNK: u32 = 38;
-const GAME_EVENT: u32 = 39;
-const ABILITIES: u32 = 65;
-const TIME: u32 = 115;
-const BATCH_START: u32 = 12;
-const BATCH_END: u32 = 11;
+use crate::java_packets::play::clientbound::{
+    CHUNK_BATCH_FINISHED as BATCH_END, CHUNK_BATCH_START as BATCH_START,
+    FORGET_LEVEL_CHUNK as FORGET_CHUNK, GAME_EVENT, KEEP_ALIVE, LEVEL_CHUNK_WITH_LIGHT as CHUNK,
+    LOGIN, PLAYER_ABILITIES as ABILITIES, PLAYER_POSITION as POSITION,
+    SET_CHUNK_CACHE_CENTER as CACHE_CENTER, SET_TIME as TIME,
+};
+
 const MAX_CHUNKS_PER_BATCH: usize = 16;
 const MAX_BATCH_BYTES: usize = 768 * 1024;
-// Air, bedrock, stone, dirt, non-snowy grass, vertical oak log, dry oak leaves.
-const BLOCK_STATES: [u32; 19] = [
-    0, 88, 1, 10, 9, 140, 294, 121, 677, 8598, 143, 322, 152, 406, 149, 378, 126, 15094, 14759,
+/// Seconds between server keep-alive challenges.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Default block state of each preview block in the official 26.3 block
+/// report, in `Block` discriminant order (checked by a unit test).
+const BLOCK_STATES: [(Block, u32); 24] = [
+    (Block::Air, 0),                // minecraft:air
+    (Block::Bedrock, 88),           // minecraft:bedrock
+    (Block::Stone, 1),              // minecraft:stone
+    (Block::Dirt, 10),              // minecraft:dirt
+    (Block::Grass, 9),              // minecraft:grass_block[snowy=false]
+    (Block::Log, 140),              // minecraft:oak_log[axis=y]
+    (Block::Leaves, 294),           // minecraft:oak_leaves (default state)
+    (Block::Sand, 121),             // minecraft:sand
+    (Block::Sandstone, 677),        // minecraft:sandstone
+    (Block::Snow, 8598),            // minecraft:snow_block
+    (Block::SpruceLog, 143),        // minecraft:spruce_log[axis=y]
+    (Block::SpruceLeaves, 322),     // minecraft:spruce_leaves (default state)
+    (Block::AcaciaLog, 152),        // minecraft:acacia_log[axis=y]
+    (Block::AcaciaLeaves, 406),     // minecraft:acacia_leaves (default state)
+    (Block::JungleLog, 149),        // minecraft:jungle_log[axis=y]
+    (Block::JungleLeaves, 378),     // minecraft:jungle_leaves (default state)
+    (Block::RedSand, 126),          // minecraft:red_sand
+    (Block::RedSandstone, 15094),   // minecraft:red_sandstone
+    (Block::Terracotta, 14759),     // minecraft:terracotta
+    (Block::ShortGrass, 2363),      // minecraft:short_grass
+    (Block::SnowLayer, 8589),       // minecraft:snow[layers=1]
+    (Block::Carpet, 14743),         // minecraft:white_carpet
+    (Block::TallGrassLower, 14771), // minecraft:tall_grass[half=lower]
+    (Block::TallGrassUpper, 14770), // minecraft:tall_grass[half=upper]
 ];
+
+fn block_state(index: u16) -> u32 {
+    BLOCK_STATES[usize::from(index)].1
+}
 const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
 const LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
 const CREATIVE: u32 = 1;
+// Vanilla Java rejects move packets beyond these magnitudes.
+pub(crate) const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
+pub(crate) const MAX_VERTICAL_POSITION: f64 = 20_000_000.0;
 
 fn registry_id(manifest: &RegistryManifest, registry: &str, entry: &str) -> Option<u32> {
     manifest
@@ -383,9 +434,9 @@ impl Preview {
     /// Validate only observer coordinates; this is not survival movement validation.
     pub fn move_to(&mut self, x: f64, y: f64, z: f64) -> Result<(), &'static str> {
         if ![x, y, z].iter().all(|v| v.is_finite())
-            || x.abs() > 1_000_000.0
-            || z.abs() > 1_000_000.0
-            || !(-64.0..=512.0).contains(&y)
+            || x.abs() > MAX_HORIZONTAL_POSITION
+            || z.abs() > MAX_HORIZONTAL_POSITION
+            || y.abs() > MAX_VERTICAL_POSITION
         {
             return Err("invalid preview position");
         }
@@ -418,15 +469,13 @@ impl Preview {
 
     /// Keepalive emission is independent of chunk admission.
     pub fn keepalive(&mut self) -> Option<Vec<u8>> {
-        if self.keepalive_at.elapsed() < std::time::Duration::from_secs(5)
-            || self.pending_keepalive.is_some()
-        {
+        if self.keepalive_at.elapsed() < KEEPALIVE_INTERVAL || self.pending_keepalive.is_some() {
             return None;
         }
         self.keepalive_id += 1;
         self.pending_keepalive = Some(self.keepalive_id);
         self.keepalive_at = std::time::Instant::now();
-        Some(frame(45, &self.keepalive_id.to_be_bytes()))
+        Some(frame(KEEP_ALIVE, &self.keepalive_id.to_be_bytes()))
     }
 
     pub fn next_chunk(&mut self) -> Option<(Vec<u8>, u128, u128)> {
@@ -704,6 +753,14 @@ fn block(chunk: &Chunk, x: usize, y: i32, z: usize) -> Block {
     }
 }
 
+/// Plants with no collision, which only `WORLD_SURFACE` captures.
+fn is_passable_plant(block: Block) -> bool {
+    matches!(
+        block,
+        Block::ShortGrass | Block::TallGrassLower | Block::TallGrassUpper
+    )
+}
+
 /// Pack fixed-width values without crossing a 64-bit word boundary.
 fn packed(values: &[u16], bits: usize) -> Vec<u64> {
     let per_word = 64 / bits;
@@ -733,6 +790,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
                         .find(|y| {
                             let b = block(chunk, x, *y, z);
                             b != Block::Air
+                                && (kind == 1 || !is_passable_plant(b))
                                 && (kind != 5
                                     || !matches!(
                                         b,
@@ -781,13 +839,13 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         palette.dedup();
         if palette.len() == 1 {
             sections.push(0);
-            put_varint(BLOCK_STATES[values[0] as usize], &mut sections);
+            put_varint(block_state(values[0]), &mut sections);
         } else {
             let bits = (usize::BITS - (palette.len() - 1).leading_zeros()).max(4) as usize;
             sections.push(bits as u8);
             put_varint(palette.len() as u32, &mut sections);
             for value in &palette {
-                put_varint(BLOCK_STATES[*value as usize], &mut sections);
+                put_varint(block_state(*value), &mut sections);
             }
             let indices: Vec<u16> = values
                 .iter()
@@ -830,14 +888,20 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         }
     }
     put_varint(LIGHT_SECTIONS as u32, &mut body);
-    // Direct vertical skylight, attenuated by leaves. No emitted light or full lateral solver yet.
+    // Direct vertical skylight, attenuated by leaves; plants and thin covers
+    // pass it unchanged. No emitted light or full lateral solver yet.
     let mut lights = vec![[0u8; 2048]; LIGHT_SECTIONS];
     for z in 0..16 {
         for x in 0..16 {
             let mut sky = 15u8;
             for y in (-80..336).rev() {
                 match block(chunk, x, y, z) {
-                    Block::Air => {}
+                    Block::Air
+                    | Block::ShortGrass
+                    | Block::SnowLayer
+                    | Block::Carpet
+                    | Block::TallGrassLower
+                    | Block::TallGrassUpper => {}
                     Block::Leaves
                     | Block::SpruceLeaves
                     | Block::AcaciaLeaves
@@ -1191,6 +1255,29 @@ mod tests {
     }
 
     #[test]
+    fn move_to_accepts_vanilla_position_range() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
+        preview.teleport_acknowledged = true;
+
+        preview.move_to(5_000_000.5, 1000.0, 0.5).unwrap();
+        assert_eq!(preview.center, (312_500, 0));
+
+        preview
+            .move_to(-30_000_000.0, -20_000_000.0, 30_000_000.0)
+            .unwrap();
+        assert_eq!(preview.center, (-1_875_000, 1_875_000));
+
+        for (x, y, z) in [
+            (30_000_000.5, 0.0, 0.0),
+            (0.0, 0.0, -30_000_000.5),
+            (0.0, 20_000_000.5, 0.0),
+            (0.0, -20_000_000.5, 0.0),
+        ] {
+            assert!(preview.move_to(x, y, z).is_err());
+        }
+    }
+
+    #[test]
     fn walking_one_chunk_forgets_old_edge_and_rejoin_starts_fresh() {
         let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
         preview.teleport_acknowledged = true;
@@ -1213,6 +1300,13 @@ mod tests {
         let mut rejoined = Preview::new(2026, 2, Terrain::Preview, &manifest()).unwrap();
         rejoined.teleport_acknowledged = true;
         assert_eq!(rejoined.next_chunk().unwrap().0, first);
+    }
+
+    #[test]
+    fn block_state_table_follows_block_discriminants() {
+        for (index, (block, _)) in BLOCK_STATES.iter().enumerate() {
+            assert_eq!(*block as usize, index, "{block:?} is out of order");
+        }
     }
 
     #[test]
@@ -1278,5 +1372,106 @@ mod tests {
             !preview.vanilla.as_ref().unwrap().in_flight.is_empty(),
             "generation should continue while awaiting the client"
         );
+    }
+
+    /// Reads skylight from the end of a framed chunk packet: 26 layers of a
+    /// two-byte `2048` length and 2048 bytes, then one byte for the empty block
+    /// light list. Layer 0 starts at y = -80; nibbles are low-first.
+    fn sky_at(packet: &[u8], x: usize, y: i32, z: usize) -> u8 {
+        let first_layer = packet.len() - 1 - 26 * 2050;
+        let layer = ((y + 80) / 16) as usize;
+        let data = first_layer + layer * 2050 + 2;
+        let index = (y.rem_euclid(16) as usize * 16 + z) * 16 + x;
+        (packet[data + index / 2] >> ((index % 2) * 4)) & 0x0f
+    }
+
+    fn encoded(chunk: &Chunk) -> Vec<u8> {
+        encode_chunk(chunk, Generator::new(1), &[0; 8])
+    }
+
+    #[test]
+    fn plants_and_thin_covers_pass_skylight() {
+        for block in [
+            Block::ShortGrass,
+            Block::TallGrassLower,
+            Block::TallGrassUpper,
+            Block::SnowLayer,
+            Block::Carpet,
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set_block(2, 10, 3, Block::Grass);
+            chunk.set_block(2, 11, 3, block);
+            let packet = encoded(&chunk);
+            assert_eq!(sky_at(&packet, 2, 12, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 11, 3), 15, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 10, 3), 0, "{block:?}");
+            assert_eq!(sky_at(&packet, 2, 9, 3), 0, "{block:?}");
+        }
+    }
+
+    #[test]
+    fn grass_is_only_in_the_world_surface_heightmap() {
+        let mut chunk = Chunk::empty(0, 0);
+        chunk.set_block(0, 10, 0, Block::Grass);
+        let without_plant = encoded(&chunk);
+        chunk.set_block(0, 11, 0, Block::ShortGrass);
+        let with_plant = encoded(&chunk);
+
+        // 8 coordinate bytes, map size, then per type: id, length 37, longs.
+        // Column (0, 0) is the low 9 bits of each array's first big-endian long.
+        let first_height = |packet: &[u8], map_index: usize| {
+            let (_, frame_prefix) = read_varint(packet);
+            let body = frame_prefix + 1 + 8 + 1;
+            let entry = body + map_index * (2 + 37 * 8);
+            let word: [u8; 8] = packet[entry + 2..entry + 10].try_into().unwrap();
+            u64::from_be_bytes(word) & 0x1ff
+        };
+        // Floor top at y = 10 is stored as 10 + 1 + 64.
+        assert_eq!(first_height(&without_plant, 0), 75);
+        assert_eq!(first_height(&with_plant, 0), 76);
+        assert_eq!(first_height(&with_plant, 1), 75);
+        assert_eq!(first_height(&with_plant, 2), 75);
+    }
+
+    #[test]
+    fn new_block_variants_reach_the_chunk_palette() {
+        // Protocol state IDs from the official 26.3 blocks report, as VarInts.
+        for (block, id_bytes) in [
+            (Block::ShortGrass, [0xBB, 0x12]),
+            (Block::SnowLayer, [0x8D, 0x43]),
+            (Block::Carpet, [0x97, 0x73]),
+            (Block::TallGrassLower, [0xB3, 0x73]),
+            (Block::TallGrassUpper, [0xB2, 0x73]),
+        ] {
+            let mut chunk = Chunk::empty(0, 0);
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        chunk.set_block(x, y, z, block);
+                    }
+                }
+            }
+            // 4096 non-air blocks, no fluid, single-value palette, state ID.
+            let section = [0x10, 0x00, 0x00, 0x00, 0x00, id_bytes[0], id_bytes[1]];
+            let packet = encoded(&chunk);
+            assert!(
+                packet.windows(section.len()).any(|bytes| bytes == section),
+                "{block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_block_state_ids_match_chunk_registry() {
+        // Official 26.3 block report values, written out independently of the table.
+        for (block, state) in [
+            (Block::ShortGrass, 2363),
+            (Block::SnowLayer, 8589),
+            (Block::Carpet, 14743),
+            (Block::TallGrassLower, 14771),
+            (Block::TallGrassUpper, 14770),
+        ] {
+            assert_eq!(block_state(block as u16), state, "{block:?}");
+        }
     }
 }

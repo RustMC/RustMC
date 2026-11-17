@@ -20,12 +20,23 @@ const MAX_BYTES: u64 = 1_073_741_824;
 const MAX_INPUT_FILES: usize = 4_096;
 const MAX_INPUT_BYTES: u64 = 67_108_864;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Build-time hash of the sources that shape cached packets (see `build.rs`).
+const PACKET_SOURCE_FINGERPRINT: &str = env!("RUSTMC_PACKET_SOURCE_FINGERPRINT");
 
 #[derive(Debug, Default)]
 struct Budget {
     files: VecDeque<(PathBuf, u64)>,
     positions: BTreeSet<(i32, i32)>,
     bytes: u64,
+}
+
+impl Budget {
+    fn remove_file_entry(&mut self, path: &Path) {
+        if let Some(index) = self.files.iter().position(|(stored, _)| stored == path) {
+            let (_, old_size) = self.files.remove(index).expect("index exists");
+            self.bytes -= old_size;
+        }
+    }
 }
 
 fn packet_position(path: &Path) -> Option<(i32, i32)> {
@@ -74,7 +85,8 @@ impl PreviewCache {
             }
             budget.files.push_back((path, size));
         }
-        prune(&mut budget)?;
+        let evicted = prune(&mut budget);
+        remove_evicted(evicted)?;
         Ok(Self {
             directory: Arc::new(directory),
             budget: Arc::new(Mutex::new(budget)),
@@ -86,36 +98,22 @@ impl PreviewCache {
     }
 
     pub fn read(&self, x: i32, z: i32) -> io::Result<Option<Vec<u8>>> {
+        let packet = read_packet(&self.path(x, z), x, z)?;
+        if packet.is_none() {
+            self.forget(x, z);
+        }
+        Ok(packet)
+    }
+
+    fn forget(&self, x: i32, z: i32) {
         let path = self.path(x, z);
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if file.metadata()?.len() > (HEADER_BYTES + MAX_PACKET_BYTES) as u64 {
-            return Ok(None);
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
-            return Ok(None);
-        }
-        let stored_x = i32::from_be_bytes(bytes[8..12].try_into().expect("fixed slice"));
-        let stored_z = i32::from_be_bytes(bytes[12..16].try_into().expect("fixed slice"));
-        let length = u32::from_be_bytes(bytes[16..20].try_into().expect("fixed slice")) as usize;
-        if stored_x != x
-            || stored_z != z
-            || length == 0
-            || length > MAX_PACKET_BYTES
-            || bytes.len() != HEADER_BYTES + length
         {
-            return Ok(None);
+            let mut budget = self.budget.lock().expect("preview cache lock poisoned");
+            budget.remove_file_entry(&path);
+            budget.positions.remove(&(x, z));
         }
-        let packet = &bytes[HEADER_BYTES..];
-        if Sha256::digest(packet).as_slice() != &bytes[20..52] {
-            return Ok(None);
-        }
-        Ok(Some(packet.to_vec()))
+        // The entry is already out of the budget, so a failed delete only wastes disk space.
+        let _ = fs::remove_file(&path);
     }
 
     /// A cheap hint for scheduling cached packets; `read` still validates them.
@@ -134,7 +132,6 @@ impl PreviewCache {
                 "invalid packet size",
             ));
         }
-        let mut budget = self.budget.lock().expect("preview cache lock poisoned");
         let path = self.path(x, z);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temporary =
@@ -159,15 +156,20 @@ impl PreviewCache {
             let _ = fs::remove_file(&temporary);
             return result;
         }
-        if let Some(index) = budget.files.iter().position(|(stored, _)| *stored == path) {
-            let (_, old_size) = budget.files.remove(index).expect("index exists");
-            budget.bytes -= old_size;
-        }
-        let size = (HEADER_BYTES + packet.len()) as u64;
-        budget.files.push_back((path, size));
-        budget.positions.insert((x, z));
-        budget.bytes += size;
-        prune(&mut budget)
+        // File I/O and fsync above, and eviction unlinks below, run without the
+        // lock, so concurrent workers and scheduling hints (`contains`) never
+        // wait on disk. Each write uses a unique temporary file and an atomic
+        // rename; only the bookkeeping in this block is serialized.
+        let evicted = {
+            let mut budget = self.budget.lock().expect("preview cache lock poisoned");
+            budget.remove_file_entry(&path);
+            let size = (HEADER_BYTES + packet.len()) as u64;
+            budget.files.push_back((path, size));
+            budget.positions.insert((x, z));
+            budget.bytes += size;
+            prune(&mut budget)
+        };
+        remove_evicted(evicted)
     }
 
     pub fn cached_count(&self) -> usize {
@@ -179,17 +181,57 @@ impl PreviewCache {
     }
 }
 
-fn prune(budget: &mut Budget) -> io::Result<()> {
+fn read_packet(path: &Path, x: i32, z: i32) -> io::Result<Option<Vec<u8>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > (HEADER_BYTES + MAX_PACKET_BYTES) as u64 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
+        return Ok(None);
+    }
+    let stored_x = i32::from_be_bytes(bytes[8..12].try_into().expect("fixed slice"));
+    let stored_z = i32::from_be_bytes(bytes[12..16].try_into().expect("fixed slice"));
+    let length = u32::from_be_bytes(bytes[16..20].try_into().expect("fixed slice")) as usize;
+    if stored_x != x
+        || stored_z != z
+        || length == 0
+        || length > MAX_PACKET_BYTES
+        || bytes.len() != HEADER_BYTES + length
+    {
+        return Ok(None);
+    }
+    let packet = &bytes[HEADER_BYTES..];
+    if Sha256::digest(packet).as_slice() != &bytes[20..52] {
+        return Ok(None);
+    }
+    Ok(Some(packet.to_vec()))
+}
+
+fn prune(budget: &mut Budget) -> Vec<PathBuf> {
+    let mut evicted = Vec::new();
     while budget.files.len() > MAX_FILES || budget.bytes > MAX_BYTES {
         let (path, size) = budget.files.pop_front().expect("over budget has files");
+        budget.bytes -= size;
+        if let Some(position) = packet_position(&path) {
+            budget.positions.remove(&position);
+        }
+        evicted.push(path);
+    }
+    evicted
+}
+
+fn remove_evicted(paths: Vec<PathBuf>) -> io::Result<()> {
+    for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        }
-        budget.bytes -= size;
-        if let Some(position) = packet_position(&path) {
-            budget.positions.remove(&position);
         }
     }
     Ok(())
@@ -197,7 +239,9 @@ fn prune(budget: &mut Budget) -> io::Result<()> {
 
 fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
-    hasher.update(b"rustmc-preview-cache-v3:java-26.3:protocol-777");
+    hasher.update(b"rustmc-preview-cache:java-26.3:protocol-777");
+    // Generator and encoder sources, so code changes never reuse old packets.
+    hasher.update(PACKET_SOURCE_FINGERPRINT.as_bytes());
     hasher.update(seed.to_be_bytes());
     let mut paths = Vec::new();
     collect_files(data_root, &mut paths)?;
@@ -395,6 +439,82 @@ mod tests {
                 .cached_count(),
             0
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_returns_evicted_paths_without_unlinking() {
+        let root = std::env::temp_dir().join(format!(
+            "rustmc-preview-cache-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let registry = root.join("registry.json");
+        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(&registry, b"registry-a").unwrap();
+        let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
+
+        let oldest = cache.path(0, 0);
+        let newest = cache.path(1, 0);
+        fs::write(&oldest, b"oldest-packet").unwrap();
+        fs::write(&newest, b"newest-packet").unwrap();
+
+        let mut budget = Budget {
+            files: VecDeque::from([(oldest.clone(), MAX_BYTES), (newest.clone(), 1)]),
+            positions: BTreeSet::from([(0, 0), (1, 0)]),
+            bytes: MAX_BYTES + 1,
+        };
+
+        let evicted = prune(&mut budget);
+        assert_eq!(evicted, vec![oldest.clone()]);
+        assert!(!budget.positions.contains(&(0, 0)));
+        assert!(budget.positions.contains(&(1, 0)));
+        assert_eq!(budget.bytes, 1);
+        assert!(oldest.exists());
+
+        remove_evicted(evicted).unwrap();
+        assert!(!oldest.exists());
+        assert!(newest.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_forgets_corrupt_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "rustmc-preview-cache-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let registry = root.join("registry.json");
+        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(&registry, b"registry-a").unwrap();
+        let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
+
+        cache.write(3, 4, b"framed-packet").unwrap();
+        assert!(cache.contains(3, 4));
+        let count_before = cache.cached_count();
+        assert_eq!(count_before, 1);
+
+        let path = cache.path(3, 4);
+        fs::write(&path, b"garbage").unwrap();
+        assert_eq!(cache.read(3, 4).unwrap(), None);
+        assert!(!cache.contains(3, 4));
+        assert_eq!(cache.cached_count(), count_before - 1);
+        assert_eq!(
+            cache
+                .budget
+                .lock()
+                .expect("preview cache lock poisoned")
+                .bytes,
+            0
+        );
+        assert!(!path.exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,0 +1,28 @@
+name: workflow-audit
+# Audits the workflow files themselves for excessive permissions, template
+# injection, credential persistence, and unpinned actions.
+on:
+  push:
+    branches: ['**']
+    paths: ['.github/**']
+  pull_request:
+    paths: ['.github/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: workflow-audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  zizmor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node.js 24
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: false
+          # Informational notes are reported but do not fail the job.
+          min-severity: low
