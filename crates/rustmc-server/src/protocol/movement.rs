@@ -31,6 +31,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::java_wire::{self, frame, put_varint};
+
 /// Serverbound packet ID for Java 26.3 AcceptTeleportation (Play state).
 pub const PACKET_ID_ACCEPT_TELEPORTATION: u32 = 0x00;
 
@@ -219,51 +221,21 @@ impl From<MovementError> for MovementValidationError {
 
 /// Reads a VarInt from a byte buffer. Returns `(value, bytes_read)` on success.
 pub fn read_varint(input: &[u8]) -> Result<(i32, usize), MovementError> {
-    let mut value = 0u32;
-    for (i, &byte) in input.iter().take(5).enumerate() {
-        if i == 4 && (byte & 0xf0) != 0 {
-            return Err(MovementError::MalformedVarInt);
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if (byte & 0x80) == 0 {
-            if i > 0 && byte == 0 && value == 0 {
-                return Err(MovementError::MalformedVarInt);
-            }
-            return Ok((value as i32, i + 1));
-        }
-    }
-    if input.len() >= 5 {
-        Err(MovementError::MalformedVarInt)
-    } else {
-        Err(MovementError::UnexpectedEof)
+    match java_wire::read_varint(input) {
+        Ok(Some((value, bytes_read))) => Ok((value as i32, bytes_read)),
+        Ok(None) => Err(MovementError::UnexpectedEof),
+        Err(_) => Err(MovementError::MalformedVarInt),
     }
 }
 
 /// Writes a VarInt to a byte buffer.
-pub fn write_varint(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+pub fn write_varint(value: u32, out: &mut Vec<u8>) {
+    put_varint(value, out);
 }
 
 /// Frames a packet with its packet ID and outer length VarInt.
 pub fn frame_packet(packet_id: u32, body: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    write_varint(packet_id, &mut packet);
-    packet.extend_from_slice(body);
-
-    let mut framed = Vec::new();
-    write_varint(packet.len() as u32, &mut framed);
-    framed.extend(packet);
-    framed
+    frame(packet_id, body)
 }
 
 /// Unframes an outer-framed packet, returning `(packet_id, body_slice)`.
@@ -1489,6 +1461,14 @@ mod tests {
         // VarInt overflow (> 5 bytes)
         assert_eq!(
             read_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01]),
+            Err(MovementError::MalformedVarInt)
+        );
+    }
+
+    #[test]
+    fn test_varint_rejects_non_canonical_nonzero() {
+        assert_eq!(
+            read_varint(&[0x81, 0x00]),
             Err(MovementError::MalformedVarInt)
         );
     }

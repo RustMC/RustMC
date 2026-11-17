@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use super::put_varint;
+use crate::java_wire::{put_nbt_text, put_varint};
 
 /// Default keep-alive timeout in server ticks (15 seconds = 300 ticks).
 pub const DEFAULT_TIMEOUT_TICKS: u64 = 300;
@@ -183,11 +183,6 @@ impl DisconnectPhase {
     }
 }
 
-/// NBT tag type of a string; a plain text component is a bare string tag.
-const TAG_STRING: u8 = 8;
-/// Largest modified UTF-8 payload an NBT string length prefix can describe.
-const MAX_NBT_STRING_BYTES: usize = u16::MAX as usize;
-
 /// Errors from encoding a disconnect reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectError {
@@ -233,13 +228,7 @@ impl DisconnectPayload {
                 payload.extend_from_slice(json.as_bytes());
             }
             DisconnectPhase::Configuration | DisconnectPhase::Play => {
-                let text = modified_utf8(reason);
-                if text.len() > MAX_NBT_STRING_BYTES {
-                    return Err(DisconnectError::ReasonTooLong);
-                }
-                payload.push(TAG_STRING);
-                payload.extend_from_slice(&(text.len() as u16).to_be_bytes());
-                payload.extend_from_slice(&text);
+                put_nbt_text(reason, &mut payload).map_err(|_| DisconnectError::ReasonTooLong)?;
             }
         }
         let mut framed = Vec::with_capacity(payload.len() + 5);
@@ -247,25 +236,4 @@ impl DisconnectPayload {
         framed.extend_from_slice(&payload);
         Ok(framed)
     }
-}
-
-/// Java's modified UTF-8: U+0000 becomes `C0 80` and supplementary characters
-/// are written as two three-byte surrogate encodings.
-fn modified_utf8(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    for unit in text.encode_utf16() {
-        match unit {
-            0x0001..=0x007f => out.push(unit as u8),
-            0x0000 | 0x0080..=0x07ff => {
-                out.push(0xc0 | (unit >> 6) as u8);
-                out.push(0x80 | (unit & 0x3f) as u8);
-            }
-            _ => {
-                out.push(0xe0 | (unit >> 12) as u8);
-                out.push(0x80 | ((unit >> 6) & 0x3f) as u8);
-                out.push(0x80 | (unit & 0x3f) as u8);
-            }
-        }
-    }
-    out
 }
