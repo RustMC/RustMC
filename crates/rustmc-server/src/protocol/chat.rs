@@ -4,7 +4,7 @@
 use std::{collections::HashMap, error::Error, fmt, sync::Arc};
 
 // Shared Java wire encoders; only the decoders below are chat specific.
-use crate::discovery_java::{put_string, put_varint};
+use crate::java_wire::{put_string, put_varint};
 
 // Packet IDs come from the 26.3 server's generated packet report. Layouts follow
 // the public protocol reference for 26.3 / protocol 777:

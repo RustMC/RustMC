@@ -788,6 +788,7 @@ mod tests {
             last_activity: Instant::now(),
             created: Instant::now(),
             pending_chunk_since: None,
+            write_overflow: false,
             rate_window: Instant::now(),
             rate_window_bytes: 0,
             play_started: None,
