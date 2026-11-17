@@ -10,13 +10,22 @@
 //! [Minecraft Wiki Entity page](https://minecraft.wiki/w/Entity), retrieved 13 November
 //! 2026, a secondary source not pinned to Java 26.3: arrows 0.05 and 0.99 (terminal
 //! 5.00 blocks/tick); eggs, snowballs, and ender pearls 0.03 and 0.99 (terminal 2.97).
-//! This module applies drag then gravity after moving, which reproduces the arrow
-//! terminal velocity but gives 3.0 for thrown items: the same table orders them
-//! "acceleration, drag, position" since Java 1.21.2. That ordering is not yet modelled.
-//! Water drag, the damage and critical formulas, knockback strengths, shake ticks, and
-//! the five-tick shooter grace period have no recorded source.
+//! Arrows apply drag then gravity after moving; snowballs and ender pearls follow the
+//! table's Java 1.21.2 "Acceleration, Drag, Position" ordering (gravity, then drag, then
+//! moving). Water drag, the damage and critical formulas, knockback strengths, shake
+//! ticks, and the five-tick shooter grace period have no recorded source.
 
+pub use super::physics::Aabb;
 use std::collections::{BTreeSet, HashSet};
+
+/// Longest path, in blocks, one tick may move a projectile; longer velocities are
+/// scaled down to it. Real projectiles move a few blocks per tick, so this only
+/// bounds corrupt or hostile input.
+pub const MAX_TICK_DISTANCE: f64 = 64.0;
+
+/// Cells one raycast may visit: a segment of length L crosses at most ceil(L)
+/// cell boundaries per axis, plus its start cell.
+const MAX_RAYCAST_STEPS: usize = 3 * (MAX_TICK_DISTANCE as usize + 1) + 1;
 
 /// Air drag multiplier applied to velocity each tick (`v *= 0.99`).
 pub const AIR_DRAG: f64 = 0.99;
@@ -87,6 +96,14 @@ impl ProjectileKind {
             Self::Snowball | Self::EnderPearl => 0,
         }
     }
+
+    /// Whether gravity and drag apply before moving (changed for thrown items in Java 1.21.2).
+    pub const fn accelerates_before_moving(self) -> bool {
+        match self {
+            Self::Arrow => false,
+            Self::Snowball | Self::EnderPearl => true,
+        }
+    }
 }
 
 /// Six cardinal directions of an axis-aligned voxel block.
@@ -130,123 +147,90 @@ pub enum ProjectileHit {
     },
 }
 
-/// Axis-aligned bounding box defined by minimum and maximum coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Aabb {
-    pub min: [f64; 3],
-    pub max: [f64; 3],
+fn is_finite_vec3(v: [f64; 3]) -> bool {
+    v[0].is_finite() && v[1].is_finite() && v[2].is_finite()
 }
 
-impl Aabb {
-    /// Creates a new bounding box from min and max coordinate bounds.
-    pub fn new(min: [f64; 3], max: [f64; 3]) -> Self {
-        Self { min, max }
-    }
+fn is_in_water<W: WorldCollision>(world: &W, pos: [f64; 3]) -> bool {
+    world.is_water_block([
+        pos[0].floor() as i32,
+        pos[1].floor() as i32,
+        pos[2].floor() as i32,
+    ])
+}
 
-    /// Creates a 1x1x1 bounding box for an integer voxel coordinate.
-    pub fn from_block(pos: [i32; 3]) -> Self {
-        let x = pos[0] as f64;
-        let y = pos[1] as f64;
-        let z = pos[2] as f64;
-        Self {
-            min: [x, y, z],
-            max: [x + 1.0, y + 1.0, z + 1.0],
-        }
-    }
+/// Computes intersection of the ray segment `origin + t * dir` for `t in [0.0, 1.0]`.
+/// Returns `Some((t, face))` with the entry parameter and face if an intersection occurs.
+fn clip_ray(aabb: &Aabb, origin: [f64; 3], dir: [f64; 3]) -> Option<(f64, BlockFace)> {
+    let mut t_near = f64::NEG_INFINITY;
+    let mut t_far = f64::INFINITY;
+    let mut hit_face = None;
 
-    /// Creates a bounding box centered horizontally at `center`, spanning `width` along X/Z
-    /// and `height` along +Y.
-    pub fn from_center_and_size(center: [f64; 3], width: f64, height: f64) -> Self {
-        let half_w = width / 2.0;
-        Self {
-            min: [center[0] - half_w, center[1], center[2] - half_w],
-            max: [center[0] + half_w, center[1] + height, center[2] + half_w],
-        }
-    }
+    for axis in 0..3 {
+        let o = origin[axis];
+        let d = dir[axis];
+        let b_min = aabb.min[axis];
+        let b_max = aabb.max[axis];
 
-    /// Returns whether the specified coordinate is within or on the bounding box.
-    pub fn contains(&self, point: [f64; 3]) -> bool {
-        point[0] >= self.min[0]
-            && point[0] <= self.max[0]
-            && point[1] >= self.min[1]
-            && point[1] <= self.max[1]
-            && point[2] >= self.min[2]
-            && point[2] <= self.max[2]
-    }
-
-    /// Computes intersection of the ray segment `origin + t * dir` for `t in [0.0, 1.0]`.
-    /// Returns `Some((t, face))` with the entry parameter and face if an intersection occurs.
-    pub fn clip_ray(&self, origin: [f64; 3], dir: [f64; 3]) -> Option<(f64, BlockFace)> {
-        let mut t_near = f64::NEG_INFINITY;
-        let mut t_far = f64::INFINITY;
-        let mut hit_face = None;
-
-        for axis in 0..3 {
-            let o = origin[axis];
-            let d = dir[axis];
-            let b_min = self.min[axis];
-            let b_max = self.max[axis];
-
-            if d.abs() < 1e-12 {
-                // Ray is parallel to slab
-                if o < b_min || o > b_max {
-                    return None;
-                }
-            } else {
-                let mut t1 = (b_min - o) / d;
-                let mut t2 = (b_max - o) / d;
-                let (entry_face, _exit_face) = match axis {
-                    0 => {
-                        if d > 0.0 {
-                            (BlockFace::West, BlockFace::East)
-                        } else {
-                            (BlockFace::East, BlockFace::West)
-                        }
+        if d.abs() < 1e-12 {
+            // Ray is parallel to slab
+            if o < b_min || o > b_max {
+                return None;
+            }
+        } else {
+            let mut t1 = (b_min - o) / d;
+            let mut t2 = (b_max - o) / d;
+            let (entry_face, _exit_face) = match axis {
+                0 => {
+                    if d > 0.0 {
+                        (BlockFace::West, BlockFace::East)
+                    } else {
+                        (BlockFace::East, BlockFace::West)
                     }
-                    1 => {
-                        if d > 0.0 {
-                            (BlockFace::Down, BlockFace::Up)
-                        } else {
-                            (BlockFace::Up, BlockFace::Down)
-                        }
+                }
+                1 => {
+                    if d > 0.0 {
+                        (BlockFace::Down, BlockFace::Up)
+                    } else {
+                        (BlockFace::Up, BlockFace::Down)
                     }
-                    _ => {
-                        if d > 0.0 {
-                            (BlockFace::North, BlockFace::South)
-                        } else {
-                            (BlockFace::South, BlockFace::North)
-                        }
+                }
+                _ => {
+                    if d > 0.0 {
+                        (BlockFace::North, BlockFace::South)
+                    } else {
+                        (BlockFace::South, BlockFace::North)
                     }
-                };
+                }
+            };
 
-                if t1 > t2 {
-                    std::mem::swap(&mut t1, &mut t2);
-                }
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
 
-                if t1 > t_near {
-                    t_near = t1;
-                    hit_face = Some(entry_face);
-                }
-                if t2 < t_far {
-                    t_far = t2;
-                }
+            if t1 > t_near {
+                t_near = t1;
+                hit_face = Some(entry_face);
+            }
+            if t2 < t_far {
+                t_far = t2;
+            }
 
-                if t_near > t_far {
-                    return None;
-                }
+            if t_near > t_far {
+                return None;
             }
         }
+    }
 
-        if t_far < 0.0 || t_near > 1.0 {
-            return None;
-        }
+    if t_far < 0.0 || t_near > 1.0 {
+        return None;
+    }
 
-        if t_near < 0.0 {
-            // Origin is inside the bounding box
-            Some((0.0, hit_face.unwrap_or(BlockFace::Up)))
-        } else {
-            Some((t_near, hit_face.unwrap_or(BlockFace::Up)))
-        }
+    if t_near < 0.0 {
+        // Origin is inside the bounding box
+        Some((0.0, hit_face.unwrap_or(BlockFace::Up)))
+    } else {
+        Some((t_near, hit_face.unwrap_or(BlockFace::Up)))
     }
 }
 
@@ -267,7 +251,7 @@ impl EntityCollider {
     pub fn player(id: i32, feet: [f64; 3]) -> Self {
         Self {
             id,
-            bounding_box: Aabb::from_center_and_size(feet, 0.6, 1.8),
+            bounding_box: Aabb::from_entity_pos(feet, 0.6, 1.8),
         }
     }
 }
@@ -488,13 +472,54 @@ impl ProjectileEntity {
         ]
     }
 
-    /// Integrates drag and gravity over one logical tick without position movement.
-    pub fn apply_drag_and_gravity(&mut self, in_water: bool) {
+    fn apply_drag(&mut self, in_water: bool) {
         let drag = if in_water { WATER_DRAG } else { AIR_DRAG };
         self.velocity[0] *= drag;
         self.velocity[1] *= drag;
         self.velocity[2] *= drag;
+    }
+
+    fn apply_drag_then_gravity(&mut self, in_water: bool) {
+        self.apply_drag(in_water);
         self.velocity[1] -= self.kind.gravity();
+    }
+
+    fn apply_gravity_then_drag(&mut self, in_water: bool) {
+        self.velocity[1] -= self.kind.gravity();
+        self.apply_drag(in_water);
+    }
+
+    fn clamp_velocity(&mut self) {
+        let max_abs = self.velocity[0]
+            .abs()
+            .max(self.velocity[1].abs())
+            .max(self.velocity[2].abs());
+        if max_abs == 0.0 {
+            return;
+        }
+        // Divide by the largest component first so squaring cannot overflow on huge inputs.
+        let scaled = [
+            self.velocity[0] / max_abs,
+            self.velocity[1] / max_abs,
+            self.velocity[2] / max_abs,
+        ];
+        let unit_norm =
+            (scaled[0] * scaled[0] + scaled[1] * scaled[1] + scaled[2] * scaled[2]).sqrt();
+        if max_abs > MAX_TICK_DISTANCE / unit_norm {
+            let scale = MAX_TICK_DISTANCE / unit_norm;
+            self.velocity[0] = scaled[0] * scale;
+            self.velocity[1] = scaled[1] * scale;
+            self.velocity[2] = scaled[2] * scale;
+        }
+    }
+
+    /// Integrates drag and gravity over one logical tick without position movement.
+    pub fn apply_drag_and_gravity(&mut self, in_water: bool) {
+        if self.kind.accelerates_before_moving() {
+            self.apply_gravity_then_drag(in_water);
+        } else {
+            self.apply_drag_then_gravity(in_water);
+        }
     }
 
     /// Advances kinematics in free air without collision detection.
@@ -518,6 +543,10 @@ impl ProjectileEntity {
         world: &W,
         entities: &[EntityCollider],
     ) -> Option<ProjectileHit> {
+        if !is_finite_vec3(self.position) || !is_finite_vec3(self.velocity) {
+            return None;
+        }
+
         if self.in_ground {
             self.ticks_in_ground = self.ticks_in_ground.saturating_add(1);
             if self.shake_ticks > 0 {
@@ -529,6 +558,12 @@ impl ProjectileEntity {
         self.ticks_in_air = self.ticks_in_air.saturating_add(1);
         if self.shake_ticks > 0 {
             self.shake_ticks -= 1;
+        }
+
+        self.clamp_velocity();
+        if self.kind.accelerates_before_moving() {
+            let in_water = is_in_water(world, self.position);
+            self.apply_gravity_then_drag(in_water);
         }
 
         let start = self.position;
@@ -549,7 +584,7 @@ impl ProjectileEntity {
                 continue;
             }
 
-            if let Some((t, _face)) = entity.bounding_box.clip_ray(start, vel)
+            if let Some((t, _face)) = clip_ray(&entity.bounding_box, start, vel)
                 && (0.0..=1.0).contains(&t)
             {
                 match best_entity_hit {
@@ -579,12 +614,10 @@ impl ProjectileEntity {
                 self.position[1] += vel[1];
                 self.position[2] += vel[2];
 
-                let in_water = world.is_water_block([
-                    self.position[0].floor() as i32,
-                    self.position[1].floor() as i32,
-                    self.position[2].floor() as i32,
-                ]);
-                self.apply_drag_and_gravity(in_water);
+                if !self.kind.accelerates_before_moving() {
+                    let in_water = is_in_water(world, self.position);
+                    self.apply_drag_then_gravity(in_water);
+                }
                 None
             }
         }
@@ -627,12 +660,10 @@ impl ProjectileEntity {
             self.pierce_level -= 1;
             self.pierced_entities.push(entity_id);
 
-            let in_water = world.is_water_block([
-                self.position[0].floor() as i32,
-                self.position[1].floor() as i32,
-                self.position[2].floor() as i32,
-            ]);
-            self.apply_drag_and_gravity(in_water);
+            if !self.kind.accelerates_before_moving() {
+                let in_water = is_in_water(world, self.position);
+                self.apply_drag_then_gravity(in_water);
+            }
         } else {
             self.velocity = [0.0, 0.0, 0.0];
         }
@@ -651,6 +682,10 @@ impl ProjectileEntity {
         start: [f64; 3],
         vel: [f64; 3],
     ) -> Option<(f64, [i32; 3], BlockFace)> {
+        if !is_finite_vec3(start) || !is_finite_vec3(vel) {
+            return None;
+        }
+
         let end = [start[0] + vel[0], start[1] + vel[1], start[2] + vel[2]];
         let start_cell = [
             start[0].floor() as i32,
@@ -665,8 +700,12 @@ impl ProjectileEntity {
 
         // Check starting cell immediately
         if world.is_solid_block(start_cell) {
-            let box_aabb = Aabb::from_block(start_cell);
-            if let Some((t, face)) = box_aabb.clip_ray(start, vel)
+            let box_aabb = Aabb::from_block(
+                i64::from(start_cell[0]),
+                i64::from(start_cell[1]),
+                i64::from(start_cell[2]),
+            );
+            if let Some((t, face)) = clip_ray(&box_aabb, start, vel)
                 && t <= 1.0
             {
                 return Some((t, start_cell, face));
@@ -684,11 +723,11 @@ impl ProjectileEntity {
 
             if v > 1e-12 {
                 step[i] = 1;
-                t_max[i] = (c as f64 + 1.0 - s) / v;
+                t_max[i] = (f64::from(c) + 1.0 - s) / v;
                 t_delta[i] = 1.0 / v;
             } else if v < -1e-12 {
                 step[i] = -1;
-                t_max[i] = (c as f64 - s) / v;
+                t_max[i] = (f64::from(c) - s) / v;
                 t_delta[i] = -1.0 / v;
             } else {
                 step[i] = 0;
@@ -698,10 +737,11 @@ impl ProjectileEntity {
         }
 
         let mut current_cell = start_cell;
-        let max_steps = (end_cell[0] - start_cell[0]).abs()
-            + (end_cell[1] - start_cell[1]).abs()
-            + (end_cell[2] - start_cell[2]).abs()
+        let cell_distance = (i64::from(end_cell[0]) - i64::from(start_cell[0])).abs()
+            + (i64::from(end_cell[1]) - i64::from(start_cell[1])).abs()
+            + (i64::from(end_cell[2]) - i64::from(start_cell[2])).abs()
             + 4;
+        let max_steps = cell_distance.min(MAX_RAYCAST_STEPS as i64) as usize;
 
         for _ in 0..max_steps {
             if current_cell == end_cell {
@@ -710,23 +750,27 @@ impl ProjectileEntity {
 
             if t_max[0] < t_max[1] {
                 if t_max[0] < t_max[2] {
-                    current_cell[0] += step[0];
+                    current_cell[0] = current_cell[0].saturating_add(step[0]);
                     t_max[0] += t_delta[0];
                 } else {
-                    current_cell[2] += step[2];
+                    current_cell[2] = current_cell[2].saturating_add(step[2]);
                     t_max[2] += t_delta[2];
                 }
             } else if t_max[1] < t_max[2] {
-                current_cell[1] += step[1];
+                current_cell[1] = current_cell[1].saturating_add(step[1]);
                 t_max[1] += t_delta[1];
             } else {
-                current_cell[2] += step[2];
+                current_cell[2] = current_cell[2].saturating_add(step[2]);
                 t_max[2] += t_delta[2];
             }
 
             if world.is_solid_block(current_cell) {
-                let box_aabb = Aabb::from_block(current_cell);
-                if let Some((t, face)) = box_aabb.clip_ray(start, vel)
+                let box_aabb = Aabb::from_block(
+                    i64::from(current_cell[0]),
+                    i64::from(current_cell[1]),
+                    i64::from(current_cell[2]),
+                );
+                if let Some((t, face)) = clip_ray(&box_aabb, start, vel)
                     && (0.0..=1.0).contains(&t)
                 {
                     return Some((t, current_cell, face));
@@ -819,7 +863,7 @@ mod tests {
 
         assert!((arrow.velocity[1] - (-5.0)).abs() < 1e-3);
 
-        // Snowball terminal velocity converges to -0.03 / 0.01 = -3.0
+        // Snowball terminal velocity converges to -0.03 * 0.99 / 0.01 = -2.97
         let mut snowball = ProjectileEntity::new(
             ProjectileKind::Snowball,
             [0.0, 1000.0, 0.0],
@@ -830,7 +874,7 @@ mod tests {
             snowball.tick_air();
         }
 
-        assert!((snowball.velocity[1] - (-3.0)).abs() < 1e-3);
+        assert!((snowball.velocity[1] - (-2.97)).abs() < 1e-3);
     }
 
     #[test]
@@ -973,7 +1017,10 @@ mod tests {
             }) => {
                 assert_eq!(entity_id, 200);
                 assert_eq!(damage, 0.0);
-                assert!((knockback[0] - 0.4).abs() < 1e-9);
+                let vx = 2.0 * AIR_DRAG;
+                let vy = -SNOWBALL_GRAVITY * AIR_DRAG;
+                let expected_kx = SNOWBALL_BASE_KNOCKBACK * vx / (vx * vx + vy * vy).sqrt();
+                assert!((knockback[0] - expected_kx).abs() < 1e-9);
             }
             other => panic!("expected EntityHit, got {other:?}"),
         }
@@ -1052,5 +1099,128 @@ mod tests {
             Some(ProjectileHit::EntityHit { entity_id: 2, .. })
         ));
         assert_eq!(arrow.pierce_level, 0);
+    }
+
+    #[test]
+    fn thrown_items_accelerate_before_moving() {
+        assert!(!ProjectileKind::Arrow.accelerates_before_moving());
+        assert!(ProjectileKind::Snowball.accelerates_before_moving());
+        assert!(ProjectileKind::EnderPearl.accelerates_before_moving());
+
+        let expected_vy = -0.03 * 0.99;
+        let expected_y = 100.0 - 0.03 * 0.99;
+
+        let mut snowball =
+            ProjectileEntity::new(ProjectileKind::Snowball, [0.0, 100.0, 0.0], [0.0, 0.0, 0.0]);
+        assert_eq!(snowball.tick_air(), None);
+        assert!((snowball.velocity[1] - expected_vy).abs() < 1e-12);
+        assert!((snowball.position[1] - expected_y).abs() < 1e-12);
+
+        let mut pearl = ProjectileEntity::new(
+            ProjectileKind::EnderPearl,
+            [0.0, 100.0, 0.0],
+            [0.0, 0.0, 0.0],
+        );
+        assert_eq!(pearl.tick_air(), None);
+        assert!((pearl.velocity[1] - expected_vy).abs() < 1e-12);
+        assert!((pearl.position[1] - expected_y).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ender_pearl_terminal_velocity_convergence() {
+        let mut pearl = ProjectileEntity::new(
+            ProjectileKind::EnderPearl,
+            [0.0, 1000.0, 0.0],
+            [0.0, 0.0, 0.0],
+        );
+
+        for _ in 0..1000 {
+            pearl.tick_air();
+        }
+
+        assert!((pearl.velocity[1] - (-2.97)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn non_finite_tick_leaves_state_unchanged() {
+        let world = SimpleWorld::new();
+
+        let mut nan_vel = ProjectileEntity::new(
+            ProjectileKind::Arrow,
+            [0.0, 64.0, 0.0],
+            [f64::NAN, 0.0, 0.0],
+        );
+        assert_eq!(nan_vel.tick(&world, &[]), None);
+        assert_eq!(nan_vel.position, [0.0, 64.0, 0.0]);
+        assert!(nan_vel.velocity[0].is_nan());
+        assert_eq!(nan_vel.velocity[1], 0.0);
+        assert_eq!(nan_vel.velocity[2], 0.0);
+        assert_eq!(nan_vel.ticks_in_air, 0);
+
+        let mut inf_pos = ProjectileEntity::new(
+            ProjectileKind::Snowball,
+            [f64::INFINITY, 64.0, 0.0],
+            [1.0, 0.0, 0.0],
+        );
+        assert_eq!(inf_pos.tick(&world, &[]), None);
+        assert_eq!(inf_pos.position, [f64::INFINITY, 64.0, 0.0]);
+        assert_eq!(inf_pos.velocity, [1.0, 0.0, 0.0]);
+        assert_eq!(inf_pos.ticks_in_air, 0);
+    }
+
+    #[test]
+    fn huge_velocity_scales_without_overflow() {
+        let mut arrow =
+            ProjectileEntity::new(ProjectileKind::Arrow, [0.5, 64.5, 0.5], [1e200, 0.0, 1e200]);
+        let mut world = SimpleWorld::new();
+        world.add_solid([10, 64, 10]);
+
+        let hit = arrow.tick(&world, &[]);
+        assert!(matches!(
+            hit,
+            Some(ProjectileHit::BlockHit {
+                block_pos: [10, 64, 10],
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raycast_blocks_bounds_and_non_finite() {
+        let arrow = ProjectileEntity::default();
+        let world = SimpleWorld::new();
+
+        assert_eq!(
+            arrow.raycast_blocks(&world, [0.0, 0.0, 0.0], [1e300, 0.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            arrow.raycast_blocks(&world, [1e15, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            arrow.raycast_blocks(&world, [1e15, 0.0, 0.0], [1.0, 1.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            arrow.raycast_blocks(&world, [0.0, 0.0, 0.0], [f64::NAN, 0.0, 0.0]),
+            None
+        );
+    }
+
+    #[test]
+    fn piercing_thrown_item_accelerates_only_before_moving() {
+        let mut snowball =
+            ProjectileEntity::new(ProjectileKind::Snowball, [0.0, 64.5, 0.0], [4.0, 0.0, 0.0])
+                .with_pierce_level(1);
+        let target = EntityCollider::player(1, [2.0, 64.0, 0.0]);
+
+        let hit = snowball.tick(&SimpleWorld::new(), &[target]);
+        assert!(matches!(
+            hit,
+            Some(ProjectileHit::EntityHit { entity_id: 1, .. })
+        ));
+        assert!((snowball.velocity[0] - 4.0 * AIR_DRAG).abs() < 1e-12);
+        assert!((snowball.velocity[1] - (-SNOWBALL_GRAVITY * AIR_DRAG)).abs() < 1e-12);
     }
 }
