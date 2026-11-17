@@ -216,19 +216,112 @@ pub fn is_repair_material(tool: &str, material: &str) -> bool {
     false
 }
 
+/// Validation failures when constructing or updating an [`AnvilItem`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnvilItemError {
+    /// Underlying [`ItemStack`] rejected item identifier or stack count.
+    InvalidStack(ItemStackError),
+    /// A damageable item cannot have `max_durability == 0`.
+    ZeroMaxDurability,
+    /// Remaining durability cannot exceed `max_durability`.
+    DurabilityExceedsMax {
+        durability: u32,
+        max_durability: u32,
+    },
+    /// Custom name exceeds [`MAX_NAME_LENGTH`] characters.
+    NameTooLong { len: usize, max: usize },
+}
+
+impl fmt::Display for AnvilItemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidStack(err) => write!(f, "{err}"),
+            Self::ZeroMaxDurability => write!(f, "damageable item must have max_durability > 0"),
+            Self::DurabilityExceedsMax {
+                durability,
+                max_durability,
+            } => write!(
+                f,
+                "durability {durability} exceeds max_durability {max_durability}"
+            ),
+            Self::NameTooLong { len, max } => {
+                write!(f, "custom name length {len} exceeds limit of {max} chars")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AnvilItemError {}
+
+impl From<ItemStackError> for AnvilItemError {
+    fn from(err: ItemStackError) -> Self {
+        Self::InvalidStack(err)
+    }
+}
+
+fn validate_anvil_item_invariants(
+    item: &str,
+    durability: u32,
+    max_durability: u32,
+    custom_name: Option<&str>,
+) -> Result<(), AnvilItemError> {
+    if default_max_durability(item).is_some() && max_durability == 0 {
+        return Err(AnvilItemError::ZeroMaxDurability);
+    }
+    if durability > max_durability {
+        return Err(AnvilItemError::DurabilityExceedsMax {
+            durability,
+            max_durability,
+        });
+    }
+    if let Some(name) = custom_name {
+        let len = name.chars().count();
+        if len > MAX_NAME_LENGTH {
+            return Err(AnvilItemError::NameTooLong {
+                len,
+                max: MAX_NAME_LENGTH,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// An anvil slot item wrapping the shared [`ItemStack`] for item ID and count,
 /// with durability, prior work penalty (`repair_cost`), and custom name fields
-/// beside it until [`ItemStack`] carries data components.
+/// kept private behind invariant-enforcing constructors and accessors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AnvilItem {
     stack: ItemStack,
-    pub durability: u32,
-    pub max_durability: u32,
-    pub repair_cost: u32,
-    pub custom_name: Option<String>,
+    durability: u32,
+    max_durability: u32,
+    repair_cost: u32,
+    custom_name: Option<String>,
 }
 
 impl AnvilItem {
+    /// Creates a validated [`AnvilItem`] from a shared [`ItemStack`] and explicit metadata.
+    pub fn new(
+        stack: ItemStack,
+        durability: u32,
+        max_durability: u32,
+        repair_cost: u32,
+        custom_name: Option<String>,
+    ) -> Result<Self, AnvilItemError> {
+        validate_anvil_item_invariants(
+            stack.item(),
+            durability,
+            max_durability,
+            custom_name.as_deref(),
+        )?;
+        Ok(Self {
+            stack,
+            durability,
+            max_durability,
+            repair_cost,
+            custom_name,
+        })
+    }
+
     /// Creates an [`AnvilItem`] from an existing shared [`ItemStack`], populating
     /// default durability if the item is a known damageable tool, weapon, or armor piece.
     #[must_use]
@@ -280,22 +373,56 @@ impl AnvilItem {
         self.stack.count()
     }
 
-    /// Sets the current remaining durability.
+    /// Returns current remaining durability.
     #[must_use]
-    pub fn with_durability(mut self, durability: u32) -> Self {
-        if self.max_durability == 0 {
-            self.max_durability = durability;
-        }
-        self.durability = durability.min(self.max_durability);
-        self
+    pub fn durability(&self) -> u32 {
+        self.durability
     }
 
-    /// Sets the maximum durability.
+    /// Returns maximum durability (`0` for non-damageable items).
     #[must_use]
-    pub fn with_max_durability(mut self, max_durability: u32) -> Self {
+    pub fn max_durability(&self) -> u32 {
+        self.max_durability
+    }
+
+    /// Returns prior work penalty (`repair_cost`).
+    #[must_use]
+    pub fn repair_cost(&self) -> u32 {
+        self.repair_cost
+    }
+
+    /// Returns the custom display name, if set.
+    #[must_use]
+    pub fn custom_name(&self) -> Option<&str> {
+        self.custom_name.as_deref()
+    }
+
+    /// Updates remaining durability, enforcing `durability <= max_durability`
+    /// and `max_durability > 0`.
+    pub fn with_durability(mut self, durability: u32) -> Result<Self, AnvilItemError> {
+        if self.max_durability == 0 {
+            return Err(AnvilItemError::ZeroMaxDurability);
+        }
+        if durability > self.max_durability {
+            return Err(AnvilItemError::DurabilityExceedsMax {
+                durability,
+                max_durability: self.max_durability,
+            });
+        }
+        self.durability = durability;
+        Ok(self)
+    }
+
+    /// Updates maximum durability, enforcing invariants for damageable items and current durability.
+    pub fn with_max_durability(mut self, max_durability: u32) -> Result<Self, AnvilItemError> {
+        validate_anvil_item_invariants(
+            self.stack.item(),
+            self.durability,
+            max_durability,
+            self.custom_name.as_deref(),
+        )?;
         self.max_durability = max_durability;
-        self.durability = self.durability.min(max_durability);
-        self
+        Ok(self)
     }
 
     /// Sets the prior work penalty (`repair_cost`).
@@ -305,11 +432,17 @@ impl AnvilItem {
         self
     }
 
-    /// Sets the custom display name.
-    #[must_use]
-    pub fn with_custom_name(mut self, name: impl Into<String>) -> Self {
-        self.custom_name = Some(name.into());
-        self
+    /// Updates the custom display name, enforcing [`MAX_NAME_LENGTH`].
+    pub fn with_custom_name(mut self, name: impl Into<String>) -> Result<Self, AnvilItemError> {
+        let name = name.into();
+        validate_anvil_item_invariants(
+            self.stack.item(),
+            self.durability,
+            self.max_durability,
+            Some(&name),
+        )?;
+        self.custom_name = Some(name);
+        Ok(self)
     }
 
     /// Returns damage taken (missing durability).
@@ -592,19 +725,24 @@ fn calculate_repair_internal(
         });
     }
 
-    let result_stack = ItemStack::try_new(
+    let Ok(result_stack) = ItemStack::try_new(
         input.base_item.item(),
         1,
         input.base_item.stack().max_stack(),
-    )
-    .expect("base_item stack is already validated");
-    let result_item = AnvilItem {
-        stack: result_stack,
-        durability: result_durability,
-        max_durability: input.base_item.max_durability,
-        repair_cost: next_prior_work_penalty,
-        custom_name: final_custom_name,
+    ) else {
+        return Err(AnvilError::NoOperation);
     };
+    let result_item = AnvilItem::new(
+        result_stack,
+        result_durability,
+        input.base_item.max_durability(),
+        next_prior_work_penalty,
+        final_custom_name,
+    )
+    .map_err(|err| match err {
+        AnvilItemError::NameTooLong { len, max } => AnvilError::NameTooLong { len, max },
+        _ => AnvilError::NoOperation,
+    })?;
 
     let degraded_state = roll.and_then(|r| anvil_state.roll_degradation(r));
 
@@ -715,15 +853,15 @@ mod tests {
     fn test_same_item_combination_durability_bonus() {
         // Iron sword has max durability 250.
         // 12% bonus = floor(250 * 0.12) = 30.
-        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
 
         let input = AnvilRepairInput::combine(sword1, sword2);
         let result = calculate_repair(&input, false).unwrap();
 
         // 50 + 50 + 30 = 130
-        assert_eq!(result.result_item.durability, 130);
-        assert_eq!(result.result_item.max_durability, 250);
+        assert_eq!(result.result_item.durability(), 130);
+        assert_eq!(result.result_item.max_durability(), 250);
         assert_eq!(result.result_item.item(), "minecraft:iron_sword");
         assert_eq!(result.result_item.count(), 1);
         // Combining tools costs 2 levels
@@ -731,21 +869,25 @@ mod tests {
         assert_eq!(result.material_cost, 1);
         // Prior work penalty: 0 -> next is 2*0 + 1 = 1
         assert_eq!(result.next_prior_work_penalty, 1);
-        assert_eq!(result.result_item.repair_cost, 1);
+        assert_eq!(result.result_item.repair_cost(), 1);
         assert!(result.degraded_state.is_none());
     }
 
     #[test]
     fn test_same_item_combination_durability_capping() {
         // Capping at max_durability
-        let pick1 = item("minecraft:diamond_pickaxe", 1).with_durability(1400);
-        let pick2 = item("minecraft:diamond_pickaxe", 1).with_durability(300);
+        let pick1 = item("minecraft:diamond_pickaxe", 1)
+            .with_durability(1400)
+            .unwrap();
+        let pick2 = item("minecraft:diamond_pickaxe", 1)
+            .with_durability(300)
+            .unwrap();
         // Max durability = 1561. Bonus = floor(1561 * 0.12) = 187.
         // 1400 + 300 + 187 = 1887 > 1561 -> capped at 1561.
         let input = AnvilRepairInput::combine(pick1, pick2);
         let result = calculate_repair(&input, false).unwrap();
 
-        assert_eq!(result.result_item.durability, 1561);
+        assert_eq!(result.result_item.durability(), 1561);
         assert_eq!(result.repair_cost_levels, 2);
         assert_eq!(result.material_cost, 1);
     }
@@ -755,7 +897,9 @@ mod tests {
         // Iron chestplate max durability = 240.
         // 25% per ingot = floor(240 * 0.25) = 60.
         // Starting durability: 100 (missing 140).
-        let chestplate = item("minecraft:iron_chestplate", 1).with_durability(100);
+        let chestplate = item("minecraft:iron_chestplate", 1)
+            .with_durability(100)
+            .unwrap();
         let ingots = item("minecraft:iron_ingot", 5);
 
         let input = AnvilRepairInput::combine(chestplate, ingots);
@@ -765,7 +909,7 @@ mod tests {
         // 2 ingots: 160 + 60 = 220
         // 3 ingots: 220 + 60 = 280 -> capped at 240.
         // Total ingots consumed = 3.
-        assert_eq!(result.result_item.durability, 240);
+        assert_eq!(result.result_item.durability(), 240);
         assert_eq!(result.material_cost, 3);
         assert_eq!(result.repair_cost_levels, 3);
         assert_eq!(result.next_prior_work_penalty, 1);
@@ -776,14 +920,16 @@ mod tests {
         // Diamond sword max durability = 1561.
         // 25% per diamond = floor(1561 * 0.25) = 390.
         // Starting durability: 1 (missing 1560).
-        let sword = item("minecraft:diamond_sword", 1).with_durability(1);
+        let sword = item("minecraft:diamond_sword", 1)
+            .with_durability(1)
+            .unwrap();
         let diamonds = item("minecraft:diamond", 10);
 
         let input = AnvilRepairInput::combine(sword, diamonds);
         let result = calculate_repair(&input, false).unwrap();
 
         // 4 diamonds repair full durability: 4 * 390 = 1560, total = 1561.
-        assert_eq!(result.result_item.durability, 1561);
+        assert_eq!(result.result_item.durability(), 1561);
         assert_eq!(result.material_cost, 4);
         assert_eq!(result.repair_cost_levels, 4);
     }
@@ -792,32 +938,36 @@ mod tests {
     fn test_four_material_units_top_up_non_divisible_durability() {
         // Wooden sword has max durability 59; 25% = floor(59 * 0.25) = 14, so 4 * 14 = 56 < 59.
         // The `mat_used == 4` branch changes the outcome from 56 to 59.
-        let wooden = item("minecraft:wooden_sword", 1).with_durability(0);
+        let wooden = item("minecraft:wooden_sword", 1)
+            .with_durability(0)
+            .unwrap();
         let planks = item("minecraft:oak_planks", 4);
         let res_wood = calculate_repair(&AnvilRepairInput::combine(wooden, planks), false).unwrap();
         assert_eq!(res_wood.material_cost, 4);
-        assert_eq!(res_wood.result_item.durability, 59);
+        assert_eq!(res_wood.result_item.durability(), 59);
 
         // Diamond sword from 0 durability: 4 * 390 = 1560 < 1561; `mat_used == 4` restores 1561.
-        let diamond = item("minecraft:diamond_sword", 1).with_durability(0);
+        let diamond = item("minecraft:diamond_sword", 1)
+            .with_durability(0)
+            .unwrap();
         let diamonds = item("minecraft:diamond", 4);
         let res_diamond =
             calculate_repair(&AnvilRepairInput::combine(diamond, diamonds), false).unwrap();
         assert_eq!(res_diamond.material_cost, 4);
-        assert_eq!(res_diamond.result_item.durability, 1561);
+        assert_eq!(res_diamond.result_item.durability(), 1561);
     }
 
     #[test]
     fn test_mace_durability_and_breeze_rod_repair() {
         // Java Edition mace has 500 durability and repairs with breeze_rod (125 per rod).
         assert_eq!(default_max_durability("minecraft:mace"), Some(500));
-        let mace = item("minecraft:mace", 1).with_durability(100);
+        let mace = item("minecraft:mace", 1).with_durability(100).unwrap();
         let rods = item("minecraft:breeze_rod", 3);
 
         let result = calculate_repair(&AnvilRepairInput::combine(mace, rods), false).unwrap();
         // 100 + 3 * 125 = 475
-        assert_eq!(result.result_item.durability, 475);
-        assert_eq!(result.result_item.max_durability, 500);
+        assert_eq!(result.result_item.durability(), 475);
+        assert_eq!(result.result_item.max_durability(), 500);
         assert_eq!(result.material_cost, 3);
         assert_eq!(result.repair_cost_levels, 3);
     }
@@ -825,14 +975,16 @@ mod tests {
     #[test]
     fn test_material_repair_insufficient_materials() {
         // Iron chestplate missing 140 durability, but player only has 2 ingots.
-        let chestplate = item("minecraft:iron_chestplate", 1).with_durability(100);
+        let chestplate = item("minecraft:iron_chestplate", 1)
+            .with_durability(100)
+            .unwrap();
         let ingots = item("minecraft:iron_ingot", 2);
 
         let input = AnvilRepairInput::combine(chestplate, ingots);
         let result = calculate_repair(&input, false).unwrap();
 
         // Consumes 2 ingots, restores 120 durability -> 220
-        assert_eq!(result.result_item.durability, 220);
+        assert_eq!(result.result_item.durability(), 220);
         assert_eq!(result.material_cost, 2);
         assert_eq!(result.repair_cost_levels, 2);
     }
@@ -844,7 +996,7 @@ mod tests {
         // Rename costs 1 level
         let input = AnvilRepairInput::rename_only(sword.clone(), "Excalibur").unwrap();
         let result = calculate_repair(&input, false).unwrap();
-        assert_eq!(result.result_item.custom_name.as_deref(), Some("Excalibur"));
+        assert_eq!(result.result_item.custom_name(), Some("Excalibur"));
         assert_eq!(result.repair_cost_levels, 1);
         assert_eq!(result.material_cost, 0);
         assert_eq!(result.next_prior_work_penalty, 1);
@@ -853,10 +1005,7 @@ mod tests {
         let input_trimmed =
             AnvilRepairInput::rename_only(sword.clone(), "   Doom Blade   ").unwrap();
         let res_trimmed = calculate_repair(&input_trimmed, false).unwrap();
-        assert_eq!(
-            res_trimmed.result_item.custom_name.as_deref(),
-            Some("Doom Blade")
-        );
+        assert_eq!(res_trimmed.result_item.custom_name(), Some("Doom Blade"));
 
         // Name longer than 50 characters is rejected
         let long_name = "a".repeat(51);
@@ -870,14 +1019,16 @@ mod tests {
         assert!(AnvilRepairInput::rename_only(sword.clone(), max_name).is_ok());
 
         // Blank string reset on an item that has an existing custom name
-        let named_sword = sword.with_custom_name("Old Name");
+        let named_sword = sword.with_custom_name("Old Name").unwrap();
         let reset_input = AnvilRepairInput::new(named_sword, None, Some("   ".into())).unwrap();
         let reset_res = calculate_repair(&reset_input, false).unwrap();
-        assert_eq!(reset_res.result_item.custom_name, None);
+        assert_eq!(reset_res.result_item.custom_name(), None);
         assert_eq!(reset_res.repair_cost_levels, 1); // un-renaming costs 1 level
 
         // Unchanged name does not cost levels
-        let sword_same = item("minecraft:iron_sword", 1).with_custom_name("Sword");
+        let sword_same = item("minecraft:iron_sword", 1)
+            .with_custom_name("Sword")
+            .unwrap();
         let same_input =
             AnvilRepairInput::new(sword_same.clone(), None, Some("Sword".into())).unwrap();
         assert_eq!(
@@ -895,9 +1046,11 @@ mod tests {
         for exp in expected {
             let sword1 = item("minecraft:iron_sword", 1)
                 .with_durability(100)
+                .unwrap()
                 .with_repair_cost(penalty);
             let sword2 = item("minecraft:iron_sword", 1)
                 .with_durability(100)
+                .unwrap()
                 .with_repair_cost(penalty);
 
             let input = AnvilRepairInput::combine(sword1, sword2);
@@ -913,9 +1066,11 @@ mod tests {
         // Combined with repair cost (2) = 48 >= 40 limit.
         let sword1 = item("minecraft:iron_sword", 1)
             .with_durability(100)
+            .unwrap()
             .with_repair_cost(15);
         let sword2 = item("minecraft:iron_sword", 1)
             .with_durability(100)
+            .unwrap()
             .with_repair_cost(31);
 
         let input = AnvilRepairInput::combine(sword1, sword2);
@@ -938,8 +1093,8 @@ mod tests {
 
     #[test]
     fn test_degradation_state_transitions_deterministic() {
-        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
         let input = AnvilRepairInput::combine(sword1, sword2);
 
         // Roll < 0.12 triggers degradation
@@ -968,8 +1123,8 @@ mod tests {
 
     #[test]
     fn test_repair_and_repair_with_state_use_caller_rng_deterministically() {
-        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
         let input = AnvilRepairInput::combine(sword1, sword2);
 
         // Pin deterministic outcomes for fixed world seeds (18 degrades, 0 stays intact).
@@ -985,8 +1140,8 @@ mod tests {
     #[test]
     fn test_anvil_struct_state_mutation() {
         let mut anvil = Anvil::undamaged();
-        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50).unwrap();
         let input = AnvilRepairInput::combine(sword1, sword2);
 
         // Step 1: degrades to Chipped
@@ -1037,7 +1192,9 @@ mod tests {
     #[test]
     fn test_incompatible_items_and_error_cases() {
         // Diamond sword + Iron ingot is incompatible
-        let sword = item("minecraft:diamond_sword", 1).with_durability(100);
+        let sword = item("minecraft:diamond_sword", 1)
+            .with_durability(100)
+            .unwrap();
         let ingot = item("minecraft:iron_ingot", 1);
         let input = AnvilRepairInput::combine(sword, ingot);
         assert_eq!(
@@ -1047,7 +1204,9 @@ mod tests {
 
         // Diamond sword + Iron sword is incompatible
         let iron_sword = item("minecraft:iron_sword", 1);
-        let sword = item("minecraft:diamond_sword", 1).with_durability(100);
+        let sword = item("minecraft:diamond_sword", 1)
+            .with_durability(100)
+            .unwrap();
         let input2 = AnvilRepairInput::combine(sword, iron_sword);
         assert_eq!(
             calculate_repair(&input2, false),
@@ -1068,6 +1227,55 @@ mod tests {
         assert_eq!(
             calculate_repair(&input_full, false),
             Err(AnvilError::NoRepairNeeded)
+        );
+    }
+
+    #[test]
+    fn anvil_item_enforces_invariants_through_validating_constructor() {
+        let sword_stack = ItemStack::try_new("minecraft:iron_sword", 1, 1).unwrap();
+
+        assert_eq!(
+            AnvilItem::new(sword_stack.clone(), 0, 0, 0, None),
+            Err(AnvilItemError::ZeroMaxDurability)
+        );
+        assert_eq!(
+            AnvilItem::new(sword_stack.clone(), 251, 250, 0, None),
+            Err(AnvilItemError::DurabilityExceedsMax {
+                durability: 251,
+                max_durability: 250,
+            })
+        );
+        assert_eq!(
+            AnvilItem::new(sword_stack.clone(), 100, 250, 0, Some("a".repeat(51))),
+            Err(AnvilItemError::NameTooLong {
+                len: 51,
+                max: MAX_NAME_LENGTH,
+            })
+        );
+
+        let valid = AnvilItem::new(sword_stack, 100, 250, 3, Some("a".repeat(50))).unwrap();
+        assert_eq!(valid.durability(), 100);
+        assert_eq!(valid.max_durability(), 250);
+        assert_eq!(valid.repair_cost(), 3);
+        assert_eq!(valid.custom_name().map(str::len), Some(50));
+
+        assert_eq!(
+            valid.clone().with_max_durability(0),
+            Err(AnvilItemError::ZeroMaxDurability)
+        );
+        assert_eq!(
+            valid.clone().with_durability(251),
+            Err(AnvilItemError::DurabilityExceedsMax {
+                durability: 251,
+                max_durability: 250,
+            })
+        );
+        assert_eq!(
+            valid.with_custom_name("b".repeat(51)),
+            Err(AnvilItemError::NameTooLong {
+                len: 51,
+                max: MAX_NAME_LENGTH,
+            })
         );
     }
 }
