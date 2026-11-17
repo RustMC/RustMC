@@ -15,6 +15,16 @@ mod tests_experience;
 
 pub use block_entity::*;
 
+pub mod entity_tracker;
+
+pub use entity_tracker::{
+    EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingError, TrackingEvent,
+    chunk_coords, try_chunk_coords,
+};
+
+#[cfg(test)]
+mod tests_entity_tracker;
+
 #[cfg(test)]
 mod tests_interaction;
 #[cfg(test)]
