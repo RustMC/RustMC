@@ -549,17 +549,18 @@ impl FurnaceBlockEntity {
             .as_ref()
             .and_then(|inp| recipes.find_recipe(inp.item()));
 
-        let can_cook = if let Some(rec) = recipe {
+        let cookable_recipe = if let Some(rec) = recipe {
             self.cooking_total_time = rec.cooking_time();
-            match &self.output {
+            let output_ready = match &self.output {
                 None => true,
                 Some(out) => out.can_stack_with(rec.output()) && out.count() < out.max_stack(),
-            }
+            };
+            output_ready.then_some(rec)
         } else {
-            false
+            None
         };
 
-        if can_cook {
+        if let Some(rec) = cookable_recipe {
             // Step 3a: If unlit and cookable, attempt to consume 1 fuel from slot 1.
             if self.lit_time == 0
                 && let Some(burn) = self
@@ -584,8 +585,6 @@ impl FurnaceBlockEntity {
 
                 // Completion check
                 if self.cooking_progress >= self.cooking_total_time {
-                    let rec = recipe.unwrap();
-
                     // Decrement 1 input from slot 0
                     consume_one(&mut self.input);
 
@@ -691,11 +690,16 @@ impl FurnaceBlockEntity {
 
 fn consume_one(slot: &mut Option<ItemStack>) -> Option<ItemStack> {
     let stack = slot.take()?;
-    let (consumed, rest) = stack
-        .split(1)
-        .expect("splitting 1 from a non-empty stack succeeds");
-    *slot = rest;
-    Some(consumed)
+    match stack.split(1) {
+        Ok((consumed, rest)) => {
+            *slot = rest;
+            Some(consumed)
+        }
+        Err(unchanged) => {
+            *slot = Some(unchanged);
+            None
+        }
+    }
 }
 
 /// Java 26.3 furnace container data property indices.
@@ -1201,5 +1205,22 @@ mod tests {
         furnace.input = Some(stack("minecraft:raw_gold", 4));
         furnace.tick();
         assert_eq!(furnace.cooking_progress, 1);
+    }
+
+    #[test]
+    fn test_full_cook_pins_output_item_count_and_xp() {
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.input = Some(stack("minecraft:beef", 2));
+        furnace.fuel = Some(stack("minecraft:coal", 1));
+
+        for _ in 0..(DEFAULT_COOKING_TOTAL_TIME * 2) {
+            furnace.tick();
+        }
+
+        assert!(furnace.input.is_none());
+        let output = furnace.output.as_ref().expect("cooked beef output");
+        assert_eq!(output.item(), "minecraft:cooked_beef");
+        assert_eq!(output.count(), 2);
+        assert!((furnace.stored_experience() - (MEAT_SMELT_XP * 2.0)).abs() < 1e-6);
     }
 }
