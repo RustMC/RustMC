@@ -448,15 +448,27 @@ fn block_state_property<'a>(state: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Blocks that always contain a water source block without a `waterlogged` property (minecraft.wiki `Waterlogging`).
+const ALWAYS_WATER_SOURCE_BLOCKS: &[&str] = &[
+    "minecraft:seagrass",
+    "minecraft:tall_seagrass",
+    "minecraft:kelp",
+    "minecraft:kelp_plant",
+    "minecraft:bubble_column",
+];
+
 /// Derives the fluid identifier (`minecraft:fluid` registry) carried by a block
-/// state from its `waterlogged` / `level` state properties (from 26.3 `blocks.json`)
-/// and base fluid block identity (`minecraft:water` / `minecraft:lava`), without a
-/// hard-coded plant block list.
+/// state from its `waterlogged` / `level` state properties (from 26.3 `blocks.json`),
+/// always-waterlogged vanilla blocks, and fluid block identity (`minecraft:water` / `minecraft:lava`).
 fn fluid_from_block_state(state: &str) -> &'static str {
     if block_state_property(state, "waterlogged") == Some("true") {
         return "minecraft:water";
     }
-    match base_block_id(state) {
+    let base = base_block_id(state);
+    if ALWAYS_WATER_SOURCE_BLOCKS.contains(&base) {
+        return "minecraft:water";
+    }
+    match base {
         "minecraft:water" => {
             if block_state_property(state, "level").is_some_and(|lvl| lvl != "0") {
                 "minecraft:flowing_water"
@@ -5928,7 +5940,11 @@ mod tests {
         target.set_block(0, 65, 0, "minecraft:chest[facing=north,waterlogged=true]");
         target.set_block(0, 66, 0, "minecraft:chest[facing=north,waterlogged=false]");
         target.set_block(0, 67, 0, "minecraft:seagrass");
-        target.set_block(0, 68, 0, "minecraft:air");
+        target.set_block(0, 68, 0, "minecraft:tall_seagrass[half=lower]");
+        target.set_block(0, 69, 0, "minecraft:kelp[age=5]");
+        target.set_block(0, 70, 0, "minecraft:kelp_plant");
+        target.set_block(0, 71, 0, "minecraft:bubble_column[drag=true]");
+        target.set_block(0, 72, 0, "minecraft:air");
 
         let still_water = BlockPredicate::MatchingFluids {
             fluids: vec!["minecraft:water".to_string()],
@@ -5966,10 +5982,23 @@ mod tests {
         assert!(!still_water.test(&target, DecorationPos { x: 0, y: 66, z: 0 }, &tags));
         assert!(empty.test(&target, DecorationPos { x: 0, y: 66, z: 0 }, &tags));
 
-        // Bare plant without `waterlogged=true` or tag membership stays empty (no hard-coded plant list).
-        assert!(!still_water.test(&target, DecorationPos { x: 0, y: 67, z: 0 }, &tags));
-        assert!(empty.test(&target, DecorationPos { x: 0, y: 67, z: 0 }, &tags));
-        assert!(empty.test(&target, DecorationPos { x: 0, y: 68, z: 0 }, &tags));
+        // Always-waterlogged plants/bubble_column hold a water source without a `waterlogged` property.
+        for y in 67..=71 {
+            let p = DecorationPos { x: 0, y, z: 0 };
+            assert!(
+                still_water.test(&target, p, &tags),
+                "y={y} must match water"
+            );
+            assert!(
+                !still_lava.test(&target, p, &tags),
+                "y={y} must not match lava"
+            );
+            assert!(
+                !empty.test(&target, p, &tags),
+                "y={y} must not count as dry"
+            );
+        }
+        assert!(empty.test(&target, DecorationPos { x: 0, y: 72, z: 0 }, &tags));
         assert!(empty.test(&target, DecorationPos { x: 0, y: 60, z: 0 }, &tags));
 
         assert!(still_lava.test(&target, DecorationPos { x: 0, y: 63, z: 0 }, &tags));
