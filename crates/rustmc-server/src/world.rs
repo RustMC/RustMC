@@ -6,6 +6,7 @@ pub mod container;
 mod tests_container;
 
 pub mod fluid;
+pub mod projectile;
 
 pub mod experience;
 pub mod physics;
