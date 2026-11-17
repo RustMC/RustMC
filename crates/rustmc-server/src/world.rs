@@ -35,6 +35,8 @@ pub use journal::{MAX_MUTATIONS_PER_TICK, WorldJournal};
 #[cfg(test)]
 mod tests_interaction;
 #[cfg(test)]
+mod tests_inventory;
+#[cfg(test)]
 mod tests_persistence;
 #[cfg(test)]
 mod tests_player_interaction;
@@ -50,6 +52,12 @@ pub use physics::{
 
 pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
+};
+
+pub mod inventory;
+pub use inventory::{
+    HOTBAR_SLOT_COUNT, HOTBAR_SLOTS, InventoryError, MAIN_SLOT_COUNT, MAIN_SLOTS, PlayerInventory,
+    TOTAL_SLOT_COUNT, TOTAL_SLOTS,
 };
 
 pub const CHUNK_SIDE: usize = 16;
