@@ -10,7 +10,9 @@ pub mod chunk_adapter;
 pub mod commands;
 pub mod discovery_bedrock;
 pub mod discovery_java;
+pub mod entity;
 pub mod java_packets;
+
 pub mod java_preview;
 mod java_wire;
 pub mod preview_cache;
