@@ -48,11 +48,14 @@ pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
+pub mod container_data;
 pub mod furnace;
 
+pub use container_data::{
+    SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
+};
 pub use furnace::{
-    FuelRegistry, FurnaceBlockEntity, FurnaceProperty, ItemStack, SetContainerDataPacket,
-    SmeltingRecipe, SmeltingRecipeRegistry,
+    FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
 };
 
 pub const CHUNK_SIDE: usize = 16;
