@@ -1,33 +1,36 @@
-//! Serverbound chat packets, clientbound system chat messages, JSON chat components,
-//! and command dispatcher for Minecraft Java Edition.
+//! Serverbound chat packets, clientbound system chat messages, and JSON/NBT text components
+//! for Minecraft Java Edition.
 
-use std::{collections::HashMap, error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt};
 
-// Shared Java wire encoders; only the decoders below are chat specific.
-use crate::java_wire::{put_string, put_varint};
+use crate::java_packets::play::{clientbound, serverbound};
+use crate::java_wire::{
+    self, MAX_NBT_STRING_BYTES, NBT_TAG_STRING, WireError, encode_modified_utf8, put_string,
+    put_varint,
+};
 
-// Packet IDs come from the 26.3 server's generated packet report. Layouts follow
-// the public protocol reference for 26.3 / protocol 777:
+// Packet IDs come from `crate::java_packets`. Wire layouts follow the public
+// protocol reference for 26.3 / protocol 777:
 // https://minecraft.wiki/w/Java_Edition_protocol/Packets (revision 3868170) and
 // https://minecraft.wiki/w/Java_Edition_protocol/Data_types (revision 3855787).
 
 /// Serverbound `chat` packet ID.
-pub const CHAT_PACKET_ID: u32 = 0x09;
+pub const CHAT_PACKET_ID: u32 = serverbound::CHAT;
 
 /// Serverbound `chat_ack` packet ID.
-pub const CHAT_ACK_PACKET_ID: u32 = 0x06;
+pub const CHAT_ACK_PACKET_ID: u32 = serverbound::CHAT_ACK;
 
 /// Serverbound `chat_command` packet ID (unsigned layout).
-pub const CHAT_COMMAND_PACKET_ID: u32 = 0x07;
+pub const CHAT_COMMAND_PACKET_ID: u32 = serverbound::CHAT_COMMAND;
 
 /// Serverbound `chat_command_signed` packet ID.
-pub const CHAT_COMMAND_SIGNED_PACKET_ID: u32 = 0x08;
+pub const CHAT_COMMAND_SIGNED_PACKET_ID: u32 = serverbound::CHAT_COMMAND_SIGNED;
 
 /// Serverbound `chat_session_update` packet ID.
-pub const CHAT_SESSION_UPDATE_PACKET_ID: u32 = 0x0A;
+pub const CHAT_SESSION_UPDATE_PACKET_ID: u32 = serverbound::CHAT_SESSION_UPDATE;
 
 /// Clientbound `system_chat` packet ID.
-pub const SYSTEM_CHAT_MESSAGE_PACKET_ID: u32 = 0x7C;
+pub const SYSTEM_CHAT_MESSAGE_PACKET_ID: u32 = clientbound::SYSTEM_CHAT;
 
 /// Maximum chat message length in UTF-16 code units.
 pub const MAX_CHAT_LENGTH: usize = 256;
@@ -53,9 +56,6 @@ pub const MAX_TEXT_COMPONENT_BYTES: usize = 262_144;
 /// RustMC policy bound on text component nesting. It limits decoder and encoder
 /// recursion; it is not a protocol value.
 pub const MAX_TEXT_COMPONENT_DEPTH: usize = 32;
-
-/// World coordinate boundary for teleportation.
-pub const MAX_COORDINATE: f64 = 30_000_000.0;
 
 // ============================================================================
 // Errors
@@ -97,75 +97,29 @@ impl fmt::Display for ProtocolError {
 
 impl Error for ProtocolError {}
 
-/// Command parsing and execution errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandError {
-    UnknownCommand(String),
-    MissingArgument(String),
-    InvalidArgument(String),
-    InvalidCoordinate(String),
-    PlayerNotFound(String),
-    ConsoleNotAllowed(String),
-    ExecutionError(String),
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownCommand(cmd) => {
-                write!(
-                    f,
-                    "Unknown command '{cmd}'. Use /help for a list of commands."
-                )
-            }
-            Self::MissingArgument(msg) => write!(f, "Missing argument: {msg}"),
-            Self::InvalidArgument(msg) => write!(f, "Invalid argument: {msg}"),
-            Self::InvalidCoordinate(msg) => write!(f, "Invalid coordinate: {msg}"),
-            Self::PlayerNotFound(name) => write!(f, "Player not found: '{name}'"),
-            Self::ConsoleNotAllowed(msg) => write!(f, "Console not allowed: {msg}"),
-            Self::ExecutionError(msg) => write!(f, "Command execution error: {msg}"),
-        }
-    }
-}
-
-impl Error for CommandError {}
-
 // ============================================================================
-// Wire Codec Primitives
+// Wire Codec Adapters over `crate::java_wire`
 // ============================================================================
 
-/// Read a VarInt from input bytes, returning `(value, bytes_read)`.
-pub fn read_varint(input: &[u8]) -> Result<(u32, usize), ProtocolError> {
-    let mut value = 0u32;
-    for (i, &byte) in input.iter().take(5).enumerate() {
-        if i == 4 && (byte & 0xf0) != 0 {
-            return Err(ProtocolError::Malformed("VarInt exceeds 5 bytes".into()));
+fn map_wire_error(err: WireError) -> ProtocolError {
+    match err {
+        WireError::Truncated => ProtocolError::UnexpectedEof,
+        WireError::VarIntTooLong => ProtocolError::Malformed("VarInt exceeds 5 bytes".into()),
+        WireError::NonCanonicalVarInt => {
+            ProtocolError::Malformed("Non-canonical VarInt zero".into())
         }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if (byte & 0x80) == 0 {
-            if i > 0 && byte == 0 {
-                return Err(ProtocolError::Malformed("Non-canonical VarInt zero".into()));
-            }
-            return Ok((value, i + 1));
-        }
-    }
-    if input.len() >= 5 {
-        Err(ProtocolError::Malformed("VarInt too large".into()))
-    } else {
-        Err(ProtocolError::UnexpectedEof)
+        WireError::TooLong { length, max } => ProtocolError::StringTooLong {
+            max,
+            actual: length,
+        },
+        WireError::InvalidText => ProtocolError::InvalidUtf8,
     }
 }
 
-/// Read a string from input bytes, returning `(&str, bytes_read)`.
-pub fn read_string(input: &[u8]) -> Result<(&str, usize), ProtocolError> {
-    let (length, prefix) = read_varint(input)?;
-    let length = length as usize;
-    if input.len() < prefix + length {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-    let s = std::str::from_utf8(&input[prefix..prefix + length])
-        .map_err(|_| ProtocolError::InvalidUtf8)?;
-    Ok((s, prefix + length))
+fn read_varint(input: &[u8]) -> Result<(u32, usize), ProtocolError> {
+    java_wire::read_varint(input)
+        .map_err(map_wire_error)?
+        .ok_or(ProtocolError::UnexpectedEof)
 }
 
 /// Unframe a standard Minecraft packet, returning `(packet_id, body_slice)`.
@@ -228,18 +182,18 @@ fn check_utf16_len(value: &str, max: usize) -> Result<(), ProtocolError> {
 }
 
 /// Read a protocol string whose limit counts UTF-16 code units, rejecting a
-/// hostile length prefix before any UTF-8 validation.
+/// hostile byte length prefix before UTF-8 decoding.
 fn read_bounded_string(input: &[u8], max: usize) -> Result<(&str, usize), ProtocolError> {
-    let (length, _) = read_varint(input)?;
-    if length as usize > max.saturating_mul(3) {
-        return Err(ProtocolError::StringTooLong {
+    let byte_limit = max.saturating_mul(3);
+    let (value, rest) = java_wire::read_string(input, byte_limit).map_err(|err| match err {
+        WireError::TooLong { length, .. } => ProtocolError::StringTooLong {
             max,
-            actual: length as usize,
-        });
-    }
-    let (value, consumed) = read_string(input)?;
+            actual: length,
+        },
+        other => map_wire_error(other),
+    })?;
     check_utf16_len(value, max)?;
-    Ok((value, consumed))
+    Ok((value, input.len() - rest.len()))
 }
 
 fn read_i64(input: &[u8]) -> Result<(i64, &[u8]), ProtocolError> {
@@ -690,64 +644,17 @@ impl SystemChatMessagePacket {
 
 const TAG_END: u8 = 0;
 const TAG_BYTE: u8 = 1;
-const TAG_STRING: u8 = 8;
+const TAG_STRING: u8 = NBT_TAG_STRING;
 const TAG_LIST: u8 = 9;
 const TAG_COMPOUND: u8 = 10;
 
-/// Append `value` in Java's modified UTF-8: UTF-16 code units, with U+0000 as
-/// `C0 80` and each surrogate encoded separately as three bytes.
-fn put_modified_utf8(value: &str, out: &mut Vec<u8>) {
-    for unit in value.encode_utf16() {
-        match unit {
-            0x0001..=0x007F => out.push(unit as u8),
-            0x0000 | 0x0080..=0x07FF => {
-                out.push(0xC0 | (unit >> 6) as u8);
-                out.push(0x80 | (unit & 0x3F) as u8);
-            }
-            _ => {
-                out.push(0xE0 | (unit >> 12) as u8);
-                out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
-                out.push(0x80 | (unit & 0x3F) as u8);
-            }
-        }
-    }
-}
-
-/// Decode Java's modified UTF-8, rejecting forms a Java reader cannot produce
-/// and unpaired surrogates, which a Rust string cannot represent.
-fn parse_modified_utf8(bytes: &[u8]) -> Result<String, ProtocolError> {
-    let mut units = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let first = bytes[index];
-        let continuation = |offset: usize| -> Result<u16, ProtocolError> {
-            match bytes.get(index + offset) {
-                Some(byte) if byte & 0xC0 == 0x80 => Ok(u16::from(byte & 0x3F)),
-                _ => Err(ProtocolError::InvalidUtf8),
-            }
-        };
-        let (unit, width) = match first {
-            0x01..=0x7F => (u16::from(first), 1),
-            0xC0..=0xDF => (u16::from(first & 0x1F) << 6 | continuation(1)?, 2),
-            0xE0..=0xEF => (
-                u16::from(first & 0x0F) << 12 | continuation(1)? << 6 | continuation(2)?,
-                3,
-            ),
-            _ => return Err(ProtocolError::InvalidUtf8),
-        };
-        units.push(unit);
-        index += width;
-    }
-    String::from_utf16(&units).map_err(|_| ProtocolError::InvalidUtf8)
-}
-
-/// Write a TAG_String payload: unsigned 16-bit byte length and modified UTF-8.
+/// Write a TAG_String payload: unsigned 16-bit byte length and modified UTF-8 via `java_wire`.
 fn put_nbt_string(value: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
     let mut encoded = Vec::with_capacity(value.len());
-    put_modified_utf8(value, &mut encoded);
+    encode_modified_utf8(value, &mut encoded);
     let length = u16::try_from(encoded.len()).map_err(|_| {
         ProtocolError::Oversized(format!(
-            "NBT string of {} bytes exceeds 65535",
+            "NBT string of {} bytes exceeds {MAX_NBT_STRING_BYTES}",
             encoded.len()
         ))
     })?;
@@ -757,15 +664,8 @@ fn put_nbt_string(value: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
 }
 
 fn read_nbt_string(input: &[u8]) -> Result<(String, &[u8]), ProtocolError> {
-    let (length, rest) = input
-        .split_first_chunk::<2>()
-        .ok_or(ProtocolError::UnexpectedEof)?;
-    let length = usize::from(u16::from_be_bytes(*length));
-    if rest.len() < length {
-        return Err(ProtocolError::UnexpectedEof);
-    }
-    let (bytes, rest) = rest.split_at(length);
-    Ok((parse_modified_utf8(bytes)?, rest))
+    let (text, consumed) = java_wire::read_nbt_string(input).map_err(map_wire_error)?;
+    Ok((text, &input[consumed..]))
 }
 
 fn put_nbt_named(tag: u8, name: &str, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
@@ -1253,751 +1153,6 @@ pub fn broadcast_chat(
 }
 
 // ============================================================================
-// Command Dispatcher & Built-in Handlers
-// ============================================================================
-
-/// Minecraft game modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GameMode {
-    Survival,
-    Creative,
-    Adventure,
-    Spectator,
-}
-
-impl GameMode {
-    /// Canonical lowercase name.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Survival => "survival",
-            Self::Creative => "creative",
-            Self::Adventure => "adventure",
-            Self::Spectator => "spectator",
-        }
-    }
-
-    /// Parse from mode name, short alias, or numeric ID.
-    pub fn parse(s: &str) -> Result<Self, CommandError> {
-        match s.to_ascii_lowercase().as_str() {
-            "survival" | "s" | "0" => Ok(Self::Survival),
-            "creative" | "c" | "1" => Ok(Self::Creative),
-            "adventure" | "a" | "2" => Ok(Self::Adventure),
-            "spectator" | "sp" | "3" => Ok(Self::Spectator),
-            other => Err(CommandError::InvalidArgument(format!(
-                "Unknown game mode '{other}', expected 'survival', 'creative', 'adventure', or 'spectator'"
-            ))),
-        }
-    }
-}
-
-/// Command execution sender context.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandSender {
-    Player(String),
-    Console,
-}
-
-impl CommandSender {
-    /// Return the sender identifier or player name.
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Player(name) => name.as_str(),
-            Self::Console => "Server",
-        }
-    }
-}
-
-/// State of a player tracked by the command dispatcher.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PlayerState {
-    pub name: String,
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-    pub yaw: f32,
-    pub pitch: f32,
-    pub gamemode: GameMode,
-    pub inventory: HashMap<String, u32>,
-}
-
-impl PlayerState {
-    /// Create a new PlayerState with standard defaults.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            x: 0.0,
-            y: 64.0,
-            z: 0.0,
-            yaw: 0.0,
-            pitch: 0.0,
-            gamemode: GameMode::Survival,
-            inventory: HashMap::new(),
-        }
-    }
-
-    /// Set player position.
-    pub fn with_position(mut self, x: f64, y: f64, z: f64) -> Self {
-        self.x = x;
-        self.y = y;
-        self.z = z;
-        self
-    }
-
-    /// Set player game mode.
-    pub fn with_gamemode(mut self, gamemode: GameMode) -> Self {
-        self.gamemode = gamemode;
-        self
-    }
-
-    /// Give items to player inventory.
-    pub fn give_item(&mut self, item: &str, count: u32) {
-        let key = item.strip_prefix("minecraft:").unwrap_or(item).to_string();
-        *self.inventory.entry(key).or_insert(0) += count;
-    }
-}
-
-/// Registered command handler signature.
-pub type CommandHandler = Arc<
-    dyn Fn(&mut CommandDispatcher, &CommandSender, &[&str]) -> Result<String, CommandError>
-        + Send
-        + Sync,
->;
-
-/// Metadata and callback for a registered command.
-#[derive(Clone)]
-pub struct CommandRegistration {
-    pub name: String,
-    pub description: String,
-    pub usage: String,
-    pub handler: CommandHandler,
-}
-
-/// Command registry, argument parser, and execution dispatcher.
-pub struct CommandDispatcher {
-    pub world_time: u64,
-    pub players: HashMap<String, PlayerState>,
-    commands: HashMap<String, CommandRegistration>,
-}
-
-impl Default for CommandDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CommandDispatcher {
-    /// Create a new dispatcher pre-populated with built-in commands:
-    /// `/help`, `/tp`, `/gamemode`, `/time`, `/give`.
-    pub fn new() -> Self {
-        let mut dispatcher = Self {
-            world_time: 1000,
-            players: HashMap::new(),
-            commands: HashMap::new(),
-        };
-        dispatcher.register_builtins();
-        dispatcher
-    }
-
-    /// Create the dispatcher for a live preview session.
-    ///
-    /// The preview world, clock, game mode and inventory are read-only, and this
-    /// dispatcher's state is not connected to them. Mutating commands are
-    /// therefore rejected instead of reporting an effect the client never sees.
-    pub fn read_only_preview() -> Self {
-        let mut dispatcher = Self {
-            world_time: 0,
-            players: HashMap::new(),
-            commands: HashMap::new(),
-        };
-        dispatcher.register(
-            "help",
-            "Lists available commands or shows help for a specific command",
-            "/help [command]",
-            handle_help,
-        );
-        for name in ["tp", "teleport", "gamemode", "time", "give"] {
-            dispatcher.register(
-                name,
-                "Unavailable in the read-only preview",
-                format!("/{name}"),
-                handle_read_only,
-            );
-        }
-        dispatcher
-    }
-
-    /// Add a player to the dispatcher.
-    pub fn add_player(&mut self, player: PlayerState) {
-        self.players.insert(player.name.clone(), player);
-    }
-
-    /// Get a reference to a player state.
-    pub fn get_player(&self, name: &str) -> Option<&PlayerState> {
-        self.players.get(name)
-    }
-
-    /// Get a mutable reference to a player state.
-    pub fn get_player_mut(&mut self, name: &str) -> Option<&mut PlayerState> {
-        self.players.get_mut(name)
-    }
-
-    /// Register a new command handler.
-    pub fn register(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        usage: impl Into<String>,
-        handler: impl Fn(
-            &mut CommandDispatcher,
-            &CommandSender,
-            &[&str],
-        ) -> Result<String, CommandError>
-        + Send
-        + Sync
-        + 'static,
-    ) {
-        let name = name.into().to_ascii_lowercase();
-        let stripped = name.strip_prefix('/').unwrap_or(&name).to_string();
-        let registration = CommandRegistration {
-            name: stripped.clone(),
-            description: description.into(),
-            usage: usage.into(),
-            handler: Arc::new(handler),
-        };
-        self.commands.insert(stripped, registration);
-    }
-
-    /// Parse and execute a command string, returning a clean success message or CommandError.
-    pub fn dispatch(
-        &mut self,
-        sender: &CommandSender,
-        command_line: &str,
-    ) -> Result<String, CommandError> {
-        let trimmed = command_line.trim();
-        let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
-        if without_slash.is_empty() {
-            return Err(CommandError::MissingArgument(
-                "Command string cannot be empty".into(),
-            ));
-        }
-
-        let tokens = tokenize(without_slash)?;
-        if tokens.is_empty() {
-            return Err(CommandError::MissingArgument(
-                "Command string cannot be empty".into(),
-            ));
-        }
-
-        let cmd_name = tokens[0].to_ascii_lowercase();
-        let args: Vec<&str> = tokens[1..].iter().map(|s| s.as_str()).collect();
-
-        let handler = match self.commands.get(&cmd_name) {
-            Some(reg) => Arc::clone(&reg.handler),
-            None => return Err(CommandError::UnknownCommand(cmd_name)),
-        };
-
-        handler(self, sender, &args)
-    }
-
-    /// Execute a command (alias for `dispatch`).
-    pub fn execute(
-        &mut self,
-        sender: &CommandSender,
-        command_line: &str,
-    ) -> Result<String, CommandError> {
-        self.dispatch(sender, command_line)
-    }
-
-    /// Dispatch a command and format the response as a `SystemChatMessagePacket`.
-    pub fn dispatch_to_chat(
-        &mut self,
-        sender: &CommandSender,
-        command_line: &str,
-    ) -> Result<SystemChatMessagePacket, ProtocolError> {
-        match self.dispatch(sender, command_line) {
-            Ok(msg) => SystemChatMessagePacket::chat_text(msg),
-            Err(err) => SystemChatMessagePacket::chat(ChatComponent::colored(
-                err.to_string(),
-                ChatColor::Red,
-            )),
-        }
-    }
-
-    fn register_builtins(&mut self) {
-        // /help
-        self.register(
-            "help",
-            "Lists available commands or shows help for a specific command",
-            "/help [command]",
-            handle_help,
-        );
-
-        // /tp and /teleport
-        self.register(
-            "tp",
-            "Teleports the player to coordinates or target",
-            "/tp <x> <y> <z>",
-            handle_tp,
-        );
-        self.register(
-            "teleport",
-            "Teleports the player to coordinates or target",
-            "/teleport <x> <y> <z>",
-            handle_tp,
-        );
-
-        // /gamemode
-        self.register(
-            "gamemode",
-            "Sets the player's game mode",
-            "/gamemode <survival|creative|adventure|spectator>",
-            handle_gamemode,
-        );
-
-        // /time
-        self.register(
-            "time",
-            "Changes or queries the world time",
-            "/time set <day|night|ticks>",
-            handle_time,
-        );
-
-        // /give
-        self.register(
-            "give",
-            "Gives an item to a player",
-            "/give <item> [count]",
-            handle_give,
-        );
-    }
-}
-
-// ============================================================================
-// Built-in Command Implementations
-// ============================================================================
-
-fn handle_help(
-    dispatcher: &mut CommandDispatcher,
-    _sender: &CommandSender,
-    args: &[&str],
-) -> Result<String, CommandError> {
-    if args.is_empty() {
-        let mut names: Vec<String> = dispatcher.commands.keys().cloned().collect();
-        names.sort();
-        let mut lines = Vec::new();
-        lines.push("--- Available Commands ---".to_string());
-        for name in names {
-            if let Some(reg) = dispatcher.commands.get(&name) {
-                lines.push(format!("{} - {}", reg.usage, reg.description));
-            }
-        }
-        Ok(lines.join("\n"))
-    } else {
-        let target = args[0]
-            .strip_prefix('/')
-            .unwrap_or(args[0])
-            .to_ascii_lowercase();
-        match dispatcher.commands.get(&target) {
-            Some(reg) => Ok(format!("{}: {} - {}", reg.name, reg.usage, reg.description)),
-            None => Err(CommandError::UnknownCommand(format!(
-                "Help topic '{target}' not found"
-            ))),
-        }
-    }
-}
-
-fn handle_read_only(
-    _dispatcher: &mut CommandDispatcher,
-    _sender: &CommandSender,
-    _args: &[&str],
-) -> Result<String, CommandError> {
-    Err(CommandError::ExecutionError(
-        "This preview session is read-only, so the command was not applied".into(),
-    ))
-}
-
-fn parse_coordinate(arg: &str, current: f64) -> Result<f64, CommandError> {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return Err(CommandError::InvalidCoordinate(
-            "Coordinate cannot be empty".into(),
-        ));
-    }
-    let val = if let Some(offset_str) = arg.strip_prefix('~') {
-        if offset_str.is_empty() {
-            current
-        } else {
-            let offset: f64 = offset_str.parse().map_err(|_| {
-                CommandError::InvalidCoordinate(format!("Invalid relative coordinate '{arg}'"))
-            })?;
-            current + offset
-        }
-    } else {
-        arg.parse::<f64>()
-            .map_err(|_| CommandError::InvalidCoordinate(format!("Invalid coordinate '{arg}'")))?
-    };
-
-    if !val.is_finite() {
-        return Err(CommandError::InvalidCoordinate(format!(
-            "Coordinate '{arg}' is not finite"
-        )));
-    }
-    if val.abs() > MAX_COORDINATE {
-        return Err(CommandError::InvalidCoordinate(format!(
-            "Coordinate '{arg}' exceeds maximum boundary of {MAX_COORDINATE}"
-        )));
-    }
-
-    Ok(val)
-}
-
-fn handle_tp(
-    dispatcher: &mut CommandDispatcher,
-    sender: &CommandSender,
-    args: &[&str],
-) -> Result<String, CommandError> {
-    match args.len() {
-        3 => {
-            // /tp <x> <y> <z>
-            let player_name = match sender {
-                CommandSender::Player(name) => name.clone(),
-                CommandSender::Console => {
-                    return Err(CommandError::ConsoleNotAllowed(
-                        "Console must specify target player. Usage: /tp <player> <x> <y> <z>"
-                            .into(),
-                    ));
-                }
-            };
-            let (cur_x, cur_y, cur_z) = if let Some(p) = dispatcher.players.get(&player_name) {
-                (p.x, p.y, p.z)
-            } else {
-                (0.0, 64.0, 0.0)
-            };
-
-            let x = parse_coordinate(args[0], cur_x)?;
-            let y = parse_coordinate(args[1], cur_y)?;
-            let z = parse_coordinate(args[2], cur_z)?;
-
-            let player = dispatcher
-                .players
-                .entry(player_name.clone())
-                .or_insert_with(|| PlayerState::new(&player_name));
-            player.x = x;
-            player.y = y;
-            player.z = z;
-
-            Ok(format!(
-                "Teleported {player_name} to {x:.2}, {y:.2}, {z:.2}"
-            ))
-        }
-        4 => {
-            // /tp <player> <x> <y> <z>
-            let target_name = args[0].to_string();
-            let (cur_x, cur_y, cur_z) = if let Some(p) = dispatcher.players.get(&target_name) {
-                (p.x, p.y, p.z)
-            } else {
-                return Err(CommandError::PlayerNotFound(target_name));
-            };
-
-            let x = parse_coordinate(args[1], cur_x)?;
-            let y = parse_coordinate(args[2], cur_y)?;
-            let z = parse_coordinate(args[3], cur_z)?;
-
-            let player = dispatcher.players.get_mut(&target_name).unwrap();
-            player.x = x;
-            player.y = y;
-            player.z = z;
-
-            Ok(format!(
-                "Teleported {target_name} to {x:.2}, {y:.2}, {z:.2}"
-            ))
-        }
-        _ => Err(CommandError::MissingArgument(
-            "Usage: /tp <x> <y> <z> or /tp <player> <x> <y> <z>".into(),
-        )),
-    }
-}
-
-fn handle_gamemode(
-    dispatcher: &mut CommandDispatcher,
-    sender: &CommandSender,
-    args: &[&str],
-) -> Result<String, CommandError> {
-    if args.is_empty() {
-        return Err(CommandError::MissingArgument(
-            "Usage: /gamemode <survival|creative|adventure|spectator> [player]".into(),
-        ));
-    }
-    if args.len() > 2 {
-        return Err(CommandError::InvalidArgument(
-            "Too many arguments for /gamemode".into(),
-        ));
-    }
-
-    let mode = GameMode::parse(args[0])?;
-    let target_name = if args.len() == 2 {
-        args[1].to_string()
-    } else {
-        match sender {
-            CommandSender::Player(name) => name.clone(),
-            CommandSender::Console => {
-                return Err(CommandError::ConsoleNotAllowed(
-                    "Console must specify target player. Usage: /gamemode <mode> <player>".into(),
-                ));
-            }
-        }
-    };
-
-    let player = dispatcher
-        .players
-        .entry(target_name.clone())
-        .or_insert_with(|| PlayerState::new(&target_name));
-    player.gamemode = mode;
-
-    Ok(format!(
-        "Set {}'s game mode to {}",
-        target_name,
-        mode.name()
-    ))
-}
-
-fn handle_time(
-    dispatcher: &mut CommandDispatcher,
-    _sender: &CommandSender,
-    args: &[&str],
-) -> Result<String, CommandError> {
-    if args.is_empty() {
-        return Err(CommandError::MissingArgument(
-            "Usage: /time set <day|night|ticks>".into(),
-        ));
-    }
-
-    match args[0].to_ascii_lowercase().as_str() {
-        "set" => {
-            if args.len() < 2 {
-                return Err(CommandError::MissingArgument(
-                    "Usage: /time set <day|night|ticks>".into(),
-                ));
-            }
-            if args.len() > 2 {
-                return Err(CommandError::InvalidArgument(
-                    "Too many arguments for /time set".into(),
-                ));
-            }
-            let ticks: u64 = match args[1].to_ascii_lowercase().as_str() {
-                "day" => 1000,
-                "night" => 13000,
-                "noon" => 6000,
-                "midnight" => 18000,
-                ticks_str => {
-                    let val: i64 = ticks_str.parse().map_err(|_| {
-                        CommandError::InvalidArgument(format!("Invalid time value '{ticks_str}'"))
-                    })?;
-                    if val < 0 {
-                        return Err(CommandError::InvalidArgument(
-                            "Time ticks cannot be negative".into(),
-                        ));
-                    }
-                    val as u64
-                }
-            };
-            dispatcher.world_time = ticks;
-            Ok(format!("Set the time to {ticks}"))
-        }
-        "add" => {
-            if args.len() < 2 {
-                return Err(CommandError::MissingArgument(
-                    "Usage: /time add <ticks>".into(),
-                ));
-            }
-            let val: i64 = args[1].parse().map_err(|_| {
-                CommandError::InvalidArgument(format!("Invalid time value '{}'", args[1]))
-            })?;
-            if val < 0 {
-                return Err(CommandError::InvalidArgument(
-                    "Added time ticks cannot be negative".into(),
-                ));
-            }
-            dispatcher.world_time = dispatcher.world_time.wrapping_add(val as u64);
-            Ok(format!("Added {val} to the time"))
-        }
-        "query" => {
-            if args.len() < 2 {
-                return Err(CommandError::MissingArgument(
-                    "Expected 'daytime', 'gametime', or 'day'".into(),
-                ));
-            }
-            match args[1].to_ascii_lowercase().as_str() {
-                "daytime" => {
-                    let val = dispatcher.world_time % 24000;
-                    Ok(format!("The time is {val}"))
-                }
-                "gametime" => {
-                    let val = dispatcher.world_time;
-                    Ok(format!("The time is {val}"))
-                }
-                "day" => {
-                    let val = dispatcher.world_time / 24000;
-                    Ok(format!("The time is {val}"))
-                }
-                other => Err(CommandError::InvalidArgument(format!(
-                    "Unknown time query target '{other}', expected 'daytime', 'gametime', or 'day'"
-                ))),
-            }
-        }
-        other => Err(CommandError::InvalidArgument(format!(
-            "Unknown subcommand '{other}', expected 'set', 'add', or 'query'"
-        ))),
-    }
-}
-
-fn handle_give(
-    dispatcher: &mut CommandDispatcher,
-    sender: &CommandSender,
-    args: &[&str],
-) -> Result<String, CommandError> {
-    if args.is_empty() {
-        return Err(CommandError::MissingArgument(
-            "Usage: /give <item> [count] or /give <player> <item> [count]".into(),
-        ));
-    }
-
-    // Disambiguate arguments:
-    // If sender is a player and args.len() is 1: /give <item>
-    // If sender is a player and args.len() is 2 with second arg numeric: /give <item> [count]
-    // Otherwise: /give <player> <item> [count]
-    let (target_name, item_str, count) = if args.len() == 1 {
-        let player_name = match sender {
-            CommandSender::Player(name) => name.clone(),
-            CommandSender::Console => {
-                return Err(CommandError::ConsoleNotAllowed(
-                    "Console must specify target player. Usage: /give <player> <item> [count]"
-                        .into(),
-                ));
-            }
-        };
-        (player_name, args[0], 1u32)
-    } else if args.len() == 2 {
-        if let Ok(c) = args[1].parse::<i64>() {
-            let player_name = match sender {
-                CommandSender::Player(name) => name.clone(),
-                CommandSender::Console => {
-                    return Err(CommandError::ConsoleNotAllowed(
-                        "Console must specify target player. Usage: /give <player> <item> [count]"
-                            .into(),
-                    ));
-                }
-            };
-            if c < 1 {
-                return Err(CommandError::InvalidArgument(
-                    "Count must be at least 1".into(),
-                ));
-            }
-            if c > 6400 {
-                return Err(CommandError::InvalidArgument(
-                    "Count must not be larger than 6400".into(),
-                ));
-            }
-            (player_name, args[0], c as u32)
-        } else {
-            (args[0].to_string(), args[1], 1u32)
-        }
-    } else if args.len() == 3 {
-        let c: i64 = args[2]
-            .parse()
-            .map_err(|_| CommandError::InvalidArgument(format!("Invalid count '{}'", args[2])))?;
-        if c < 1 {
-            return Err(CommandError::InvalidArgument(
-                "Count must be at least 1".into(),
-            ));
-        }
-        if c > 6400 {
-            return Err(CommandError::InvalidArgument(
-                "Count must not be larger than 6400".into(),
-            ));
-        }
-        (args[0].to_string(), args[1], c as u32)
-    } else {
-        return Err(CommandError::InvalidArgument(
-            "Too many arguments for /give".into(),
-        ));
-    };
-
-    let item_clean = item_str.trim();
-    if item_clean.is_empty() {
-        return Err(CommandError::InvalidArgument(
-            "Item ID cannot be empty".into(),
-        ));
-    }
-    let canonical_item = item_clean.strip_prefix("minecraft:").unwrap_or(item_clean);
-
-    let player = dispatcher
-        .players
-        .entry(target_name.clone())
-        .or_insert_with(|| PlayerState::new(&target_name));
-    player.give_item(canonical_item, count);
-
-    Ok(format!("Gave {count} [{canonical_item}] to {target_name}"))
-}
-
-/// Tokenize a command line string into whitespace-separated arguments,
-/// supporting single-quoted and double-quoted strings.
-pub fn tokenize(command_line: &str) -> Result<Vec<String>, CommandError> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = command_line.chars().peekable();
-    let mut in_quote = None;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' | '\'' => {
-                if let Some(quote_char) = in_quote {
-                    if quote_char == ch {
-                        in_quote = None;
-                    } else {
-                        current.push(ch);
-                    }
-                } else {
-                    in_quote = Some(ch);
-                }
-            }
-            ' ' | '\t' | '\r' | '\n' => {
-                if in_quote.is_some() {
-                    current.push(ch);
-                } else if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            '\\' => {
-                if let Some(next) = chars.peek().copied()
-                    && (next == '"' || next == '\'' || next == '\\')
-                {
-                    chars.next();
-                    current.push(next);
-                    continue;
-                }
-                current.push(ch);
-            }
-            _ => {
-                current.push(ch);
-            }
-        }
-    }
-
-    if in_quote.is_some() {
-        return Err(CommandError::InvalidArgument(
-            "Unclosed quoted string in command".into(),
-        ));
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    Ok(tokens)
-}
-
-// ============================================================================
 // Unit Tests
 // ============================================================================
 
@@ -2305,30 +1460,6 @@ mod tests {
     }
 
     #[test]
-    fn read_only_preview_rejects_mutating_commands() {
-        let mut dispatcher = CommandDispatcher::read_only_preview();
-        let sender = CommandSender::Player("Alice".into());
-        for command in [
-            "tp 1 2 3",
-            "teleport 1 2 3",
-            "gamemode survival",
-            "time set day",
-            "give diamond",
-        ] {
-            assert!(
-                matches!(
-                    dispatcher.dispatch(&sender, command),
-                    Err(CommandError::ExecutionError(_))
-                ),
-                "{command}"
-            );
-        }
-        assert!(dispatcher.players.is_empty());
-        assert_eq!(dispatcher.world_time, 0);
-        assert!(dispatcher.dispatch(&sender, "help").is_ok());
-    }
-
-    #[test]
     fn test_chat_component_json_serialization() {
         // Plain text
         let plain = ChatComponent::text("Hello, world!");
@@ -2371,161 +1502,6 @@ mod tests {
         let packet = broadcast_chat("Bob", "testing 123").unwrap();
         assert!(!packet.is_overlay());
         assert_eq!(packet.content().text, "<Bob> testing 123");
-    }
-
-    #[test]
-    fn test_command_dispatcher_help() {
-        let mut dispatcher = CommandDispatcher::new();
-        let sender = CommandSender::Console;
-
-        let help = dispatcher.dispatch(&sender, "/help").unwrap();
-        assert!(help.contains("/tp"));
-        assert!(help.contains("/gamemode"));
-        assert!(help.contains("/time"));
-        assert!(help.contains("/give"));
-
-        let help_tp = dispatcher.dispatch(&sender, "help tp").unwrap();
-        assert!(help_tp.contains("/tp <x> <y> <z>"));
-
-        let help_unknown = dispatcher.dispatch(&sender, "/help foobar");
-        assert!(help_unknown.is_err());
-    }
-
-    #[test]
-    fn test_command_dispatcher_tp() {
-        let mut dispatcher = CommandDispatcher::new();
-        let player = PlayerState::new("Player1").with_position(10.0, 64.0, 20.0);
-        dispatcher.add_player(player);
-
-        let sender = CommandSender::Player("Player1".into());
-
-        // Absolute tp
-        let res = dispatcher.dispatch(&sender, "/tp 100 70 -50").unwrap();
-        assert!(res.contains("Teleported Player1 to 100.00, 70.00, -50.00"));
-        let p = dispatcher.get_player("Player1").unwrap();
-        assert_eq!((p.x, p.y, p.z), (100.0, 70.0, -50.0));
-
-        // Relative tp with tildes
-        let res2 = dispatcher.dispatch(&sender, "/tp ~5 ~-10 ~").unwrap();
-        assert!(res2.contains("Teleported Player1 to 105.00, 60.00, -50.00"));
-        let p = dispatcher.get_player("Player1").unwrap();
-        assert_eq!((p.x, p.y, p.z), (105.0, 60.0, -50.0));
-
-        // Invalid tp coordinates
-        let err = dispatcher.dispatch(&sender, "/tp abc 70 80").unwrap_err();
-        assert!(matches!(err, CommandError::InvalidCoordinate(_)));
-
-        // Missing coordinates
-        let err_missing = dispatcher.dispatch(&sender, "/tp 100").unwrap_err();
-        assert!(matches!(err_missing, CommandError::MissingArgument(_)));
-    }
-
-    #[test]
-    fn test_command_dispatcher_gamemode() {
-        let mut dispatcher = CommandDispatcher::new();
-        dispatcher.add_player(PlayerState::new("Player1"));
-
-        let sender = CommandSender::Player("Player1".into());
-
-        let res = dispatcher.dispatch(&sender, "/gamemode creative").unwrap();
-        assert!(res.contains("Set Player1's game mode to creative"));
-        assert_eq!(
-            dispatcher.get_player("Player1").unwrap().gamemode,
-            GameMode::Creative
-        );
-
-        let res_alias = dispatcher.dispatch(&sender, "/gamemode s").unwrap();
-        assert!(res_alias.contains("Set Player1's game mode to survival"));
-        assert_eq!(
-            dispatcher.get_player("Player1").unwrap().gamemode,
-            GameMode::Survival
-        );
-
-        let err = dispatcher
-            .dispatch(&sender, "/gamemode godmode")
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn test_command_dispatcher_time() {
-        let mut dispatcher = CommandDispatcher::new();
-        let sender = CommandSender::Console;
-
-        let res = dispatcher.dispatch(&sender, "/time set day").unwrap();
-        assert_eq!(dispatcher.world_time, 1000);
-        assert!(res.contains("Set the time to 1000"));
-
-        let res_night = dispatcher.dispatch(&sender, "/time set night").unwrap();
-        assert_eq!(dispatcher.world_time, 13000);
-        assert!(res_night.contains("Set the time to 13000"));
-
-        let res_ticks = dispatcher.dispatch(&sender, "/time set 18000").unwrap();
-        assert_eq!(dispatcher.world_time, 18000);
-        assert!(res_ticks.contains("Set the time to 18000"));
-
-        let err = dispatcher
-            .dispatch(&sender, "/time set invalid")
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn test_command_dispatcher_give() {
-        let mut dispatcher = CommandDispatcher::new();
-        dispatcher.add_player(PlayerState::new("Steve"));
-
-        let sender = CommandSender::Player("Steve".into());
-
-        // Default count = 1
-        let res = dispatcher.dispatch(&sender, "/give diamond").unwrap();
-        assert!(res.contains("Gave 1 [diamond] to Steve"));
-        let p = dispatcher.get_player("Steve").unwrap();
-        assert_eq!(*p.inventory.get("diamond").unwrap(), 1);
-
-        // Explicit count
-        let res64 = dispatcher
-            .dispatch(&sender, "/give minecraft:apple 64")
-            .unwrap();
-        assert!(res64.contains("Gave 64 [apple] to Steve"));
-        let p = dispatcher.get_player("Steve").unwrap();
-        assert_eq!(*p.inventory.get("apple").unwrap(), 64);
-
-        // Invalid count
-        let err = dispatcher
-            .dispatch(&sender, "/give iron_ingot 0")
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn test_command_dispatcher_unknown_command() {
-        let mut dispatcher = CommandDispatcher::new();
-        let sender = CommandSender::Console;
-
-        let err = dispatcher
-            .dispatch(&sender, "/nonexistent arg1 arg2")
-            .unwrap_err();
-        assert_eq!(err, CommandError::UnknownCommand("nonexistent".into()));
-    }
-
-    #[test]
-    fn test_command_dispatcher_dispatch_to_chat() {
-        let mut dispatcher = CommandDispatcher::new();
-        let sender = CommandSender::Console;
-
-        let success_packet = dispatcher
-            .dispatch_to_chat(&sender, "/time set 5000")
-            .unwrap();
-        assert!(!success_packet.is_overlay());
-        assert!(success_packet.content().text.contains("5000"));
-
-        let error_packet = dispatcher
-            .dispatch_to_chat(&sender, "/unknown_cmd")
-            .unwrap();
-        assert!(!error_packet.is_overlay());
-        assert_eq!(error_packet.content().color, Some(ChatColor::Red));
-        assert!(error_packet.content().text.contains("Unknown command"));
     }
 
     #[test]
@@ -2605,66 +1581,5 @@ mod tests {
 
         // Display trait output matches to_json
         assert_eq!(format!("{comp}"), comp.to_json());
-    }
-
-    #[test]
-    fn test_tokenizer_quoted_strings_and_escapes() {
-        let tokens = tokenize("say \"hello world\" 'single quoted' standard").unwrap();
-        assert_eq!(
-            tokens,
-            vec!["say", "hello world", "single quoted", "standard"]
-        );
-
-        let escaped = tokenize("give steve \"diamond\\\"sword\"").unwrap();
-        assert_eq!(escaped, vec!["give", "steve", "diamond\"sword"]);
-
-        let unclosed = tokenize("say \"unclosed");
-        assert!(matches!(unclosed, Err(CommandError::InvalidArgument(_))));
-    }
-
-    #[test]
-    fn test_command_dispatcher_extended() {
-        let mut dispatcher = CommandDispatcher::new();
-        dispatcher.add_player(PlayerState::new("Alice").with_position(0.0, 64.0, 0.0));
-        let console = CommandSender::Console;
-
-        // /tp <target> <x> <y> <z> from Console
-        let res = dispatcher
-            .dispatch(&console, "/tp Alice 50 100 150")
-            .unwrap();
-        assert!(res.contains("Teleported Alice to 50.00, 100.00, 150.00"));
-        assert_eq!(
-            (
-                dispatcher.get_player("Alice").unwrap().x,
-                dispatcher.get_player("Alice").unwrap().y,
-                dispatcher.get_player("Alice").unwrap().z
-            ),
-            (50.0, 100.0, 150.0)
-        );
-
-        // /tp out of bounds
-        let player_sender = CommandSender::Player("Alice".into());
-        let err_oob = dispatcher
-            .dispatch(&player_sender, "/tp 40000000 64 0")
-            .unwrap_err();
-        assert!(matches!(err_oob, CommandError::InvalidCoordinate(_)));
-
-        // /time add
-        dispatcher.dispatch(&console, "/time set 1000").unwrap();
-        dispatcher.dispatch(&console, "/time add 500").unwrap();
-        assert_eq!(dispatcher.world_time, 1500);
-
-        // /time query
-        let q_daytime = dispatcher
-            .dispatch(&console, "/time query daytime")
-            .unwrap();
-        assert!(q_daytime.contains("1500"));
-
-        // Custom command registration
-        dispatcher.register("ping", "Replies with pong", "/ping", |_d, _s, _args| {
-            Ok("pong!".to_string())
-        });
-        let pong = dispatcher.dispatch(&console, "/ping").unwrap();
-        assert_eq!(pong, "pong!");
     }
 }

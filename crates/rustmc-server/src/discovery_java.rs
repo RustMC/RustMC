@@ -520,7 +520,7 @@ pub struct Session {
     preview_terrain: crate::world::Terrain,
     vanilla_source: Option<crate::java_preview::VanillaSource>,
     player_name: String,
-    dispatcher: chat::CommandDispatcher,
+    dispatcher: crate::commands::CommandDispatcher,
     broadcasts: Vec<Vec<u8>>,
 }
 impl Default for Session {
@@ -538,7 +538,7 @@ impl Default for Session {
             preview_terrain: crate::world::Terrain::Preview,
             vanilla_source: None,
             player_name: "Player".to_string(),
-            dispatcher: chat::CommandDispatcher::read_only_preview(),
+            dispatcher: crate::commands::CommandDispatcher::read_only_preview(0),
             broadcasts: Vec::new(),
         }
     }
@@ -577,11 +577,16 @@ impl Session {
         std::mem::take(&mut self.broadcasts)
     }
     fn run_command(&mut self, command: &str) -> Result<Vec<u8>, Error> {
-        let sender = chat::CommandSender::Player(self.player_name.clone());
-        let reply = self
-            .dispatcher
-            .dispatch_to_chat(&sender, command)
-            .map_err(|_| Error::Malformed)?;
+        let sender = crate::commands::CommandSender::player(&self.player_name, (0.0, 64.0, 0.0), 2);
+        let reply = match self.dispatcher.execute(&sender, command) {
+            crate::commands::CommandResult::Success(msg) => {
+                chat::SystemChatMessagePacket::chat_text(msg)
+            }
+            crate::commands::CommandResult::Error(err) => chat::SystemChatMessagePacket::chat(
+                chat::ChatComponent::colored(err, chat::ChatColor::Red),
+            ),
+        }
+        .map_err(|_| Error::Malformed)?;
         Ok(reply.to_frame())
     }
     pub fn receive(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, Error> {
@@ -720,6 +725,7 @@ impl Session {
                     }
                     .ok_or(Error::Malformed)?;
                     responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
+                    self.dispatcher.set_seed(self.preview_seed as i64);
                     self.preview = Some(preview);
                     self.state = State::Play;
                 }
@@ -878,7 +884,7 @@ impl Session {
                             }
                             // Spectator action with no target.
                         }
-                        chat::CHAT_PACKET_ID => {
+                        sb::CHAT => {
                             // No secure chat is negotiated, so a signature is
                             // not verified and the text is relayed as system chat.
                             let packet = chat::ChatPacket::decode_payload(body)
@@ -892,18 +898,18 @@ impl Session {
                             self.broadcasts.push(frame.clone());
                             responses.push(frame);
                         }
-                        chat::CHAT_COMMAND_PACKET_ID => {
+                        sb::CHAT_COMMAND => {
                             let packet = chat::ChatCommandPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
                             responses.push(self.run_command(&packet.command)?);
                         }
-                        chat::CHAT_COMMAND_SIGNED_PACKET_ID => {
+                        sb::CHAT_COMMAND_SIGNED => {
                             let packet = chat::SignedChatCommandPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
                             responses.push(self.run_command(&packet.command)?);
                         }
                         // Only system chat is sent, so there is nothing to acknowledge.
-                        chat::CHAT_ACK_PACKET_ID => {
+                        sb::CHAT_ACK => {
                             let (ack_count, n) = read_varint(body)?.ok_or(Error::Malformed)?;
                             let _ = ack_count;
                             if n != body.len() {
@@ -912,7 +918,7 @@ impl Session {
                         }
                         // A keyed client may announce a session; it is unused
                         // because the login packet negotiates no secure chat.
-                        chat::CHAT_SESSION_UPDATE_PACKET_ID => {}
+                        sb::CHAT_SESSION_UPDATE => {}
                         _ => {
                             eprintln!(
                                 "event=preview_unsupported_packet packet_id={id} bytes={}",
@@ -1547,24 +1553,48 @@ mod tests {
         assert_eq!(s.take_broadcasts(), vec![frame_bytes(&system_chat)]);
         assert!(s.take_broadcasts().is_empty());
 
-        // An offline client sends a string-only command.
-        let command = [
-            0x07, 0x0C, b't', b'i', b'm', b'e', b' ', b's', b'e', b't', b' ', b'd', b'a', b'y',
-        ];
-        let replies = s.receive(&frame_bytes(&command), 4096).unwrap();
-        assert_eq!(replies.len(), 1);
-        let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
-        assert_eq!(reply.content().color, Some(chat::ChatColor::Red));
-        assert!(reply.content().text.contains("read-only"));
-        assert!(s.take_broadcasts().is_empty());
+        // An offline client sends a string-only mutating command, and all
+        // world-mutating commands (tp, gamemode, time set, give) are refused
+        // with a red system chat message while the preview is read-only.
+        for cmd in [
+            "time set day",
+            "tp 1 2 3",
+            "gamemode creative",
+            "give Alice diamond 1",
+        ] {
+            let mut body = vec![0x07];
+            put_string(cmd, &mut body);
+            let replies = s.receive(&frame_bytes(&body), 4096).unwrap();
+            assert_eq!(replies.len(), 1);
+            let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
+            assert_eq!(reply.content().color, Some(chat::ChatColor::Red), "{cmd}");
+            assert!(reply.content().text.contains("read-only"), "{cmd}");
+            assert!(s.take_broadcasts().is_empty());
 
-        // The signed form reaches the same read-only dispatcher.
+            // The signed form reaches the same `crate::commands` dispatcher.
+            let mut signed_mut = vec![0x08];
+            put_string(cmd, &mut signed_mut);
+            signed_mut.extend([0; 16]); // Timestamp and salt.
+            signed_mut.extend([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // No arguments, empty tail.
+            let replies = s.receive(&frame_bytes(&signed_mut), 4096).unwrap();
+            assert_eq!(replies.len(), 1);
+            let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
+            assert_eq!(reply.content().color, Some(chat::ChatColor::Red), "{cmd}");
+            assert!(reply.content().text.contains("read-only"), "{cmd}");
+        }
+
+        // Read-only commands (/help and /seed) succeed through `crate::commands`.
         let mut signed = vec![0x08, 0x04, b'h', b'e', b'l', b'p'];
         signed.extend([0; 16]);
         signed.extend([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // No arguments, empty tail.
         let replies = s.receive(&frame_bytes(&signed), 4096).unwrap();
         let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
         assert!(reply.content().text.contains("/help"));
+
+        let seed_cmd = [0x07, 0x04, b's', b'e', b'e', b'd'];
+        let replies = s.receive(&frame_bytes(&seed_cmd), 4096).unwrap();
+        let reply = chat::SystemChatMessagePacket::decode_frame(&replies[0]).unwrap();
+        assert_eq!(reply.content().text, "Seed: [0]");
 
         // Acknowledgments and session announcements have no reply.
         assert!(
