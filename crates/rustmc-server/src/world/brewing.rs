@@ -13,7 +13,7 @@
 //! Java recipe set is registered. On the wire a potion is one `minecraft:potion`
 //! item with a `potion_contents` component, so slot encoding needs a mapping.
 
-use crate::discovery_java::{frame, put_varint, varint};
+use crate::java_wire::{frame, put_varint, read_varint};
 use std::fmt;
 
 /// Potion bottle slot 0 (left slot).
@@ -1270,7 +1270,7 @@ pub fn decode_set_container_data(
     payload: &[u8],
 ) -> Result<SetContainerDataPacket, SetContainerDataError> {
     let Some((packet_id, prefix_len)) =
-        varint(payload).map_err(|_| SetContainerDataError::Malformed)?
+        read_varint(payload).map_err(|_| SetContainerDataError::Malformed)?
     else {
         return Err(SetContainerDataError::Truncated);
     };
@@ -1289,7 +1289,7 @@ pub fn decode_set_container_data_body(
     body: &[u8],
 ) -> Result<SetContainerDataPacket, SetContainerDataError> {
     let Some((window_id, window_len)) =
-        varint(body).map_err(|_| SetContainerDataError::Malformed)?
+        read_varint(body).map_err(|_| SetContainerDataError::Malformed)?
     else {
         return Err(SetContainerDataError::Truncated);
     };
@@ -1319,7 +1319,7 @@ pub fn decode_set_container_data_framed(
     framed: &[u8],
 ) -> Result<SetContainerDataPacket, SetContainerDataError> {
     let Some((length, len_prefix)) =
-        varint(framed).map_err(|_| SetContainerDataError::Malformed)?
+        read_varint(framed).map_err(|_| SetContainerDataError::Malformed)?
     else {
         return Err(SetContainerDataError::Truncated);
     };
