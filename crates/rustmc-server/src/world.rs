@@ -1,7 +1,12 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod experience;
+pub mod time_weather;
+
 pub mod block_entity;
 pub mod interaction;
+#[cfg(test)]
+mod tests_experience;
 
 pub use block_entity::*;
 
@@ -9,6 +14,8 @@ pub use block_entity::*;
 mod tests_interaction;
 #[cfg(test)]
 mod tests_player_interaction;
+#[cfg(test)]
+mod tests_time_weather;
 
 pub use interaction::*;
 
