@@ -12,28 +12,36 @@
 //! articles; item durabilities follow the minecraft.wiki `Durability` article.
 //! Enchantment combination costs are not modelled.
 
+use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::vanilla::random::RandomSource;
 use std::fmt;
 
-/// Maximum allowable characters for an item's custom name in an anvil text box.
+/// Maximum allowable characters for an item's custom name in an anvil text box (minecraft.wiki `Anvil`).
 pub const MAX_NAME_LENGTH: usize = 50;
 
-/// Experience level cost cap in Survival mode ("Too Expensive!" at 40 levels).
+/// Experience level cost cap in Survival mode ("Too Expensive!" at 40 levels; minecraft.wiki `Anvil_mechanics`).
 pub const SURVIVAL_LEVEL_CAP: u32 = 40;
 
-/// Probability of anvil degradation upon completing a repair (12%).
+/// Probability of anvil degradation upon completing a repair (12%; minecraft.wiki `Anvil`).
 pub const DEGRADATION_CHANCE: f64 = 0.12;
 
-/// Bonus factor applied to max durability during same-item combination (12%).
+/// Bonus factor applied to max durability during same-item combination (12%; minecraft.wiki `Anvil_mechanics`).
 pub const DURABILITY_BONUS_FACTOR: f64 = 0.12;
 
-/// Fraction of max durability restored per unit of repair material (25%).
+/// Fraction of max durability restored per unit of repair material (25%; minecraft.wiki `Anvil_mechanics`).
 pub const MATERIAL_REPAIR_FRACTION: f64 = 0.25;
 
-/// Cost in experience levels to rename an item when the name is modified.
+/// Maximum material units consumed in a single material repair (4 units; minecraft.wiki `Anvil_mechanics`).
+const MAX_REPAIR_MATERIAL_UNITS: u32 = 4;
+
+/// Cost in experience levels to rename an item when the name is modified (minecraft.wiki `Anvil_mechanics`).
 pub const RENAME_LEVEL_COST: u32 = 1;
 
-/// Cost in experience levels for tool durability combination.
+/// Cost in experience levels for tool durability combination (minecraft.wiki `Anvil_mechanics`).
 pub const COMBINE_REPAIR_LEVEL_COST: u32 = 2;
+
+/// Max durability of `minecraft:mace` in Java Edition (minecraft.wiki `Mace` / `Durability`: 500).
+const MACE_MAX_DURABILITY: u32 = 500;
 
 /// State of an anvil block in the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -163,6 +171,7 @@ pub fn default_max_durability(item: &str) -> Option<u32> {
         "brush" => Some(64),
         "carrot_on_a_stick" => Some(25),
         "warped_fungus_on_a_stick" => Some(100),
+        "mace" => Some(MACE_MAX_DURABILITY),
         _ => None,
     }
 }
@@ -195,7 +204,7 @@ pub fn is_repair_material(tool: &str, material: &str) -> bool {
         return m == "leather";
     }
     if t == "turtle_helmet" {
-        return matches!(m, "turtle_scute" | "scute");
+        return m == "turtle_scute";
     }
     if t == "elytra" {
         return m == "phantom_membrane";
@@ -207,32 +216,68 @@ pub fn is_repair_material(tool: &str, material: &str) -> bool {
     false
 }
 
-/// An item stack representing an item identifier, stack count, durability, prior work penalty,
-/// and optional custom name.
+/// An anvil slot item wrapping the shared [`ItemStack`] for item ID and count,
+/// with durability, prior work penalty (`repair_cost`), and custom name fields
+/// beside it until [`ItemStack`] carries data components.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ItemStack {
-    pub item: String,
-    pub count: u32,
+pub struct AnvilItem {
+    stack: ItemStack,
     pub durability: u32,
     pub max_durability: u32,
     pub repair_cost: u32,
     pub custom_name: Option<String>,
 }
 
-impl ItemStack {
-    /// Creates a new `ItemStack`. If the item has a known default max durability, it is
-    /// populated automatically with full durability and zero repair penalty.
-    pub fn new(item: impl Into<String>, count: u32) -> Self {
-        let item = item.into();
-        let max_durability = default_max_durability(&item).unwrap_or(0);
+impl AnvilItem {
+    /// Creates an [`AnvilItem`] from an existing shared [`ItemStack`], populating
+    /// default durability if the item is a known damageable tool, weapon, or armor piece.
+    #[must_use]
+    pub fn from_stack(stack: ItemStack) -> Self {
+        let max_durability = default_max_durability(stack.item()).unwrap_or(0);
         Self {
-            item,
-            count,
+            stack,
             durability: max_durability,
             max_durability,
             repair_cost: 0,
             custom_name: None,
         }
+    }
+
+    /// Creates a validated [`AnvilItem`], checking item ID and count via [`ItemStack::try_new`].
+    pub fn try_new(item: impl Into<String>, count: u16) -> Result<Self, ItemStackError> {
+        let item = item.into();
+        let max_durability = default_max_durability(&item).unwrap_or(0);
+        let max_stack = if max_durability > 0 {
+            1
+        } else {
+            DEFAULT_MAX_STACK
+        };
+        let stack = ItemStack::try_new(item, count, max_stack)?;
+        Ok(Self {
+            stack,
+            durability: max_durability,
+            max_durability,
+            repair_cost: 0,
+            custom_name: None,
+        })
+    }
+
+    /// Returns the underlying shared [`ItemStack`].
+    #[must_use]
+    pub fn stack(&self) -> &ItemStack {
+        &self.stack
+    }
+
+    /// Returns the namespaced item identifier.
+    #[must_use]
+    pub fn item(&self) -> &str {
+        self.stack.item()
+    }
+
+    /// Returns the stack count.
+    #[must_use]
+    pub fn count(&self) -> u16 {
+        self.stack.count()
     }
 
     /// Sets the current remaining durability.
@@ -284,27 +329,21 @@ impl ItemStack {
     pub fn is_damaged(&self) -> bool {
         self.is_damageable() && self.durability < self.max_durability
     }
-
-    /// Returns whether this item stack is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.count == 0 || self.item.trim().is_empty()
-    }
 }
 
 /// Input parameters for an anvil operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnvilRepairInput {
-    pub base_item: ItemStack,
-    pub sacrifice_item: Option<ItemStack>,
+    pub base_item: AnvilItem,
+    pub sacrifice_item: Option<AnvilItem>,
     pub custom_name: Option<String>,
 }
 
 impl AnvilRepairInput {
     /// Creates a new `AnvilRepairInput`, validating custom name length (max 50 chars).
     pub fn new(
-        base_item: ItemStack,
-        sacrifice_item: Option<ItemStack>,
+        base_item: AnvilItem,
+        sacrifice_item: Option<AnvilItem>,
         custom_name: Option<String>,
     ) -> Result<Self, AnvilError> {
         if let Some(ref name) = custom_name {
@@ -325,14 +364,14 @@ impl AnvilRepairInput {
 
     /// Helper to create a rename-only anvil input.
     pub fn rename_only(
-        base_item: ItemStack,
+        base_item: AnvilItem,
         custom_name: impl Into<String>,
     ) -> Result<Self, AnvilError> {
         Self::new(base_item, None, Some(custom_name.into()))
     }
 
     /// Helper to create a same-item or material combination anvil input.
-    pub fn combine(base_item: ItemStack, sacrifice_item: ItemStack) -> Self {
+    pub fn combine(base_item: AnvilItem, sacrifice_item: AnvilItem) -> Self {
         Self {
             base_item,
             sacrifice_item: Some(sacrifice_item),
@@ -345,7 +384,7 @@ impl AnvilRepairInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnvilRepairResult {
     /// The resulting repaired and/or renamed item stack.
-    pub result_item: ItemStack,
+    pub result_item: AnvilItem,
     /// Total experience level cost to perform the operation.
     pub repair_cost_levels: u32,
     /// Count of items consumed from the sacrifice slot (0 for rename-only, 1 for tools, 1-4 for materials).
@@ -367,8 +406,6 @@ impl AnvilRepairResult {
 /// Errors returned by anvil repair operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnvilError {
-    /// Base item stack is empty or missing.
-    EmptyBaseItem,
     /// Custom name exceeds the 50-character limit.
     NameTooLong { len: usize, max: usize },
     /// Sacrifice item cannot be combined with or used to repair the base item.
@@ -388,7 +425,6 @@ pub enum AnvilError {
 impl fmt::Display for AnvilError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyBaseItem => write!(f, "base item stack is empty"),
             Self::NameTooLong { len, max } => {
                 write!(f, "custom name length {len} exceeds limit of {max} chars")
             }
@@ -423,9 +459,6 @@ fn calculate_repair_internal(
 ) -> Result<AnvilRepairResult, AnvilError> {
     if anvil_state.is_broken() {
         return Err(AnvilError::AnvilBroken);
-    }
-    if input.base_item.is_empty() {
-        return Err(AnvilError::EmptyBaseItem);
     }
 
     // Custom rename validation (max 50 chars, trimmed, blank string reset)
@@ -467,14 +500,9 @@ fn calculate_repair_internal(
                 return Err(AnvilError::NoOperation);
             }
         }
-        Some(sacrifice) if sacrifice.is_empty() => {
-            if !rename_changed {
-                return Err(AnvilError::NoOperation);
-            }
-        }
         Some(sacrifice) => {
-            let is_same_item = items_equal(&input.base_item.item, &sacrifice.item);
-            let is_mat = is_repair_material(&input.base_item.item, &sacrifice.item);
+            let is_same_item = items_equal(input.base_item.item(), sacrifice.item());
+            let is_mat = is_repair_material(input.base_item.item(), sacrifice.item());
 
             if !is_same_item && !is_mat {
                 return Err(AnvilError::IncompatibleSacrificeItem);
@@ -521,13 +549,19 @@ fn calculate_repair_internal(
                         ((f64::from(max_durability)) * MATERIAL_REPAIR_FRACTION).floor() as u32;
                     let unit_repair = unit_repair.max(1);
 
-                    let mut mat_used = 0;
+                    let mut mat_used = 0u32;
                     let mut cur_d = d1;
-                    while cur_d < max_durability && mat_used < sacrifice.count && mat_used < 4 {
+                    let sacrifice_count = u32::from(sacrifice.count());
+                    while cur_d < max_durability
+                        && mat_used < sacrifice_count
+                        && mat_used < MAX_REPAIR_MATERIAL_UNITS
+                    {
                         cur_d = cur_d.saturating_add(unit_repair).min(max_durability);
                         mat_used += 1;
                     }
-                    if mat_used == 4 {
+                    // When max_durability % 4 != 0 (e.g. 59 or 1561), 4 * floor(max * 0.25) < max;
+                    // this branch tops up the 4th material unit to full durability.
+                    if mat_used == MAX_REPAIR_MATERIAL_UNITS {
                         cur_d = max_durability;
                     }
 
@@ -558,11 +592,19 @@ fn calculate_repair_internal(
         });
     }
 
-    let mut result_item = input.base_item.clone();
-    result_item.count = 1;
-    result_item.durability = result_durability;
-    result_item.repair_cost = next_prior_work_penalty;
-    result_item.custom_name = final_custom_name;
+    let result_stack = ItemStack::try_new(
+        input.base_item.item(),
+        1,
+        input.base_item.stack().max_stack(),
+    )
+    .expect("base_item stack is already validated");
+    let result_item = AnvilItem {
+        stack: result_stack,
+        durability: result_durability,
+        max_durability: input.base_item.max_durability,
+        repair_cost: next_prior_work_penalty,
+        custom_name: final_custom_name,
+    };
 
     let degraded_state = roll.and_then(|r| anvil_state.roll_degradation(r));
 
@@ -593,37 +635,24 @@ pub fn repair_with_roll(
     calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
 }
 
-/// Executes an anvil repair with a caller-provided random source.
-pub fn repair_with_rng(
-    input: &AnvilRepairInput,
-    anvil_state: AnvilState,
-    is_creative: bool,
-    rng: &mut crate::vanilla::random::RandomSource,
-) -> Result<AnvilRepairResult, AnvilError> {
-    let roll = rng.next_double();
-    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
-}
-
-/// Executes an anvil repair on an `Undamaged` anvil, sampling degradation using a time-seeded random source.
+/// Executes an anvil repair on an `Undamaged` anvil using the caller's random source.
 pub fn repair(
     input: &AnvilRepairInput,
     is_creative: bool,
+    rng: &mut RandomSource,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    repair_with_state(input, AnvilState::Undamaged, is_creative)
+    repair_with_state(input, AnvilState::Undamaged, is_creative, rng)
 }
 
-/// Executes an anvil repair with the given `anvil_state`, sampling degradation using a time-seeded random source.
+/// Executes an anvil repair with the given `anvil_state` using the caller's random source.
 pub fn repair_with_state(
     input: &AnvilRepairInput,
     anvil_state: AnvilState,
     is_creative: bool,
+    rng: &mut RandomSource,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let mut rng = crate::vanilla::random::RandomSource::from_world_seed(seed);
-    repair_with_rng(input, anvil_state, is_creative, &mut rng)
+    let roll = rng.next_double();
+    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
 }
 
 /// Anvil block instance tracking its current state in the world.
@@ -664,9 +693,9 @@ impl Anvil {
         &mut self,
         input: &AnvilRepairInput,
         is_creative: bool,
-        rng: &mut crate::vanilla::random::RandomSource,
+        rng: &mut RandomSource,
     ) -> Result<AnvilRepairResult, AnvilError> {
-        let result = repair_with_rng(input, self.state, is_creative, rng)?;
+        let result = repair_with_state(input, self.state, is_creative, rng)?;
         if let Some(new_state) = result.degraded_state {
             self.state = new_state;
         }
@@ -677,14 +706,17 @@ impl Anvil {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vanilla::random::RandomSource;
+
+    fn item(id: &str, count: u16) -> AnvilItem {
+        AnvilItem::try_new(id, count).unwrap()
+    }
 
     #[test]
     fn test_same_item_combination_durability_bonus() {
         // Iron sword has max durability 250.
         // 12% bonus = floor(250 * 0.12) = 30.
-        let sword1 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
 
         let input = AnvilRepairInput::combine(sword1, sword2);
         let result = calculate_repair(&input, false).unwrap();
@@ -692,6 +724,8 @@ mod tests {
         // 50 + 50 + 30 = 130
         assert_eq!(result.result_item.durability, 130);
         assert_eq!(result.result_item.max_durability, 250);
+        assert_eq!(result.result_item.item(), "minecraft:iron_sword");
+        assert_eq!(result.result_item.count(), 1);
         // Combining tools costs 2 levels
         assert_eq!(result.repair_cost_levels, 2);
         assert_eq!(result.material_cost, 1);
@@ -704,8 +738,8 @@ mod tests {
     #[test]
     fn test_same_item_combination_durability_capping() {
         // Capping at max_durability
-        let pick1 = ItemStack::new("minecraft:diamond_pickaxe", 1).with_durability(1400);
-        let pick2 = ItemStack::new("minecraft:diamond_pickaxe", 1).with_durability(300);
+        let pick1 = item("minecraft:diamond_pickaxe", 1).with_durability(1400);
+        let pick2 = item("minecraft:diamond_pickaxe", 1).with_durability(300);
         // Max durability = 1561. Bonus = floor(1561 * 0.12) = 187.
         // 1400 + 300 + 187 = 1887 > 1561 -> capped at 1561.
         let input = AnvilRepairInput::combine(pick1, pick2);
@@ -721,8 +755,8 @@ mod tests {
         // Iron chestplate max durability = 240.
         // 25% per ingot = floor(240 * 0.25) = 60.
         // Starting durability: 100 (missing 140).
-        let chestplate = ItemStack::new("minecraft:iron_chestplate", 1).with_durability(100);
-        let ingots = ItemStack::new("minecraft:iron_ingot", 5);
+        let chestplate = item("minecraft:iron_chestplate", 1).with_durability(100);
+        let ingots = item("minecraft:iron_ingot", 5);
 
         let input = AnvilRepairInput::combine(chestplate, ingots);
         let result = calculate_repair(&input, false).unwrap();
@@ -742,8 +776,8 @@ mod tests {
         // Diamond sword max durability = 1561.
         // 25% per diamond = floor(1561 * 0.25) = 390.
         // Starting durability: 1 (missing 1560).
-        let sword = ItemStack::new("minecraft:diamond_sword", 1).with_durability(1);
-        let diamonds = ItemStack::new("minecraft:diamond", 10);
+        let sword = item("minecraft:diamond_sword", 1).with_durability(1);
+        let diamonds = item("minecraft:diamond", 10);
 
         let input = AnvilRepairInput::combine(sword, diamonds);
         let result = calculate_repair(&input, false).unwrap();
@@ -755,10 +789,44 @@ mod tests {
     }
 
     #[test]
+    fn test_four_material_units_top_up_non_divisible_durability() {
+        // Wooden sword has max durability 59; 25% = floor(59 * 0.25) = 14, so 4 * 14 = 56 < 59.
+        // The `mat_used == 4` branch changes the outcome from 56 to 59.
+        let wooden = item("minecraft:wooden_sword", 1).with_durability(0);
+        let planks = item("minecraft:oak_planks", 4);
+        let res_wood = calculate_repair(&AnvilRepairInput::combine(wooden, planks), false).unwrap();
+        assert_eq!(res_wood.material_cost, 4);
+        assert_eq!(res_wood.result_item.durability, 59);
+
+        // Diamond sword from 0 durability: 4 * 390 = 1560 < 1561; `mat_used == 4` restores 1561.
+        let diamond = item("minecraft:diamond_sword", 1).with_durability(0);
+        let diamonds = item("minecraft:diamond", 4);
+        let res_diamond =
+            calculate_repair(&AnvilRepairInput::combine(diamond, diamonds), false).unwrap();
+        assert_eq!(res_diamond.material_cost, 4);
+        assert_eq!(res_diamond.result_item.durability, 1561);
+    }
+
+    #[test]
+    fn test_mace_durability_and_breeze_rod_repair() {
+        // Java Edition mace has 500 durability and repairs with breeze_rod (125 per rod).
+        assert_eq!(default_max_durability("minecraft:mace"), Some(500));
+        let mace = item("minecraft:mace", 1).with_durability(100);
+        let rods = item("minecraft:breeze_rod", 3);
+
+        let result = calculate_repair(&AnvilRepairInput::combine(mace, rods), false).unwrap();
+        // 100 + 3 * 125 = 475
+        assert_eq!(result.result_item.durability, 475);
+        assert_eq!(result.result_item.max_durability, 500);
+        assert_eq!(result.material_cost, 3);
+        assert_eq!(result.repair_cost_levels, 3);
+    }
+
+    #[test]
     fn test_material_repair_insufficient_materials() {
         // Iron chestplate missing 140 durability, but player only has 2 ingots.
-        let chestplate = ItemStack::new("minecraft:iron_chestplate", 1).with_durability(100);
-        let ingots = ItemStack::new("minecraft:iron_ingot", 2);
+        let chestplate = item("minecraft:iron_chestplate", 1).with_durability(100);
+        let ingots = item("minecraft:iron_ingot", 2);
 
         let input = AnvilRepairInput::combine(chestplate, ingots);
         let result = calculate_repair(&input, false).unwrap();
@@ -771,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_rename_handling_and_validation() {
-        let sword = ItemStack::new("minecraft:diamond_sword", 1);
+        let sword = item("minecraft:diamond_sword", 1);
 
         // Rename costs 1 level
         let input = AnvilRepairInput::rename_only(sword.clone(), "Excalibur").unwrap();
@@ -809,7 +877,7 @@ mod tests {
         assert_eq!(reset_res.repair_cost_levels, 1); // un-renaming costs 1 level
 
         // Unchanged name does not cost levels
-        let sword_same = ItemStack::new("minecraft:iron_sword", 1).with_custom_name("Sword");
+        let sword_same = item("minecraft:iron_sword", 1).with_custom_name("Sword");
         let same_input =
             AnvilRepairInput::new(sword_same.clone(), None, Some("Sword".into())).unwrap();
         assert_eq!(
@@ -825,10 +893,10 @@ mod tests {
         let mut penalty = 0;
         let expected = [1, 3, 7, 15, 31, 63];
         for exp in expected {
-            let sword1 = ItemStack::new("minecraft:iron_sword", 1)
+            let sword1 = item("minecraft:iron_sword", 1)
                 .with_durability(100)
                 .with_repair_cost(penalty);
-            let sword2 = ItemStack::new("minecraft:iron_sword", 1)
+            let sword2 = item("minecraft:iron_sword", 1)
                 .with_durability(100)
                 .with_repair_cost(penalty);
 
@@ -843,10 +911,10 @@ mod tests {
     fn test_too_expensive_survival_vs_creative() {
         // Base penalty 15 + sacrifice penalty 31 = 46.
         // Combined with repair cost (2) = 48 >= 40 limit.
-        let sword1 = ItemStack::new("minecraft:iron_sword", 1)
+        let sword1 = item("minecraft:iron_sword", 1)
             .with_durability(100)
             .with_repair_cost(15);
-        let sword2 = ItemStack::new("minecraft:iron_sword", 1)
+        let sword2 = item("minecraft:iron_sword", 1)
             .with_durability(100)
             .with_repair_cost(31);
 
@@ -870,8 +938,8 @@ mod tests {
 
     #[test]
     fn test_degradation_state_transitions_deterministic() {
-        let sword1 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
         let input = AnvilRepairInput::combine(sword1, sword2);
 
         // Roll < 0.12 triggers degradation
@@ -899,10 +967,26 @@ mod tests {
     }
 
     #[test]
+    fn test_repair_and_repair_with_state_use_caller_rng_deterministically() {
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
+        let input = AnvilRepairInput::combine(sword1, sword2);
+
+        // Pin deterministic outcomes for fixed world seeds (18 degrades, 0 stays intact).
+        let mut rng_a = RandomSource::from_world_seed(18);
+        let res_degraded = repair(&input, false, &mut rng_a).unwrap();
+        assert_eq!(res_degraded.degraded_state, Some(AnvilState::Chipped));
+
+        let mut rng_b = RandomSource::from_world_seed(0);
+        let res_intact = repair_with_state(&input, AnvilState::Chipped, false, &mut rng_b).unwrap();
+        assert_eq!(res_intact.degraded_state, None);
+    }
+
+    #[test]
     fn test_anvil_struct_state_mutation() {
         let mut anvil = Anvil::undamaged();
-        let sword1 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
-        let sword2 = ItemStack::new("minecraft:iron_sword", 1).with_durability(50);
+        let sword1 = item("minecraft:iron_sword", 1).with_durability(50);
+        let sword2 = item("minecraft:iron_sword", 1).with_durability(50);
         let input = AnvilRepairInput::combine(sword1, sword2);
 
         // Step 1: degrades to Chipped
@@ -953,8 +1037,8 @@ mod tests {
     #[test]
     fn test_incompatible_items_and_error_cases() {
         // Diamond sword + Iron ingot is incompatible
-        let sword = ItemStack::new("minecraft:diamond_sword", 1).with_durability(100);
-        let ingot = ItemStack::new("minecraft:iron_ingot", 1);
+        let sword = item("minecraft:diamond_sword", 1).with_durability(100);
+        let ingot = item("minecraft:iron_ingot", 1);
         let input = AnvilRepairInput::combine(sword, ingot);
         assert_eq!(
             calculate_repair(&input, false),
@@ -962,25 +1046,24 @@ mod tests {
         );
 
         // Diamond sword + Iron sword is incompatible
-        let iron_sword = ItemStack::new("minecraft:iron_sword", 1);
-        let sword = ItemStack::new("minecraft:diamond_sword", 1).with_durability(100);
+        let iron_sword = item("minecraft:iron_sword", 1);
+        let sword = item("minecraft:diamond_sword", 1).with_durability(100);
         let input2 = AnvilRepairInput::combine(sword, iron_sword);
         assert_eq!(
             calculate_repair(&input2, false),
             Err(AnvilError::IncompatibleSacrificeItem)
         );
 
-        // Empty base item
-        let empty_item = ItemStack::new("", 0);
-        let input_empty = AnvilRepairInput::new(empty_item, None, None).unwrap();
+        // Shared ItemStack rejects invalid item ids and zero counts
+        assert_eq!(AnvilItem::try_new("", 1), Err(ItemStackError::InvalidItem));
         assert_eq!(
-            calculate_repair(&input_empty, false),
-            Err(AnvilError::EmptyBaseItem)
+            AnvilItem::try_new("minecraft:iron_sword", 0),
+            Err(ItemStackError::InvalidCount(0))
         );
 
         // Fully repaired item with no rename
-        let full_sword1 = ItemStack::new("minecraft:iron_sword", 1);
-        let full_sword2 = ItemStack::new("minecraft:iron_sword", 1);
+        let full_sword1 = item("minecraft:iron_sword", 1);
+        let full_sword2 = item("minecraft:iron_sword", 1);
         let input_full = AnvilRepairInput::combine(full_sword1, full_sword2);
         assert_eq!(
             calculate_repair(&input_full, false),
