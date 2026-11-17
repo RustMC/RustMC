@@ -15,7 +15,7 @@ use std::{
 };
 
 use crate::{
-    discovery_java::{frame, put_varint},
+    java_wire::{frame, put_varint},
     world::{Block, CHUNK_SIDE, Chunk, WORLD_HEIGHT},
 };
 
