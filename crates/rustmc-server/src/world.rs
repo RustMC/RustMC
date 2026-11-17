@@ -1,5 +1,30 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
+pub mod fluid;
+
+pub mod experience;
+pub mod physics;
+#[cfg(test)]
+mod tests_fluid;
+pub mod time_weather;
+
+pub mod block_entity;
+pub mod interaction;
+#[cfg(test)]
+mod tests_experience;
+
+pub use block_entity::*;
+
+pub mod entity_tracker;
+
+pub use entity_tracker::{
+    EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingError, TrackingEvent,
+    chunk_coords, try_chunk_coords,
+};
+
+#[cfg(test)]
+mod tests_entity_tracker;
+
 pub mod journal;
 pub use journal::{MAX_MUTATIONS_PER_TICK, WorldJournal};
 
@@ -7,6 +32,21 @@ pub use journal::{MAX_MUTATIONS_PER_TICK, WorldJournal};
 mod tests_interaction;
 #[cfg(test)]
 mod tests_persistence;
+#[cfg(test)]
+mod tests_player_interaction;
+#[cfg(test)]
+mod tests_time_weather;
+
+pub use interaction::*;
+
+pub use physics::{
+    Aabb, PhysicsBody, SimpleVoxelWorld, StepResult, WorldCollisionView, compute_fall_damage,
+    compute_fall_damage_f32,
+};
+
+pub use fluid::{
+    BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
+};
 
 pub const CHUNK_SIDE: usize = 16;
 pub const WORLD_HEIGHT: usize = 128;
@@ -35,31 +75,132 @@ pub enum Block {
     RedSand,
     RedSandstone,
     Terracotta,
+    ShortGrass,
+    SnowLayer,
+    Carpet,
+    TallGrassLower,
+    TallGrassUpper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportRequirement {
+    None,
+    Soil,
+    TopSupport,
+    DoublePlantLower,
+    DoublePlantUpper,
+}
+
+impl SupportRequirement {
+    pub const fn is_self_supporting(self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
 impl Block {
+    pub const fn provides_top_support(self) -> bool {
+        !matches!(
+            self,
+            Self::Air
+                | Self::ShortGrass
+                | Self::SnowLayer
+                | Self::Carpet
+                | Self::TallGrassLower
+                | Self::TallGrassUpper
+        )
+    }
+
+    pub const fn is_soil(self) -> bool {
+        matches!(self, Self::Dirt | Self::Grass)
+    }
+
+    pub const fn support_requirement(self) -> SupportRequirement {
+        match self {
+            Self::ShortGrass => SupportRequirement::Soil,
+            Self::SnowLayer | Self::Carpet => SupportRequirement::TopSupport,
+            Self::TallGrassLower => SupportRequirement::DoublePlantLower,
+            Self::TallGrassUpper => SupportRequirement::DoublePlantUpper,
+            _ => SupportRequirement::None,
+        }
+    }
+
+    pub const fn can_survive_with(self, below: Option<Block>, above: Option<Block>) -> bool {
+        match self.support_requirement() {
+            SupportRequirement::None => true,
+            SupportRequirement::Soil => match below {
+                Some(b) => b.is_soil(),
+                None => false,
+            },
+            SupportRequirement::TopSupport => match below {
+                Some(b) => b.provides_top_support(),
+                None => false,
+            },
+            SupportRequirement::DoublePlantLower => match (below, above) {
+                (Some(b), Some(Self::TallGrassUpper)) => b.is_soil(),
+                _ => false,
+            },
+            SupportRequirement::DoublePlantUpper => matches!(below, Some(Self::TallGrassLower)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellChange {
+    pub x: usize,
+    pub y: usize,
+    pub z: usize,
+    pub block: Block,
+}
+
+impl CellChange {
+    pub const fn new(x: usize, y: usize, z: usize, block: Block) -> Self {
+        Self { x, y, z, block }
+    }
+}
+
+impl Block {
+    /// Whether this block represents a solid obstacle for collision sweeps.
+    #[inline]
+    pub const fn is_solid(self) -> bool {
+        !matches!(self, Block::Air)
+    }
+}
+
+impl Block {
+    /// Every block, in discriminant order (checked by a unit test).
+    pub const ALL: [Self; 24] = [
+        Self::Air,
+        Self::Bedrock,
+        Self::Stone,
+        Self::Dirt,
+        Self::Grass,
+        Self::Log,
+        Self::Leaves,
+        Self::Sand,
+        Self::Sandstone,
+        Self::Snow,
+        Self::SpruceLog,
+        Self::SpruceLeaves,
+        Self::AcaciaLog,
+        Self::AcaciaLeaves,
+        Self::JungleLog,
+        Self::JungleLeaves,
+        Self::RedSand,
+        Self::RedSandstone,
+        Self::Terracotta,
+        Self::ShortGrass,
+        Self::SnowLayer,
+        Self::Carpet,
+        Self::TallGrassLower,
+        Self::TallGrassUpper,
+    ];
+
+    /// Decode a journalled block discriminant; unknown values are corrupt input.
     pub const fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Air),
-            1 => Some(Self::Bedrock),
-            2 => Some(Self::Stone),
-            3 => Some(Self::Dirt),
-            4 => Some(Self::Grass),
-            5 => Some(Self::Log),
-            6 => Some(Self::Leaves),
-            7 => Some(Self::Sand),
-            8 => Some(Self::Sandstone),
-            9 => Some(Self::Snow),
-            10 => Some(Self::SpruceLog),
-            11 => Some(Self::SpruceLeaves),
-            12 => Some(Self::AcaciaLog),
-            13 => Some(Self::AcaciaLeaves),
-            14 => Some(Self::JungleLog),
-            15 => Some(Self::JungleLeaves),
-            16 => Some(Self::RedSand),
-            17 => Some(Self::RedSandstone),
-            18 => Some(Self::Terracotta),
-            _ => None,
+        if (value as usize) < Self::ALL.len() {
+            Some(Self::ALL[value as usize])
+        } else {
+            None
         }
     }
 }
@@ -109,12 +250,138 @@ pub struct Chunk {
     blocks: Vec<Block>,
 }
 impl Chunk {
+    pub fn empty(x: i32, z: i32) -> Self {
+        Self {
+            x,
+            z,
+            blocks: vec![Block::Air; CHUNK_SIDE * CHUNK_SIDE * WORLD_HEIGHT],
+        }
+    }
+
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: Block) {
+        if x < CHUNK_SIDE && y < WORLD_HEIGHT && z < CHUNK_SIDE {
+            self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x] = block;
+        }
+    }
+
     pub fn block(&self, x: usize, y: usize, z: usize) -> Option<Block> {
         if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
             return None;
         }
         Some(self.blocks[(y * CHUNK_SIDE + z) * CHUNK_SIDE + x])
     }
+
+    pub fn set_and_update(
+        &mut self,
+        x: usize,
+        y: usize,
+        z: usize,
+        block: Block,
+    ) -> Option<Vec<CellChange>> {
+        if x >= CHUNK_SIDE || y >= WORLD_HEIGHT || z >= CHUNK_SIDE {
+            return None;
+        }
+
+        // Gate placement support if placing dependent blocks.
+        let below = if y > 0 { self.block(x, y - 1, z) } else { None };
+        let above = if y + 1 < WORLD_HEIGHT {
+            self.block(x, y + 1, z)
+        } else {
+            None
+        };
+
+        match block.support_requirement() {
+            SupportRequirement::None => {}
+            SupportRequirement::Soil => {
+                if !below.is_some_and(|b| b.is_soil()) {
+                    return None;
+                }
+            }
+            SupportRequirement::TopSupport => {
+                if !below.is_some_and(|b| b.provides_top_support()) {
+                    return None;
+                }
+            }
+            SupportRequirement::DoublePlantLower => {
+                if !below.is_some_and(|b| b.is_soil())
+                    || y + 1 >= WORLD_HEIGHT
+                    || !matches!(above, Some(Block::Air) | Some(Block::TallGrassUpper))
+                {
+                    return None;
+                }
+            }
+            SupportRequirement::DoublePlantUpper => {
+                if below != Some(Block::TallGrassLower) {
+                    return None;
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+
+        // Primary write at (x, y, z).
+        let index = (y * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+        self.blocks[index] = block;
+        changes.push(CellChange { x, y, z, block });
+
+        // Atomic double plant placement: placing TallGrassLower atomically places TallGrassUpper at y + 1.
+        if block == Block::TallGrassLower && y + 1 < WORLD_HEIGHT {
+            let upper_index = ((y + 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            if self.blocks[upper_index] != Block::TallGrassUpper {
+                self.blocks[upper_index] = Block::TallGrassUpper;
+                changes.push(CellChange {
+                    x,
+                    y: y + 1,
+                    z,
+                    block: Block::TallGrassUpper,
+                });
+            }
+        }
+
+        // Step A: downward coupled-half check at y - 1 (breaks lower half if upper half broken).
+        if y > 0 {
+            let prev_y = y - 1;
+            let prev_index = (prev_y * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            if self.blocks[prev_index] == Block::TallGrassLower && block != Block::TallGrassUpper {
+                self.blocks[prev_index] = Block::Air;
+                changes.push(CellChange {
+                    x,
+                    y: prev_y,
+                    z,
+                    block: Block::Air,
+                });
+            }
+        }
+
+        // Step B: bounded upward pass (cy = y + 1 .. WORLD_HEIGHT), breaking unsupported dependent blocks until Air or a surviving block is hit.
+        for cy in (y + 1)..WORLD_HEIGHT {
+            let curr_index = (cy * CHUNK_SIDE + z) * CHUNK_SIDE + x;
+            let current = self.blocks[curr_index];
+            if current == Block::Air {
+                break;
+            }
+            let curr_below = Some(self.blocks[((cy - 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x]);
+            let curr_above = if cy + 1 < WORLD_HEIGHT {
+                Some(self.blocks[((cy + 1) * CHUNK_SIDE + z) * CHUNK_SIDE + x])
+            } else {
+                None
+            };
+            if current.can_survive_with(curr_below, curr_above) {
+                break;
+            } else {
+                self.blocks[curr_index] = Block::Air;
+                changes.push(CellChange {
+                    x,
+                    y: cy,
+                    z,
+                    block: Block::Air,
+                });
+            }
+        }
+
+        Some(changes)
+    }
+
     fn set(&mut self, x: i64, y: i64, z: i64, block: Block) {
         if y < 0 || y >= WORLD_HEIGHT as i64 {
             return;
@@ -135,7 +402,9 @@ impl Chunk {
         }
         self.blocks[index] = block;
     }
-    pub fn set_block(&mut self, x: i64, y: i64, z: i64, block: Block) -> bool {
+
+    /// Set a block by world coordinates; false when they fall outside this chunk.
+    pub fn set_world_block(&mut self, x: i64, y: i64, z: i64, block: Block) -> bool {
         if y < 0 || y >= WORLD_HEIGHT as i64 {
             return false;
         }
@@ -592,12 +861,12 @@ impl World {
             let max_z = min_z + CHUNK_SIDE as i64;
             for (&(x, y, z), &block) in &self.committed_mutations {
                 if x >= min_x && x < max_x && z >= min_z && z < max_z {
-                    chunk.set_block(x, y, z, block);
+                    chunk.set_world_block(x, y, z, block);
                 }
             }
             for m in &self.pending_tick_mutations {
                 if m.x >= min_x && m.x < max_x && m.z >= min_z && m.z < max_z {
-                    chunk.set_block(m.x, m.y, m.z, m.block);
+                    chunk.set_world_block(m.x, m.y, m.z, m.block);
                 }
             }
             self.chunk_cache.insert((chunk_x, chunk_z), chunk);
@@ -627,7 +896,7 @@ impl World {
         self.pending_tick_mutations
             .push(BlockMutation { x, y, z, block });
         if let Some(chunk) = self.chunk_cache.get_mut(&(chunk_x, chunk_z)) {
-            chunk.set_block(x, y, z, block);
+            chunk.set_world_block(x, y, z, block);
         }
         true
     }
@@ -649,7 +918,7 @@ impl World {
                 continue;
             };
             if let Some(chunk) = self.chunk_cache.get_mut(&(chunk_x, chunk_z)) {
-                chunk.set_block(m.x, m.y, m.z, m.block);
+                chunk.set_world_block(m.x, m.y, m.z, m.block);
             }
         }
         self.current_tick += 1;

@@ -991,3 +991,17 @@ fn direct_appends_are_bounded_and_sequenced_without_touching_the_log() {
         32 + 16 + 4
     );
 }
+
+#[test]
+fn every_block_round_trips_through_its_journal_discriminant() {
+    for (index, block) in Block::ALL.iter().enumerate() {
+        assert_eq!(
+            *block as usize, index,
+            "{block:?} is out of order in Block::ALL"
+        );
+        assert_eq!(Block::from_u8(*block as u8), Some(*block));
+    }
+    // One past the last block is corrupt input, not a new block.
+    assert_eq!(Block::from_u8(Block::ALL.len() as u8), None);
+    assert_eq!(Block::from_u8(u8::MAX), None);
+}

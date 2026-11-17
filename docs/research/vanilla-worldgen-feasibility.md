@@ -335,7 +335,7 @@ The oracle gains a `census` mode: every stored block of the sampled chunk
 rectangle is decoded once and counted into decoration families (ore
 families split by stone/deepslate host, raw-metal and debris families,
 base stone/deepslate denominators, and the vegetation families logs,
-leaves, saplings, grasses, flowers, cactus, sugar cane), with exact
+leaves, saplings, grasses, the then-defined `flowers` family, cactus, sugar cane), with exact
 attribution to 32-block Y bands (sections are 16-aligned, so a section
 never straddles a band). Over the same seed-2026 range — 2,401 chunks,
 none missing — the save contains (totals, with the dominant bands):
@@ -346,11 +346,17 @@ none missing — the save contains (totals, with the dominant bands):
   (deepslate-dominant as expected), emerald 682 + 27 (mountain-only
   sparsity), raw metals and no debris in the overworld sample.
 - vegetation: 85,909 log blocks and 605,691 leaf blocks (canopy bands
-  64..95), 54,537 grasses, 1,598 flowers, 120 sugar cane; zero saplings
-  and cactus in the sampled columns.
+  64..95), 54,537 grasses, 1,598 blocks in the legacy `flowers` family, 120 sugar
+  cane; zero saplings and cactus in the sampled columns.
 - denominators: 28.7M stone and 30.9M deepslate, so e.g. coal reaches
   about 1.2% of the stone volume in its peak band — the distribution
   levels the T4 gate must be evaluated against.
+
+The historical `flowers` family above omitted wildflowers and bushes but
+included `pitcher_plant` among its small-flower names. Its `with_rose` spelling
+did not match `wither_rose`. The historical sample's exact square is not recorded
+here, so its 1,598 cannot be relabeled as a count under the corrected definition.
+Later, separately measured census rows appear below.
 
 Two attributions were assumed for the implementation slice. The first —
 that part of the ore volume comes from the `minecraft:vein`-type material
@@ -467,7 +473,7 @@ descent alone versus with the placement stage:
   `deepslate_diamond_ore` 110.2%, `emerald_ore` 84.8%, and `deepslate_emerald_ore`
   against a save count of 2 blocks in the whole square.
 - What is still absent is explicit and measurable: `logs` 6,795, `leaves`
-  66,776, `grasses` 2,543 and `flowers` 95 blocks in the same square, all
+  66,776, `grasses` 2,543 and `flowers` 95 under the then-defined family in the same square, all
   counted at zero by RustMC — the vegetation and tree families of the
   placement stage, plus structures, are the next slices and no claim is made
   about them.
@@ -755,6 +761,32 @@ Two reporting changes came with it rather than as cleanup: the bench's occupancy
 line counts chunk maps instead of columns, and its fixed-budget line now includes
 the heightmap cache, which it had been leaving out — the committed 1,791 KiB total
 understated the per-generator state by the 160 KiB column memo.
+
+## 14 October 2026: separated vegetation census families
+
+The seed-2026 save's block-name histogram exposed two measurement gaps:
+`wildflowers`, `bush` and most tall-flower names were outside the old
+`flowers` family,
+while `big_dripleaf_stem` matched the broad `_stem` rule for logs. The census
+keeps the `flowers` row name with corrected small-flower membership and adds
+separate block-row families. A two-block plant may contribute two rows.
+
+| sampled blocks | saved chunks | logs before → after | grasses | selected small flowers | wildflowers | bushes | tall flowers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0..255` | 256/256 | 6,837 → 6,653 | 2,622 | 34 | 1,453 | 39 | 112 |
+| `-128..127` | 256/256 | 6,795 → 6,795 | 2,543 | 95 | 1,008 | 101 | 112 |
+
+In `0..255`, the 184 removed log rows are exactly the histogram's
+`big_dripleaf_stem` rows; the new families reconcile to 1,453
+`wildflowers`, 33 `bush` + 6 `firefly_bush`, and 80 `rose_bush` + 32 `lilac`
+rows. The old and new `census 0 255` reports each scored 256/256 stored
+chunks; after excluding the corrected logs and added family lines, every
+other report line and the coverage line were byte-identical. One release
+process run per build took 0.15 s wall / 0.14 s user on merged main
+`5c23390` and 0.17 s wall / 0.16 s user on this candidate. Those short single
+runs do not establish a speed change. The census is a measurement tool; these
+counts do not show that RustMC places
+all the corresponding vegetation or passes T4's distribution gate.
 
 ## Risks
 
