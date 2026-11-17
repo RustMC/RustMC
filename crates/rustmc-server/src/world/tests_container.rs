@@ -1,27 +1,11 @@
 use super::container::*;
-
-#[test]
-fn test_item_stack_creation_and_stacking() {
-    let mut stack = ItemStack::new("minecraft:cobblestone", 32, 64).unwrap();
-    assert_eq!(stack.item_id(), "minecraft:cobblestone");
-    assert_eq!(stack.count(), 32);
-    assert_eq!(stack.max_stack(), 64);
-
-    let overflow = stack.add(40);
-    assert_eq!(stack.count(), 64);
-    assert_eq!(overflow, 8);
-
-    let split = stack.split(10).unwrap();
-    assert_eq!(stack.count(), 54);
-    assert_eq!(split.count(), 10);
-    assert_eq!(split.item_id(), "minecraft:cobblestone");
-}
+use crate::item::ItemStack;
 
 #[test]
 fn test_player_inventory_left_click_pickup_and_place() {
     let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
 
-    let stone = ItemStack::new("minecraft:stone", 16, 64).unwrap();
+    let stone = ItemStack::try_new("minecraft:stone", 16, 64).unwrap();
     win.set_slot(36, Some(stone.clone())).unwrap();
 
     // Left click on slot 36 with empty cursor -> picks up entire stack into cursor
@@ -40,7 +24,7 @@ fn test_player_inventory_left_click_pickup_and_place() {
 #[test]
 fn test_right_click_split_and_place_single() {
     let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
-    let wood = ItemStack::new("minecraft:oak_planks", 10, 64).unwrap();
+    let wood = ItemStack::try_new("minecraft:oak_planks", 10, 64).unwrap();
     win.set_slot(9, Some(wood)).unwrap();
 
     // Right click on slot 9 -> picks up half (5) into cursor
@@ -61,7 +45,7 @@ fn test_shift_click_transfer_between_zones() {
     let mut win = ContainerWindow::new(1, ContainerType::Chest9x3);
 
     // Chest slot 0 has 20 iron ingots
-    let iron = ItemStack::new("minecraft:iron_ingot", 20, 64).unwrap();
+    let iron = ItemStack::try_new("minecraft:iron_ingot", 20, 64).unwrap();
     win.set_slot(0, Some(iron)).unwrap();
 
     // Shift-click on chest slot 0 fills the player inventory from its last
@@ -69,7 +53,7 @@ fn test_shift_click_transfer_between_zones() {
     let update = win.handle_click(0, ClickMode::ShiftClick, 0).unwrap();
     assert_eq!(update.state_id, 1);
     assert_eq!(win.slot(0), None);
-    assert_eq!(win.slot(62).unwrap().item_id(), "minecraft:iron_ingot");
+    assert_eq!(win.slot(62).unwrap().item(), "minecraft:iron_ingot");
     assert_eq!(win.slot(62).unwrap().count(), 20);
 
     // Shift-click back on player slot 62 -> moves to the first chest slot
@@ -96,7 +80,7 @@ fn test_out_of_bounds_slot_rejection() {
 }
 
 fn stone(count: u16) -> ItemStack {
-    ItemStack::new("minecraft:stone", count, 64).unwrap()
+    ItemStack::try_new("minecraft:stone", count, 64).unwrap()
 }
 
 #[test]
@@ -124,9 +108,8 @@ fn crafting_result_and_armor_slots_refuse_ordinary_items() {
 #[test]
 fn armor_slots_hold_one_matching_item() {
     let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
-    let helmet = ItemStack::new("minecraft:iron_helmet", 2, 64)
-        .unwrap()
-        .with_equipment(EquipmentSlot::Head);
+    win.set_equipment_slot("minecraft:iron_helmet", EquipmentSlot::Head);
+    let helmet = ItemStack::try_new("minecraft:iron_helmet", 2, 64).unwrap();
     win.set_cursor(Some(helmet.clone()));
     // A helmet does not fit the chest slot, and only one enters the head slot.
     win.handle_click(6, ClickMode::LeftClick, 0).unwrap();
@@ -152,7 +135,7 @@ fn offhand_shift_click_reaches_the_hotbar_when_storage_is_full() {
     for slot in 9..36 {
         win.set_slot(
             slot,
-            Some(ItemStack::new("minecraft:dirt", 64, 64).unwrap()),
+            Some(ItemStack::try_new("minecraft:dirt", 64, 64).unwrap()),
         )
         .unwrap();
     }
@@ -165,9 +148,8 @@ fn offhand_shift_click_reaches_the_hotbar_when_storage_is_full() {
 #[test]
 fn shift_clicking_armor_from_storage_equips_it() {
     let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
-    let boots = ItemStack::new("minecraft:iron_boots", 1, 1)
-        .unwrap()
-        .with_equipment(EquipmentSlot::Feet);
+    win.set_equipment_slot("minecraft:iron_boots", EquipmentSlot::Feet);
+    let boots = ItemStack::try_new("minecraft:iron_boots", 1, 1).unwrap();
     win.set_slot(20, Some(boots.clone())).unwrap();
     win.handle_click(20, ClickMode::ShiftClick, 0).unwrap();
     assert_eq!(win.slot(8), Some(&boots));
@@ -175,17 +157,22 @@ fn shift_clicking_armor_from_storage_equips_it() {
 }
 
 #[test]
-fn exhausted_stacks_never_occupy_the_cursor_or_a_slot() {
+fn crafting_result_that_does_not_fit_stays_in_the_output_slot() {
     let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
-    let mut source = stone(3);
-    let moved = source.split(3).unwrap();
-    assert_eq!(source.count(), 0);
-    win.set_cursor(Some(source.clone()));
+    let stack = ItemStack::try_new("minecraft:stone", 60, 99).unwrap();
+    win.set_slot(0, Some(stack.clone())).unwrap();
+    win.set_cursor(Some(stack.clone()));
+    win.handle_click(0, ClickMode::LeftClick, 0).unwrap();
+    assert_eq!(win.slot(0), Some(&stack));
+    assert_eq!(win.cursor(), Some(&stack));
+}
+
+#[test]
+fn right_click_outside_drops_one_item_and_empties_the_cursor_on_the_last() {
+    let mut win = ContainerWindow::new(0, ContainerType::PlayerInventory);
+    win.set_cursor(Some(stone(2)));
+    win.handle_click(-999, ClickMode::RightClick, 0).unwrap();
+    assert_eq!(win.cursor(), Some(&stone(1)));
+    win.handle_click(-999, ClickMode::RightClick, 1).unwrap();
     assert_eq!(win.cursor(), None);
-    win.set_slot(9, Some(source)).unwrap();
-    assert_eq!(win.slot(9), None);
-    // Placing the real stack still works afterwards.
-    win.set_cursor(Some(moved));
-    win.handle_click(9, ClickMode::LeftClick, 0).unwrap();
-    assert_eq!(win.slot(9), Some(&stone(3)));
 }
