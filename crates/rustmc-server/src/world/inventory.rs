@@ -6,14 +6,14 @@
 //! - Active hotbar index (`0..=8`)
 //! - Monotonic transaction revision counter (`revision: u64`)
 //!
-//! All slot transactions guarantee strict conservation of item counts. Any
-//! transaction that fails or is rejected is strictly atomic and leaves the
-//! inventory unmodified.
+//! Each occupied slot holds a validated `crate::item::ItemStack` whose own
+//! `max_stack()` defines its stack limit. All slot transactions guarantee strict
+//! conservation of item counts. Any transaction that fails or is rejected is
+//! strictly atomic and leaves the inventory unmodified.
 
 use std::fmt;
 
-/// Maximum number of items in a single stack.
-pub const MAX_STACK_SIZE: u8 = 64;
+use crate::item::ItemStack;
 
 /// Number of hotbar slots (slots 0..=8).
 pub const HOTBAR_SLOT_COUNT: usize = 9;
@@ -33,38 +33,6 @@ pub const MAIN_SLOTS: std::ops::RangeInclusive<u8> = 9..=35;
 /// Closed range of all valid inventory slot indices.
 pub const TOTAL_SLOTS: std::ops::RangeInclusive<u8> = 0..=35;
 
-/// A counted stack of items with max stack size bounds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ItemStack {
-    item: String,
-    count: u8,
-}
-
-impl ItemStack {
-    /// Creates a new item stack, validating that `count` is within `1..=MAX_STACK_SIZE`
-    /// and that `item` is non-empty.
-    pub fn new(item: impl Into<String>, count: u8) -> Result<Self, InventoryError> {
-        let item = item.into();
-        if item.trim().is_empty() {
-            return Err(InventoryError::InvalidItem);
-        }
-        if count == 0 || count > MAX_STACK_SIZE {
-            return Err(InventoryError::InvalidCount(count));
-        }
-        Ok(Self { item, count })
-    }
-
-    /// The item identifier.
-    pub fn item(&self) -> &str {
-        &self.item
-    }
-
-    /// The item stack count, guaranteed to be within `1..=MAX_STACK_SIZE`.
-    pub fn count(&self) -> u8 {
-        self.count
-    }
-}
-
 /// Errors returned by inventory transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryError {
@@ -73,13 +41,13 @@ pub enum InventoryError {
     /// Slot index is outside the valid hotbar range `0..=8`.
     InvalidHotbarSlot(u8),
     /// Item count is invalid (e.g. zero or exceeding bounds).
-    InvalidCount(u8),
-    /// Item identifier is empty or invalid.
-    InvalidItem,
+    InvalidCount(u16),
     /// Held slot does not contain enough items to satisfy the requested consumption.
-    InsufficientItems { requested: u8, available: u8 },
+    InsufficientItems { requested: u16, available: u16 },
     /// Inventory has no available space to accept items.
     InventoryFull,
+    /// Transaction revision counter reached `u64::MAX` and cannot advance.
+    RevisionExhausted,
 }
 
 impl fmt::Display for InventoryError {
@@ -92,7 +60,6 @@ impl fmt::Display for InventoryError {
                 write!(f, "hotbar slot {slot} is out of bounds (0..=8)")
             }
             Self::InvalidCount(count) => write!(f, "invalid item count {count}"),
-            Self::InvalidItem => write!(f, "item identifier cannot be empty"),
             Self::InsufficientItems {
                 requested,
                 available,
@@ -101,6 +68,7 @@ impl fmt::Display for InventoryError {
                 "insufficient items: requested {requested}, but only {available} available"
             ),
             Self::InventoryFull => write!(f, "inventory has no available space"),
+            Self::RevisionExhausted => write!(f, "inventory revision counter exhausted"),
         }
     }
 }
@@ -151,12 +119,20 @@ impl PlayerInventory {
         self.get_slot(self.held_slot)
     }
 
+    /// Computes the next revision without mutating state so failed checks remain atomic.
+    const fn next_revision(&self) -> Result<u64, InventoryError> {
+        match self.revision.checked_add(1) {
+            Some(next) => Ok(next),
+            None => Err(InventoryError::RevisionExhausted),
+        }
+    }
+
     /// Returns the total count of all items across all 36 inventory slots.
     pub fn total_item_count(&self) -> u64 {
         self.slots
             .iter()
             .filter_map(|s| s.as_ref())
-            .map(|s| s.count as u64)
+            .map(|s| u64::from(s.count()))
             .sum()
     }
 
@@ -169,11 +145,9 @@ impl PlayerInventory {
         if !HOTBAR_SLOTS.contains(&slot) {
             return Err(InventoryError::InvalidHotbarSlot(slot));
         }
+        let next_revision = self.next_revision()?;
         self.held_slot = slot;
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
+        self.revision = next_revision;
         Ok(())
     }
 
@@ -187,34 +161,24 @@ impl PlayerInventory {
         }
     }
 
-    /// Sets the item stack in a specific slot (`0..=35`), validating count bounds.
+    /// Sets the item stack in a specific slot (`0..=35`).
     ///
     /// On success, the revision counter increments.
-    /// On rejection (slot out of bounds or invalid stack), state and revision are untouched.
+    /// On rejection (slot out of bounds or revision exhausted), state and revision are untouched.
     pub fn set_slot(&mut self, slot: u8, stack: Option<ItemStack>) -> Result<(), InventoryError> {
         if (slot as usize) >= TOTAL_SLOT_COUNT {
             return Err(InventoryError::InvalidSlot(slot));
         }
-        if let Some(ref s) = stack {
-            if s.item.trim().is_empty() {
-                return Err(InventoryError::InvalidItem);
-            }
-            if s.count == 0 || s.count > MAX_STACK_SIZE {
-                return Err(InventoryError::InvalidCount(s.count));
-            }
-        }
+        let next_revision = self.next_revision()?;
         self.slots[slot as usize] = stack;
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
+        self.revision = next_revision;
         Ok(())
     }
 
     /// Deterministically swaps the contents of two slots (`0..=35`).
     ///
-    /// Strictly atomic: if either slot index is out of bounds, no modification is
-    /// performed, no items are lost or duplicated, and an error is returned.
+    /// Strictly atomic: if either slot index is out of bounds or revision is exhausted,
+    /// no modification is performed, no items are lost or duplicated, and an error is returned.
     /// On success, revision is incremented.
     pub fn swap_slots(&mut self, slot_a: u8, slot_b: u8) -> Result<(), InventoryError> {
         if (slot_a as usize) >= TOTAL_SLOT_COUNT {
@@ -223,16 +187,14 @@ impl PlayerInventory {
         if (slot_b as usize) >= TOTAL_SLOT_COUNT {
             return Err(InventoryError::InvalidSlot(slot_b));
         }
+        let next_revision = self.next_revision()?;
 
         self.slots.swap(slot_a as usize, slot_b as usize);
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
+        self.revision = next_revision;
         Ok(())
     }
 
-    /// Grants `count` of `item` to the inventory, stacking with existing compatible stacks
+    /// Grants `stack` to the inventory, stacking with existing compatible stacks
     /// first, then filling empty slots in slot order (`0..=35`).
     ///
     /// Returns `Ok(remaining)` where `remaining` is the count of items that could
@@ -243,25 +205,19 @@ impl PlayerInventory {
     /// the inventory has no capacity, `Err(InventoryError::InventoryFull)` is returned
     /// and the inventory is completely unmodified.
     ///
-    /// If rejected (empty item name, count == 0, or inventory full), the operation
-    /// is strictly atomic: no state is modified and revision is not incremented.
-    pub fn grant_item(&mut self, item: String, count: u8) -> Result<u8, InventoryError> {
-        if item.trim().is_empty() {
-            return Err(InventoryError::InvalidItem);
-        }
-        if count == 0 {
-            return Err(InventoryError::InvalidCount(0));
-        }
-
-        // Calculate available capacity for this item across all slots.
+    /// If rejected (inventory full or revision exhausted), the operation is
+    /// strictly atomic: no state is modified and revision is not incremented.
+    pub fn grant_item(&mut self, stack: ItemStack) -> Result<u16, InventoryError> {
+        // Calculate available capacity for this stack across all slots.
         let mut available_capacity: usize = 0;
         for slot in &self.slots {
             match slot {
-                Some(stack) if stack.item == item => {
-                    available_capacity += (MAX_STACK_SIZE.saturating_sub(stack.count)) as usize;
+                Some(existing) if existing.can_stack_with(&stack) => {
+                    available_capacity +=
+                        usize::from(existing.max_stack().saturating_sub(existing.count()));
                 }
                 None => {
-                    available_capacity += MAX_STACK_SIZE as usize;
+                    available_capacity += usize::from(stack.max_stack());
                 }
                 _ => {}
             }
@@ -271,116 +227,109 @@ impl PlayerInventory {
             return Err(InventoryError::InventoryFull);
         }
 
-        let to_place = (count as usize).min(available_capacity) as u8;
-        let remainder = count - to_place;
+        let next_revision = self.next_revision()?;
+        let mut pending = Some(stack);
 
-        let mut remaining_to_place = to_place;
-
-        // Pass 1: Top up existing compatible stacks in deterministic slot order (0..=35)
-        for slot in 0..TOTAL_SLOT_COUNT {
-            if remaining_to_place == 0 {
+        // Pass 1: Top up existing compatible stacks in deterministic slot order (0..=35).
+        for slot in &mut self.slots {
+            let Some(incoming) = pending.take() else {
                 break;
-            }
-            if let Some(stack) = &mut self.slots[slot]
-                && stack.item == item
-                && stack.count < MAX_STACK_SIZE
+            };
+            if let Some(existing) = slot
+                && existing.can_stack_with(&incoming)
             {
-                let space = MAX_STACK_SIZE - stack.count;
-                let add = remaining_to_place.min(space);
-                stack.count += add;
-                remaining_to_place -= add;
+                let space = existing.max_stack().saturating_sub(existing.count());
+                if space > 0 {
+                    match incoming.split(space) {
+                        Ok((taken, rest)) => {
+                            let overflow = existing.add(taken.count());
+                            debug_assert_eq!(overflow, 0);
+                            pending = rest;
+                        }
+                        Err(returned) => {
+                            pending = Some(returned);
+                        }
+                    }
+                    continue;
+                }
             }
+            pending = Some(incoming);
         }
 
-        // Pass 2: Place remainder into empty slots in deterministic slot order (0..=35)
-        for slot in 0..TOTAL_SLOT_COUNT {
-            if remaining_to_place == 0 {
+        // Pass 2: Place remainder into empty slots in deterministic slot order (0..=35).
+        for slot in &mut self.slots {
+            let Some(incoming) = pending.take() else {
                 break;
-            }
-            if self.slots[slot].is_none() {
-                let add = remaining_to_place.min(MAX_STACK_SIZE);
-                self.slots[slot] = Some(ItemStack {
-                    item: item.clone(),
-                    count: add,
-                });
-                remaining_to_place -= add;
+            };
+            if slot.is_none() {
+                let limit = incoming.max_stack();
+                match incoming.split(limit) {
+                    Ok((placed, rest)) => {
+                        *slot = Some(placed);
+                        pending = rest;
+                    }
+                    Err(returned) => {
+                        pending = Some(returned);
+                    }
+                }
+            } else {
+                pending = Some(incoming);
             }
         }
 
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
+        let remainder = pending.map_or(0, |rem| rem.count());
+        self.revision = next_revision;
         Ok(remainder)
     }
 
     /// Consumes `count` items from the currently active held hotbar slot (`held_slot`).
     ///
     /// Strictly atomic: if the held slot is empty or contains fewer items than `count`,
-    /// or if `count == 0`, the transaction fails, no items are consumed, and revision
-    /// is not incremented.
+    /// `count == 0`, or revision is exhausted, the transaction fails, no items are
+    /// consumed, and revision is not incremented.
     ///
     /// On success, returns the consumed `ItemStack`, updates the held slot (clearing
     /// to `None` if all items were consumed), and increments the revision counter.
-    pub fn consume_held(&mut self, count: u8) -> Result<ItemStack, InventoryError> {
+    pub fn consume_held(&mut self, count: u16) -> Result<ItemStack, InventoryError> {
         if count == 0 {
             return Err(InventoryError::InvalidCount(0));
         }
 
-        let held_idx = self.held_slot as usize;
-        let Some(stack) = &mut self.slots[held_idx] else {
+        let held_idx = usize::from(self.held_slot);
+        let available = self.slots[held_idx].as_ref().map_or(0, ItemStack::count);
+        if available < count {
+            return Err(InventoryError::InsufficientItems {
+                requested: count,
+                available,
+            });
+        }
+
+        let next_revision = self.next_revision()?;
+        let Some(stack) = self.slots[held_idx].take() else {
             return Err(InventoryError::InsufficientItems {
                 requested: count,
                 available: 0,
             });
         };
 
-        if stack.count < count {
-            return Err(InventoryError::InsufficientItems {
-                requested: count,
-                available: stack.count,
-            });
+        match stack.split(count) {
+            Ok((taken, remainder)) => {
+                self.slots[held_idx] = remainder;
+                self.revision = next_revision;
+                Ok(taken)
+            }
+            Err(original) => {
+                self.slots[held_idx] = Some(original);
+                Err(InventoryError::InvalidCount(count))
+            }
         }
-
-        let item_name = stack.item.clone();
-        if stack.count == count {
-            self.slots[held_idx] = None;
-        } else {
-            stack.count -= count;
-        }
-
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("inventory revision overflow");
-
-        Ok(ItemStack {
-            item: item_name,
-            count,
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn item_stack_validation() {
-        assert_eq!(ItemStack::new("", 1), Err(InventoryError::InvalidItem));
-        assert_eq!(ItemStack::new("   ", 1), Err(InventoryError::InvalidItem));
-        assert_eq!(
-            ItemStack::new("minecraft:dirt", 0),
-            Err(InventoryError::InvalidCount(0))
-        );
-        assert_eq!(
-            ItemStack::new("minecraft:dirt", 65),
-            Err(InventoryError::InvalidCount(65))
-        );
-        let valid = ItemStack::new("minecraft:dirt", 64).unwrap();
-        assert_eq!(valid.item(), "minecraft:dirt");
-        assert_eq!(valid.count(), 64);
-    }
+    use crate::item::DEFAULT_MAX_STACK;
 
     #[test]
     fn error_display_coverage() {
@@ -388,12 +337,12 @@ mod tests {
             InventoryError::InvalidSlot(40),
             InventoryError::InvalidHotbarSlot(12),
             InventoryError::InvalidCount(0),
-            InventoryError::InvalidItem,
             InventoryError::InsufficientItems {
                 requested: 10,
                 available: 2,
             },
             InventoryError::InventoryFull,
+            InventoryError::RevisionExhausted,
         ];
         for err in &errs {
             let msg = err.to_string();
@@ -409,19 +358,65 @@ mod tests {
 
         // 1. Invalid slot rejected without modifying revision
         assert_eq!(
-            inv.set_slot(36, Some(ItemStack::new("minecraft:apple", 2).unwrap())),
+            inv.set_slot(
+                36,
+                Some(ItemStack::try_new("minecraft:apple", 2, DEFAULT_MAX_STACK).unwrap())
+            ),
             Err(InventoryError::InvalidSlot(36))
         );
         assert_eq!(inv.revision(), initial_rev);
 
         // 2. Valid set_slot increments revision
-        inv.set_slot(5, Some(ItemStack::new("minecraft:apple", 2).unwrap()))
-            .unwrap();
+        inv.set_slot(
+            5,
+            Some(ItemStack::try_new("minecraft:apple", 2, DEFAULT_MAX_STACK).unwrap()),
+        )
+        .unwrap();
         assert_eq!(inv.revision(), initial_rev + 1);
         assert_eq!(inv.get_slot(5).unwrap().count(), 2);
         assert_eq!(inv.get_slot(5).unwrap().item(), "minecraft:apple");
 
         // 3. Transactions are strictly checked; no direct mutable slot reference
         assert!(inv.get_slot(36).is_none());
+    }
+
+    #[test]
+    fn revision_exhaustion_is_atomic_for_all_transactions() {
+        let mut inv = PlayerInventory::new();
+        let apples = ItemStack::try_new("minecraft:apple", 5, DEFAULT_MAX_STACK).unwrap();
+        let sword = ItemStack::try_new("minecraft:diamond_sword", 1, 1).unwrap();
+        inv.set_slot(0, Some(apples.clone())).unwrap();
+        inv.set_slot(1, Some(sword)).unwrap();
+        inv.revision = u64::MAX;
+
+        let snapshot_slots = inv.slots().to_vec();
+        let snapshot_held = inv.held_slot();
+
+        let assert_unchanged = |inv: &PlayerInventory| {
+            assert_eq!(inv.slots(), snapshot_slots.as_slice());
+            assert_eq!(inv.held_slot(), snapshot_held);
+            assert_eq!(inv.revision(), u64::MAX);
+        };
+
+        assert_eq!(
+            inv.set_slot(2, Some(apples.clone())),
+            Err(InventoryError::RevisionExhausted)
+        );
+        assert_unchanged(&inv);
+
+        assert_eq!(inv.swap_slots(0, 1), Err(InventoryError::RevisionExhausted));
+        assert_unchanged(&inv);
+
+        assert_eq!(inv.set_held_slot(1), Err(InventoryError::RevisionExhausted));
+        assert_unchanged(&inv);
+
+        assert_eq!(
+            inv.grant_item(apples),
+            Err(InventoryError::RevisionExhausted)
+        );
+        assert_unchanged(&inv);
+
+        assert_eq!(inv.consume_held(1), Err(InventoryError::RevisionExhausted));
+        assert_unchanged(&inv);
     }
 }
