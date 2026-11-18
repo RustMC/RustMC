@@ -199,6 +199,41 @@ pub(crate) fn read_nbt_string(input: &[u8]) -> Result<(String, usize), WireError
     Ok((text, length_bytes.len() + length))
 }
 
+/// Decode a big-endian `i16`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_i16_be(input: &[u8]) -> Result<(i16, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<2>().ok_or(WireError::Truncated)?;
+    Ok((i16::from_be_bytes(*bytes), rest))
+}
+
+/// Decode a big-endian `i64`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_i64_be(input: &[u8]) -> Result<(i64, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((i64::from_be_bytes(*bytes), rest))
+}
+
+/// Decode a big-endian `u64`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_u64_be(input: &[u8]) -> Result<(u64, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((u64::from_be_bytes(*bytes), rest))
+}
+
+/// Decode a big-endian `f32`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_f32_be(input: &[u8]) -> Result<(f32, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<4>().ok_or(WireError::Truncated)?;
+    Ok((f32::from_be_bytes(*bytes), rest))
+}
+
+/// Decode a big-endian `f64`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_f64_be(input: &[u8]) -> Result<(f64, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((f64::from_be_bytes(*bytes), rest))
+}
+
 /// Pack signed `(x, y, z)` block coordinates into Minecraft's 26/26/12-bit `i64` layout.
 #[inline]
 pub(crate) fn pack_block_position(x: i32, y: i32, z: i32) -> i64 {
@@ -375,6 +410,65 @@ mod tests {
         ] {
             let packed = pack_block_position(coords.0, coords.1, coords.2);
             assert_eq!(unpack_block_position(packed), coords);
+        }
+    }
+
+    #[test]
+    fn fixed_width_big_endian_readers_decode_values_and_reject_truncation() {
+        for value in [i16::MIN, -1, 0, 8, i16::MAX] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.push(0xaa);
+            assert_eq!(read_i16_be(&buf), Ok((value, &[0xaa][..])));
+        }
+        for len in 0..2 {
+            assert_eq!(read_i16_be(&[0; 2][..len]), Err(WireError::Truncated));
+        }
+
+        for value in [i64::MIN, -1, 0, 0x0102_0304_0506_0708, i64::MAX] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.extend_from_slice(&[0xbb, 0xcc]);
+            assert_eq!(read_i64_be(&buf), Ok((value, &[0xbb, 0xcc][..])));
+        }
+        for len in 0..8 {
+            assert_eq!(read_i64_be(&[0; 8][..len]), Err(WireError::Truncated));
+        }
+
+        for value in [0u64, 1, 0x0102_0304_0506_0708, u64::MAX] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.push(0xdd);
+            assert_eq!(read_u64_be(&buf), Ok((value, &[0xdd][..])));
+        }
+        for len in 0..8 {
+            assert_eq!(read_u64_be(&[0; 8][..len]), Err(WireError::Truncated));
+        }
+
+        for value in [-90.0f32, -0.5, 0.0, 0.25, 180.0, f32::INFINITY] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.push(0xee);
+            let (decoded, rest) = read_f32_be(&buf).unwrap();
+            assert_eq!(decoded.to_bits(), value.to_bits());
+            assert_eq!(rest, &[0xee][..]);
+        }
+        for len in 0..4 {
+            assert_eq!(read_f32_be(&[0; 4][..len]), Err(WireError::Truncated));
+        }
+
+        for value in [
+            -30_000_000.0f64,
+            -1.5,
+            0.0,
+            64.0,
+            30_000_000.0,
+            f64::NEG_INFINITY,
+        ] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.push(0xff);
+            let (decoded, rest) = read_f64_be(&buf).unwrap();
+            assert_eq!(decoded.to_bits(), value.to_bits());
+            assert_eq!(rest, &[0xff][..]);
+        }
+        for len in 0..8 {
+            assert_eq!(read_f64_be(&[0; 8][..len]), Err(WireError::Truncated));
         }
     }
 }

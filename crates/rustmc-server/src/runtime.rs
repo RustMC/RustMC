@@ -319,7 +319,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         },
         None => None,
     };
-    let vanilla_source = if let (Some(data_root), Some(registry_table)) =
+    let (vanilla_source, protocol_ids) = if let (Some(data_root), Some(registry_table)) =
         (&config.vanilla_data_root, &config.vanilla_registry_table)
     {
         // The configuration stores the signed seed's two's-complement bits.
@@ -343,23 +343,37 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                     format!("invalid local 26.3 registry table: {error}"),
                 ))
             })?;
-        Some(java_preview::VanillaSource {
-            data_root: data_root.clone(),
-            registry_table: registry_table.clone(),
-            seed,
-            spawn_y: generator.surface_height(0, 0),
-            workers: config.vanilla_generation_workers,
-            cache: config
-                .vanilla_cache_root
-                .as_ref()
-                .map(|root| {
-                    crate::preview_cache::PreviewCache::open(root, data_root, registry_table, seed)
-                })
-                .transpose()
-                .map_err(RuntimeError::Bind)?,
-        })
+        let protocol_ids = crate::protocol::ids::ProtocolIds::load(data_root).map_err(|error| {
+            RuntimeError::Bind(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid local 26.3 registries report: {error}"),
+            ))
+        })?;
+        (
+            Some(java_preview::VanillaSource {
+                data_root: data_root.clone(),
+                registry_table: registry_table.clone(),
+                seed,
+                spawn_y: generator.surface_height(0, 0),
+                workers: config.vanilla_generation_workers,
+                cache: config
+                    .vanilla_cache_root
+                    .as_ref()
+                    .map(|root| {
+                        crate::preview_cache::PreviewCache::open(
+                            root,
+                            data_root,
+                            registry_table,
+                            seed,
+                        )
+                    })
+                    .transpose()
+                    .map_err(RuntimeError::Bind)?,
+            }),
+            Some(Arc::new(protocol_ids)),
+        )
     } else {
-        None
+        (None, None)
     };
     let bind_address = SocketAddr::new(config.bind_address, config.port);
     let listener = match TcpListener::bind(bind_address) {
@@ -507,6 +521,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         );
                     if let Some(source) = &vanilla_source {
                         discovery = discovery.with_vanilla_source(source.clone());
+                    }
+                    if let Some(ids) = &protocol_ids {
+                        discovery = discovery.with_protocol_ids(Arc::clone(ids));
                     }
                     if let Some(manifest) = &registry_manifest {
                         discovery = discovery.with_registry_manifest(Arc::clone(manifest));

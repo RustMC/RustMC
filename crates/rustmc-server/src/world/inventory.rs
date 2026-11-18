@@ -33,6 +33,24 @@ pub const MAIN_SLOTS: std::ops::RangeInclusive<u8> = 9..=35;
 /// Closed range of all valid inventory slot indices.
 pub const TOTAL_SLOTS: std::ops::RangeInclusive<u8> = 0..=35;
 
+/// Closed range of main inventory slot indices in the Java Edition player inventory window
+/// (`Java Edition protocol/Inventory`, revision 3201379, `== Player Inventory ==`: `9–35`).
+pub const WINDOW_MAIN_SLOTS: std::ops::RangeInclusive<i16> = 9..=35;
+
+/// Closed range of hotbar slot indices in the Java Edition player inventory window
+/// (`Java Edition protocol/Inventory`, revision 3201379, `== Player Inventory ==`: `36–44`).
+pub const WINDOW_HOTBAR_SLOTS: std::ops::RangeInclusive<i16> = 36..=44;
+
+/// Every slot number of the Java Edition player inventory window: crafting output
+/// `0`, 2×2 crafting input `1–4`, armor `5–8`, main `9–35`, hotbar `36–44`, offhand
+/// `45` (`Java Edition protocol/Inventory`, revision 3201379, `== Player Inventory ==`).
+pub const WINDOW_PLAYER_SLOTS: std::ops::RangeInclusive<i16> = 0..=45;
+
+/// Slot number a creative client sends when it drops an item outside the window
+/// (`Java Edition protocol/Packets`, revision 3868170, `Set Creative Mode Slot`:
+/// "Dropping an item (by clicking outside the window) effectively sets slot -1").
+pub const WINDOW_CREATIVE_DROP_SLOT: i16 = -1;
+
 /// Errors returned by inventory transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryError {
@@ -159,6 +177,27 @@ impl PlayerInventory {
         } else {
             None
         }
+    }
+
+    /// Maps a protocol player inventory window slot (`9..=35` main inventory,
+    /// `36..=44` hotbar; `Java Edition protocol/Inventory`, revision 3201379,
+    /// `== Player Inventory ==`) to its [`PlayerInventory`] slot index
+    /// (`9..=35` main inventory, `0..=8` hotbar).
+    #[must_use]
+    pub const fn window_slot_to_index(window_slot: i16) -> Option<u8> {
+        match window_slot {
+            9..=35 => Some(window_slot as u8),
+            36..=44 => Some((window_slot - 36) as u8),
+            _ => None,
+        }
+    }
+
+    /// Gets a reference to the item stack at a protocol player inventory window
+    /// slot (`9..=35` main inventory, `36..=44` hotbar), or `None` if empty or
+    /// outside `9..=44`.
+    #[must_use]
+    pub fn get_window_slot(&self, window_slot: i16) -> Option<&ItemStack> {
+        Self::window_slot_to_index(window_slot).and_then(|slot| self.get_slot(slot))
     }
 
     /// Sets the item stack in a specific slot (`0..=35`).

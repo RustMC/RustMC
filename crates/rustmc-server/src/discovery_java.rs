@@ -8,11 +8,16 @@ mod tests_keepalive;
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
 use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
 use crate::java_wire::{
-    WireError, frame, pack_block_position, put_string, put_varint, read_string, read_varint,
-    unpack_block_position,
+    WireError, frame, pack_block_position, put_string, put_varint, read_f32_be, read_f64_be,
+    read_i16_be, read_i64_be, read_string, read_u64_be, read_varint, unpack_block_position,
 };
 use crate::preview_data::RegistryManifest;
-use crate::protocol::chat;
+use crate::protocol::{
+    chat,
+    ids::{DynamicRegistryIds, ProtocolIds},
+    slot,
+};
+use crate::world::inventory::{PlayerInventory, WINDOW_CREATIVE_DROP_SLOT, WINDOW_PLAYER_SLOTS};
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
@@ -264,17 +269,12 @@ pub fn decode_player_action(body: &[u8]) -> Result<PlayerAction, Error> {
         return Err(Error::Malformed);
     };
     let status = PlayerActionStatus::try_from(status_val)?;
-    let mut rest = &body[prefix..];
 
-    if rest.len() < 8 {
-        return Err(Error::Malformed);
-    }
-    let packed_pos = i64::from_be_bytes(rest[..8].try_into().unwrap());
+    let (packed_pos, mut rest) = read_i64_be(&body[prefix..])?;
     let (x, y, z) = unpack_block_pos(packed_pos);
     if !is_valid_block_pos(x, y, z) {
         return Err(Error::Malformed);
     }
-    rest = &rest[8..];
 
     if rest.is_empty() {
         return Err(Error::Malformed);
@@ -339,17 +339,12 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     if hand > 1 {
         return Err(Error::Malformed);
     }
-    let mut rest = &body[prefix..];
 
-    if rest.len() < 8 {
-        return Err(Error::Malformed);
-    }
-    let packed_pos = i64::from_be_bytes(rest[..8].try_into().unwrap());
+    let (packed_pos, rest) = read_i64_be(&body[prefix..])?;
     let (x, y, z) = unpack_block_pos(packed_pos);
     if !is_valid_block_pos(x, y, z) {
         return Err(Error::Malformed);
     }
-    rest = &rest[8..];
 
     let Some((face, face_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
@@ -357,14 +352,11 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     if face > 5 {
         return Err(Error::Malformed);
     }
-    rest = &rest[face_len..];
+    let rest = &rest[face_len..];
 
-    if rest.len() < 12 {
-        return Err(Error::Malformed);
-    }
-    let cursor_x = f32::from_be_bytes(rest[0..4].try_into().unwrap());
-    let cursor_y = f32::from_be_bytes(rest[4..8].try_into().unwrap());
-    let cursor_z = f32::from_be_bytes(rest[8..12].try_into().unwrap());
+    let (cursor_x, rest) = read_f32_be(rest)?;
+    let (cursor_y, rest) = read_f32_be(rest)?;
+    let (cursor_z, mut rest) = read_f32_be(rest)?;
     if !cursor_x.is_finite()
         || !cursor_y.is_finite()
         || !cursor_z.is_finite()
@@ -374,7 +366,6 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     {
         return Err(Error::Malformed);
     }
-    rest = &rest[12..];
 
     if rest.is_empty() {
         return Err(Error::Malformed);
@@ -514,6 +505,9 @@ pub struct Session {
     local_preview: bool,
     session_id: [u8; 16],
     registry_manifest: Option<Arc<RegistryManifest>>,
+    protocol_ids: Option<Arc<ProtocolIds>>,
+    dynamic_registry_ids: DynamicRegistryIds,
+    inventory: PlayerInventory,
     pub preview: Option<crate::java_preview::Preview>,
     preview_seed: u64,
     preview_radius: u8,
@@ -532,6 +526,9 @@ impl Default for Session {
             local_preview: false,
             session_id: [0; 16],
             registry_manifest: None,
+            protocol_ids: None,
+            dynamic_registry_ids: DynamicRegistryIds::default(),
+            inventory: PlayerInventory::new(),
             preview: None,
             preview_seed: 0,
             preview_radius: 2,
@@ -565,10 +562,18 @@ impl Session {
         self.vanilla_source = Some(source);
         self
     }
+    pub fn with_protocol_ids(mut self, protocol_ids: Arc<ProtocolIds>) -> Self {
+        self.protocol_ids = Some(protocol_ids);
+        self
+    }
     pub fn state(&self) -> State {
         self.state
     }
+    pub fn inventory(&self) -> &PlayerInventory {
+        &self.inventory
+    }
     pub fn with_registry_manifest(mut self, manifest: Arc<RegistryManifest>) -> Self {
+        self.dynamic_registry_ids = DynamicRegistryIds::from_manifest(&manifest);
         self.registry_manifest = Some(manifest);
         self
     }
@@ -734,27 +739,31 @@ impl Session {
                     let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
                     match id {
                         sb::ACCEPT_TELEPORTATION => {
-                            if body.len() != 33 || body[0] != 1 {
+                            let Some((&1, rest)) = body.split_first() else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[1..9].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[9..17].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[17..25].try_into().unwrap());
-                            let yaw = f32::from_be_bytes(body[25..29].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[29..33].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
+                            };
+                            let (x, rest) = read_f64_be(rest)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let (yaw, rest) = read_f32_be(rest)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            if !rest.is_empty()
+                                || !is_valid_coord(x, y, z)
+                                || !is_valid_rotation(yaw, pitch)
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.teleport_acknowledged = true;
                         }
                         sb::CHUNK_BATCH_RECEIVED => {
-                            if body.len() != 4 {
-                                return Err(Error::Malformed);
-                            }
-                            let rate = f32::from_be_bytes(body.try_into().unwrap());
+                            let (rate, rest) = read_f32_be(body)?;
                             // Clients report any positive desired rate; large values
                             // are valid on fast machines and only cap the batch size.
-                            if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
+                            if !rest.is_empty()
+                                || !preview.awaiting_batch
+                                || !rate.is_finite()
+                                || rate <= 0.0
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.awaiting_batch = false;
@@ -766,48 +775,48 @@ impl Session {
                         }
                         sb::CLIENT_INFORMATION | sb::CUSTOM_PAYLOAD => {} // Bounded information/custom payloads have no effect.
                         sb::KEEP_ALIVE => {
-                            if body.len() != 8 {
-                                return Err(Error::Malformed);
-                            }
-                            let id = u64::from_be_bytes(body.try_into().unwrap());
-                            if preview.pending_keepalive != Some(id) {
+                            let (id, rest) = read_u64_be(body)?;
+                            if !rest.is_empty() || preview.pending_keepalive != Some(id) {
                                 return Err(Error::Malformed);
                             }
                             preview.pending_keepalive = None;
                         }
                         sb::MOVE_PLAYER_POS => {
-                            if body.len() != 25 || (body[24] & !MOVEMENT_FLAGS) != 0 {
+                            let (x, rest) = read_f64_be(body)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0 || !is_valid_coord(x, y, z) {
                                 return Err(Error::Malformed);
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         sb::MOVE_PLAYER_POS_ROT => {
-                            if body.len() != 33 || (body[32] & !MOVEMENT_FLAGS) != 0 {
+                            let (x, rest) = read_f64_be(body)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let (yaw, rest) = read_f32_be(rest)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
-                            let yaw = f32::from_be_bytes(body[24..28].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[28..32].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0
+                                || !is_valid_coord(x, y, z)
+                                || !is_valid_rotation(yaw, pitch)
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         sb::MOVE_PLAYER_ROT => {
-                            if body.len() != 9 || (body[8] & !MOVEMENT_FLAGS) != 0 {
+                            let (yaw, rest) = read_f32_be(body)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let yaw = f32::from_be_bytes(body[0..4].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[4..8].try_into().unwrap());
-                            if !is_valid_rotation(yaw, pitch) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0 || !is_valid_rotation(yaw, pitch) {
                                 return Err(Error::Malformed);
                             }
                         }
@@ -834,8 +843,52 @@ impl Session {
                             let action = decode_use_item_on(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
                         }
-                        sb::SET_CREATIVE_MODE_SLOT
-                        | sb::USE_ITEM
+                        sb::SET_CREATIVE_MODE_SLOT => {
+                            // `Set Creative Mode Slot` (0x39 / 57, `Java Edition protocol/Packets`
+                            // revision 3868170): `Slot` (Short) followed by `Clicked Item` (Slot,
+                            // `Java Edition protocol/Slot data` revision 3763756).
+                            //
+                            // Player inventory window slots (`Java Edition protocol/Inventory`
+                            // revision 3201379, `== Player Inventory ==`): main inventory `9..=35`
+                            // maps to `PlayerInventory` `9..=35` and hotbar `36..=44` maps to
+                            // `PlayerInventory` `0..=8`. Without `ProtocolIds` (when started
+                            // without a vanilla data root containing `reports/registries.json`),
+                            // creative slot packets remain bounded by frame/session limits and
+                            // ignored.
+                            if let Some(protocol_ids) = &self.protocol_ids {
+                                let (window_slot, rest) = read_i16_be(body)?;
+                                if window_slot != WINDOW_CREATIVE_DROP_SLOT
+                                    && !WINDOW_PLAYER_SLOTS.contains(&window_slot)
+                                {
+                                    return Err(Error::Malformed);
+                                }
+                                let decoded = match slot::decode_slot(
+                                    rest,
+                                    protocol_ids,
+                                    &self.dynamic_registry_ids,
+                                ) {
+                                    Ok((stack, consumed)) if consumed == rest.len() => Some(stack),
+                                    // Creative tabs offer items with components RustMC does
+                                    // not model yet; that is valid client input, so the slot
+                                    // is no longer tracked rather than ending the session.
+                                    Err(slot::SlotError::UnsupportedComponent(_)) => None,
+                                    _ => return Err(Error::Malformed),
+                                };
+                                // Only main inventory and hotbar slots are modelled; drops
+                                // (-1), crafting, armor and offhand slots are accepted and
+                                // not stored.
+                                if let Some(slot_index) =
+                                    PlayerInventory::window_slot_to_index(window_slot)
+                                {
+                                    self.inventory
+                                        .set_slot(slot_index, decoded.flatten())
+                                        .map_err(|_| Error::Malformed)?;
+                                }
+                            } else if body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        sb::USE_ITEM
                         | sb::PICK_ITEM_FROM_BLOCK
                         | sb::PICK_ITEM_FROM_ENTITY
                         | sb::CONTAINER_CLOSE => {
@@ -869,14 +922,13 @@ impl Session {
                             // Punch has no world effect in the preview.
                         }
                         sb::SET_CARRIED_ITEM => {
-                            if body.len() != 2 {
+                            let (slot, rest) = read_i16_be(body)?;
+                            if !rest.is_empty() || !(0..HOTBAR_SLOTS).contains(&slot) {
                                 return Err(Error::Malformed);
                             }
-                            let slot = i16::from_be_bytes(body.try_into().unwrap());
-                            if !(0..HOTBAR_SLOTS).contains(&slot) {
-                                return Err(Error::Malformed);
-                            }
-                            // Selected hotbar slot is client-local here.
+                            self.inventory
+                                .set_held_slot(slot as u8)
+                                .map_err(|_| Error::Malformed)?;
                         }
                         sb::SPECTATOR_ACTION => {
                             if body != [0] {
@@ -2191,5 +2243,445 @@ mod tests {
             s.receive(&frame(USE_ITEM_ON_ID, &bad_cursor_use), 4096),
             Err(Error::Malformed)
         );
+    }
+
+    #[test]
+    fn truncated_player_action_is_malformed() {
+        let valid = encode_player_action(&PlayerAction {
+            status: PlayerActionStatus::StartedDigging,
+            pos: (10, 64, -20),
+            face: 1,
+            sequence: 7,
+        });
+        for len in 0..valid.len() {
+            assert_eq!(decode_player_action(&valid[..len]), Err(Error::Malformed));
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::PLAYER_ACTION, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_use_item_on_is_malformed() {
+        let valid = encode_use_item_on(&UseItemOn {
+            hand: 0,
+            pos: (10, 64, -20),
+            face: 1,
+            cursor_x: 0.5,
+            cursor_y: 0.5,
+            cursor_z: 0.5,
+            inside_block: false,
+            world_border_hit: false,
+            sequence: 7,
+        });
+        for len in 0..valid.len() {
+            assert_eq!(decode_use_item_on(&valid[..len]), Err(Error::Malformed));
+            assert_eq!(
+                enter_play_session()
+                    .receive(&frame(play::serverbound::USE_ITEM_ON, &valid[..len]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_accept_teleportation_is_malformed() {
+        let valid = teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0);
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::ACCEPT_TELEPORTATION, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_chunk_batch_received_is_malformed() {
+        let valid = 20.0f32.to_be_bytes();
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().awaiting_batch = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::CHUNK_BATCH_RECEIVED, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_keep_alive_is_malformed() {
+        let valid = 12345u64.to_be_bytes();
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().pending_keepalive = Some(12345);
+            assert_eq!(
+                s.receive(&frame(play::serverbound::KEEP_ALIVE, &valid[..len]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_pos_is_malformed() {
+        let valid = player_position(0.0, 64.0, 0.0, 1);
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().teleport_acknowledged = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::MOVE_PLAYER_POS, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_pos_rot_is_malformed() {
+        let valid = player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, 1);
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().teleport_acknowledged = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::MOVE_PLAYER_POS_ROT, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_rot_is_malformed() {
+        let valid = player_rotation(0.0, 0.0, 1);
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::MOVE_PLAYER_ROT, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_set_carried_item_is_malformed() {
+        let valid = 4i16.to_be_bytes();
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::SET_CARRIED_ITEM, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    fn test_protocol_ids() -> Arc<ProtocolIds> {
+        const SYNTHETIC_REGISTRIES: &str = r#"{
+            "minecraft:item": {
+                "entries": {
+                    "minecraft:air": { "protocol_id": 0 },
+                    "minecraft:stone": { "protocol_id": 1 },
+                    "minecraft:cobblestone": { "protocol_id": 14 },
+                    "minecraft:diamond_sword": { "protocol_id": 851 }
+                }
+            },
+            "minecraft:data_component_type": {
+                "entries": {
+                    "minecraft:damage": { "protocol_id": 3 },
+                    "minecraft:custom_name": { "protocol_id": 6 },
+                    "minecraft:enchantments": { "protocol_id": 13 }
+                }
+            },
+            "minecraft:potion": {
+                "entries": {
+                    "minecraft:water": { "protocol_id": 0 }
+                }
+            }
+        }"#;
+        Arc::new(
+            ProtocolIds::from_json_str(
+                std::path::Path::new("reports/registries.json"),
+                SYNTHETIC_REGISTRIES,
+            )
+            .expect("synthetic protocol ids"),
+        )
+    }
+
+    fn test_manifest_with_enchantments() -> Arc<RegistryManifest> {
+        let mut manifest = (*test_manifest()).clone();
+        manifest.registries.push((
+            "minecraft:enchantment".into(),
+            vec!["minecraft:sharpness".into(), "minecraft:unbreaking".into()],
+        ));
+        Arc::new(manifest)
+    }
+
+    fn enter_play_session_with_protocol_ids() -> (Session, Arc<ProtocolIds>, DynamicRegistryIds) {
+        let ids = test_protocol_ids();
+        let manifest = test_manifest_with_enchantments();
+        let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
+
+        let mut current = handshake(777);
+        *current.last_mut().unwrap() = 2;
+        let mut s = Session::new(true)
+            .with_registry_manifest(manifest)
+            .with_protocol_ids(Arc::clone(&ids));
+        s.receive(&current, 4096).unwrap();
+        let mut login = vec![4];
+        login.extend_from_slice(b"Test");
+        login.extend_from_slice(&[7; 16]);
+        s.receive(&frame(0, &login), 4096).unwrap();
+        s.receive(&frame(3, &[]), 4096).unwrap();
+        let mut known = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known);
+        }
+        s.receive(&frame(7, &known), 4096).unwrap();
+        s.receive(&frame(3, &[]), 4096).unwrap();
+        assert_eq!(s.state(), State::Play);
+        (s, ids, dynamic_ids)
+    }
+
+    fn creative_slot_frame(
+        window_slot: i16,
+        stack: &Option<crate::item::ItemStack>,
+        ids: &ProtocolIds,
+        dynamic_ids: &DynamicRegistryIds,
+    ) -> Vec<u8> {
+        let mut body = window_slot.to_be_bytes().to_vec();
+        slot::encode_slot(stack, ids, dynamic_ids, &mut body).expect("encode creative slot");
+        frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &body)
+    }
+
+    #[test]
+    fn creative_slot_stores_and_clears_stacks_and_tracks_carried_item() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemComponents, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        assert_eq!(s.inventory().held_slot(), 0);
+        assert!(s.inventory().held_item().is_none());
+
+        // Window slot 36 is hotbar slot 0 (`Java Edition protocol/Inventory` rev 3201379).
+        let stone = ItemStack::try_new("minecraft:stone", 64, DEFAULT_MAX_STACK).unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(36, &Some(stone.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(0), Some(&stone));
+        assert_eq!(s.inventory().get_window_slot(36), Some(&stone));
+        assert_eq!(s.inventory().held_item(), Some(&stone));
+
+        // Window slot 44 is hotbar slot 8; store an enchanted named sword with damage.
+        let sword = ItemStack::try_new("minecraft:diamond_sword", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(12)
+                    .with_custom_name("Excalibur")
+                    .with_enchantment("minecraft:sharpness", 5)
+                    .unwrap(),
+            )
+            .unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(44, &Some(sword.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(8), Some(&sword));
+        assert_eq!(s.inventory().get_window_slot(44), Some(&sword));
+
+        // Window slot 9 is the first main inventory slot (`9..=35`).
+        let cobble = ItemStack::try_new("minecraft:cobblestone", 32, DEFAULT_MAX_STACK).unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(9, &Some(cobble.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(9), Some(&cobble));
+        assert_eq!(s.inventory().get_window_slot(9), Some(&cobble));
+
+        // `SET_CARRIED_ITEM` selects hotbar slot 8 (window slot 44).
+        let replies = s
+            .receive(
+                &frame(play::serverbound::SET_CARRIED_ITEM, &8i16.to_be_bytes()),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().held_slot(), 8);
+        assert_eq!(s.inventory().held_item(), Some(&sword));
+
+        // Clearing hotbar slot 0 (window slot 36) and hotbar slot 8 (window slot 44) removes them.
+        assert!(
+            s.receive(&creative_slot_frame(36, &None, &ids, &dynamic_ids), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.inventory().get_slot(0).is_none());
+        assert!(
+            s.receive(&creative_slot_frame(44, &None, &ids, &dynamic_ids), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.inventory().get_slot(8).is_none());
+        assert!(s.inventory().held_item().is_none());
+        assert_eq!(s.inventory().get_slot(9), Some(&cobble));
+    }
+
+    #[test]
+    fn creative_slot_accepts_drop_crafting_armor_and_offhand_slots_without_storing() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+        // -1 drops the item; 0..=8 are crafting output/input and armor; 45 is the offhand.
+        for slot in [-1, 0, 1, 4, 5, 8, 45] {
+            let packet = creative_slot_frame(slot, &Some(stone.clone()), &ids, &dynamic_ids);
+            assert!(
+                s.receive(&packet, 4096).is_ok(),
+                "window slot {slot} is valid creative input"
+            );
+        }
+        assert_eq!(s.state(), State::Play);
+        assert_eq!(s.inventory().total_item_count(), 0);
+    }
+
+    #[test]
+    fn creative_slot_with_unmodelled_component_keeps_the_session_and_untracks_the_slot() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+        s.receive(
+            &creative_slot_frame(36, &Some(stone), &ids, &dynamic_ids),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(s.inventory().total_item_count(), 1);
+
+        // Component type 99 is not modelled (for example fireworks or banner patterns).
+        let mut body = 36i16.to_be_bytes().to_vec();
+        put_varint(1, &mut body); // count
+        put_varint(1, &mut body); // minecraft:stone
+        put_varint(1, &mut body); // one component to add
+        put_varint(0, &mut body); // none to remove
+        put_varint(99, &mut body); // unmodelled component type
+        body.push(0);
+        assert!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &body),
+                4096
+            )
+            .is_ok()
+        );
+        assert_eq!(s.state(), State::Play);
+        assert!(s.inventory().get_window_slot(36).is_none());
+    }
+
+    #[test]
+    fn creative_slot_rejects_out_of_range_slot_and_unknown_item_id() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+
+        // Only numbers outside the player inventory window (`0..=45`) and the creative
+        // drop slot (`-1`) are rejected.
+        for bad_slot in [i16::MIN, -999, -2, 46, 100, i16::MAX] {
+            let packet = creative_slot_frame(bad_slot, &Some(stone.clone()), &ids, &dynamic_ids);
+            assert_eq!(
+                s.receive(&packet, 4096),
+                Err(Error::Malformed),
+                "window slot {bad_slot} should be rejected"
+            );
+        }
+        assert_eq!(s.inventory().total_item_count(), 0);
+
+        // Unknown item protocol ID (999) in a valid window slot (36) is rejected as Malformed.
+        let mut unknown_item = 36i16.to_be_bytes().to_vec();
+        put_varint(1, &mut unknown_item); // count = 1
+        put_varint(999, &mut unknown_item); // unknown item id
+        put_varint(0, &mut unknown_item); // 0 components to add
+        put_varint(0, &mut unknown_item); // 0 components to remove
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &unknown_item),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(s.inventory().total_item_count(), 0);
+
+        // Truncated creative slot body and trailing bytes after the slot are rejected.
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &[0x00]),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            s.receive(
+                &frame(
+                    play::serverbound::SET_CREATIVE_MODE_SLOT,
+                    &36i16.to_be_bytes()
+                ),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        let mut trailing = 36i16.to_be_bytes().to_vec();
+        trailing.push(0); // Empty slot
+        trailing.push(0); // Trailing byte
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &trailing),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn creative_slot_without_protocol_ids_stays_bounded_and_ignored() {
+        let mut s = enter_play_session();
+        assert_eq!(
+            s.receive(&frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &[]), 4096),
+            Err(Error::Malformed)
+        );
+        for payload in [&[0u8][..], &[0, 36, 1, 99, 0, 0][..], &[0xff; 32][..]] {
+            assert!(
+                s.receive(
+                    &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, payload),
+                    4096
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert_eq!(s.inventory().total_item_count(), 0);
     }
 }
