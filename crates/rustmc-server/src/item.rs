@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 
 /// Default stack limit for standard items.
@@ -76,7 +77,7 @@ pub struct ItemStack {
 }
 
 // Java Edition resource-location character rules.
-fn valid_item_id(id: &str) -> bool {
+pub(crate) fn valid_item_id(id: &str) -> bool {
     let Some((namespace, path)) = id.split_once(':') else {
         return false;
     };
@@ -198,10 +199,19 @@ impl From<WorldgenError> for ItemDefaultsError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepairableItems {
+    Id(String),
+    Tag(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ItemDefaultEntry {
     max_stack_size: u8,
     max_damage: Option<u32>,
+    repairable: Option<RepairableItems>,
+    enchantability: Option<u32>,
 }
 
 /// Default per-item components read from `reports/minecraft/components/item/*.json`.
@@ -250,6 +260,36 @@ impl ItemDefaults {
         self.entries
             .get(normalize_item_id(item))
             .and_then(|entry| entry.max_damage)
+    }
+
+    /// Returns the resolved repair material identifiers for `item` from its
+    /// `minecraft:repairable` component using `tags`, or `None` if `item` has no
+    /// `minecraft:repairable` entry (or references an unloaded tag).
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn repair_materials(&self, item: &str, tags: &ItemTags) -> Option<Vec<String>> {
+        let entry = self.entries.get(normalize_item_id(item))?;
+        match entry.repairable.as_ref()? {
+            RepairableItems::Id(id) => Some(vec![id.clone()]),
+            RepairableItems::Tag(raw_tag) => {
+                let tag_id = raw_tag.strip_prefix('#').unwrap_or(raw_tag);
+                tags.members(tag_id).map(|members| members.to_vec())
+            }
+            RepairableItems::List(list) => Some(list.clone()),
+        }
+    }
+
+    /// Returns the default `minecraft:enchantable` value for `item`, if present.
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    ///
+    /// Source: minecraft.wiki `Enchanting table mechanics` (revision 3881519):
+    /// "In Java Edition, an item's enchantability is stored in the `minecraft:enchantable`
+    /// item component."
+    #[must_use]
+    pub fn enchantability(&self, item: &str) -> Option<u32> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.enchantability)
     }
 
     /// Returns the number of items loaded from the report.
@@ -331,13 +371,105 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
         }
     };
 
+    let repairable = match components.get("minecraft:repairable") {
+        None => None,
+        Some(value) => Some(parse_repairable(value, file)?),
+    };
+
+    let enchantability = match components.get("minecraft:enchantable") {
+        None => None,
+        Some(value) => Some(parse_enchantable(value, file)?),
+    };
+
     Ok((
         item_stem.to_owned(),
         ItemDefaultEntry {
             max_stack_size,
             max_damage,
+            repairable,
+            enchantability,
         },
     ))
+}
+
+fn parse_repairable(value: &Value, file: &Path) -> Result<RepairableItems, ItemDefaultsError> {
+    let obj = value.as_object().ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "`components[\"minecraft:repairable\"]` must be a JSON object",
+        )
+    })?;
+    let items_val = obj.get("items").ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "missing `items` field in `components[\"minecraft:repairable\"]`",
+        )
+    })?;
+    match items_val {
+        Value::String(raw) => {
+            if let Some(tag) = raw.strip_prefix('#') {
+                if !valid_item_id(tag) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid repairable item tag `{raw}`"),
+                    ));
+                }
+                Ok(RepairableItems::Tag(raw.clone()))
+            } else {
+                if !valid_item_id(raw) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid repairable item id `{raw}`"),
+                    ));
+                }
+                Ok(RepairableItems::Id(raw.clone()))
+            }
+        }
+        Value::Array(arr) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for elem in arr {
+                let raw = elem.as_str().ok_or_else(|| {
+                    item_report_invalid(
+                        file,
+                        "`components[\"minecraft:repairable\"].items` list entries must be strings",
+                    )
+                })?;
+                if !valid_item_id(raw) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid repairable item id `{raw}` in list"),
+                    ));
+                }
+                if !list.iter().any(|existing| existing == raw) {
+                    list.push(raw.to_owned());
+                }
+            }
+            Ok(RepairableItems::List(list))
+        }
+        _ => Err(item_report_invalid(
+            file,
+            "`components[\"minecraft:repairable\"].items` must be an id string, #tag string, or list",
+        )),
+    }
+}
+
+fn parse_enchantable(value: &Value, file: &Path) -> Result<u32, ItemDefaultsError> {
+    let obj = value.as_object().ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "`components[\"minecraft:enchantable\"]` must be a JSON object",
+        )
+    })?;
+    obj.get("value")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| {
+            item_report_invalid(
+                file,
+                "`components[\"minecraft:enchantable\"].value` must be a positive 32-bit integer",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -658,5 +790,169 @@ mod tests {
         assert_eq!(defaults.max_damage("shears"), Some(238));
         assert_eq!(defaults.max_stack_size("minecraft:ender_pearl"), Some(16));
         assert_eq!(defaults.max_damage("minecraft:ender_pearl"), None);
+    }
+
+    #[test]
+    fn item_defaults_reads_repairable_variants_and_enchantability() {
+        let root = scratch_root("repairable-enchantable");
+        write_file(
+            &root.join("data/testns/tags/item/tool_mats.json"),
+            r##"{"values": ["testns:ore_a", "#testns:extra_mats"]}"##,
+        );
+        write_file(
+            &root.join("data/testns/tags/item/extra_mats.json"),
+            r#"{"values": ["testns:ore_b"]}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/widget.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 120,
+                "minecraft:repairable": {"items": "testns:crystal"},
+                "minecraft:enchantable": {"value": 14}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/tagged_tool.json"),
+            r##"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 200,
+                "minecraft:repairable": {"items": "#testns:tool_mats"},
+                "minecraft:enchantable": {"value": 10}
+            }}"##,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/multi_tool.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 80,
+                "minecraft:repairable": {"items": ["testns:alpha", "testns:beta", "testns:alpha"]}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/plain.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load synthetic item tags");
+        let defaults = ItemDefaults::load(&root).expect("load synthetic item defaults");
+
+        assert_eq!(
+            defaults.repair_materials("minecraft:widget", &tags),
+            Some(vec!["testns:crystal".to_owned()])
+        );
+        assert_eq!(
+            defaults.repair_materials("widget", &tags),
+            Some(vec!["testns:crystal".to_owned()])
+        );
+        assert_eq!(
+            defaults.repair_materials("tagged_tool", &tags),
+            Some(vec!["testns:ore_a".to_owned(), "testns:ore_b".to_owned()])
+        );
+        assert_eq!(
+            defaults.repair_materials("tagged_tool", &ItemTags::default()),
+            None
+        );
+        assert_eq!(
+            defaults.repair_materials("minecraft:multi_tool", &tags),
+            Some(vec!["testns:alpha".to_owned(), "testns:beta".to_owned()])
+        );
+        assert_eq!(defaults.repair_materials("plain", &tags), None);
+        assert_eq!(defaults.repair_materials("missing", &tags), None);
+
+        assert_eq!(defaults.enchantability("minecraft:widget"), Some(14));
+        assert_eq!(defaults.enchantability("tagged_tool"), Some(10));
+        assert_eq!(defaults.enchantability("multi_tool"), None);
+        assert_eq!(defaults.enchantability("plain"), None);
+        assert_eq!(defaults.enchantability("missing"), None);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn item_defaults_rejects_malformed_repairable_and_enchantable_naming_file() {
+        let cases = [
+            (
+                "bad_repair_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:repairable": "bad"}}"#,
+            ),
+            (
+                "missing_repair_items.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:repairable": {}}}"#,
+            ),
+            (
+                "bad_repair_id.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:repairable": {"items": "bad"}}}"#,
+            ),
+            (
+                "bad_repair_tag.json",
+                r##"{"components": {"minecraft:max_stack_size": 1, "minecraft:repairable": {"items": "#bad"}}}"##,
+            ),
+            (
+                "bad_repair_list_entry.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:repairable": {"items": [42]}}}"#,
+            ),
+            (
+                "bad_enchantable_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:enchantable": 10}}"#,
+            ),
+            (
+                "zero_enchantable.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:enchantable": {"value": 0}}}"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write_file(
+                &root.join("reports/minecraft/components/item").join(name),
+                body,
+            );
+            let err = ItemDefaults::load(&root)
+                .expect_err("malformed component must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_item_defaults_pin_repairable_and_enchantable`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_item_defaults_pin_repairable_and_enchantable() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+
+        assert_eq!(defaults.max_damage("minecraft:diamond_sword"), Some(1561));
+        assert_eq!(
+            defaults.repair_materials("minecraft:diamond_sword", &tags),
+            Some(vec!["minecraft:diamond".to_owned()])
+        );
+        assert_eq!(defaults.enchantability("minecraft:diamond_sword"), Some(10));
+
+        assert_eq!(defaults.max_damage("minecraft:mace"), Some(500));
+        assert_eq!(
+            defaults.repair_materials("minecraft:mace", &tags),
+            Some(vec!["minecraft:breeze_rod".to_owned()])
+        );
+        assert_eq!(defaults.enchantability("minecraft:mace"), Some(15));
+
+        assert_eq!(
+            defaults.repair_materials("minecraft:copper_pickaxe", &tags),
+            Some(vec!["minecraft:copper_ingot".to_owned()])
+        );
+        assert_eq!(defaults.max_damage("minecraft:copper_pickaxe"), Some(190));
+        assert_eq!(
+            defaults.enchantability("minecraft:copper_pickaxe"),
+            Some(13)
+        );
+
+        assert_eq!(defaults.max_damage("minecraft:book"), None);
+        assert_eq!(defaults.repair_materials("minecraft:book", &tags), None);
+        assert_eq!(defaults.enchantability("minecraft:book"), Some(1));
     }
 }

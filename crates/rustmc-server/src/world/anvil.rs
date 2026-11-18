@@ -7,13 +7,23 @@
 //!
 //! Sources: the level costs, the 40-level "Too Expensive!" cap, the 12%
 //! durability bonus, the 25%-per-unit material repair, the `2 * penalty + 1`
-//! prior work penalty, the 12% degradation chance, and the 50-character name
-//! limit follow the public minecraft.wiki `Anvil_mechanics` and `Anvil`
-//! articles; item durabilities follow the minecraft.wiki `Durability` article.
-//! Enchantment combination costs are not modelled.
+//! prior work penalty, the 12% degradation chance, the 50-character name
+//! limit, and Java Edition enchantment combination follow the public
+//! minecraft.wiki `Anvil_mechanics` (revision 3804134), `Anvil` (revision
+//! 3902804), `Item_repair` (revision 3791643), and `Enchantment_definition`
+//! (revision 3843772) articles; offline fallback item durabilities follow
+//! the minecraft.wiki `Durability` article, while [`AnvilRules`] reads
+//! `minecraft:max_damage`, `minecraft:repairable`, and enchantment rules
+//! from [`ItemDefaults`], [`ItemTags`], and [`EnchantmentRegistry`].
 
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError, items_equal, normalize_item_id};
+use crate::item::{
+    DEFAULT_MAX_STACK, ItemDefaults, ItemStack, ItemStackError, items_equal, normalize_item_id,
+};
+use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
+use crate::world::enchantment::EnchantmentRegistry;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Maximum allowable characters for an item's custom name in an anvil text box (minecraft.wiki `Anvil`).
@@ -39,6 +49,24 @@ pub const RENAME_LEVEL_COST: u32 = 1;
 
 /// Cost in experience levels for tool durability combination (minecraft.wiki `Anvil_mechanics`).
 pub const COMBINE_REPAIR_LEVEL_COST: u32 = 2;
+
+/// Experience level surcharge per incompatible enchantment on the target item in Java Edition
+/// (minecraft.wiki `Anvil mechanics`, revision 3804134: "Add one level for every incompatible
+/// enchantment on the target (in Java Edition).").
+pub const INCOMPATIBLE_ENCHANTMENT_LEVEL_COST: u32 = 1;
+
+/// Divisor applied to an enchantment's `anvil_cost` when the sacrifice is an enchanted book
+/// (minecraft.wiki `Enchantment definition`, revision 3843772: "Halved when adding using a
+/// book, multiplied by the level of the enchantment.").
+const BOOK_ANVIL_COST_DIVISOR: u32 = 2;
+
+/// Minimum multiplier for applying an enchantment from an enchanted book in an anvil
+/// (minecraft.wiki `Anvil mechanics`, revision 3804134: book multiplier is 1 when item
+/// multiplier is 1 or 2).
+const MIN_BOOK_ANVIL_COST_MULTIPLIER: u32 = 1;
+
+/// Canonical item identifier for enchanted books (minecraft.wiki `Anvil mechanics`, revision 3804134).
+pub const ENCHANTED_BOOK_ID: &str = "minecraft:enchanted_book";
 
 /// Max durability of `minecraft:mace` in Java Edition (minecraft.wiki `Mace` / `Durability`: 500).
 const MACE_MAX_DURABILITY: u32 = 500;
@@ -93,6 +121,9 @@ impl AnvilState {
 }
 
 /// Returns the standard vanilla max durability for a known tool, weapon, or armor piece.
+///
+/// Offline fallback table used when no [`ItemDefaults`] report is loaded.
+/// Prefer [`AnvilRules`] for data-backed durability lookups.
 #[must_use]
 pub fn default_max_durability(item: &str) -> Option<u32> {
     match normalize_item_id(item) {
@@ -165,6 +196,9 @@ pub fn default_max_durability(item: &str) -> Option<u32> {
 }
 
 /// Checks whether `material` is a valid repair ingredient for `tool`.
+///
+/// Offline fallback table used when no [`ItemDefaults`] / [`ItemTags`] data is loaded.
+/// Prefer [`AnvilRules`] for data-backed repair-material lookups.
 #[must_use]
 pub fn is_repair_material(tool: &str, material: &str) -> bool {
     let t = normalize_item_id(tool);
@@ -248,12 +282,12 @@ impl From<ItemStackError> for AnvilItemError {
 }
 
 fn validate_anvil_item_invariants(
-    item: &str,
+    is_known_damageable: bool,
     durability: u32,
     max_durability: u32,
     custom_name: Option<&str>,
 ) -> Result<(), AnvilItemError> {
-    if default_max_durability(item).is_some() && max_durability == 0 {
+    if is_known_damageable && max_durability == 0 {
         return Err(AnvilItemError::ZeroMaxDurability);
     }
     if durability > max_durability {
@@ -275,8 +309,9 @@ fn validate_anvil_item_invariants(
 }
 
 /// An anvil slot item wrapping the shared [`ItemStack`] for item ID and count,
-/// with durability, prior work penalty (`repair_cost`), and custom name fields
-/// kept private behind invariant-enforcing constructors and accessors.
+/// with durability, prior work penalty (`repair_cost`), custom name, stored
+/// enchantments, and enchanted-book flag kept private behind invariant-enforcing
+/// constructors and accessors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AnvilItem {
     stack: ItemStack,
@@ -284,10 +319,15 @@ pub struct AnvilItem {
     max_durability: u32,
     repair_cost: u32,
     custom_name: Option<String>,
+    enchantments: BTreeMap<String, u8>,
+    is_enchanted_book: bool,
 }
 
 impl AnvilItem {
     /// Creates a validated [`AnvilItem`] from a shared [`ItemStack`] and explicit metadata.
+    ///
+    /// Uses the offline [`default_max_durability`] table to reject zero max durability on
+    /// known fallback damageable items; for data-backed validation, use [`AnvilRules::new_item`].
     pub fn new(
         stack: ItemStack,
         durability: u32,
@@ -295,8 +335,34 @@ impl AnvilItem {
         repair_cost: u32,
         custom_name: Option<String>,
     ) -> Result<Self, AnvilItemError> {
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
+        Self::new_with_enchantments(
+            stack,
+            durability,
+            max_durability,
+            repair_cost,
+            custom_name,
+            BTreeMap::new(),
+            is_enchanted_book,
+        )
+    }
+
+    /// Creates a validated [`AnvilItem`] with an explicit enchantment map and enchanted-book flag.
+    ///
+    /// Uses the offline [`default_max_durability`] table for zero-durability checks;
+    /// for data-backed validation, use [`AnvilRules::new_item`] combined with
+    /// [`AnvilItem::with_enchantments`] and [`AnvilItem::with_enchanted_book`].
+    pub fn new_with_enchantments(
+        stack: ItemStack,
+        durability: u32,
+        max_durability: u32,
+        repair_cost: u32,
+        custom_name: Option<String>,
+        enchantments: BTreeMap<String, u8>,
+        is_enchanted_book: bool,
+    ) -> Result<Self, AnvilItemError> {
         validate_anvil_item_invariants(
-            stack.item(),
+            default_max_durability(stack.item()).is_some(),
             durability,
             max_durability,
             custom_name.as_deref(),
@@ -307,24 +373,35 @@ impl AnvilItem {
             max_durability,
             repair_cost,
             custom_name,
+            enchantments,
+            is_enchanted_book,
         })
     }
 
     /// Creates an [`AnvilItem`] from an existing shared [`ItemStack`], populating
     /// default durability if the item is a known damageable tool, weapon, or armor piece.
+    ///
+    /// Offline fallback constructor using [`default_max_durability`]; prefer
+    /// [`AnvilRules::item_from_stack`] when item report data is loaded.
     #[must_use]
     pub fn from_stack(stack: ItemStack) -> Self {
         let max_durability = default_max_durability(stack.item()).unwrap_or(0);
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
         Self {
             stack,
             durability: max_durability,
             max_durability,
             repair_cost: 0,
             custom_name: None,
+            enchantments: BTreeMap::new(),
+            is_enchanted_book,
         }
     }
 
     /// Creates a validated [`AnvilItem`], checking item ID and count via [`ItemStack::try_new`].
+    ///
+    /// Offline fallback constructor using [`default_max_durability`]; prefer
+    /// [`AnvilRules::try_new_item`] when item report data is loaded.
     pub fn try_new(item: impl Into<String>, count: u16) -> Result<Self, ItemStackError> {
         let item = item.into();
         let max_durability = default_max_durability(&item).unwrap_or(0);
@@ -333,6 +410,7 @@ impl AnvilItem {
         } else {
             DEFAULT_MAX_STACK
         };
+        let is_enchanted_book = items_equal(&item, ENCHANTED_BOOK_ID);
         let stack = ItemStack::try_new(item, count, max_stack)?;
         Ok(Self {
             stack,
@@ -340,6 +418,8 @@ impl AnvilItem {
             max_durability,
             repair_cost: 0,
             custom_name: None,
+            enchantments: BTreeMap::new(),
+            is_enchanted_book,
         })
     }
 
@@ -385,6 +465,40 @@ impl AnvilItem {
         self.custom_name.as_deref()
     }
 
+    /// Returns the enchantments on this item (or stored on an enchanted book).
+    #[must_use]
+    pub fn enchantments(&self) -> &BTreeMap<String, u8> {
+        &self.enchantments
+    }
+
+    /// Returns `true` if this item is treated as an enchanted book (`minecraft:enchanted_book`)
+    /// when combining enchantments in an anvil.
+    #[must_use]
+    pub const fn is_enchanted_book(&self) -> bool {
+        self.is_enchanted_book
+    }
+
+    /// Replaces the item's enchantment map.
+    #[must_use]
+    pub fn with_enchantments(mut self, enchantments: BTreeMap<String, u8>) -> Self {
+        self.enchantments = enchantments;
+        self
+    }
+
+    /// Inserts or updates a single enchantment level on this item.
+    #[must_use]
+    pub fn with_enchantment(mut self, id: impl Into<String>, level: u8) -> Self {
+        self.enchantments.insert(id.into(), level);
+        self
+    }
+
+    /// Explicitly sets whether this item acts as an enchanted book in anvil combinations.
+    #[must_use]
+    pub const fn with_enchanted_book(mut self, is_enchanted_book: bool) -> Self {
+        self.is_enchanted_book = is_enchanted_book;
+        self
+    }
+
     /// Updates remaining durability, enforcing `durability <= max_durability`
     /// and `max_durability > 0`.
     pub fn with_durability(mut self, durability: u32) -> Result<Self, AnvilItemError> {
@@ -404,7 +518,7 @@ impl AnvilItem {
     /// Updates maximum durability, enforcing invariants for damageable items and current durability.
     pub fn with_max_durability(mut self, max_durability: u32) -> Result<Self, AnvilItemError> {
         validate_anvil_item_invariants(
-            self.stack.item(),
+            default_max_durability(self.stack.item()).is_some(),
             self.durability,
             max_durability,
             self.custom_name.as_deref(),
@@ -424,7 +538,7 @@ impl AnvilItem {
     pub fn with_custom_name(mut self, name: impl Into<String>) -> Result<Self, AnvilItemError> {
         let name = name.into();
         validate_anvil_item_invariants(
-            self.stack.item(),
+            default_max_durability(self.stack.item()).is_some(),
             self.durability,
             self.max_durability,
             Some(&name),
@@ -570,6 +684,424 @@ impl fmt::Display for AnvilError {
 
 impl std::error::Error for AnvilError {}
 
+/// Data-backed anvil durability, repair-material, and enchantment-combining rules
+/// built from [`ItemDefaults`], [`ItemTags`], and [`EnchantmentRegistry`].
+///
+/// Uses the official item report (`minecraft:max_damage` and resolved
+/// `minecraft:repairable` components) instead of the offline fallback tables
+/// [`default_max_durability`] and [`is_repair_material`], and applies Java Edition
+/// enchantment combination semantics using loaded enchantment definitions.
+///
+/// Sources:
+/// - minecraft.wiki `Anvil` (revision 3902804): "one material repairs 1/4 of
+///   the item's maximum durability."
+/// - minecraft.wiki `Anvil mechanics` (revision 3804134):
+///   - "Each unit restores up to 25% total durability of the item (rounded down)
+///     and costs 1 level per unit of material used in addition to any applicable
+///     prior work penalties."
+///   - "The anvil can be used to combine two of the same item, or an item with
+///     an enchanted book."
+///   - "If the sacrifice is a book, there is no repair, but the anvil tries to
+///     combine the book's enchantments onto the target."
+///   - "For each enchantment on the sacrifice: Ignore any enchantment that cannot
+///     be applied to the target (e.g. Protection on a sword). Add one level for
+///     every incompatible enchantment on the target (in Java Edition). If the
+///     enchantment is compatible with the existing enchantments on the target:
+///     For Java Edition, add the final level of the enchantment on the resulting
+///     item multiplied by the multiplier from the table below."
+///   - "Once the cost exceeds 39 levels, the anvil menu refuses the operation
+///     with the message \"Too Expensive!\", no matter how high the player's
+///     experience level is."
+/// - minecraft.wiki `Enchantment definition` (revision 3843772):
+///   - "`anvil_cost`: The base cost when applying this enchantment to another item
+///     using an anvil. Halved when adding using a book, multiplied by the level
+///     of the enchantment."
+#[derive(Debug, Clone, Default)]
+pub struct AnvilRules {
+    defaults: ItemDefaults,
+    tags: ItemTags,
+    enchantments: EnchantmentRegistry,
+}
+
+impl AnvilRules {
+    /// Builds data-backed anvil rules from loaded [`ItemDefaults`] and [`ItemTags`].
+    #[must_use]
+    pub fn new(defaults: &ItemDefaults, tags: &ItemTags) -> Self {
+        Self {
+            defaults: defaults.clone(),
+            tags: tags.clone(),
+            enchantments: EnchantmentRegistry::default(),
+        }
+    }
+
+    /// Builds data-backed anvil rules with loaded item defaults, item tags, and
+    /// [`EnchantmentRegistry`].
+    #[must_use]
+    pub fn with_enchantments(
+        defaults: &ItemDefaults,
+        tags: &ItemTags,
+        enchantments: &EnchantmentRegistry,
+    ) -> Self {
+        Self {
+            defaults: defaults.clone(),
+            tags: tags.clone(),
+            enchantments: enchantments.clone(),
+        }
+    }
+
+    /// Builds anvil rules from an [`EnchantmentRegistry`] without item report defaults.
+    #[must_use]
+    pub fn from_enchantments(enchantments: &EnchantmentRegistry) -> Self {
+        Self {
+            defaults: ItemDefaults::default(),
+            tags: ItemTags::default(),
+            enchantments: enchantments.clone(),
+        }
+    }
+
+    /// Attaches an [`EnchantmentRegistry`] to these [`AnvilRules`].
+    #[must_use]
+    pub fn with_enchantment_registry(mut self, enchantments: &EnchantmentRegistry) -> Self {
+        self.enchantments = enchantments.clone();
+        self
+    }
+
+    /// Returns the underlying [`ItemDefaults`] report.
+    #[must_use]
+    pub fn defaults(&self) -> &ItemDefaults {
+        &self.defaults
+    }
+
+    /// Returns the underlying [`ItemTags`] registry.
+    #[must_use]
+    pub fn tags(&self) -> &ItemTags {
+        &self.tags
+    }
+
+    /// Returns the underlying [`EnchantmentRegistry`].
+    #[must_use]
+    pub fn enchantments(&self) -> &EnchantmentRegistry {
+        &self.enchantments
+    }
+
+    /// Returns the report `minecraft:max_damage` for `item`, if damageable.
+    #[must_use]
+    pub fn max_durability(&self, item: &str) -> Option<u32> {
+        self.defaults.max_damage(item)
+    }
+
+    /// Returns the report `minecraft:max_stack_size` for `item`, if known.
+    #[must_use]
+    pub fn max_stack_size(&self, item: &str) -> Option<u8> {
+        self.defaults.max_stack_size(item)
+    }
+
+    /// Returns the resolved repair material identifiers for `item`, if repairable.
+    #[must_use]
+    pub fn repair_materials(&self, item: &str) -> Option<Vec<String>> {
+        self.defaults.repair_materials(item, &self.tags)
+    }
+
+    /// Checks whether `material` is a valid repair ingredient for `tool` in the report.
+    #[must_use]
+    pub fn is_repair_material(&self, tool: &str, material: &str) -> bool {
+        self.repair_materials(tool).is_some_and(|materials| {
+            materials
+                .iter()
+                .any(|candidate| items_equal(candidate, material))
+        })
+    }
+
+    /// Returns the report `minecraft:enchantable` value for `item`, if present.
+    #[must_use]
+    pub fn enchantability(&self, item: &str) -> Option<u32> {
+        self.defaults.enchantability(item)
+    }
+
+    /// Creates a validated [`AnvilItem`] from a shared [`ItemStack`] and explicit metadata,
+    /// enforcing non-zero `max_durability` when `item` has `minecraft:max_damage` in the report.
+    pub fn new_item(
+        &self,
+        stack: ItemStack,
+        durability: u32,
+        max_durability: u32,
+        repair_cost: u32,
+        custom_name: Option<String>,
+    ) -> Result<AnvilItem, AnvilItemError> {
+        validate_anvil_item_invariants(
+            self.max_durability(stack.item()).is_some(),
+            durability,
+            max_durability,
+            custom_name.as_deref(),
+        )?;
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
+        Ok(AnvilItem {
+            stack,
+            durability,
+            max_durability,
+            repair_cost,
+            custom_name,
+            enchantments: BTreeMap::new(),
+            is_enchanted_book,
+        })
+    }
+
+    /// Creates an [`AnvilItem`] from an existing [`ItemStack`], populating
+    /// `max_durability` from `minecraft:max_damage` in the report.
+    #[must_use]
+    pub fn item_from_stack(&self, stack: ItemStack) -> AnvilItem {
+        let max_durability = self.max_durability(stack.item()).unwrap_or(0);
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
+        AnvilItem {
+            stack,
+            durability: max_durability,
+            max_durability,
+            repair_cost: 0,
+            custom_name: None,
+            enchantments: BTreeMap::new(),
+            is_enchanted_book,
+        }
+    }
+
+    /// Creates a validated [`AnvilItem`] using `minecraft:max_damage` and
+    /// `minecraft:max_stack_size` from the report.
+    pub fn try_new_item(
+        &self,
+        item: impl Into<String>,
+        count: u16,
+    ) -> Result<AnvilItem, ItemStackError> {
+        let item = item.into();
+        let max_durability = self.max_durability(&item).unwrap_or(0);
+        let max_stack = self
+            .max_stack_size(&item)
+            .map(u16::from)
+            .unwrap_or_else(|| {
+                if max_durability > 0 {
+                    1
+                } else {
+                    DEFAULT_MAX_STACK
+                }
+            });
+        let is_enchanted_book = items_equal(&item, ENCHANTED_BOOK_ID);
+        let stack = ItemStack::try_new(item, count, max_stack)?;
+        Ok(AnvilItem {
+            stack,
+            durability: max_durability,
+            max_durability,
+            repair_cost: 0,
+            custom_name: None,
+            enchantments: BTreeMap::new(),
+            is_enchanted_book,
+        })
+    }
+
+    /// Calculates the anvil repair result in preview mode (`degraded_state = None`)
+    /// using the report durability and repair-material rules.
+    pub fn calculate_repair(
+        &self,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        calculate_repair_internal(
+            input,
+            AnvilState::Undamaged,
+            is_creative,
+            None,
+            RepairSource::Data(self),
+        )
+    }
+
+    /// Executes an anvil repair with a specified degradation roll `[0.0, 1.0)`
+    /// using the report durability and repair-material rules.
+    pub fn repair_with_roll(
+        &self,
+        input: &AnvilRepairInput,
+        anvil_state: AnvilState,
+        is_creative: bool,
+        roll: f64,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        calculate_repair_internal(
+            input,
+            anvil_state,
+            is_creative,
+            Some(roll),
+            RepairSource::Data(self),
+        )
+    }
+
+    /// Executes an anvil repair on an `Undamaged` anvil using the caller's random source
+    /// and the report durability and repair-material rules.
+    pub fn repair(
+        &self,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.repair_with_state(input, AnvilState::Undamaged, is_creative, rng)
+    }
+
+    /// Executes an anvil repair with the given `anvil_state` using the caller's random
+    /// source and the report durability and repair-material rules.
+    pub fn repair_with_state(
+        &self,
+        input: &AnvilRepairInput,
+        anvil_state: AnvilState,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        let roll = rng.next_double();
+        calculate_repair_internal(
+            input,
+            anvil_state,
+            is_creative,
+            Some(roll),
+            RepairSource::Data(self),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RepairSource<'a> {
+    Fallback,
+    Data(&'a AnvilRules),
+}
+
+impl<'a> RepairSource<'a> {
+    fn is_repair_material(self, tool: &str, material: &str) -> bool {
+        match self {
+            Self::Fallback => is_repair_material(tool, material),
+            Self::Data(rules) => rules.is_repair_material(tool, material),
+        }
+    }
+
+    fn is_known_damageable(self, item: &str) -> bool {
+        match self {
+            Self::Fallback => default_max_durability(item).is_some(),
+            Self::Data(rules) => rules.max_durability(item).is_some(),
+        }
+    }
+
+    fn enchantments(self) -> Option<&'a EnchantmentRegistry> {
+        match self {
+            Self::Fallback => None,
+            Self::Data(rules) => Some(&rules.enchantments),
+        }
+    }
+}
+
+struct EnchantmentCombineOutcome {
+    enchantments: BTreeMap<String, u8>,
+    enchant_cost: u32,
+    any_applied: bool,
+    any_incompatible: bool,
+}
+
+fn canonical_enchantment_id(registry: &EnchantmentRegistry, id: &str) -> String {
+    registry
+        .get(id)
+        .map_or_else(|| id.to_owned(), |def| def.id().to_owned())
+}
+
+/// Combines enchantments from `sacrifice` onto `base` following Java Edition
+/// rules (minecraft.wiki `Anvil mechanics`, revision 3804134, and
+/// `Enchantment definition`, revision 3843772).
+fn combine_enchantments(
+    base: &AnvilItem,
+    sacrifice: &AnvilItem,
+    registry: &EnchantmentRegistry,
+) -> EnchantmentCombineOutcome {
+    let mut result_enchantments = BTreeMap::new();
+    for (id, &level) in &base.enchantments {
+        if level > 0 {
+            result_enchantments.insert(canonical_enchantment_id(registry, id), level);
+        }
+    }
+
+    let mut enchant_cost = 0u32;
+    let mut any_applied = false;
+    let mut any_incompatible = false;
+
+    for (raw_id, &sac_level) in &sacrifice.enchantments {
+        if sac_level == 0 {
+            continue;
+        }
+        let Some(def) = registry.get(raw_id) else {
+            continue;
+        };
+        let ench_id = def.id().to_owned();
+
+        // minecraft.wiki `Anvil mechanics` (revision 3804134):
+        // "Ignore any enchantment that cannot be applied to the target (e.g. Protection on a sword)."
+        // Enchanted books accept all valid enchantments for book-book merging.
+        if !base.is_enchanted_book() && !registry.can_apply(&ench_id, base.item()) {
+            continue;
+        }
+
+        // minecraft.wiki `Anvil mechanics` (revision 3804134):
+        // "Add one level for every incompatible enchantment on the target (in Java Edition)."
+        let incompatible_count = result_enchantments
+            .keys()
+            .filter(|existing| {
+                existing.as_str() != ench_id.as_str()
+                    && registry.get(existing).is_some()
+                    && !registry.are_compatible(&ench_id, existing)
+            })
+            .count() as u32;
+
+        if incompatible_count > 0 {
+            enchant_cost = enchant_cost.saturating_add(
+                incompatible_count.saturating_mul(INCOMPATIBLE_ENCHANTMENT_LEVEL_COST),
+            );
+            any_incompatible = true;
+            continue;
+        }
+
+        // minecraft.wiki `Anvil mechanics` (revision 3804134):
+        // "and the level of the enchantment on the sacrifice item is greater, the enchantment
+        // level on the target item is raised to match it; and the level of the enchantment on
+        // the sacrifice item is equal AND the enchantment is not already at the maximum level,
+        // the enchantment on the target item gains one level; and the level of the enchantment
+        // on the sacrifice item is less, the enchantment level on the target item is unaffected."
+        let merged_level = match result_enchantments.get(&ench_id).copied() {
+            Some(target_level) => match sac_level.cmp(&target_level) {
+                Ordering::Greater => sac_level,
+                Ordering::Equal => {
+                    if target_level < def.max_level() {
+                        target_level.saturating_add(1)
+                    } else {
+                        target_level
+                    }
+                }
+                Ordering::Less => target_level,
+            },
+            None => sac_level,
+        };
+
+        // minecraft.wiki `Enchantment definition` (revision 3843772):
+        // "`anvil_cost`: The base cost when applying this enchantment to another item using an
+        // anvil. Halved when adding using a book, multiplied by the level of the enchantment."
+        // minecraft.wiki `Anvil mechanics` (revision 3804134):
+        // "For Java Edition, add the final level of the enchantment on the resulting item
+        // multiplied by the multiplier from the table below."
+        let multiplier = if sacrifice.is_enchanted_book() {
+            (def.anvil_cost() / BOOK_ANVIL_COST_DIVISOR).max(MIN_BOOK_ANVIL_COST_MULTIPLIER)
+        } else {
+            def.anvil_cost()
+        };
+        enchant_cost =
+            enchant_cost.saturating_add(multiplier.saturating_mul(u32::from(merged_level)));
+        result_enchantments.insert(ench_id, merged_level);
+        any_applied = true;
+    }
+
+    EnchantmentCombineOutcome {
+        enchantments: result_enchantments,
+        enchant_cost,
+        any_applied,
+        any_incompatible,
+    }
+}
+
 /// Calculates and executes the anvil operation with full validation, durability combination math,
 /// level calculation, and deterministic degradation roll.
 fn calculate_repair_internal(
@@ -577,6 +1109,7 @@ fn calculate_repair_internal(
     anvil_state: AnvilState,
     is_creative: bool,
     roll: Option<f64>,
+    source: RepairSource<'_>,
 ) -> Result<AnvilRepairResult, AnvilError> {
     if anvil_state.is_broken() {
         return Err(AnvilError::AnvilBroken);
@@ -609,8 +1142,9 @@ fn calculate_repair_internal(
 
     let rename_level_cost = if rename_changed { RENAME_LEVEL_COST } else { 0 };
 
-    // Evaluate repair operation
+    // Evaluate repair and enchantment combination
     let mut result_durability = input.base_item.durability;
+    let mut result_enchantments = input.base_item.enchantments.clone();
     let mut repair_cost_levels = 0;
     let mut material_cost = 0;
     let mut sacrifice_penalty = 0;
@@ -622,14 +1156,38 @@ fn calculate_repair_internal(
             }
         }
         Some(sacrifice) => {
-            let is_same_item = items_equal(input.base_item.item(), sacrifice.item());
-            let is_mat = is_repair_material(input.base_item.item(), sacrifice.item());
+            let sacrifice_is_book = sacrifice.is_enchanted_book();
+            let both_books = input.base_item.is_enchanted_book() && sacrifice_is_book;
+            let book_onto_item = !input.base_item.is_enchanted_book() && sacrifice_is_book;
+            let is_same_item = !input.base_item.is_enchanted_book()
+                && !sacrifice_is_book
+                && items_equal(input.base_item.item(), sacrifice.item());
+            let is_mat = !input.base_item.is_enchanted_book()
+                && !sacrifice_is_book
+                && source.is_repair_material(input.base_item.item(), sacrifice.item());
 
-            if !is_same_item && !is_mat {
+            if !both_books && !book_onto_item && !is_same_item && !is_mat {
                 return Err(AnvilError::IncompatibleSacrificeItem);
             }
 
-            if is_same_item {
+            if both_books || book_onto_item {
+                let Some(registry) = source.enchantments() else {
+                    return Err(AnvilError::IncompatibleSacrificeItem);
+                };
+                if sacrifice.enchantments.is_empty() {
+                    return Err(AnvilError::IncompatibleSacrificeItem);
+                }
+
+                let outcome = combine_enchantments(&input.base_item, sacrifice, registry);
+                if !outcome.any_applied && !outcome.any_incompatible {
+                    return Err(AnvilError::IncompatibleSacrificeItem);
+                }
+
+                result_enchantments = outcome.enchantments;
+                repair_cost_levels = outcome.enchant_cost;
+                material_cost = 1;
+                sacrifice_penalty = sacrifice.repair_cost;
+            } else if is_same_item {
                 if !input.base_item.is_damageable() {
                     return Err(AnvilError::NotDamageable);
                 }
@@ -643,14 +1201,28 @@ fn calculate_repair_internal(
                     .saturating_add(bonus)
                     .min(max_durability);
 
-                if combined > d1 {
+                let repaired = combined > d1;
+                if repaired {
                     result_durability = combined;
                     repair_cost_levels = COMBINE_REPAIR_LEVEL_COST;
-                    material_cost = 1;
-                } else if !rename_changed {
+                }
+
+                let mut any_enchant_change = false;
+                if !sacrifice.enchantments.is_empty() {
+                    let Some(registry) = source.enchantments() else {
+                        return Err(AnvilError::IncompatibleSacrificeItem);
+                    };
+                    let outcome = combine_enchantments(&input.base_item, sacrifice, registry);
+                    result_enchantments = outcome.enchantments;
+                    repair_cost_levels = repair_cost_levels.saturating_add(outcome.enchant_cost);
+                    any_enchant_change = outcome.any_applied || outcome.any_incompatible;
+                }
+
+                if !repaired && !any_enchant_change && !rename_changed {
                     return Err(AnvilError::NoRepairNeeded);
                 }
 
+                material_cost = 1;
                 sacrifice_penalty = sacrifice.repair_cost;
             } else if is_mat {
                 if !input.base_item.is_damageable() {
@@ -720,17 +1292,26 @@ fn calculate_repair_internal(
     ) else {
         return Err(AnvilError::NoOperation);
     };
-    let result_item = AnvilItem::new(
-        result_stack,
+    let result_max_durability = input.base_item.max_durability();
+    validate_anvil_item_invariants(
+        source.is_known_damageable(result_stack.item()),
         result_durability,
-        input.base_item.max_durability(),
-        next_prior_work_penalty,
-        final_custom_name,
+        result_max_durability,
+        final_custom_name.as_deref(),
     )
     .map_err(|err| match err {
         AnvilItemError::NameTooLong { len, max } => AnvilError::NameTooLong { len, max },
         _ => AnvilError::NoOperation,
     })?;
+    let result_item = AnvilItem {
+        stack: result_stack,
+        durability: result_durability,
+        max_durability: result_max_durability,
+        repair_cost: next_prior_work_penalty,
+        custom_name: final_custom_name,
+        enchantments: result_enchantments,
+        is_enchanted_book: input.base_item.is_enchanted_book,
+    };
 
     let degraded_state = roll.and_then(|r| anvil_state.roll_degradation(r));
 
@@ -744,24 +1325,45 @@ fn calculate_repair_internal(
 }
 
 /// Calculates the anvil repair result in preview mode without degrading the anvil (`degraded_state = None`).
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::calculate_repair`] when item report data is loaded.
 pub fn calculate_repair(
     input: &AnvilRepairInput,
     is_creative: bool,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    calculate_repair_internal(input, AnvilState::Undamaged, is_creative, None)
+    calculate_repair_internal(
+        input,
+        AnvilState::Undamaged,
+        is_creative,
+        None,
+        RepairSource::Fallback,
+    )
 }
 
 /// Executes an anvil repair with a specified degradation roll `[0.0, 1.0)`.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair_with_roll`] when item report data is loaded.
 pub fn repair_with_roll(
     input: &AnvilRepairInput,
     anvil_state: AnvilState,
     is_creative: bool,
     roll: f64,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
+    calculate_repair_internal(
+        input,
+        anvil_state,
+        is_creative,
+        Some(roll),
+        RepairSource::Fallback,
+    )
 }
 
 /// Executes an anvil repair on an `Undamaged` anvil using the caller's random source.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair`] when item report data is loaded.
 pub fn repair(
     input: &AnvilRepairInput,
     is_creative: bool,
@@ -771,6 +1373,9 @@ pub fn repair(
 }
 
 /// Executes an anvil repair with the given `anvil_state` using the caller's random source.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair_with_state`] when item report data is loaded.
 pub fn repair_with_state(
     input: &AnvilRepairInput,
     anvil_state: AnvilState,
@@ -778,7 +1383,13 @@ pub fn repair_with_state(
     rng: &mut RandomSource,
 ) -> Result<AnvilRepairResult, AnvilError> {
     let roll = rng.next_double();
-    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
+    calculate_repair_internal(
+        input,
+        anvil_state,
+        is_creative,
+        Some(roll),
+        RepairSource::Fallback,
+    )
 }
 
 /// Anvil block instance tracking its current state in the world.
@@ -800,28 +1411,53 @@ impl Anvil {
         }
     }
 
-    /// Performs a repair, updating the anvil's state if degradation occurs.
+    /// Performs a repair using offline fallback rules, updating the anvil's state if degradation occurs.
     pub fn repair_with_roll(
         &mut self,
         input: &AnvilRepairInput,
         is_creative: bool,
         roll: f64,
     ) -> Result<AnvilRepairResult, AnvilError> {
-        let result = repair_with_roll(input, self.state, is_creative, roll)?;
-        if let Some(new_state) = result.degraded_state {
-            self.state = new_state;
-        }
-        Ok(result)
+        self.apply_repair(repair_with_roll(input, self.state, is_creative, roll))
     }
 
-    /// Performs a repair with a random source, updating the anvil's state if degradation occurs.
+    /// Performs a repair using offline fallback rules and a random source, updating the anvil's state if degradation occurs.
     pub fn repair(
         &mut self,
         input: &AnvilRepairInput,
         is_creative: bool,
         rng: &mut RandomSource,
     ) -> Result<AnvilRepairResult, AnvilError> {
-        let result = repair_with_state(input, self.state, is_creative, rng)?;
+        self.apply_repair(repair_with_state(input, self.state, is_creative, rng))
+    }
+
+    /// Performs a repair using data-backed [`AnvilRules`] and a roll, updating the anvil's state if degradation occurs.
+    pub fn repair_with_rules_and_roll(
+        &mut self,
+        rules: &AnvilRules,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        roll: f64,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.apply_repair(rules.repair_with_roll(input, self.state, is_creative, roll))
+    }
+
+    /// Performs a repair using data-backed [`AnvilRules`] and a random source, updating the anvil's state if degradation occurs.
+    pub fn repair_with_rules(
+        &mut self,
+        rules: &AnvilRules,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.apply_repair(rules.repair_with_state(input, self.state, is_creative, rng))
+    }
+
+    fn apply_repair(
+        &mut self,
+        outcome: Result<AnvilRepairResult, AnvilError>,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        let result = outcome?;
         if let Some(new_state) = result.degraded_state {
             self.state = new_state;
         }
@@ -1264,6 +1900,700 @@ mod tests {
                 len: 51,
                 max: MAX_NAME_LENGTH,
             })
+        );
+    }
+
+    fn scratch_root(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rustmc-anvil-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        path
+    }
+
+    fn write_scratch_file(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, text).expect("write");
+    }
+
+    #[test]
+    fn anvil_rules_uses_report_durability_and_repair_materials_instead_of_fallback() {
+        let root = scratch_root("rules");
+        write_scratch_file(
+            &root.join("data/testns/tags/item/ingots.json"),
+            r#"{"values": ["testns:ingot_a"]}"#,
+        );
+        // Intentionally diverge from offline fallback (42 vs 1561, testns:gem vs diamond)
+        // to prove AnvilRules reads from the report rather than default tables.
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/diamond_sword.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 42,
+                "minecraft:repairable": {"items": "testns:gem"}
+            }}"#,
+        );
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/copper_blade.json"),
+            r##"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 100,
+                "minecraft:repairable": {"items": "#testns:ingots"}
+            }}"##,
+        );
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/diamond_horse_armor.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load synthetic item tags");
+        let defaults = ItemDefaults::load(&root).expect("load synthetic item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        assert_eq!(rules.max_durability("minecraft:diamond_sword"), Some(42));
+        assert_eq!(rules.max_durability("minecraft:iron_sword"), None);
+        assert!(!rules.is_repair_material("minecraft:diamond_sword", "minecraft:diamond"));
+        assert!(rules.is_repair_material("minecraft:diamond_sword", "testns:gem"));
+
+        let sword = rules
+            .try_new_item("minecraft:diamond_sword", 1)
+            .expect("construct report sword")
+            .with_durability(10)
+            .expect("damage sword");
+        assert_eq!(sword.max_durability(), 42);
+        let gem = rules.try_new_item("testns:gem", 1).expect("gem");
+        let sword_rep = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword, gem), false)
+            .expect("repair with report material");
+        // floor(42 * 0.25) = 10 -> 10 + 10 = 20
+        assert_eq!(sword_rep.result_item.durability(), 20);
+        assert_eq!(sword_rep.material_cost, 1);
+
+        let blade = rules
+            .try_new_item("minecraft:copper_blade", 1)
+            .expect("construct copper_blade")
+            .with_durability(50)
+            .expect("damage blade");
+        let ingot = rules.try_new_item("testns:ingot_a", 1).expect("ingot");
+        let blade_rep = rules
+            .calculate_repair(&AnvilRepairInput::combine(blade, ingot), false)
+            .expect("repair with tagged material");
+        // floor(100 * 0.25) = 25 -> 50 + 25 = 75
+        assert_eq!(blade_rep.result_item.durability(), 75);
+        assert_eq!(blade_rep.material_cost, 1);
+
+        let horse_armor = rules
+            .try_new_item("minecraft:diamond_horse_armor", 1)
+            .expect("horse armor");
+        let diamond = AnvilItem::try_new("minecraft:diamond", 1).expect("diamond");
+        assert_eq!(
+            rules.calculate_repair(&AnvilRepairInput::combine(horse_armor, diamond), false),
+            Err(AnvilError::IncompatibleSacrificeItem)
+        );
+
+        let mut anvil = Anvil::undamaged();
+        let blade2 = rules
+            .try_new_item("minecraft:copper_blade", 1)
+            .expect("blade2")
+            .with_durability(50)
+            .expect("damage");
+        let ingot2 = rules.try_new_item("testns:ingot_a", 1).expect("ingot2");
+        let mut rng = RandomSource::from_world_seed(18);
+        let res = anvil
+            .repair_with_rules(
+                &rules,
+                &AnvilRepairInput::combine(blade2, ingot2),
+                false,
+                &mut rng,
+            )
+            .expect("repair through Anvil struct");
+        assert_eq!(res.result_item.durability(), 75);
+        assert_eq!(anvil.state, AnvilState::Chipped);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_anvil_rules_diamond_sword_mace_and_all_max_damage_items`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_anvil_rules_diamond_sword_mace_and_all_max_damage_items() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        assert_eq!(rules.max_durability("minecraft:diamond_sword"), Some(1561));
+        assert!(rules.is_repair_material("minecraft:diamond_sword", "minecraft:diamond"));
+        assert!(!rules.is_repair_material("minecraft:diamond_sword", "minecraft:iron_ingot"));
+
+        assert_eq!(rules.max_durability("minecraft:mace"), Some(500));
+        assert!(rules.is_repair_material("minecraft:mace", "minecraft:breeze_rod"));
+        assert!(!rules.is_repair_material("minecraft:mace", "minecraft:diamond"));
+
+        let items_dir = root.join("reports/minecraft/components/item");
+        let report_files = crate::vanilla::worldgen::walk_json(&items_dir).expect("walk reports");
+        let mut checked_max_damage = 0usize;
+        for file in report_files {
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("valid item stem");
+            let doc = crate::vanilla::worldgen::read_json(&file).expect("read item report");
+            let components = doc["components"].as_object().expect("components object");
+            let full_id = format!("minecraft:{stem}");
+            if let Some(expected_damage) = components
+                .get("minecraft:max_damage")
+                .and_then(serde_json::Value::as_u64)
+            {
+                let expected = u32::try_from(expected_damage).expect("u32 max_damage");
+                assert_eq!(rules.max_durability(&full_id), Some(expected), "{full_id}");
+                let built = rules.try_new_item(&full_id, 1).expect("build anvil item");
+                assert_eq!(built.max_durability(), expected, "{full_id}");
+                checked_max_damage += 1;
+            } else {
+                assert_eq!(rules.max_durability(&full_id), None, "{full_id}");
+            }
+        }
+        assert_eq!(checked_max_damage, 84);
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_anvil_rules_full_material_repair_diamond_pickaxe`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_anvil_rules_full_material_repair_diamond_pickaxe() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        // Diamond pickaxe max durability = 1561; 25% per diamond = floor(1561 * 0.25) = 390.
+        // Starting at 1171 (missing exactly 390), 1 diamond restores full durability (1561).
+        let pickaxe = rules
+            .try_new_item("minecraft:diamond_pickaxe", 1)
+            .expect("diamond_pickaxe")
+            .with_durability(1171)
+            .expect("damaged pickaxe");
+        let diamond = rules.try_new_item("minecraft:diamond", 1).expect("diamond");
+
+        let result = rules
+            .calculate_repair(&AnvilRepairInput::combine(pickaxe, diamond), false)
+            .expect("full repair with 1 diamond");
+        assert_eq!(result.result_item.durability(), 1561);
+        assert_eq!(result.result_item.max_durability(), 1561);
+        assert_eq!(result.material_cost, 1);
+        assert_eq!(result.repair_cost_levels, 1);
+        assert_eq!(result.next_prior_work_penalty, 1);
+    }
+
+    fn synthetic_enchantment_registry() -> EnchantmentRegistry {
+        use crate::world::enchantment::{EnchantmentCost, EnchantmentDefinition, EnchantmentSpec};
+
+        let mut reg = EnchantmentRegistry::default();
+        let cost = EnchantmentCost::new(1, 10);
+        let reg_def =
+            |id: &str, max_level: u8, anvil_cost: u32, supported: &[&str], exclusive: &[&str]| {
+                EnchantmentDefinition::try_new(EnchantmentSpec {
+                    id: id.to_owned(),
+                    max_level,
+                    anvil_cost,
+                    weight: 10,
+                    min_cost: cost,
+                    max_cost: cost,
+                    slots: vec!["mainhand".to_owned()],
+                    supported_items: supported.iter().map(|s| (*s).to_owned()).collect(),
+                    primary_items: None,
+                    exclusive_set: exclusive.iter().map(|s| (*s).to_owned()).collect(),
+                })
+                .expect("valid synthetic enchantment")
+            };
+
+        reg.register(reg_def(
+            "minecraft:sharpness",
+            5,
+            1,
+            &["minecraft:diamond_sword", "minecraft:diamond_axe"],
+            &["minecraft:sharpness", "minecraft:smite"],
+        ));
+        reg.register(reg_def(
+            "minecraft:smite",
+            5,
+            2,
+            &["minecraft:diamond_sword", "minecraft:diamond_axe"],
+            &["minecraft:sharpness", "minecraft:smite"],
+        ));
+        reg.register(reg_def(
+            "minecraft:looting",
+            3,
+            4,
+            &["minecraft:diamond_sword"],
+            &[],
+        ));
+        reg.register(reg_def(
+            "minecraft:unbreaking",
+            3,
+            2,
+            &["minecraft:diamond_sword", "minecraft:bow"],
+            &[],
+        ));
+        reg.register(reg_def(
+            "minecraft:protection",
+            4,
+            1,
+            &["minecraft:diamond_helmet"],
+            &[],
+        ));
+        reg.register(reg_def(
+            "minecraft:depth_strider",
+            3,
+            4,
+            &["minecraft:diamond_boots"],
+            &[],
+        ));
+        reg
+    }
+
+    #[test]
+    fn existing_anvil_item_constructors_preserve_empty_enchantments_and_book_flag() {
+        let sword = AnvilItem::try_new("minecraft:diamond_sword", 1).expect("sword");
+        assert!(sword.enchantments().is_empty());
+        assert!(!sword.is_enchanted_book());
+
+        let stack = ItemStack::try_new("minecraft:diamond_sword", 1, 1).expect("stack");
+        let built = AnvilItem::new(stack, 100, 1561, 1, None).expect("new");
+        assert!(built.enchantments().is_empty());
+        assert!(!built.is_enchanted_book());
+
+        let book = AnvilItem::try_new("minecraft:enchanted_book", 1).expect("book");
+        assert!(book.enchantments().is_empty());
+        assert!(book.is_enchanted_book());
+
+        let custom_book = AnvilItem::try_new("testns:tome", 1)
+            .expect("tome")
+            .with_enchanted_book(true)
+            .with_enchantment("minecraft:sharpness", 4);
+        assert!(custom_book.is_enchanted_book());
+        assert_eq!(
+            custom_book.enchantments().get("minecraft:sharpness"),
+            Some(&4)
+        );
+    }
+
+    #[test]
+    fn anvil_combines_sword_sharpness_iv_with_book_sharpness_iv_at_exact_wiki_cost() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+        let sword = item("minecraft:diamond_sword", 1).with_enchantment("minecraft:sharpness", 4);
+        let book = item("minecraft:enchanted_book", 1).with_enchantment("minecraft:sharpness", 4);
+
+        let result = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword, book), false)
+            .expect("combine Sharpness IV + IV");
+
+        assert_eq!(
+            result.result_item.enchantments().get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(result.result_item.durability(), 1561);
+        assert_eq!(result.material_cost, 1);
+        // Sharpness V (5) * book multiplier max(1, 1/2) = 1 -> 5 levels
+        assert_eq!(result.repair_cost_levels, 5);
+        assert_eq!(result.next_prior_work_penalty, 1);
+    }
+
+    #[test]
+    fn anvil_drops_incompatible_smite_from_book_and_adds_java_penalty() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+        let sword = item("minecraft:diamond_sword", 1).with_enchantment("minecraft:sharpness", 5);
+        let book = item("minecraft:enchanted_book", 1).with_enchantment("minecraft:smite", 1);
+
+        let result = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword, book), false)
+            .expect("Sharpness V sword + Smite I book");
+
+        assert_eq!(
+            result.result_item.enchantments().get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(
+            result.result_item.enchantments().get("minecraft:smite"),
+            None
+        );
+        assert_eq!(result.repair_cost_levels, 1);
+        assert_eq!(result.material_cost, 1);
+    }
+
+    #[test]
+    fn anvil_merges_enchanted_books_and_respects_item_vs_book_multipliers() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+
+        // Wiki example: Depth Strider II book + Depth Strider II book -> Depth Strider III, cost 6
+        let ds_book_1 =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:depth_strider", 2);
+        let ds_book_2 =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:depth_strider", 2);
+        let ds_res = rules
+            .calculate_repair(&AnvilRepairInput::combine(ds_book_1, ds_book_2), false)
+            .expect("book + book Depth Strider");
+        assert!(ds_res.result_item.is_enchanted_book());
+        assert_eq!(
+            ds_res
+                .result_item
+                .enchantments()
+                .get("minecraft:depth_strider"),
+            Some(&3)
+        );
+        // anvil_cost 4 -> book mult 2 * level 3 = 6
+        assert_eq!(ds_res.repair_cost_levels, 6);
+        assert_eq!(ds_res.next_prior_work_penalty, 1);
+
+        // Book + book merging distinct enchantments + prior work penalties
+        let book_a = item("minecraft:enchanted_book", 1)
+            .with_enchantment("minecraft:sharpness", 4)
+            .with_repair_cost(1);
+        let book_b = item("minecraft:enchanted_book", 1)
+            .with_enchantment("minecraft:unbreaking", 3)
+            .with_repair_cost(1);
+        let merged_book = rules
+            .calculate_repair(&AnvilRepairInput::combine(book_a, book_b), false)
+            .expect("book + book distinct");
+        assert_eq!(merged_book.result_item.enchantments().len(), 2);
+        // Unbreaking III (3 * max(1, 2/2)=1 = 3) + penalties (1 + 1) = 5
+        assert_eq!(merged_book.repair_cost_levels, 5);
+        assert_eq!(merged_book.next_prior_work_penalty, 3);
+
+        // Same-item vs book multiplier comparison for Looting II -> Looting III (anvil_cost = 4)
+        let sword_a = item("minecraft:diamond_sword", 1).with_enchantment("minecraft:looting", 2);
+        let sword_b = item("minecraft:diamond_sword", 1).with_enchantment("minecraft:looting", 2);
+        let item_combine = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword_a.clone(), sword_b), false)
+            .expect("item + item Looting");
+        // Item multiplier 4 * level 3 = 12
+        assert_eq!(item_combine.repair_cost_levels, 12);
+
+        let book_looting =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:looting", 2);
+        let book_combine = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword_a, book_looting), false)
+            .expect("item + book Looting");
+        // Book multiplier 2 * level 3 = 6
+        assert_eq!(book_combine.repair_cost_levels, 6);
+    }
+
+    #[test]
+    fn anvil_handles_unequal_levels_max_level_cap_and_wiki_mixed_book() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+
+        // Wiki example: sword (Looting II) + book (Protection III, Sharpness I, Looting II) -> 7 levels
+        // Protection III cannot apply to sword and is ignored.
+        let sword = item("minecraft:diamond_sword", 1).with_enchantment("minecraft:looting", 2);
+        let mixed_book = item("minecraft:enchanted_book", 1)
+            .with_enchantment("minecraft:protection", 3)
+            .with_enchantment("minecraft:sharpness", 1)
+            .with_enchantment("minecraft:looting", 2);
+        let res = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword, mixed_book), false)
+            .expect("mixed book");
+        assert_eq!(
+            res.result_item.enchantments().get("minecraft:protection"),
+            None
+        );
+        assert_eq!(
+            res.result_item.enchantments().get("minecraft:sharpness"),
+            Some(&1)
+        );
+        assert_eq!(
+            res.result_item.enchantments().get("minecraft:looting"),
+            Some(&3)
+        );
+        assert_eq!(res.repair_cost_levels, 7);
+
+        // Unequal levels keep the higher, and Java charges final level * multiplier;
+        // Equal levels at max_level stay capped at max_level.
+        let target = item("minecraft:diamond_sword", 1)
+            .with_enchantment("minecraft:sharpness", 5)
+            .with_enchantment("minecraft:looting", 1);
+        let sacrifice = item("minecraft:diamond_sword", 1)
+            .with_enchantment("minecraft:sharpness", 5)
+            .with_enchantment("minecraft:looting", 3);
+        let unequal = rules
+            .calculate_repair(&AnvilRepairInput::combine(target, sacrifice), false)
+            .expect("unequal and capped");
+        assert_eq!(
+            unequal
+                .result_item
+                .enchantments()
+                .get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(
+            unequal.result_item.enchantments().get("minecraft:looting"),
+            Some(&3)
+        );
+        // Sharpness V (5 * 1) + Looting III (3 * 4) = 17
+        assert_eq!(unequal.repair_cost_levels, 17);
+    }
+
+    #[test]
+    fn anvil_rejects_item_that_cannot_take_enchantment_and_book_on_left_of_tool() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+
+        // Bow cannot take Sharpness
+        let bow = item("minecraft:bow", 1);
+        let sharp_book =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:sharpness", 1);
+        assert_eq!(
+            rules.calculate_repair(&AnvilRepairInput::combine(bow, sharp_book), false),
+            Err(AnvilError::IncompatibleSacrificeItem)
+        );
+
+        // Enchanted book in left slot with sword in right slot is invalid
+        let book_left =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:sharpness", 1);
+        let sword_right = item("minecraft:diamond_sword", 1);
+        assert_eq!(
+            rules.calculate_repair(&AnvilRepairInput::combine(book_left, sword_right), false),
+            Err(AnvilError::IncompatibleSacrificeItem)
+        );
+    }
+
+    #[test]
+    fn anvil_combines_repair_rename_penalties_and_rejects_over_39_in_survival() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+
+        // Damaged sword1 (1000/1561, Sharpness IV, penalty 3)
+        // + damaged sword2 (500/1561, Sharpness IV, penalty 1) + rename "Blade"
+        // Durability repairs (2) + Sharpness V from item (5*1 = 5) + rename (1) + penalties (3 + 1) = 12
+        let sword1 = item("minecraft:diamond_sword", 1)
+            .with_durability(1000)
+            .expect("dur1")
+            .with_enchantment("minecraft:sharpness", 4)
+            .with_repair_cost(3);
+        let sword2 = item("minecraft:diamond_sword", 1)
+            .with_durability(500)
+            .expect("dur2")
+            .with_enchantment("minecraft:sharpness", 4)
+            .with_repair_cost(1);
+        let input =
+            AnvilRepairInput::new(sword1, Some(sword2), Some("Blade".to_owned())).expect("input");
+        let combined = rules
+            .calculate_repair(&input, false)
+            .expect("repair + enchant + rename");
+        assert_eq!(combined.result_item.durability(), 1561);
+        assert_eq!(combined.result_item.custom_name(), Some("Blade"));
+        assert_eq!(
+            combined
+                .result_item
+                .enchantments()
+                .get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(combined.repair_cost_levels, 12);
+        assert_eq!(combined.next_prior_work_penalty, 7);
+
+        // Survival cap boundary: 39 succeeds, 40 returns TooExpensive, Creative permits 40.
+        // Sharpness V (5) + Looting III from book (3*2=6) + Unbreaking III from book (3*1=3) = 14 enchant cost
+        // Base penalty 15 + book penalty 10 = 25 -> total 39 (succeeds);
+        // With rename (+1) -> total 40 (TooExpensive in survival, succeeds in creative).
+        let sword_39 = item("minecraft:diamond_sword", 1).with_repair_cost(15);
+        let book_39 = item("minecraft:enchanted_book", 1)
+            .with_enchantment("minecraft:sharpness", 5)
+            .with_enchantment("minecraft:looting", 3)
+            .with_enchantment("minecraft:unbreaking", 3)
+            .with_repair_cost(10);
+        let ok_39 = rules
+            .calculate_repair(
+                &AnvilRepairInput::combine(sword_39.clone(), book_39.clone()),
+                false,
+            )
+            .expect("39 levels allowed in survival");
+        assert_eq!(ok_39.repair_cost_levels, 39);
+
+        let too_high = AnvilRepairInput::new(sword_39, Some(book_39), Some("OverCap".to_owned()))
+            .expect("overcap input");
+        assert_eq!(
+            rules.calculate_repair(&too_high, false),
+            Err(AnvilError::TooExpensive {
+                cost: 40,
+                limit: SURVIVAL_LEVEL_CAP,
+            })
+        );
+        let creative_ok = rules
+            .calculate_repair(&too_high, true)
+            .expect("40 levels allowed in creative");
+        assert_eq!(creative_ok.repair_cost_levels, 40);
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_anvil_enchant_combine_vanilla_scenarios`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_anvil_enchant_combine_vanilla_scenarios() {
+        use crate::vanilla::feature::EnchantmentTags;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let item_tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let ench_tags = EnchantmentTags::load(&root).expect("load vanilla enchantment tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let enchantments = EnchantmentRegistry::load(&root, &item_tags, &ench_tags)
+            .expect("load vanilla enchantments");
+        let rules = AnvilRules::with_enchantments(&defaults, &item_tags, &enchantments);
+
+        // 1. Sword Sharpness IV + Book Sharpness IV -> Sharpness V, cost 5
+        let sword_iv = rules
+            .try_new_item("minecraft:diamond_sword", 1)
+            .expect("diamond_sword")
+            .with_enchantment("minecraft:sharpness", 4);
+        let book_iv = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("enchanted_book")
+            .with_enchantment("minecraft:sharpness", 4);
+        let sharp_v = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword_iv, book_iv), false)
+            .expect("Sharpness IV + IV");
+        assert_eq!(
+            sharp_v
+                .result_item
+                .enchantments()
+                .get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(sharp_v.repair_cost_levels, 5);
+
+        // 2. Sword Sharpness V + Book Smite I -> Smite dropped with Java cost +1
+        let book_smite = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("enchanted_book")
+            .with_enchantment("minecraft:smite", 1);
+        let conflict = rules
+            .calculate_repair(
+                &AnvilRepairInput::combine(sharp_v.result_item.clone(), book_smite),
+                false,
+            )
+            .expect("Sharpness V + Smite I");
+        assert_eq!(
+            conflict
+                .result_item
+                .enchantments()
+                .get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert_eq!(
+            conflict.result_item.enchantments().get("minecraft:smite"),
+            None
+        );
+        // 1 incompatible + 1 prior work penalty on sharp_v = 2
+        assert_eq!(conflict.repair_cost_levels, 2);
+
+        // 3. Book + Book merge (Wiki: Thorns III + Feather Falling IV -> cost 4;
+        //    and Mending + Infinity -> Infinity dropped, cost 1)
+        let thorns_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:thorns", 3);
+        let ff_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:feather_falling", 4);
+        let merged = rules
+            .calculate_repair(&AnvilRepairInput::combine(thorns_book, ff_book), false)
+            .expect("Thorns + Feather Falling books");
+        assert!(merged.result_item.is_enchanted_book());
+        assert_eq!(
+            merged.result_item.enchantments().get("minecraft:thorns"),
+            Some(&3)
+        );
+        assert_eq!(
+            merged
+                .result_item
+                .enchantments()
+                .get("minecraft:feather_falling"),
+            Some(&4)
+        );
+        assert_eq!(merged.repair_cost_levels, 4);
+
+        let mending_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:mending", 1);
+        let infinity_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:infinity", 1);
+        let bow_conflict = rules
+            .calculate_repair(
+                &AnvilRepairInput::combine(mending_book, infinity_book),
+                false,
+            )
+            .expect("Mending + Infinity books");
+        assert_eq!(
+            bow_conflict
+                .result_item
+                .enchantments()
+                .get("minecraft:mending"),
+            Some(&1)
+        );
+        assert_eq!(
+            bow_conflict
+                .result_item
+                .enchantments()
+                .get("minecraft:infinity"),
+            None
+        );
+        assert_eq!(bow_conflict.repair_cost_levels, 1);
+
+        // 4. Item that cannot take the enchantment: bow + Sharpness I book
+        let bow = rules.try_new_item("minecraft:bow", 1).expect("bow");
+        let sharp_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:sharpness", 1);
+        assert_eq!(
+            rules.calculate_repair(&AnvilRepairInput::combine(bow, sharp_book), false),
+            Err(AnvilError::IncompatibleSacrificeItem)
+        );
+
+        // 5. Too Expensive (> 39) in survival vs permitted in creative
+        let boots = rules
+            .try_new_item("minecraft:diamond_boots", 1)
+            .expect("boots")
+            .with_repair_cost(31);
+        let soul_speed_book = rules
+            .try_new_item("minecraft:enchanted_book", 1)
+            .expect("book")
+            .with_enchantment("minecraft:soul_speed", 3)
+            .with_repair_cost(1);
+        // Soul Speed III from book (3 * 4 = 12) + penalties (31 + 1) = 44 >= 40
+        assert_eq!(
+            rules.calculate_repair(
+                &AnvilRepairInput::combine(boots.clone(), soul_speed_book.clone()),
+                false,
+            ),
+            Err(AnvilError::TooExpensive {
+                cost: 44,
+                limit: SURVIVAL_LEVEL_CAP,
+            })
+        );
+        let creative = rules
+            .calculate_repair(&AnvilRepairInput::combine(boots, soul_speed_book), true)
+            .expect("allowed in creative");
+        assert_eq!(creative.repair_cost_levels, 44);
+        assert_eq!(
+            creative
+                .result_item
+                .enchantments()
+                .get("minecraft:soul_speed"),
+            Some(&3)
         );
     }
 }
