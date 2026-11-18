@@ -2,9 +2,9 @@
 //!
 //! Reads `data/<namespace>/recipe/**/*.json` at runtime, resolves item tag
 //! ingredients via [`ItemTags`], converts crafting recipes into
-//! [`crate::world::crafting`] types, indexes cooking, stonecutting, and brewing recipes,
-//! and records unsupported recipe types or component-bearing results in
-//! [`RecipeData::skipped`].
+//! [`crate::world::crafting`] types, indexes cooking, stonecutting, brewing, and
+//! smithing recipes, and records unsupported recipe types or component-bearing
+//! results in [`RecipeData::skipped`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -210,10 +210,125 @@ impl BrewingRecipe {
     }
 }
 
+/// A parsed `minecraft:smithing_transform` recipe.
+///
+/// Source: minecraft.wiki `Recipe (Java Edition)` (revision 3873625).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmithingTransformRecipe {
+    id: String,
+    template: Option<Ingredient>,
+    base: Ingredient,
+    addition: Option<Ingredient>,
+    result: ItemStack,
+}
+
+impl SmithingTransformRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Optional template slot ingredient.
+    #[must_use]
+    pub fn template(&self) -> Option<&Ingredient> {
+        self.template.as_ref()
+    }
+
+    /// Base item ingredient to upgrade.
+    #[must_use]
+    pub fn base(&self) -> &Ingredient {
+        &self.base
+    }
+
+    /// Optional addition slot ingredient.
+    #[must_use]
+    pub fn addition(&self) -> Option<&Ingredient> {
+        self.addition.as_ref()
+    }
+
+    /// Output item stack produced by the smithing transform.
+    #[must_use]
+    pub fn result(&self) -> &ItemStack {
+        &self.result
+    }
+}
+
+/// A parsed `minecraft:smithing_trim` recipe.
+///
+/// Source: minecraft.wiki `Recipe (Java Edition)` (revision 3873625).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmithingTrimRecipe {
+    id: String,
+    template: Option<Ingredient>,
+    base: Ingredient,
+    addition: Ingredient,
+    pattern: String,
+    base_stacks: BTreeMap<String, ItemStack>,
+}
+
+impl SmithingTrimRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Optional template slot ingredient.
+    #[must_use]
+    pub fn template(&self) -> Option<&Ingredient> {
+        self.template.as_ref()
+    }
+
+    /// Base armor ingredient to trim.
+    #[must_use]
+    pub fn base(&self) -> &Ingredient {
+        &self.base
+    }
+
+    /// Trim material ingredient (`addition`).
+    #[must_use]
+    pub fn addition(&self) -> &Ingredient {
+        &self.addition
+    }
+
+    /// Armor trim pattern identifier (for example `"minecraft:coast"`).
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+}
+
+/// Result of looking up inputs in [`RecipeData::find_smithing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmithingResult {
+    /// Result stack of a `minecraft:smithing_transform` recipe.
+    Transform {
+        /// Matched recipe identifier.
+        recipe_id: String,
+        /// Transformed output stack.
+        result: ItemStack,
+    },
+    /// Result of a `minecraft:smithing_trim` recipe.
+    ///
+    /// [`ItemStack`] has no component data, so the base item stack is returned
+    /// alongside the trim `pattern` identifier and `material` item identifier.
+    Trim {
+        /// Matched recipe identifier.
+        recipe_id: String,
+        /// Base item stack (without component data).
+        base: ItemStack,
+        /// Trim pattern identifier (for example `"minecraft:coast"`).
+        pattern: String,
+        /// Canonical trim material item identifier (for example `"minecraft:gold_ingot"`).
+        material: String,
+    },
+}
+
 /// Reason a recipe file was skipped instead of loaded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkipReason {
-    /// Recipe `type` is outside the supported crafting/cooking/stonecutting/brewing kinds.
+    /// Recipe `type` is outside the supported crafting/cooking/stonecutting/brewing/smithing kinds.
     UnsupportedType(String),
     /// Recipe `result` carries item `components`, which are not modeled yet.
     ResultHasComponents,
@@ -297,6 +412,8 @@ pub struct RecipeData {
     stonecutting: Vec<StonecuttingRecipe>,
     brewing: Vec<BrewingRecipe>,
     brewing_by_reagent: HashMap<String, Vec<usize>>,
+    smithing_transform: Vec<SmithingTransformRecipe>,
+    smithing_trim: Vec<SmithingTrimRecipe>,
     skipped: Vec<(String, SkipReason)>,
     total_files: usize,
 }
@@ -448,6 +565,14 @@ impl RecipeData {
                         }
                     }
                     data.brewing.push(recipe);
+                } else if recipe_type == "minecraft:smithing_transform" {
+                    match parse_smithing_transform_recipe(&id, obj, tags, items, &entry)? {
+                        ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
+                        ParsedOrSkipped::Loaded(recipe) => data.smithing_transform.push(recipe),
+                    }
+                } else if recipe_type == "minecraft:smithing_trim" {
+                    let recipe = parse_smithing_trim_recipe(&id, obj, tags, items, &entry)?;
+                    data.smithing_trim.push(recipe);
                 } else {
                     data.skipped
                         .push((id, SkipReason::UnsupportedType(recipe_type.to_owned())));
@@ -456,6 +581,8 @@ impl RecipeData {
         }
 
         data.crafting.sort_by(|a, b| a.id().cmp(&b.id()));
+        data.smithing_transform.sort_by(|a, b| a.id().cmp(b.id()));
+        data.smithing_trim.sort_by(|a, b| a.id().cmp(b.id()));
         Ok(data)
     }
 
@@ -589,6 +716,94 @@ impl RecipeData {
             .filter_map(|recipe| recipe.id().map(|id| (id, recipe)))
             .min_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b))
             .map(|(id, recipe)| (id, recipe.output().clone()))
+    }
+
+    /// Loaded `minecraft:smithing_transform` recipes, sorted by recipe id.
+    #[must_use]
+    pub fn smithing_transform(&self) -> &[SmithingTransformRecipe] {
+        &self.smithing_transform
+    }
+
+    /// Loaded `minecraft:smithing_trim` recipes, sorted by recipe id.
+    #[must_use]
+    pub fn smithing_trim(&self) -> &[SmithingTrimRecipe] {
+        &self.smithing_trim
+    }
+
+    /// Finds a loaded `minecraft:smithing_transform` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_smithing_transform_by_id(&self, id: &str) -> Option<&SmithingTransformRecipe> {
+        self.smithing_transform
+            .iter()
+            .find(|recipe| recipe.id() == id)
+    }
+
+    /// Finds a loaded `minecraft:smithing_trim` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_smithing_trim_by_id(&self, id: &str) -> Option<&SmithingTrimRecipe> {
+        self.smithing_trim.iter().find(|recipe| recipe.id() == id)
+    }
+
+    /// Finds a loaded smithing transform or trim recipe matching `(template, base, addition)`,
+    /// ignoring optional `minecraft:` prefixes.
+    #[must_use]
+    pub fn find_smithing(
+        &self,
+        template: &str,
+        base: &str,
+        addition: &str,
+    ) -> Option<SmithingResult> {
+        for recipe in &self.smithing_transform {
+            if optional_ingredient_matches(recipe.template.as_ref(), template)
+                && ingredient_matches_item(&recipe.base, base)
+                && optional_ingredient_matches(recipe.addition.as_ref(), addition)
+            {
+                return Some(SmithingResult::Transform {
+                    recipe_id: recipe.id.clone(),
+                    result: recipe.result.clone(),
+                });
+            }
+        }
+        for recipe in &self.smithing_trim {
+            if !optional_ingredient_matches(recipe.template.as_ref(), template) {
+                continue;
+            }
+            let Some(base_stack) = recipe.base_stacks.get(normalize_item_id(base)) else {
+                continue;
+            };
+            let Some(material) = find_matching_ingredient_item(&recipe.addition, addition) else {
+                continue;
+            };
+            return Some(SmithingResult::Trim {
+                recipe_id: recipe.id.clone(),
+                base: base_stack.clone(),
+                pattern: recipe.pattern.clone(),
+                material: material.to_owned(),
+            });
+        }
+        None
+    }
+}
+
+fn find_matching_ingredient_item<'a>(ingredient: &'a Ingredient, input: &str) -> Option<&'a str> {
+    if input.is_empty() {
+        return None;
+    }
+    ingredient
+        .allowed_items()
+        .iter()
+        .find(|allowed| items_equal(allowed, input))
+        .map(String::as_str)
+}
+
+fn ingredient_matches_item(ingredient: &Ingredient, input: &str) -> bool {
+    find_matching_ingredient_item(ingredient, input).is_some()
+}
+
+fn optional_ingredient_matches(ingredient: Option<&Ingredient>, input: &str) -> bool {
+    match ingredient {
+        Some(ing) => ingredient_matches_item(ing, input),
+        None => input.is_empty(),
     }
 }
 
@@ -835,14 +1050,7 @@ fn parse_shaped_recipe(
 
     let group = parse_optional_string(obj, "group", file)?;
     let category = parse_optional_string(obj, "category", file)?;
-    let show_notification = match obj.get("show_notification") {
-        None => None,
-        Some(value) => Some(
-            value
-                .as_bool()
-                .ok_or_else(|| invalid(file, "`show_notification` must be a boolean"))?,
-        ),
-    };
+    let show_notification = parse_optional_bool(obj, "show_notification", file)?;
 
     let mut recipe = ShapedRecipe::from_pattern(&pattern, &keys, result)
         .map_err(|error| invalid(file, format!("invalid shaped pattern: {error}")))?
@@ -1098,6 +1306,124 @@ fn parse_brewing_recipe(
     })
 }
 
+fn parse_optional_bool(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    file: &Path,
+) -> Result<Option<bool>, RecipeDataError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| invalid(file, format!("`{key}` must be a boolean"))),
+    }
+}
+
+fn parse_optional_ingredient(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    tags: &ItemTags,
+    file: &Path,
+) -> Result<Option<Ingredient>, RecipeDataError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(val) => parse_ingredient(val, tags, file).map(Some),
+    }
+}
+
+fn parse_required_ingredient(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    tags: &ItemTags,
+    file: &Path,
+) -> Result<Ingredient, RecipeDataError> {
+    let val = obj
+        .get(key)
+        .ok_or_else(|| invalid(file, format!("missing `{key}` field")))?;
+    parse_ingredient(val, tags, file)
+}
+
+fn parse_smithing_transform_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    tags: &ItemTags,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<ParsedOrSkipped<SmithingTransformRecipe>, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &[
+            "type",
+            "template",
+            "base",
+            "addition",
+            "result",
+            "show_notification",
+        ],
+        "smithing_transform recipe",
+        file,
+    )?;
+    parse_optional_bool(obj, "show_notification", file)?;
+    let result = match parse_result(obj, items, file)? {
+        ParsedOrSkipped::Skipped(reason) => return Ok(ParsedOrSkipped::Skipped(reason)),
+        ParsedOrSkipped::Loaded(stack) => stack,
+    };
+    let template = parse_optional_ingredient(obj, "template", tags, file)?;
+    let base = parse_required_ingredient(obj, "base", tags, file)?;
+    let addition = parse_optional_ingredient(obj, "addition", tags, file)?;
+
+    Ok(ParsedOrSkipped::Loaded(SmithingTransformRecipe {
+        id: id.to_owned(),
+        template,
+        base,
+        addition,
+        result,
+    }))
+}
+
+fn parse_smithing_trim_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    tags: &ItemTags,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<SmithingTrimRecipe, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &[
+            "type",
+            "template",
+            "base",
+            "addition",
+            "pattern",
+            "show_notification",
+        ],
+        "smithing_trim recipe",
+        file,
+    )?;
+    parse_optional_bool(obj, "show_notification", file)?;
+    let template = parse_optional_ingredient(obj, "template", tags, file)?;
+    let base = parse_required_ingredient(obj, "base", tags, file)?;
+    let addition = parse_required_ingredient(obj, "addition", tags, file)?;
+    let pattern = parse_non_tag_id(obj, "pattern", "pattern", file)?.to_owned();
+
+    let mut base_stacks = BTreeMap::new();
+    for allowed in base.allowed_items() {
+        let stack = build_result_stack(allowed, 1, items, file)?;
+        base_stacks.insert(normalize_item_id(allowed).to_owned(), stack);
+    }
+
+    Ok(SmithingTrimRecipe {
+        id: id.to_owned(),
+        template,
+        base,
+        addition,
+        pattern,
+        base_stacks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,8 +1597,8 @@ mod tests {
     fn skips_unsupported_types_and_component_results() {
         let root = scratch_root("skipped");
         write(
-            &root.join("data/testns/recipe/smithing.json"),
-            r#"{"type": "minecraft:smithing_trim"}"#,
+            &root.join("data/testns/recipe/transmute.json"),
+            r#"{"type": "minecraft:crafting_transmute"}"#,
         );
         write(
             &root.join("data/testns/recipe/stew.json"),
@@ -1293,11 +1619,11 @@ mod tests {
         assert_eq!(
             data.skipped(),
             &[
-                (
-                    "testns:smithing".to_owned(),
-                    SkipReason::UnsupportedType("minecraft:smithing_trim".to_owned())
-                ),
                 ("testns:stew".to_owned(), SkipReason::ResultHasComponents),
+                (
+                    "testns:transmute".to_owned(),
+                    SkipReason::UnsupportedType("minecraft:crafting_transmute".to_owned())
+                ),
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
@@ -1930,5 +2256,313 @@ mod tests {
             assert_eq!(splash.output_item(), "minecraft:splash_potion");
             assert_eq!(splash.output_potion(), "minecraft:awkward");
         }
+    }
+
+    #[test]
+    fn loads_smithing_transform_and_trim_resolves_tags_and_matches() {
+        let root = scratch_root("smithing");
+        write(
+            &root.join("data/testns/tags/item/upgrade_mats.json"),
+            r#"{"values": ["testns:alloy"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/item/armors.json"),
+            r#"{"values": ["minecraft:bronze_plate", "minecraft:iron_chestplate"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/item/trim_mats.json"),
+            r#"{"values": ["testns:ruby", "testns:sapphire"]}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/bronze_plate.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/iron_chestplate.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/mythril_blade.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/free_result.json"),
+            r#"{"components": {"minecraft:max_stack_size": 16}}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/upgrade_blade.json"),
+            r##"{
+                "type": "minecraft:smithing_transform",
+                "template": "testns:forge_template",
+                "base": "testns:steel_blade",
+                "addition": "#testns:upgrade_mats",
+                "result": {"id": "minecraft:mythril_blade"}
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/templateless_upgrade.json"),
+            r#"{
+                "type": "minecraft:smithing_transform",
+                "base": "testns:raw_core",
+                "result": {"id": "minecraft:free_result", "count": 2},
+                "show_notification": false
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/wave_trim.json"),
+            r##"{
+                "type": "minecraft:smithing_trim",
+                "template": "testns:wave_template",
+                "base": "#testns:armors",
+                "addition": "#testns:trim_mats",
+                "pattern": "testns:wave"
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/component_transform.json"),
+            r#"{
+                "type": "minecraft:smithing_transform",
+                "template": "testns:t",
+                "base": "testns:b",
+                "addition": "testns:a",
+                "result": {"id": "minecraft:mythril_blade", "components": {"minecraft:enchantments": {}}}
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load synthetic item tags");
+        let items = ItemDefaults::load(&root).expect("load synthetic item defaults");
+        let data = RecipeData::load(&root, &tags).expect("load synthetic recipes");
+
+        assert_eq!(data.smithing_transform().len(), 2);
+        assert_eq!(data.smithing_trim().len(), 1);
+        assert_eq!(
+            data.skipped(),
+            &[(
+                "testns:component_transform".to_owned(),
+                SkipReason::ResultHasComponents
+            )]
+        );
+
+        // Transform match.
+        let upgrade = data
+            .find_smithing(
+                "testns:forge_template",
+                "testns:steel_blade",
+                "testns:alloy",
+            )
+            .expect("upgrade match");
+        assert_eq!(
+            upgrade,
+            SmithingResult::Transform {
+                recipe_id: "testns:upgrade_blade".to_owned(),
+                result: ItemStack::try_new("minecraft:mythril_blade", 1, 64).unwrap(),
+            }
+        );
+
+        // Optional template/addition omitted only match empty inputs.
+        assert_eq!(
+            data.find_smithing("", "testns:raw_core", ""),
+            Some(SmithingResult::Transform {
+                recipe_id: "testns:templateless_upgrade".to_owned(),
+                result: ItemStack::try_new("minecraft:free_result", 2, 64).unwrap(),
+            })
+        );
+        assert_eq!(
+            data.find_smithing("testns:forge_template", "testns:raw_core", ""),
+            None
+        );
+
+        // Trim match (with prefix-insensitive lookup on minecraft: item).
+        let trim = data
+            .find_smithing("testns:wave_template", "iron_chestplate", "testns:ruby")
+            .expect("trim match");
+        assert_eq!(
+            trim,
+            SmithingResult::Trim {
+                recipe_id: "testns:wave_trim".to_owned(),
+                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 64).unwrap(),
+                pattern: "testns:wave".to_owned(),
+                material: "testns:ruby".to_owned(),
+            }
+        );
+
+        // Wrong template/base/addition -> None.
+        assert_eq!(
+            data.find_smithing("testns:wrong", "iron_chestplate", "testns:ruby"),
+            None
+        );
+        assert_eq!(
+            data.find_smithing("testns:wave_template", "testns:not_armor", "testns:ruby"),
+            None
+        );
+        assert_eq!(
+            data.find_smithing("testns:wave_template", "iron_chestplate", "testns:stone"),
+            None
+        );
+
+        // Also check ItemDefaults max_stack_size propagation via load_with_items.
+        let data_with_items = RecipeData::load_with_items(&root, &tags, &items)
+            .expect("load synthetic recipes with items");
+        let with_items_trim = data_with_items
+            .find_smithing(
+                "testns:wave_template",
+                "minecraft:iron_chestplate",
+                "testns:sapphire",
+            )
+            .expect("trim with items");
+        assert_eq!(
+            with_items_trim,
+            SmithingResult::Trim {
+                recipe_id: "testns:wave_trim".to_owned(),
+                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
+                pattern: "testns:wave".to_owned(),
+                material: "testns:sapphire".to_owned(),
+            }
+        );
+        let with_items_upgrade = data_with_items
+            .find_smithing(
+                "testns:forge_template",
+                "testns:steel_blade",
+                "testns:alloy",
+            )
+            .expect("upgrade with items");
+        assert_eq!(
+            with_items_upgrade,
+            SmithingResult::Transform {
+                recipe_id: "testns:upgrade_blade".to_owned(),
+                result: ItemStack::try_new("minecraft:mythril_blade", 1, 1).unwrap(),
+            }
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn smithing_rejects_malformed_shapes_naming_file() {
+        let cases = [
+            (
+                "missing_base.json",
+                r#"{"type": "minecraft:smithing_transform", "template": "testns:t", "addition": "testns:a", "result": {"id": "testns:out"}}"#,
+            ),
+            (
+                "bad_template.json",
+                r#"{"type": "minecraft:smithing_transform", "template": 42, "base": "testns:b", "result": {"id": "testns:out"}}"#,
+            ),
+            (
+                "unknown_transform_key.json",
+                r#"{"type": "minecraft:smithing_transform", "base": "testns:b", "result": {"id": "testns:out"}, "extra": 1}"#,
+            ),
+            (
+                "missing_pattern.json",
+                r#"{"type": "minecraft:smithing_trim", "template": "testns:t", "base": "testns:b", "addition": "testns:a"}"#,
+            ),
+            (
+                "missing_trim_addition.json",
+                r#"{"type": "minecraft:smithing_trim", "template": "testns:t", "base": "testns:b", "pattern": "testns:p"}"#,
+            ),
+            (
+                "bad_pattern_tag.json",
+                r##"{"type": "minecraft:smithing_trim", "template": "testns:t", "base": "testns:b", "addition": "testns:a", "pattern": "#testns:p"}"##,
+            ),
+            (
+                "unknown_trim_key.json",
+                r#"{"type": "minecraft:smithing_trim", "template": "testns:t", "base": "testns:b", "addition": "testns:a", "pattern": "testns:p", "extra": true}"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write(&root.join("data/testns/recipe").join(name), body);
+            let err = RecipeData::load(&root, &ItemTags::default())
+                .expect_err("malformed smithing recipe must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_smithing_recipes_load_and_lookup`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_smithing_recipes_load_and_lookup() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        assert_eq!(data.smithing_transform().len(), 12);
+        assert_eq!(data.smithing_trim().len(), 18);
+        assert!(
+            !data.skipped().iter().any(|(_, reason)| {
+                *reason == SkipReason::UnsupportedType("minecraft:smithing_transform".to_owned())
+                    || *reason == SkipReason::UnsupportedType("minecraft:smithing_trim".to_owned())
+            }),
+            "no smithing recipes may be skipped"
+        );
+
+        let netherite_sword = data
+            .find_smithing(
+                "minecraft:netherite_upgrade_smithing_template",
+                "minecraft:diamond_sword",
+                "minecraft:netherite_ingot",
+            )
+            .expect("netherite sword smithing transform");
+        assert_eq!(
+            netherite_sword,
+            SmithingResult::Transform {
+                recipe_id: "minecraft:netherite_sword_smithing".to_owned(),
+                result: ItemStack::try_new("minecraft:netherite_sword", 1, 1).unwrap(),
+            }
+        );
+
+        assert!(
+            tags.contains("minecraft:trim_materials", "minecraft:gold_ingot"),
+            "gold_ingot must be in #minecraft:trim_materials"
+        );
+        let coast_trim = data
+            .find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:gold_ingot",
+            )
+            .expect("coast armor trim with iron chestplate and gold ingot");
+        assert_eq!(
+            coast_trim,
+            SmithingResult::Trim {
+                recipe_id: "minecraft:coast_armor_trim_smithing_template_smithing_trim".to_owned(),
+                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
+                pattern: "minecraft:coast".to_owned(),
+                material: "minecraft:gold_ingot".to_owned(),
+            }
+        );
+
+        // Wrong template returns None.
+        assert_eq!(
+            data.find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:diamond_sword",
+                "minecraft:netherite_ingot",
+            ),
+            None
+        );
+        assert_eq!(
+            data.find_smithing(
+                "minecraft:netherite_upgrade_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:gold_ingot",
+            ),
+            None
+        );
+        assert_eq!(
+            data.find_smithing(
+                "minecraft:stick",
+                "minecraft:diamond_sword",
+                "minecraft:netherite_ingot",
+            ),
+            None
+        );
     }
 }

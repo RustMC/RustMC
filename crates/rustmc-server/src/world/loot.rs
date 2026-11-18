@@ -14,16 +14,18 @@
 //! - `match_block` uses the plural key `blocks` (a single block id string or
 //!   a list of block id strings) plus optional `state` string properties.
 //! - `entity_properties` occurs twice (`chorus_flower`, `snow`), and
-//!   `location_check` occurs 4 times (`large_fern`, `tall_grass`, parsed as
-//!   [`LootCondition::Unsupported`]).
+//!   `location_check` occurs 4 times (`large_fern`, `tall_grass`, checking
+//!   `offsetY` ±1 with `predicate.block` `blocks` + `state`).
 //!
 //! Schema definitions follow `minecraft.wiki`:
 //! - `Loot table` (revision 3893957): root fields `type`, `modifier`, `pools`,
 //!   `random_sequence`; pool fields `condition`, `modifier`, `rolls`, `entries`;
 //!   entry types `item`, `alternatives`, `dynamic`.
 //! - `Predicate` (revision 3888899): `all_of`, `any_of`, `inverted`,
-//!   `match_block`, `match_tool`, `random_chance`, `survives_explosion`,
-//!   `table_bonus`, `entity_properties`.
+//!   `location_check` (with `Advancement/Conditions/location` revision 3684921 &
+//!   `Advancement/Conditions/block` revision 3684708), `match_block`,
+//!   `match_tool`, `random_chance`, `survives_explosion`, `table_bonus`,
+//!   `entity_properties`.
 //! - `Item modifier` (revision 3896146): `apply_bonus`, `copy_components`,
 //!   `copy_state`, `explosion_decay`, `limit_count`, `set_count`.
 //! - `Number provider` (revision 3869456): constant numbers, `uniform`, and
@@ -134,14 +136,23 @@ pub struct ToolPredicate {
 /// Predicate condition attached to pools, entries, or modifiers.
 ///
 /// Mirrors `minecraft.wiki` `Predicate` (revision 3888899). Unsupported
-/// condition types (such as `minecraft:location_check`) are retained as
-/// [`LootCondition::Unsupported`] so callers can inspect coverage gaps.
+/// condition types or unsupported `location_check` predicate fields are
+/// retained as [`LootCondition::Unsupported`] so callers can inspect coverage gaps.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LootCondition {
     /// `minecraft:survives_explosion` — survival test under an explosion radius.
     SurvivesExplosion,
     /// `minecraft:match_block` — matches block id(s) (`blocks`) and optional `state` properties.
     MatchBlock {
+        blocks: Vec<String>,
+        state: BTreeMap<String, String>,
+    },
+    /// `minecraft:location_check` — matches relative block at
+    /// `(offsetX, offsetY, offsetZ)` against `predicate.block` (`blocks` and `state`).
+    LocationCheck {
+        offset_x: i32,
+        offset_y: i32,
+        offset_z: i32,
         blocks: Vec<String>,
         state: BTreeMap<String, String>,
     },
@@ -300,8 +311,28 @@ pub struct ToolContext {
     pub enchantments: BTreeMap<String, u8>,
 }
 
+/// Relative block lookup supplied to [`LootContext`] for `minecraft:location_check`.
+///
+/// Receives offsets `(dx, dy, dz)` relative to the broken block's origin and
+/// returns `Some((block_id, properties))` for loaded locations, or `None` when
+/// unloaded or unavailable.
+pub trait BlockLookup: Send + Sync {
+    /// Returns `(block_id, state_properties)` at relative offset `(dx, dy, dz)`,
+    /// or `None` if unavailable/unloaded.
+    fn block_at(&self, dx: i32, dy: i32, dz: i32) -> Option<(String, BTreeMap<String, String>)>;
+}
+
+impl<F> BlockLookup for F
+where
+    F: Fn(i32, i32, i32) -> Option<(String, BTreeMap<String, String>)> + Send + Sync,
+{
+    fn block_at(&self, dx: i32, dy: i32, dz: i32) -> Option<(String, BTreeMap<String, String>)> {
+        self(dx, dy, dz)
+    }
+}
+
 /// Execution context for evaluating a block [`LootTable`].
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub struct LootContext {
     /// Broken block state as `(block_id, properties)`.
     pub block_state: (String, BTreeMap<String, String>),
@@ -309,6 +340,21 @@ pub struct LootContext {
     pub tool: Option<ToolContext>,
     /// Explosion radius when destroyed by an explosion, or `None` otherwise.
     pub explosion_radius: Option<f32>,
+    /// Optional relative block lookup `(dx, dy, dz) -> Option<(block_id, properties)>`
+    /// used by `minecraft:location_check`. When `None`, `location_check` evaluates
+    /// to `false`.
+    pub neighbor_blocks: Option<Arc<dyn BlockLookup>>,
+}
+
+impl fmt::Debug for LootContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LootContext")
+            .field("block_state", &self.block_state)
+            .field("tool", &self.tool)
+            .field("explosion_radius", &self.explosion_radius)
+            .field("has_neighbor_blocks", &self.neighbor_blocks.is_some())
+            .finish()
+    }
 }
 
 impl LootContext {
@@ -319,7 +365,29 @@ impl LootContext {
             block_state: (block_id.into(), BTreeMap::new()),
             tool: None,
             explosion_radius: None,
+            neighbor_blocks: None,
         }
+    }
+
+    /// Attaches an optional relative block lookup used by `minecraft:location_check`.
+    #[must_use]
+    pub fn with_block_lookup(mut self, lookup: impl BlockLookup + 'static) -> Self {
+        self.neighbor_blocks = Some(Arc::new(lookup));
+        self
+    }
+
+    /// Looks up the block id and state properties at offset `(dx, dy, dz)`,
+    /// returning `None` if no lookup is attached or the location is unloaded.
+    #[must_use]
+    pub fn block_at(
+        &self,
+        dx: i32,
+        dy: i32,
+        dz: i32,
+    ) -> Option<(String, BTreeMap<String, String>)> {
+        self.neighbor_blocks
+            .as_ref()
+            .and_then(|lookup| lookup.block_at(dx, dy, dz))
     }
 }
 
@@ -460,8 +528,9 @@ impl LootTable {
     ///     Reviewer decision: levels beyond the list use `chances[min(level, len - 1)]`, backed by `Fortune` (rev 3864999), where `"Fortune IV+"` for `"Flint"` from `"Gravel"` shares `"100%"` with Fortune III.
     ///   - `random_chance`: `"Generates a random number between 0.0 and 1.0, and checks if it is less than a specified value."`
     ///   - `match_tool`: `"Checks tool used to mine the block. Requires tool provided by loot context, and always fails if not provided."` (`minecraft:enchantments`: `"Array of conditions. The sub-predicate succeeds when all the conditions succeed."`)
+    ///   - `location_check` (`Predicate` rev 3888899, `Advancement/Conditions/location` rev 3684921, `Advancement/Conditions/block` rev 3684708): `"Checks the current location against location criteria. Requires origin provided by loot context, and always fails if not provided."` Queries `LootContext::block_at(offsetX, offsetY, offsetZ)` and matches `predicate.block` (`blocks` and `state`); evaluates to `false` when no neighbour lookup is attached or `block_at` returns `None`. Any other location or block predicate field remains `Unsupported` (`false`).
     ///   - `entity_properties`: reviewer decision — with no entity in [`LootContext`], evaluates to `false`.
-    ///   - `Unsupported` (including `minecraft:location_check`): evaluates to `false`.
+    ///   - `Unsupported`: evaluates to `false`.
     /// - **Modifiers** (`Item modifier` rev 3896146, `Fortune` rev 3864999, `Explosion` rev 3903416):
     ///   - `apply_bonus` (`ore_drops`): `"Count *= (max(1; randomInt(0(inclusive) .. (Level + 2)(exclusive))))"` — reviewer decision: `count *= max(1, random_int(0 ..= level + 1))`.
     ///   - `apply_bonus` (`uniform_bonus_count`): `"uniform distribution (from 0 to level * bonusMultiplier)"` — reviewer decision: `count += random_int(0 ..= level * bonusMultiplier)`.
@@ -1223,11 +1292,39 @@ fn parse_single_condition(
             Ok(LootCondition::RandomChance { chance })
         }
         "match_tool" => parse_match_tool(obj, file),
+        "location_check" => parse_location_check(obj, kind, file),
         "entity_properties" => parse_entity_properties(obj, file),
         _ => Ok(LootCondition::Unsupported {
             what: kind.to_owned(),
         }),
     }
+}
+
+fn parse_block_match_fields(
+    obj: &Map<String, Value>,
+    context: &str,
+    file: &Path,
+) -> Result<(Vec<String>, BTreeMap<String, String>), LootError> {
+    let blocks = match obj.get("blocks") {
+        None => Vec::new(),
+        Some(raw) => parse_string_or_list(raw, &format!("{context}.blocks"), file)?,
+    };
+    let mut state = BTreeMap::new();
+    if let Some(raw_state) = obj.get("state") {
+        let state_obj = raw_state
+            .as_object()
+            .ok_or_else(|| invalid(file, format!("{context} `state` must be a JSON object")))?;
+        for (prop, val) in state_obj {
+            let val_str = val.as_str().ok_or_else(|| {
+                invalid(
+                    file,
+                    format!("{context} state `{prop}` value must be a string"),
+                )
+            })?;
+            state.insert(prop.clone(), val_str.to_owned());
+        }
+    }
+    Ok((blocks, state))
 }
 
 fn parse_match_block(obj: &Map<String, Value>, file: &Path) -> Result<LootCondition, LootError> {
@@ -1237,26 +1334,68 @@ fn parse_match_block(obj: &Map<String, Value>, file: &Path) -> Result<LootCondit
         "match_block condition",
         file,
     )?;
-    let blocks = match obj.get("blocks") {
-        None => Vec::new(),
-        Some(raw) => parse_string_or_list(raw, "match_block.blocks", file)?,
-    };
-    let mut state = BTreeMap::new();
-    if let Some(raw_state) = obj.get("state") {
-        let state_obj = raw_state
-            .as_object()
-            .ok_or_else(|| invalid(file, "match_block `state` must be a JSON object"))?;
-        for (prop, val) in state_obj {
-            let val_str = val.as_str().ok_or_else(|| {
+    let (blocks, state) = parse_block_match_fields(obj, "match_block", file)?;
+    Ok(LootCondition::MatchBlock { blocks, state })
+}
+
+fn parse_optional_offset(
+    obj: &Map<String, Value>,
+    key: &str,
+    file: &Path,
+) -> Result<i32, LootError> {
+    match obj.get(key) {
+        None => Ok(0),
+        Some(v) => parse_i32(v, &format!("location_check.{key}"), file),
+    }
+}
+
+fn parse_location_check(
+    obj: &Map<String, Value>,
+    kind: &str,
+    file: &Path,
+) -> Result<LootCondition, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "offsetX", "offsetY", "offsetZ", "predicate"],
+        "location_check condition",
+        file,
+    )?;
+    let offset_x = parse_optional_offset(obj, "offsetX", file)?;
+    let offset_y = parse_optional_offset(obj, "offsetY", file)?;
+    let offset_z = parse_optional_offset(obj, "offsetZ", file)?;
+    let pred_obj = obj
+        .get("predicate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "location_check missing or non-object `predicate`"))?;
+    if pred_obj.keys().any(|k| k != "block") {
+        return Ok(LootCondition::Unsupported {
+            what: kind.to_owned(),
+        });
+    }
+    let (blocks, state) = match pred_obj.get("block") {
+        None => (Vec::new(), BTreeMap::new()),
+        Some(raw_block) => {
+            let block_obj = raw_block.as_object().ok_or_else(|| {
                 invalid(
                     file,
-                    format!("match_block state `{prop}` value must be a string"),
+                    "location_check `predicate.block` must be a JSON object",
                 )
             })?;
-            state.insert(prop.clone(), val_str.to_owned());
+            if block_obj.keys().any(|k| k != "blocks" && k != "state") {
+                return Ok(LootCondition::Unsupported {
+                    what: kind.to_owned(),
+                });
+            }
+            parse_block_match_fields(block_obj, "location_check.predicate.block", file)?
         }
-    }
-    Ok(LootCondition::MatchBlock { blocks, state })
+    };
+    Ok(LootCondition::LocationCheck {
+        offset_x,
+        offset_y,
+        offset_z,
+        blocks,
+        state,
+    })
 }
 
 fn parse_table_bonus(obj: &Map<String, Value>, file: &Path) -> Result<LootCondition, LootError> {
@@ -1724,6 +1863,7 @@ fn collect_unsupported_condition<'a>(condition: &'a LootCondition, out: &mut Vec
         LootCondition::Unsupported { what } => out.push(what.as_str()),
         LootCondition::SurvivesExplosion
         | LootCondition::MatchBlock { .. }
+        | LootCondition::LocationCheck { .. }
         | LootCondition::TableBonus { .. }
         | LootCondition::RandomChance { .. }
         | LootCondition::MatchTool { .. }
@@ -1857,6 +1997,19 @@ fn eval_condition(condition: &LootCondition, ctx: &EvalCtx<'_>, random: &mut Ran
             .explosion_radius
             .is_none_or(|radius| survives_explosion_radius(radius, random)),
         LootCondition::MatchBlock { blocks, state } => match_block(blocks, state, ctx),
+        LootCondition::LocationCheck {
+            offset_x,
+            offset_y,
+            offset_z,
+            blocks,
+            state,
+        } => {
+            let Some((block_id, properties)) = ctx.loot.block_at(*offset_x, *offset_y, *offset_z)
+            else {
+                return false;
+            };
+            match_block_state(blocks, state, &block_id, &properties, ctx.block_tags)
+        }
         LootCondition::TableBonus {
             enchantment,
             chances,
@@ -1894,6 +2047,16 @@ fn sample_probability(chance: f64, random: &mut RandomSource) -> bool {
 
 fn match_block(blocks: &[String], state: &BTreeMap<String, String>, ctx: &EvalCtx<'_>) -> bool {
     let (block_id, properties) = &ctx.loot.block_state;
+    match_block_state(blocks, state, block_id, properties, ctx.block_tags)
+}
+
+fn match_block_state(
+    blocks: &[String],
+    state: &BTreeMap<String, String>,
+    block_id: &str,
+    properties: &BTreeMap<String, String>,
+    block_tags: &BlockTags,
+) -> bool {
     if !blocks.is_empty() {
         if block_id.is_empty() {
             return false;
@@ -1901,7 +2064,7 @@ fn match_block(blocks: &[String], state: &BTreeMap<String, String>, ctx: &EvalCt
         let id_matches = blocks.iter().any(|spec| {
             if let Some(tag_id) = spec.strip_prefix('#') {
                 let tag = ensure_namespaced(tag_id);
-                ctx.block_tags
+                block_tags
                     .members(&tag)
                     .is_some_and(|members| members.iter().any(|m| items_equal(m, block_id)))
             } else {
@@ -2670,6 +2833,7 @@ mod tests {
                 enchantments: hammer_delicate,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let drops_first = table.roll(&ctx_first, &mut rng);
         assert_eq!(drops_first.len(), 1);
@@ -2683,6 +2847,7 @@ mod tests {
                 enchantments: BTreeMap::new(),
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let drops_second = table.roll(&ctx_second, &mut rng);
         assert_eq!(drops_second.len(), 1);
@@ -2728,6 +2893,7 @@ mod tests {
             block_state: ("testns:widget".to_owned(), BTreeMap::new()),
             tool: None,
             explosion_radius: Some(4.0),
+            neighbor_blocks: None,
         };
         let mut survived = 0_u32;
         for seed in 0..10_000_u64 {
@@ -2779,6 +2945,7 @@ mod tests {
                 }
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
 
         // Missing tool -> level 0 -> chance 0.0 -> never drops.
@@ -2885,6 +3052,7 @@ mod tests {
                 enchantments: enchs,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let ctx_bare = LootContext::for_block("testns:block");
 
@@ -3073,6 +3241,7 @@ mod tests {
             block_state: ("testns:widget".to_owned(), BTreeMap::new()),
             tool: None,
             explosion_radius: Some(4.0),
+            neighbor_blocks: None,
         };
         let mut kept = 0_u32;
         for seed in 0..10_000_u64 {
@@ -3197,6 +3366,7 @@ mod tests {
             block_state: ("testns:gadget".to_owned(), props_cracked),
             tool: None,
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let mut rng = RandomSource::from_world_seed(99);
         let cracked_roll = gadget.roll_with_notes(&ctx_cracked, &mut rng);
@@ -3223,6 +3393,7 @@ mod tests {
                 enchantments: BTreeMap::new(),
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let cutter_roll = tables
             .roll("testns:gadget", &ctx_cutter, &mut rng)
@@ -3315,6 +3486,7 @@ mod tests {
                 enchantments: enchs,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let mut rng = RandomSource::from_world_seed(123);
         let drops = table.roll(&ctx_delicate, &mut rng);
@@ -3336,6 +3508,7 @@ mod tests {
                 enchantments: zero_enchs,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let mut seed_hits = 0_u32;
         let mut seed_total = 0_u32;
@@ -3374,17 +3547,9 @@ mod tests {
         assert!(tables.get("minecraft:blocks/stone").is_some());
 
         let unsupported = tables.unsupported();
-        for (table_id, what) in &unsupported {
-            println!("unsupported: {table_id} -> {what}");
-        }
-        assert_eq!(
-            unsupported,
-            vec![
-                ("minecraft:blocks/large_fern", "minecraft:location_check"),
-                ("minecraft:blocks/large_fern", "minecraft:location_check"),
-                ("minecraft:blocks/tall_grass", "minecraft:location_check"),
-                ("minecraft:blocks/tall_grass", "minecraft:location_check"),
-            ]
+        assert!(
+            unsupported.is_empty(),
+            "expected no unsupported nodes across 1201 block loot tables, got {unsupported:?}"
         );
     }
 
@@ -3435,6 +3600,7 @@ mod tests {
                 enchantments: silk_enchs,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let silk_drops = stone.roll(&silk_ctx, &mut rng);
         assert_eq!(silk_drops.len(), 1);
@@ -3469,6 +3635,7 @@ mod tests {
                 enchantments: BTreeMap::new(),
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         for seed in 0..100_u64 {
             let mut rng = RandomSource::from_world_seed(seed);
@@ -3487,6 +3654,7 @@ mod tests {
                 enchantments: fortune_enchs,
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let total: u64 = (0..10_000_u64)
             .map(|seed| {
@@ -3538,6 +3706,7 @@ mod tests {
                     enchantments,
                 }),
                 explosion_radius: None,
+                neighbor_blocks: None,
             };
 
             let mut flint_count = 0_u64;
@@ -3582,6 +3751,7 @@ mod tests {
                 enchantments: BTreeMap::new(),
             }),
             explosion_radius: None,
+            neighbor_blocks: None,
         };
         let mut rng = RandomSource::from_world_seed(7);
         let sheared = oak_leaves.roll(&shears_ctx, &mut rng);
@@ -3617,6 +3787,7 @@ mod tests {
             block_state: ("minecraft:stone".to_owned(), BTreeMap::new()),
             tool: None,
             explosion_radius: Some(4.0),
+            neighbor_blocks: None,
         };
         let mut drops_count = 0_u32;
         for seed in 0..10_000_u64 {
@@ -3681,5 +3852,379 @@ mod tests {
             tables.len(),
             returned_nothing
         );
+    }
+
+    #[test]
+    fn location_check_evaluates_offsets_block_state_and_missing_lookup() {
+        let root = scratch_root("location_check");
+        write(
+            &root.join("data/testns/tags/block/double_tops.json"),
+            r#"{"values": ["testns:tall_plant"]}"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/blocks/tall_plant.json"),
+            r##"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "condition": {
+                            "type": "minecraft:all_of",
+                            "terms": [
+                                {
+                                    "type": "minecraft:match_block",
+                                    "blocks": "testns:tall_plant",
+                                    "state": {"half": "lower"}
+                                },
+                                {
+                                    "type": "minecraft:location_check",
+                                    "offsetX": 1,
+                                    "offsetY": 1,
+                                    "offsetZ": -2,
+                                    "predicate": {
+                                        "block": {
+                                            "blocks": "#testns:double_tops",
+                                            "state": {"half": "upper"}
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "testns:frond",
+                                "modifier": {"type": "minecraft:set_count", "count": 2}
+                            }
+                        ]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_blocks(&root).expect("load synthetic location_check");
+        assert!(tables.unsupported().is_empty());
+        let plant = tables.get("testns:tall_plant").expect("tall_plant table");
+
+        let mut lower_props = BTreeMap::new();
+        lower_props.insert("half".to_owned(), "lower".to_owned());
+
+        // No neighbor lookup -> location_check evaluates to false.
+        let no_lookup_ctx = LootContext {
+            block_state: ("testns:tall_plant".to_owned(), lower_props.clone()),
+            tool: None,
+            explosion_radius: None,
+            neighbor_blocks: None,
+        };
+        assert!(
+            plant
+                .roll(&no_lookup_ctx, &mut RandomSource::from_world_seed(1))
+                .is_empty()
+        );
+
+        // Matching neighbor at exact offset (1, 1, -2) -> drops 2 testns:frond.
+        let matching_ctx = LootContext {
+            block_state: ("testns:tall_plant".to_owned(), lower_props.clone()),
+            tool: None,
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (1, 1, -2) {
+                let mut props = BTreeMap::new();
+                props.insert("half".to_owned(), "upper".to_owned());
+                Some(("testns:tall_plant".to_owned(), props))
+            } else {
+                None
+            }
+        });
+        let drops = plant.roll(&matching_ctx, &mut RandomSource::from_world_seed(1));
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item(), "testns:frond");
+        assert_eq!(drops[0].count(), 2);
+
+        // Wrong state property at offset -> false.
+        let wrong_state_ctx = LootContext {
+            block_state: ("testns:tall_plant".to_owned(), lower_props.clone()),
+            tool: None,
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (1, 1, -2) {
+                let mut props = BTreeMap::new();
+                props.insert("half".to_owned(), "lower".to_owned());
+                Some(("testns:tall_plant".to_owned(), props))
+            } else {
+                None
+            }
+        });
+        assert!(
+            plant
+                .roll(&wrong_state_ctx, &mut RandomSource::from_world_seed(1))
+                .is_empty()
+        );
+
+        // Wrong block id at offset -> false.
+        let wrong_block_ctx = LootContext {
+            block_state: ("testns:tall_plant".to_owned(), lower_props),
+            tool: None,
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (1, 1, -2) {
+                let mut props = BTreeMap::new();
+                props.insert("half".to_owned(), "upper".to_owned());
+                Some(("testns:other".to_owned(), props))
+            } else {
+                None
+            }
+        });
+        assert!(
+            plant
+                .roll(&wrong_block_ctx, &mut RandomSource::from_world_seed(1))
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn location_check_unsupported_predicate_fields_stay_unsupported_and_false() {
+        let root = scratch_root("location_check_unsupported");
+        write(
+            &root.join("data/testns/loot_table/blocks/biome_plant.json"),
+            r#"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "condition": {
+                            "type": "minecraft:location_check",
+                            "offsetY": 1,
+                            "predicate": {
+                                "block": {"blocks": "testns:top"},
+                                "biomes": "minecraft:plains"
+                            }
+                        },
+                        "entries": [{"type": "minecraft:item", "name": "testns:drop"}]
+                    },
+                    {
+                        "rolls": 1,
+                        "condition": {
+                            "type": "minecraft:location_check",
+                            "predicate": {
+                                "block": {"blocks": "testns:top", "nbt": "{}"}
+                            }
+                        },
+                        "entries": [{"type": "minecraft:item", "name": "testns:drop"}]
+                    }
+                ]
+            }"#,
+        );
+
+        let tables = LootTables::load_blocks(&root).expect("load unsupported location_check");
+        assert_eq!(
+            tables.unsupported(),
+            vec![
+                ("testns:blocks/biome_plant", "minecraft:location_check"),
+                ("testns:blocks/biome_plant", "minecraft:location_check"),
+            ]
+        );
+
+        let table = tables.get("testns:biome_plant").expect("table present");
+        let ctx = LootContext::for_block("testns:biome_plant")
+            .with_block_lookup(|_, _, _| Some(("testns:top".to_owned(), BTreeMap::new())));
+        assert!(
+            table
+                .roll(&ctx, &mut RandomSource::from_world_seed(5))
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn location_check_rejects_malformed_shapes_naming_file() {
+        let cases = [
+            (
+                "bad_offset.json",
+                r#"{"type": "minecraft:block", "pools": [{"rolls": 1, "condition": {"type": "minecraft:location_check", "offsetY": "up", "predicate": {}}, "entries": []}]}"#,
+            ),
+            (
+                "missing_predicate.json",
+                r#"{"type": "minecraft:block", "pools": [{"rolls": 1, "condition": {"type": "minecraft:location_check"}, "entries": []}]}"#,
+            ),
+            (
+                "bad_block_pred.json",
+                r#"{"type": "minecraft:block", "pools": [{"rolls": 1, "condition": {"type": "minecraft:location_check", "predicate": {"block": "bad"}}, "entries": []}]}"#,
+            ),
+            (
+                "unknown_loc_key.json",
+                r#"{"type": "minecraft:block", "pools": [{"rolls": 1, "condition": {"type": "minecraft:location_check", "extra": 1, "predicate": {}}, "entries": []}]}"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write(&root.join("data/testns/loot_table/blocks").join(name), body);
+            let err = LootTables::load_blocks(&root)
+                .expect_err("malformed location_check must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            fs::remove_dir_all(&root).expect("cleanup");
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_double_plant_location_check_and_unsupported_empty`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_double_plant_location_check_and_unsupported_empty() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        assert_eq!(tables.len(), 1201);
+        assert!(
+            tables.unsupported().is_empty(),
+            "all 1201 vanilla block loot tables must have empty unsupported(), got {:?}",
+            tables.unsupported()
+        );
+
+        let tall_grass = tables
+            .get("minecraft:tall_grass")
+            .expect("tall_grass loot table");
+        let raw_tall_grass = read_vanilla_block_table_json(&root, "tall_grass");
+        let expected_seed_chance = raw_tall_grass["pools"][0]["entries"][0]["children"][1]
+            ["condition"]["terms"][1]["chance"]
+            .as_f64()
+            .expect("tall_grass random_chance from file");
+
+        let mut lower_props = BTreeMap::new();
+        lower_props.insert("half".to_owned(), "lower".to_owned());
+
+        // Lower half of tall_grass with upper half above and shears -> 2 short_grass.
+        let shears_with_upper = LootContext {
+            block_state: ("minecraft:tall_grass".to_owned(), lower_props.clone()),
+            tool: Some(ToolContext {
+                item: "minecraft:shears".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (0, 1, 0) {
+                let mut upper = BTreeMap::new();
+                upper.insert("half".to_owned(), "upper".to_owned());
+                Some(("minecraft:tall_grass".to_owned(), upper))
+            } else {
+                None
+            }
+        });
+        let sheared_drops =
+            tall_grass.roll(&shears_with_upper, &mut RandomSource::from_world_seed(1));
+        assert_eq!(sheared_drops.len(), 1);
+        assert_eq!(sheared_drops[0].item(), "minecraft:short_grass");
+        assert_eq!(sheared_drops[0].count(), 2);
+
+        // Same without the upper half above -> nothing (both air above and missing lookup).
+        let shears_without_upper = LootContext {
+            block_state: ("minecraft:tall_grass".to_owned(), lower_props.clone()),
+            tool: Some(ToolContext {
+                item: "minecraft:shears".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (0, 1, 0) {
+                Some(("minecraft:air".to_owned(), BTreeMap::new()))
+            } else {
+                None
+            }
+        });
+        assert!(
+            tall_grass
+                .roll(&shears_without_upper, &mut RandomSource::from_world_seed(1))
+                .is_empty()
+        );
+        let shears_no_lookup = LootContext {
+            block_state: ("minecraft:tall_grass".to_owned(), lower_props.clone()),
+            tool: Some(ToolContext {
+                item: "minecraft:shears".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+            neighbor_blocks: None,
+        };
+        assert!(
+            tall_grass
+                .roll(&shears_no_lookup, &mut RandomSource::from_world_seed(1))
+                .is_empty()
+        );
+
+        // Without shears over 20_000 seeds -> wheat_seeds rate within +-0.01 of random_chance.
+        let bare_with_upper = LootContext {
+            block_state: ("minecraft:tall_grass".to_owned(), lower_props),
+            tool: None,
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (0, 1, 0) {
+                let mut upper = BTreeMap::new();
+                upper.insert("half".to_owned(), "upper".to_owned());
+                Some(("minecraft:tall_grass".to_owned(), upper))
+            } else {
+                None
+            }
+        });
+        let mut seed_drops = 0_u64;
+        for seed in 0..20_000_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = tall_grass.roll(&bare_with_upper, &mut rng);
+            if let Some(first) = drops.first() {
+                assert_eq!(drops.len(), 1);
+                assert_eq!(first.item(), "minecraft:wheat_seeds");
+                assert_eq!(first.count(), 1);
+                seed_drops += 1;
+            }
+        }
+        let observed_rate = seed_drops as f64 / 20_000.0;
+        assert!(
+            (observed_rate - expected_seed_chance).abs() <= 0.01,
+            "expected wheat_seeds rate {expected_seed_chance} +- 0.01, got {observed_rate}"
+        );
+
+        // Also check upper half of large_fern with lower half below and shears -> 2 fern.
+        let large_fern = tables
+            .get("minecraft:large_fern")
+            .expect("large_fern loot table");
+        let mut upper_props = BTreeMap::new();
+        upper_props.insert("half".to_owned(), "upper".to_owned());
+        let fern_ctx = LootContext {
+            block_state: ("minecraft:large_fern".to_owned(), upper_props),
+            tool: Some(ToolContext {
+                item: "minecraft:shears".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+            neighbor_blocks: None,
+        }
+        .with_block_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (0, -1, 0) {
+                let mut lower = BTreeMap::new();
+                lower.insert("half".to_owned(), "lower".to_owned());
+                Some(("minecraft:large_fern".to_owned(), lower))
+            } else {
+                None
+            }
+        });
+        let fern_drops = large_fern.roll(&fern_ctx, &mut RandomSource::from_world_seed(1));
+        assert_eq!(fern_drops.len(), 1);
+        assert_eq!(fern_drops[0].item(), "minecraft:fern");
+        assert_eq!(fern_drops[0].count(), 2);
     }
 }
