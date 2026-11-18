@@ -514,8 +514,8 @@ mod tests {
                     smithing_transform: 12,
                     smithing_trim: 18,
                     brewing: 279,
-                    // 81 previously skipped minus 33 loaded `minecraft:crafting_transmute` files = 48.
-                    skipped: 48,
+                    // 48 previously skipped minus 1 loaded `minecraft:crafting_special_repairitem` file = 47.
+                    skipped: 47,
                 },
                 loot_tables: 1201,
                 enchantments: 43,
