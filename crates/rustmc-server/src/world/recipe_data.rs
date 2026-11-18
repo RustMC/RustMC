@@ -163,7 +163,6 @@ pub struct BrewingRecipe {
     input_potions: Vec<String>,
     reagent: Ingredient,
     output: ItemStack,
-    output_potion: String,
 }
 
 impl BrewingRecipe {
@@ -191,7 +190,7 @@ impl BrewingRecipe {
         &self.reagent
     }
 
-    /// Output container item stack produced per brew.
+    /// Output container item stack produced per brew (with its `potion` component set).
     #[must_use]
     pub fn output(&self) -> &ItemStack {
         &self.output
@@ -206,7 +205,7 @@ impl BrewingRecipe {
     /// Output `minecraft:potion` registry identifier.
     #[must_use]
     pub fn output_potion(&self) -> &str {
-        &self.output_potion
+        self.output.components().potion().unwrap_or("")
     }
 }
 
@@ -1295,14 +1294,17 @@ fn parse_brewing_recipe(
     )?
     .to_owned();
 
-    let output = build_result_stack(output_id, 1, items, file)?;
+    let mut output = build_result_stack(output_id, 1, items, file)?;
+    output
+        .components_mut()
+        .set_potion(Some(output_potion))
+        .map_err(|error| invalid(file, format!("invalid output potion component: {error}")))?;
     Ok(BrewingRecipe {
         id: id.to_owned(),
         input_item,
         input_potions,
         reagent,
         output,
-        output_potion,
     })
 }
 

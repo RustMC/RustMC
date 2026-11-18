@@ -416,17 +416,25 @@ pub fn evaluate_potion_modifier(ingredient: &str, input_potion_type: &str) -> Op
     }
 }
 
-/// An item stack in a brewing stand slot, paired with an optional `minecraft:potion`
-/// registry entry because [`ItemStack`] does not model data components yet.
+/// An item stack in a brewing stand slot, storing any `minecraft:potion`
+/// registry ID in the stack's [`crate::item::ItemComponents::potion`] field.
+///
+/// Sources (minecraft.wiki `Data component format` revision 3903955):
+/// - `Data component format/potion contents` (revision 3676971):
+///   "`minecraft:potion_contents`: The base potion, custom list of mob effects, and
+///   custom color contained in this potion, splash potion, lingering potion, tipped
+///   arrow, or area effect cloud."
+/// - `Entity format/potion contents` (revision 3620348):
+///   "`potion`: The ID of a potion type. Optional."
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BrewingSlotItem {
     stack: ItemStack,
-    potion_type: Option<String>,
 }
 
 impl BrewingSlotItem {
-    /// Constructs a validated brewing slot item from a shared [`ItemStack`] and optional potion type.
-    pub fn try_new(stack: ItemStack, potion_type: Option<&str>) -> Result<Self, BrewingError> {
+    /// Constructs a validated brewing slot item from a shared [`ItemStack`] and optional potion type,
+    /// recording the canonical potion ID in the stack's `potion` data component.
+    pub fn try_new(mut stack: ItemStack, potion_type: Option<&str>) -> Result<Self, BrewingError> {
         if is_potion_container_item(stack.item()) {
             let Some(raw_potion_type) = potion_type else {
                 return Err(BrewingError::MissingPotionType);
@@ -439,17 +447,15 @@ impl BrewingSlotItem {
                     stack.max_stack(),
                 )));
             }
-            Ok(Self {
-                stack,
-                potion_type: Some(canonical.to_owned()),
-            })
-        } else if potion_type.is_some() {
+            stack
+                .components_mut()
+                .set_potion(Some(canonical.to_owned()))
+                .map_err(|err| BrewingError::InvalidStack(err.into()))?;
+            Ok(Self { stack })
+        } else if potion_type.is_some() || stack.components().potion().is_some() {
             Err(BrewingError::UnexpectedPotionType)
         } else {
-            Ok(Self {
-                stack,
-                potion_type: None,
-            })
+            Ok(Self { stack })
         }
     }
 
@@ -528,7 +534,7 @@ impl BrewingSlotItem {
     #[inline]
     #[must_use]
     pub fn potion_type(&self) -> Option<&str> {
-        self.potion_type.as_deref()
+        self.stack.components().potion()
     }
 
     /// Returns the item identifier from the underlying [`ItemStack`].
@@ -549,30 +555,28 @@ impl BrewingSlotItem {
     #[inline]
     #[must_use]
     pub fn potion_descriptor(&self) -> Option<Potion> {
-        self.potion_type
-            .as_deref()
-            .and_then(Potion::from_registry_id)
+        self.potion_type().and_then(Potion::from_registry_id)
     }
 
     /// Whether this slot holds a potion item with a potion type.
     #[inline]
     #[must_use]
     pub fn is_potion(&self) -> bool {
-        is_potion_container_item(self.stack.item()) && self.potion_type.is_some()
+        is_potion_container_item(self.stack.item()) && self.potion_type().is_some()
     }
 
     /// Whether this slot holds a water bottle (`minecraft:water`).
     #[inline]
     #[must_use]
     pub fn is_water_bottle(&self) -> bool {
-        self.potion_type.as_deref() == Some("minecraft:water")
+        self.potion_type() == Some("minecraft:water")
     }
 
     /// Whether this slot holds an awkward potion (`minecraft:awkward`).
     #[inline]
     #[must_use]
     pub fn is_awkward_potion(&self) -> bool {
-        self.potion_type.as_deref() == Some("minecraft:awkward")
+        self.potion_type() == Some("minecraft:awkward")
     }
 
     /// Whether this slot holds a potion with the given [`PotionEffect`].
@@ -1114,18 +1118,19 @@ impl BrewingStandBlockEntity {
         ingredient: &str,
         bottle: &BrewingSlotItem,
     ) -> Option<BrewingSlotItem> {
-        let (container_item, output_potion_type) = match recipes {
+        match recipes {
             Some(data) => {
                 let potion_type = bottle.potion_type()?;
                 let recipe = data.find_brewing(bottle.item_id(), potion_type, ingredient)?;
-                (
-                    recipe.output_item().to_owned(),
-                    recipe.output_potion().to_owned(),
-                )
+                let output_potion = recipe.output().components().potion()?;
+                BrewingSlotItem::try_new(recipe.output().clone(), Some(output_potion)).ok()
             }
-            None => self.recipe_registry.find_output_item(ingredient, bottle)?,
-        };
-        BrewingSlotItem::potion_with_container(&container_item, &output_potion_type).ok()
+            None => {
+                let (container_item, output_potion_type) =
+                    self.recipe_registry.find_output_item(ingredient, bottle)?;
+                BrewingSlotItem::potion_with_container(&container_item, &output_potion_type).ok()
+            }
+        }
     }
 
     fn can_brew_inner(&self, recipes: Option<&RecipeData>) -> bool {
@@ -1306,22 +1311,16 @@ impl BrewingStandBlockEntity {
 }
 
 fn consume_one_brewing_item(slot: &mut Option<BrewingSlotItem>) -> bool {
-    let Some(BrewingSlotItem { stack, potion_type }) = slot.take() else {
+    let Some(BrewingSlotItem { stack }) = slot.take() else {
         return false;
     };
     match stack.split(1) {
         Ok((_, rest)) => {
-            *slot = rest.map(|stack| BrewingSlotItem {
-                stack,
-                potion_type: None,
-            });
+            *slot = rest.map(|stack| BrewingSlotItem { stack });
             true
         }
         Err(unchanged) => {
-            *slot = Some(BrewingSlotItem {
-                stack: unchanged,
-                potion_type,
-            });
+            *slot = Some(BrewingSlotItem { stack: unchanged });
             false
         }
     }
@@ -2105,5 +2104,116 @@ mod tests {
                 "  {id}: ({in_item}, {in_pot}) + {reag} -> ({out_item}, {out_pot}); registry={fb:?}"
             );
         }
+    }
+
+    #[test]
+    fn brewed_stack_component_equals_recipe_output_and_distinct_potions_do_not_stack() {
+        use crate::item::ItemComponents;
+        use crate::vanilla::feature::ItemTags;
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // 1. Loaded recipe: brewed stack's component and full stack match the recipe output.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-brewing-comp-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let recipe_path = root.join("data/testns/recipe/brewing/water_to_healing.json");
+        fs::create_dir_all(recipe_path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &recipe_path,
+            r#"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "minecraft:potion",
+                    "potion_contents": {"potions": "minecraft:water"}
+                },
+                "reagent": {"item": "testns:herb"},
+                "output": {
+                    "id": "minecraft:splash_potion",
+                    "components": {
+                        "minecraft:potion_contents": {"potion": "minecraft:healing"}
+                    }
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let data = RecipeData::load(&root, &ItemTags::default()).expect("load recipe data");
+        let loaded_recipe = data
+            .find_brewing("minecraft:potion", "minecraft:water", "testns:herb")
+            .expect("loaded recipe");
+        assert_eq!(
+            loaded_recipe.output().components().potion(),
+            Some("minecraft:healing")
+        );
+
+        let mut loaded_stand = BrewingStandBlockEntity::new();
+        loaded_stand.set_fuel_charges(1);
+        loaded_stand
+            .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::water_bottle()))
+            .unwrap();
+        loaded_stand.set_ingredient(Some(item("testns:herb", 1)));
+        for _ in 0..BREW_TIME_MAX {
+            assert!(loaded_stand.tick_with_recipes(&data));
+        }
+        let brewed_loaded = loaded_stand
+            .potion_slot(POTION_SLOT_0)
+            .expect("brewed loaded output");
+        assert_eq!(brewed_loaded.stack(), loaded_recipe.output());
+        assert_eq!(
+            brewed_loaded.stack().components(),
+            loaded_recipe.output().components()
+        );
+        assert_eq!(
+            brewed_loaded.stack().components().potion(),
+            Some("minecraft:healing")
+        );
+
+        // 2. Fallback registry: brewed stack's component carries the expected output potion.
+        let mut fallback_stand = BrewingStandBlockEntity::new();
+        fallback_stand.set_fuel_charges(1);
+        fallback_stand
+            .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::water_bottle()))
+            .unwrap();
+        fallback_stand.set_ingredient(Some(item("minecraft:nether_wart", 1)));
+        for _ in 0..BREW_TIME_MAX {
+            assert!(fallback_stand.tick());
+        }
+        let brewed_fallback = fallback_stand
+            .potion_slot(POTION_SLOT_0)
+            .expect("brewed fallback output");
+        assert_eq!(
+            brewed_fallback.stack().components().potion(),
+            Some("minecraft:awkward")
+        );
+
+        // 3. Two potions of different types do not stack (both via BrewingSlotItem and forced stackable items).
+        let healing = BrewingSlotItem::potion("minecraft:healing").unwrap();
+        let swiftness = BrewingSlotItem::potion("minecraft:swiftness").unwrap();
+        let another_healing = BrewingSlotItem::potion("minecraft:healing").unwrap();
+        assert!(!healing.stack().can_stack_with(swiftness.stack()));
+        assert!(healing.stack().can_stack_with(another_healing.stack()));
+
+        let stackable_heal = ItemStack::try_new("minecraft:potion", 1, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_potion("minecraft:healing")
+                    .unwrap(),
+            )
+            .unwrap();
+        let stackable_swift = ItemStack::try_new("minecraft:potion", 1, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_potion("minecraft:swiftness")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!stackable_heal.can_stack_with(&stackable_swift));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
