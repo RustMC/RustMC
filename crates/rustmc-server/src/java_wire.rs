@@ -206,6 +206,13 @@ pub(crate) fn read_i16_be(input: &[u8]) -> Result<(i16, &[u8]), WireError> {
     Ok((i16::from_be_bytes(*bytes), rest))
 }
 
+/// Decode a big-endian `i32`, returning the value and the remaining slice.
+#[inline]
+pub(crate) fn read_i32_be(input: &[u8]) -> Result<(i32, &[u8]), WireError> {
+    let (bytes, rest) = input.split_first_chunk::<4>().ok_or(WireError::Truncated)?;
+    Ok((i32::from_be_bytes(*bytes), rest))
+}
+
 /// Decode a big-endian `i64`, returning the value and the remaining slice.
 #[inline]
 pub(crate) fn read_i64_be(input: &[u8]) -> Result<(i64, &[u8]), WireError> {
@@ -422,6 +429,15 @@ mod tests {
         }
         for len in 0..2 {
             assert_eq!(read_i16_be(&[0; 2][..len]), Err(WireError::Truncated));
+        }
+
+        for value in [i32::MIN, -1, 0, 0x0102_0304, i32::MAX] {
+            let mut buf = value.to_be_bytes().to_vec();
+            buf.push(0x99);
+            assert_eq!(read_i32_be(&buf), Ok((value, &[0x99][..])));
+        }
+        for len in 0..4 {
+            assert_eq!(read_i32_be(&[0; 4][..len]), Err(WireError::Truncated));
         }
 
         for value in [i64::MIN, -1, 0, 0x0102_0304_0506_0708, i64::MAX] {

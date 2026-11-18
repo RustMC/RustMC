@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const MAGIC: &[u8; 8] = b"RMCPC002";
 const HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 32;
@@ -32,8 +32,9 @@ struct Budget {
 
 impl Budget {
     fn remove_file_entry(&mut self, path: &Path) {
-        if let Some(index) = self.files.iter().position(|(stored, _)| stored == path) {
-            let (_, old_size) = self.files.remove(index).expect("index exists");
+        if let Some(index) = self.files.iter().position(|(stored, _)| stored == path)
+            && let Some((_, old_size)) = self.files.remove(index)
+        {
             self.bytes -= old_size;
         }
     }
@@ -93,6 +94,11 @@ impl PreviewCache {
         })
     }
 
+    fn lock_budget(&self) -> MutexGuard<'_, Budget> {
+        // The budget only tracks in-memory cache paths and byte totals; `read` re-validates files on disk.
+        self.budget.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn path(&self, x: i32, z: i32) -> PathBuf {
         self.directory.join(format!("{x}.{z}.pkt"))
     }
@@ -108,7 +114,7 @@ impl PreviewCache {
     fn forget(&self, x: i32, z: i32) {
         let path = self.path(x, z);
         {
-            let mut budget = self.budget.lock().expect("preview cache lock poisoned");
+            let mut budget = self.lock_budget();
             budget.remove_file_entry(&path);
             budget.positions.remove(&(x, z));
         }
@@ -118,11 +124,7 @@ impl PreviewCache {
 
     /// A cheap hint for scheduling cached packets; `read` still validates them.
     pub fn contains(&self, x: i32, z: i32) -> bool {
-        self.budget
-            .lock()
-            .expect("preview cache lock poisoned")
-            .positions
-            .contains(&(x, z))
+        self.lock_budget().positions.contains(&(x, z))
     }
 
     pub fn write(&self, x: i32, z: i32, packet: &[u8]) -> io::Result<()> {
@@ -161,7 +163,7 @@ impl PreviewCache {
         // wait on disk. Each write uses a unique temporary file and an atomic
         // rename; only the bookkeeping in this block is serialized.
         let evicted = {
-            let mut budget = self.budget.lock().expect("preview cache lock poisoned");
+            let mut budget = self.lock_budget();
             budget.remove_file_entry(&path);
             let size = (HEADER_BYTES + packet.len()) as u64;
             budget.files.push_back((path, size));
@@ -173,11 +175,7 @@ impl PreviewCache {
     }
 
     pub fn cached_count(&self) -> usize {
-        self.budget
-            .lock()
-            .expect("preview cache lock poisoned")
-            .files
-            .len()
+        self.lock_budget().files.len()
     }
 }
 
@@ -192,22 +190,36 @@ fn read_packet(path: &Path, x: i32, z: i32) -> io::Result<Option<Vec<u8>>> {
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
+    let Some((magic, rest)) = bytes.split_first_chunk::<8>() else {
+        return Ok(None);
+    };
+    if magic != MAGIC {
         return Ok(None);
     }
-    let stored_x = i32::from_be_bytes(bytes[8..12].try_into().expect("fixed slice"));
-    let stored_z = i32::from_be_bytes(bytes[12..16].try_into().expect("fixed slice"));
-    let length = u32::from_be_bytes(bytes[16..20].try_into().expect("fixed slice")) as usize;
+    let Some((stored_x_bytes, rest)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let Some((stored_z_bytes, rest)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let Some((length_bytes, rest)) = rest.split_first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let Some((digest, packet)) = rest.split_first_chunk::<32>() else {
+        return Ok(None);
+    };
+    let stored_x = i32::from_be_bytes(*stored_x_bytes);
+    let stored_z = i32::from_be_bytes(*stored_z_bytes);
+    let length = u32::from_be_bytes(*length_bytes) as usize;
     if stored_x != x
         || stored_z != z
         || length == 0
         || length > MAX_PACKET_BYTES
-        || bytes.len() != HEADER_BYTES + length
+        || packet.len() != length
     {
         return Ok(None);
     }
-    let packet = &bytes[HEADER_BYTES..];
-    if Sha256::digest(packet).as_slice() != &bytes[20..52] {
+    if Sha256::digest(packet).as_slice() != digest {
         return Ok(None);
     }
     Ok(Some(packet.to_vec()))
@@ -216,7 +228,9 @@ fn read_packet(path: &Path, x: i32, z: i32) -> io::Result<Option<Vec<u8>>> {
 fn prune(budget: &mut Budget) -> Vec<PathBuf> {
     let mut evicted = Vec::new();
     while budget.files.len() > MAX_FILES || budget.bytes > MAX_BYTES {
-        let (path, size) = budget.files.pop_front().expect("over budget has files");
+        let Some((path, size)) = budget.files.pop_front() else {
+            break;
+        };
         budget.bytes -= size;
         if let Some(position) = packet_position(&path) {
             budget.positions.remove(&position);

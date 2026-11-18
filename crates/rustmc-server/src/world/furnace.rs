@@ -11,7 +11,9 @@
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::{CookingKind, RecipeData};
 pub use crate::item::default_max_stack;
-use crate::item::{ItemStack, ItemStackError, normalize_item_id};
+use crate::item::{
+    DEFAULT_MAX_STACK, ItemStack, ItemStackError, StaticStackSpec, normalize_item_id,
+};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
@@ -114,8 +116,7 @@ impl FuelRegistry {
             fallback: false,
         };
         let bucket =
-            ItemStack::try_new("minecraft:bucket", 1, default_max_stack("minecraft:bucket"))
-                .expect("built-in bucket item id is valid");
+            ItemStack::from_static(const { StaticStackSpec::new("minecraft:bucket", 1, 16) });
         registry.insert_entry("minecraft:lava_bucket", LAVA_BUCKET_BURN_TIME, Some(bucket));
 
         const EXPLICIT_FUELS: [(&str, u16); 44] = [
@@ -261,10 +262,7 @@ impl FuelRegistry {
             return entry.remainder.clone();
         }
         if self.fallback {
-            fuel_remainder(normalized).map(|rem| {
-                ItemStack::try_new(rem, 1, default_max_stack(rem))
-                    .expect("built-in fuel remainders use valid item ids")
-            })
+            fuel_remainder_spec(normalized).map(ItemStack::from_static)
         } else {
             None
         }
@@ -355,13 +353,17 @@ pub fn fuel_burn_time(item_id: &str) -> u16 {
     }
 }
 
+fn fuel_remainder_spec(item_id: &str) -> Option<StaticStackSpec> {
+    match normalize_item_id(item_id) {
+        "lava_bucket" => Some(const { StaticStackSpec::new("minecraft:bucket", 1, 16) }),
+        _ => None,
+    }
+}
+
 /// Returns the standard vanilla residual item left when burning a fuel item.
 #[must_use]
 pub fn fuel_remainder(item_id: &str) -> Option<&'static str> {
-    match normalize_item_id(item_id) {
-        "lava_bucket" => Some("minecraft:bucket"),
-        _ => None,
-    }
+    fuel_remainder_spec(item_id).map(|spec| spec.id.as_str())
 }
 
 /// Smelting recipe definition matching an input item type to an output item and experience yield.
@@ -441,12 +443,6 @@ impl Default for SmeltingRecipeRegistry {
 }
 
 impl SmeltingRecipeRegistry {
-    fn register_builtin(&mut self, input: &str, output: &str, experience: f32, cooking_time: u16) {
-        let recipe = SmeltingRecipe::new(input, output, experience, cooking_time)
-            .expect("built-in smelting recipes use valid item ids");
-        self.register(recipe);
-    }
-
     /// Offline fallback registry used when no operator-provisioned data root is provisioned.
     ///
     /// Constructs a new recipe registry pre-populated with standard vanilla smelting recipes:
@@ -458,56 +454,46 @@ impl SmeltingRecipeRegistry {
     /// - Raw Beef -> Cooked Beef (0.35 XP).
     /// - Raw Porkchop -> Cooked Porkchop (0.35 XP).
     pub fn new() -> Self {
-        const BUILTINS: [(&str, &str, f32); 15] = [
+        const IRON_INGOT: StaticStackSpec =
+            StaticStackSpec::new("minecraft:iron_ingot", 1, DEFAULT_MAX_STACK);
+        const GOLD_INGOT: StaticStackSpec =
+            StaticStackSpec::new("minecraft:gold_ingot", 1, DEFAULT_MAX_STACK);
+        const COPPER_INGOT: StaticStackSpec =
+            StaticStackSpec::new("minecraft:copper_ingot", 1, DEFAULT_MAX_STACK);
+        const STONE: StaticStackSpec =
+            StaticStackSpec::new("minecraft:stone", 1, DEFAULT_MAX_STACK);
+        const GLASS: StaticStackSpec =
+            StaticStackSpec::new("minecraft:glass", 1, DEFAULT_MAX_STACK);
+        const COOKED_BEEF: StaticStackSpec =
+            StaticStackSpec::new("minecraft:cooked_beef", 1, DEFAULT_MAX_STACK);
+        const COOKED_PORKCHOP: StaticStackSpec =
+            StaticStackSpec::new("minecraft:cooked_porkchop", 1, DEFAULT_MAX_STACK);
+        const BUILTINS: [(&str, StaticStackSpec, f32); 15] = [
             // Iron recipes
-            ("minecraft:raw_iron", "minecraft:iron_ingot", IRON_SMELT_XP),
-            ("minecraft:iron_ore", "minecraft:iron_ingot", IRON_SMELT_XP),
-            (
-                "minecraft:deepslate_iron_ore",
-                "minecraft:iron_ingot",
-                IRON_SMELT_XP,
-            ),
+            ("minecraft:raw_iron", IRON_INGOT, IRON_SMELT_XP),
+            ("minecraft:iron_ore", IRON_INGOT, IRON_SMELT_XP),
+            ("minecraft:deepslate_iron_ore", IRON_INGOT, IRON_SMELT_XP),
             // Gold recipes
-            ("minecraft:raw_gold", "minecraft:gold_ingot", GOLD_SMELT_XP),
-            ("minecraft:gold_ore", "minecraft:gold_ingot", GOLD_SMELT_XP),
-            (
-                "minecraft:deepslate_gold_ore",
-                "minecraft:gold_ingot",
-                GOLD_SMELT_XP,
-            ),
-            (
-                "minecraft:nether_gold_ore",
-                "minecraft:gold_ingot",
-                GOLD_SMELT_XP,
-            ),
+            ("minecraft:raw_gold", GOLD_INGOT, GOLD_SMELT_XP),
+            ("minecraft:gold_ore", GOLD_INGOT, GOLD_SMELT_XP),
+            ("minecraft:deepslate_gold_ore", GOLD_INGOT, GOLD_SMELT_XP),
+            ("minecraft:nether_gold_ore", GOLD_INGOT, GOLD_SMELT_XP),
             // Copper recipes
-            (
-                "minecraft:raw_copper",
-                "minecraft:copper_ingot",
-                COPPER_SMELT_XP,
-            ),
-            (
-                "minecraft:copper_ore",
-                "minecraft:copper_ingot",
-                COPPER_SMELT_XP,
-            ),
+            ("minecraft:raw_copper", COPPER_INGOT, COPPER_SMELT_XP),
+            ("minecraft:copper_ore", COPPER_INGOT, COPPER_SMELT_XP),
             (
                 "minecraft:deepslate_copper_ore",
-                "minecraft:copper_ingot",
+                COPPER_INGOT,
                 COPPER_SMELT_XP,
             ),
             // Stone recipes
-            ("minecraft:cobblestone", "minecraft:stone", COMMON_SMELT_XP),
+            ("minecraft:cobblestone", STONE, COMMON_SMELT_XP),
             // Glass recipes
-            ("minecraft:sand", "minecraft:glass", COMMON_SMELT_XP),
-            ("minecraft:red_sand", "minecraft:glass", COMMON_SMELT_XP),
+            ("minecraft:sand", GLASS, COMMON_SMELT_XP),
+            ("minecraft:red_sand", GLASS, COMMON_SMELT_XP),
             // Food recipes (26.3 uses `minecraft:beef` and `minecraft:porkchop`, not `raw_*`)
-            ("minecraft:beef", "minecraft:cooked_beef", MEAT_SMELT_XP),
-            (
-                "minecraft:porkchop",
-                "minecraft:cooked_porkchop",
-                MEAT_SMELT_XP,
-            ),
+            ("minecraft:beef", COOKED_BEEF, MEAT_SMELT_XP),
+            ("minecraft:porkchop", COOKED_PORKCHOP, MEAT_SMELT_XP),
         ];
 
         let mut registry = Self {
@@ -515,7 +501,12 @@ impl SmeltingRecipeRegistry {
         };
 
         for (input, output, experience) in BUILTINS {
-            registry.register_builtin(input, output, experience, DEFAULT_COOKING_TOTAL_TIME);
+            registry.register(SmeltingRecipe::with_output(
+                input,
+                ItemStack::from_static(output),
+                experience,
+                DEFAULT_COOKING_TOTAL_TIME,
+            ));
         }
 
         registry

@@ -53,9 +53,27 @@ pub fn upgrade_seed_to_128bit(legacy_seed: u64) -> Seed128Bit {
 pub fn seed_from_hash_of(input: &str) -> Seed128Bit {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    let lo = u64::from_be_bytes(digest[0..8].try_into().expect("md5 prefix"));
-    let hi = u64::from_be_bytes(digest[8..16].try_into().expect("md5 suffix"));
+    let digest: [u8; 16] = hasher.finalize().into();
+    let [
+        a0,
+        a1,
+        a2,
+        a3,
+        a4,
+        a5,
+        a6,
+        a7,
+        b0,
+        b1,
+        b2,
+        b3,
+        b4,
+        b5,
+        b6,
+        b7,
+    ] = digest;
+    let lo = u64::from_be_bytes([a0, a1, a2, a3, a4, a5, a6, a7]);
+    let hi = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
     Seed128Bit { lo, hi }
 }
 

@@ -37,8 +37,6 @@
 
 pub mod registry;
 
-use std::collections::BTreeSet;
-
 use crate::java_wire::{frame, put_varint};
 use crate::vanilla::generator::VanillaGenerator;
 
@@ -379,8 +377,12 @@ pub fn chunk_from_generator(
     chunk_z: i32,
     tables: &RegistryTables,
 ) -> Result<VanillaChunk, EncodeError> {
-    chunk_from_generator_cancellable(generator, chunk_x, chunk_z, tables, || false)
-        .map(|chunk| chunk.expect("unconditional generation cannot cancel"))
+    match build_vanilla_chunk(generator, chunk_x, chunk_z, tables, || {
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(result) => result,
+        Err(never) => match never {},
+    }
 }
 
 fn chunk_origin(chunk_x: i32, chunk_z: i32) -> Result<(i32, i32), EncodeError> {
@@ -407,31 +409,50 @@ pub fn chunk_from_generator_cancellable(
     tables: &RegistryTables,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<Option<VanillaChunk>, EncodeError> {
-    if generator.min_y() != OVERWORLD_MIN_Y {
-        return Err(EncodeError::UnsupportedMinY {
-            min_y: generator.min_y(),
-        });
+    match build_vanilla_chunk(generator, chunk_x, chunk_z, tables, || {
+        if should_cancel() { Err(()) } else { Ok(()) }
+    }) {
+        Ok(result) => result.map(Some),
+        Err(()) => Ok(None),
     }
-    let (origin_x, origin_z) = chunk_origin(chunk_x, chunk_z)?;
+}
+
+fn build_vanilla_chunk<C>(
+    generator: &VanillaGenerator,
+    chunk_x: i32,
+    chunk_z: i32,
+    tables: &RegistryTables,
+    mut check_cancel: impl FnMut() -> Result<(), C>,
+) -> Result<Result<VanillaChunk, EncodeError>, C> {
+    if generator.min_y() != OVERWORLD_MIN_Y {
+        return Ok(Err(EncodeError::UnsupportedMinY {
+            min_y: generator.min_y(),
+        }));
+    }
+    let (origin_x, origin_z) = match chunk_origin(chunk_x, chunk_z) {
+        Ok(origin) => origin,
+        Err(err) => return Ok(Err(err)),
+    };
     let air = tables.air_state();
     let mut states = vec![air; CHUNK_CELLS];
     for z in 0..CHUNK_SIDE {
         for x in 0..CHUNK_SIDE {
-            if should_cancel() {
-                return Ok(None);
-            }
+            check_cancel()?;
             let wx = origin_x + x as i32;
             let wz = origin_z + z as i32;
             let column = generator.column_ids(wx, wz);
             if column.len() != OVERWORLD_HEIGHT {
-                return Err(EncodeError::WrongColumnLength {
+                return Ok(Err(EncodeError::WrongColumnLength {
                     expected: OVERWORLD_HEIGHT,
                     got: column.len(),
-                });
+                }));
             }
             for (row, name) in column.iter().enumerate() {
                 let id = match name {
-                    Some(name) => tables.state(name)?.id,
+                    Some(name) => match tables.state(name) {
+                        Ok(entry) => entry.id,
+                        Err(err) => return Ok(Err(err.into())),
+                    },
                     None => air,
                 };
                 let y = OVERWORLD_MIN_Y + row as i32;
@@ -445,19 +466,20 @@ pub fn chunk_from_generator_cancellable(
             let wx = origin_x + bx as i32 * SECTION_BIOME_SIDE as i32;
             let wz = origin_z + bz as i32 * SECTION_BIOME_SIDE as i32;
             for layer in 0..BIOME_LAYERS {
-                if should_cancel() {
-                    return Ok(None);
-                }
+                check_cancel()?;
                 let by = OVERWORLD_MIN_Y + layer as i32 * SECTION_BIOME_SIDE as i32;
-                let name = generator
-                    .biome(wx, wz, by)
-                    .ok_or(EncodeError::MissingBiomePlacement)?;
-                let id = tables.biome(&name)?;
+                let Some(name) = generator.biome(wx, wz, by) else {
+                    return Ok(Err(EncodeError::MissingBiomePlacement));
+                };
+                let id = match tables.biome(&name) {
+                    Ok(id) => id,
+                    Err(err) => return Ok(Err(err.into())),
+                };
                 biomes[biome_index(bx, by, bz)] = id;
             }
         }
     }
-    Ok(Some(VanillaChunk {
+    Ok(Ok(VanillaChunk {
         chunk_x,
         chunk_z,
         states,
@@ -563,35 +585,49 @@ fn write_sections(chunk: &VanillaChunk, tables: &RegistryTables) -> Result<Vec<u
     Ok(out)
 }
 
-fn write_block_container(
+fn write_paletted_container(
     cells: &[u32],
-    tables: &RegistryTables,
+    min_bits: usize,
+    max_bits: usize,
+    direct_width: usize,
     out: &mut Vec<u8>,
-) -> Result<(), EncodeError> {
-    let palette = distinct(cells);
+) {
+    let (palette, indices) = build_palette_and_indices(cells);
     if palette.len() == 1 {
         // Single-value palette: byte 0 and one bare id, and no long array at
         // all (`SingleValuePalette#write`).
         out.push(0);
         put_varint(palette[0], out);
-        return Ok(());
+        return;
     }
-    let bits = ceillog2(palette.len() as u32).max(BLOCK_PALETTE_MIN_BITS);
-    if bits > BLOCK_PALETTE_MAX_BITS {
+    let bits = ceillog2(palette.len() as u32).max(min_bits);
+    if bits > max_bits {
         // Direct mode: the byte is the global palette width and no palette
         // entries follow it (`Strategy$1` falls through to `Configuration.Global`).
-        let width = tables.state_bits();
-        out.push(width as u8);
-        write_words(cells, width, out);
-        return Ok(());
+        out.push(direct_width as u8);
+        write_words(cells, direct_width, out);
+        return;
     }
     out.push(bits as u8);
     put_varint(palette.len() as u32, out);
     for id in &palette {
         put_varint(*id, out);
     }
-    let indices = palette_indices(cells, &palette);
     write_words(&indices, bits, out);
+}
+
+fn write_block_container(
+    cells: &[u32],
+    tables: &RegistryTables,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    write_paletted_container(
+        cells,
+        BLOCK_PALETTE_MIN_BITS,
+        BLOCK_PALETTE_MAX_BITS,
+        tables.state_bits(),
+        out,
+    );
     Ok(())
 }
 
@@ -608,26 +644,13 @@ fn write_biome_container(
             });
         }
     }
-    let palette = distinct(cells);
-    if palette.len() == 1 {
-        out.push(0);
-        put_varint(palette[0], out);
-        return Ok(());
-    }
-    let bits = ceillog2(palette.len() as u32).max(BIOME_PALETTE_MIN_BITS);
-    if bits > BIOME_PALETTE_MAX_BITS {
-        let width = tables.biome_bits();
-        out.push(width as u8);
-        write_words(cells, width, out);
-        return Ok(());
-    }
-    out.push(bits as u8);
-    put_varint(palette.len() as u32, out);
-    for id in &palette {
-        put_varint(*id, out);
-    }
-    let indices = palette_indices(cells, &palette);
-    write_words(&indices, bits, out);
+    write_paletted_container(
+        cells,
+        BIOME_PALETTE_MIN_BITS,
+        BIOME_PALETTE_MAX_BITS,
+        tables.biome_bits(),
+        out,
+    );
     Ok(())
 }
 
@@ -710,24 +733,29 @@ fn state_kind(tables: &RegistryTables, id: u32) -> Result<StateKind, EncodeError
     tables.kind(id).ok_or(EncodeError::UnregisteredState { id })
 }
 
-fn distinct(cells: &[u32]) -> Vec<u32> {
-    cells
+fn build_palette_and_indices(cells: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut entries: Vec<(u32, usize)> = cells
         .iter()
         .copied()
-        .collect::<BTreeSet<u32>>()
-        .into_iter()
-        .collect()
-}
+        .enumerate()
+        .map(|(index, id)| (id, index))
+        .collect();
+    entries.sort_unstable_by_key(|&(id, _)| id);
 
-fn palette_indices(cells: &[u32], palette: &[u32]) -> Vec<u32> {
-    cells
-        .iter()
-        .map(|id| {
-            palette
-                .binary_search(id)
-                .expect("palette holds every cell value") as u32
-        })
-        .collect()
+    let mut palette = Vec::new();
+    let mut indices = vec![0u32; cells.len()];
+    let mut palette_index = 0u32;
+    for (id, cell_index) in entries {
+        match palette.last() {
+            Some(&prev) if prev == id => {}
+            _ => {
+                palette_index = palette.len() as u32;
+                palette.push(id);
+            }
+        }
+        indices[cell_index] = palette_index;
+    }
+    (palette, indices)
 }
 
 /// Packs fixed-width values without ever crossing a 64-bit word, the

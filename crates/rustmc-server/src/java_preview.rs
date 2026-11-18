@@ -88,7 +88,12 @@ impl VanillaWorker {
                         let ChunkRequest {
                             position,
                             center: requested_center,
-                        } = match rx.lock().expect("worker request lock poisoned").recv() {
+                        } = match rx
+                            .lock()
+                            // Workers only call `recv()` under this lock; a panic elsewhere leaves the channel receiver valid.
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv()
+                        {
                             Ok(request) => request,
                             Err(_) => break,
                         };
@@ -697,15 +702,14 @@ impl Preview {
             {
                 continue;
             }
+            let Ok(Some(packet)) = built.packet else {
+                self.failed = true;
+                return None;
+            };
             if count == 0 {
                 output.extend(frame(BATCH_START, &[]));
             }
-            output.extend(
-                built
-                    .packet
-                    .expect("checked packet")
-                    .expect("checked non-cancelled"),
-            );
+            output.extend(packet);
             self.sent.insert(built.position);
             if distance <= MOVING_NEAR_RADIUS {
                 near_unsent -= 1;
@@ -780,6 +784,44 @@ fn packed(values: &[u16], bits: usize) -> Vec<u64> {
         .collect()
 }
 
+fn biome_index(biome: Biome) -> u16 {
+    match biome {
+        Biome::Plains => 0,
+        Biome::Forest => 1,
+        Biome::Desert => 2,
+        Biome::SnowyPlains => 3,
+        Biome::Taiga => 4,
+        Biome::Savanna => 5,
+        Biome::Jungle => 6,
+        Biome::Badlands => 7,
+    }
+}
+
+fn build_palette<T: Copy + Ord>(values: &[T]) -> (Vec<T>, Vec<u16>) {
+    let mut entries: Vec<(T, usize)> = values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| (value, index))
+        .collect();
+    entries.sort_unstable_by_key(|&(value, _)| value);
+
+    let mut palette = Vec::new();
+    let mut indices = vec![0u16; values.len()];
+    let mut palette_index = 0u16;
+    for (value, original_index) in entries {
+        match palette.last() {
+            Some(&prev) if prev == value => {}
+            _ => {
+                palette_index = palette.len() as u16;
+                palette.push(value);
+            }
+        }
+        indices[original_index] = palette_index;
+    }
+    (palette, indices)
+}
+
 pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -> Vec<u8> {
     let mut body = chunk.x.to_be_bytes().to_vec();
     body.extend(chunk.z.to_be_bytes());
@@ -822,13 +864,10 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         .map(|(x, z)| {
             let wx = i64::from(chunk.x) * 16 + x * 4 + 2;
             let wz = i64::from(chunk.z) * 16 + z * 4 + 2;
-            let biome = generator.biome(wx, wz);
-            Biome::ALL.iter().position(|value| *value == biome).unwrap() as u16
+            biome_index(generator.biome(wx, wz))
         })
         .collect();
-    let mut biome_palette = biome_values.clone();
-    biome_palette.sort_unstable();
-    biome_palette.dedup();
+    let (biome_palette, biome_indices) = build_palette(&biome_values);
     for section in 0..SECTION_COUNT {
         let values: Vec<u16> = (0..16)
             .flat_map(|y| {
@@ -840,9 +879,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
         let non_air = values.iter().filter(|v| **v != 0).count() as u16;
         sections.extend(non_air.to_be_bytes());
         sections.extend(0u16.to_be_bytes()); // Fluid count added in 26.3.
-        let mut palette = values.clone();
-        palette.sort_unstable();
-        palette.dedup();
+        let (palette, indices) = build_palette(&values);
         if palette.len() == 1 {
             sections.push(0);
             put_varint(block_state(values[0]), &mut sections);
@@ -853,10 +890,6 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
             for value in &palette {
                 put_varint(block_state(*value), &mut sections);
             }
-            let indices: Vec<u16> = values
-                .iter()
-                .map(|v| palette.binary_search(v).unwrap() as u16)
-                .collect();
             // 26.3 has a fixed-size long array, with no array-length prefix.
             for word in packed(&indices, bits) {
                 sections.extend(word.to_be_bytes());
@@ -872,11 +905,7 @@ pub fn encode_chunk(chunk: &Chunk, generator: Generator, biome_ids: &[u32; 8]) -
             for index in &biome_palette {
                 put_varint(biome_ids[*index as usize], &mut sections);
             }
-            let indices: Vec<u16> = biome_values
-                .iter()
-                .map(|v| biome_palette.binary_search(v).unwrap() as u16)
-                .collect();
-            for word in packed(&indices, bits) {
+            for word in packed(&biome_indices, bits) {
                 sections.extend(word.to_be_bytes());
             }
         }

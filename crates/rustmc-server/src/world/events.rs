@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     thread::ThreadId,
@@ -430,6 +430,14 @@ impl EventBus {
         }
     }
 
+    fn lock_listeners(&self) -> MutexGuard<'_, BTreeMap<TypeId, Vec<RegisteredListener>>> {
+        // Callers only insert, remove, or clone listener Arcs under this lock, so the map remains valid if a listener panics elsewhere.
+        self.inner
+            .listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Registers a listener for event type `E` at the specified priority.
     ///
     /// Returns a listener ID for unregistration.
@@ -451,11 +459,7 @@ impl EventBus {
         };
 
         let type_id = TypeId::of::<E>();
-        let mut map = self
-            .inner
-            .listeners
-            .lock()
-            .expect("event bus lock poisoned");
+        let mut map = self.lock_listeners();
         let list = map.entry(type_id).or_default();
         list.push(listener);
         list.sort_by_key(|l| l.priority);
@@ -464,11 +468,7 @@ impl EventBus {
 
     /// Unregisters a listener by ID.
     pub fn unregister(&self, listener_id: u64) -> bool {
-        let mut map = self
-            .inner
-            .listeners
-            .lock()
-            .expect("event bus lock poisoned");
+        let mut map = self.lock_listeners();
         for list in map.values_mut() {
             if let Some(pos) = list.iter().position(|l| l.id == listener_id) {
                 list.remove(pos);
@@ -480,22 +480,13 @@ impl EventBus {
 
     /// Clears all registered listeners.
     pub fn clear(&self) {
-        let mut map = self
-            .inner
-            .listeners
-            .lock()
-            .expect("event bus lock poisoned");
-        map.clear();
+        self.lock_listeners().clear();
     }
 
     /// Returns the number of registered listeners for event type `E`.
     pub fn listener_count<E: Event + 'static>(&self) -> usize {
         let type_id = TypeId::of::<E>();
-        let map = self
-            .inner
-            .listeners
-            .lock()
-            .expect("event bus lock poisoned");
+        let map = self.lock_listeners();
         map.get(&type_id).map_or(0, |l| l.len())
     }
 
@@ -523,11 +514,7 @@ impl EventBus {
 
         let type_id = TypeId::of::<E>();
         let listeners_snapshot: Vec<(EventPriority, AnyListener)> = {
-            let map = self
-                .inner
-                .listeners
-                .lock()
-                .expect("event bus lock poisoned");
+            let map = self.lock_listeners();
             let Some(list) = map.get(&type_id) else {
                 return Ok(());
             };
@@ -769,19 +756,26 @@ pub fn rollback_break_with_ack(event: &BlockBreakEvent, sequence: i32) -> Option
     rollback_break_explicit(event, block_default_state_id(event.block), Some(sequence))
 }
 
+fn build_break_rollback(
+    event: &BlockBreakEvent,
+    state_id: u32,
+    sequence: Option<i32>,
+) -> BreakRollback {
+    BreakRollback {
+        block_update: Some(BlockUpdatePacket::new(event.pos, state_id)),
+        ack: sequence.map(AcknowledgeBlockChangePacket::new),
+    }
+}
+
 /// Produces authoritative break rollback with explicit block state ID and sequence.
 pub fn rollback_break_explicit(
     event: &BlockBreakEvent,
     state_id: u32,
     sequence: Option<i32>,
 ) -> Option<BreakRollback> {
-    if !event.is_cancelled() {
-        return None;
-    }
-    Some(BreakRollback {
-        block_update: Some(BlockUpdatePacket::new(event.pos, state_id)),
-        ack: sequence.map(AcknowledgeBlockChangePacket::new),
-    })
+    event
+        .is_cancelled()
+        .then(|| build_break_rollback(event, state_id, sequence))
 }
 
 /// Produces authoritative place rollback packets restoring air and syncing client inventory.
@@ -808,17 +802,13 @@ pub fn rollback_place_with_ack(
     )
 }
 
-/// Produces authoritative place rollback with explicit air state ID, inventory slot, and sequence.
-pub fn rollback_place_explicit(
+fn build_place_rollback(
     event: &BlockPlaceEvent,
     air_state_id: u32,
     inventory_slot: i16,
     sequence: Option<i32>,
-) -> Option<PlaceRollback> {
-    if !event.is_cancelled() {
-        return None;
-    }
-    Some(PlaceRollback {
+) -> PlaceRollback {
+    PlaceRollback {
         block_update: Some(BlockUpdatePacket::new(event.placed_pos, air_state_id)),
         inventory_sync: ContainerSetSlotPacket::player_inventory(
             inventory_slot,
@@ -826,7 +816,19 @@ pub fn rollback_place_explicit(
             None,
         ),
         ack: sequence.map(AcknowledgeBlockChangePacket::new),
-    })
+    }
+}
+
+/// Produces authoritative place rollback with explicit air state ID, inventory slot, and sequence.
+pub fn rollback_place_explicit(
+    event: &BlockPlaceEvent,
+    air_state_id: u32,
+    inventory_slot: i16,
+    sequence: Option<i32>,
+) -> Option<PlaceRollback> {
+    event
+        .is_cancelled()
+        .then(|| build_place_rollback(event, air_state_id, inventory_slot, sequence))
 }
 
 /// Result of an accepted world block break.
@@ -891,10 +893,11 @@ pub fn apply_block_break(
     }
 
     if event.is_cancelled() {
-        Err(
-            rollback_break_explicit(&event, block_default_state_id(current_block), sequence)
-                .expect("rollback for cancelled break"),
-        )
+        Err(build_break_rollback(
+            &event,
+            block_default_state_id(current_block),
+            sequence,
+        ))
     } else {
         chunk.set_world_block(
             i64::from(pos.x),
@@ -962,33 +965,39 @@ pub fn apply_block_place(
     }
 
     if event.is_cancelled() {
-        Err(rollback_place_explicit(
+        return Err(build_place_rollback(
             &event,
             block_default_state_id(existing),
             inventory_slot,
             sequence,
-        )
-        .expect("rollback for cancelled place"))
-    } else {
-        chunk.set_world_block(
-            i64::from(placed_pos.x),
-            i64::from(placed_pos.y),
-            i64::from(placed_pos.z),
-            placed_block,
-        );
-        let (_, remaining_item) = event
-            .item_in_hand
-            .expect("non-empty hand validated above")
-            .split(1)
-            .expect("splitting 1 from non-empty ItemStack succeeds");
-        Ok(BlockPlaceOutcome {
-            player_id,
-            placed_pos,
-            placed_against,
-            placed_block,
-            remaining_item,
-        })
+        ));
     }
+    let Some(hand_item) = event.item_in_hand.take() else {
+        event.cancel();
+        return Err(build_place_rollback(
+            &event,
+            block_default_state_id(existing),
+            inventory_slot,
+            sequence,
+        ));
+    };
+    chunk.set_world_block(
+        i64::from(placed_pos.x),
+        i64::from(placed_pos.y),
+        i64::from(placed_pos.z),
+        placed_block,
+    );
+    let remaining_item = match hand_item.split(1) {
+        Ok((_, rest)) => rest,
+        Err(unchanged) => Some(unchanged),
+    };
+    Ok(BlockPlaceOutcome {
+        player_id,
+        placed_pos,
+        placed_against,
+        placed_block,
+        remaining_item,
+    })
 }
 
 #[cfg(test)]

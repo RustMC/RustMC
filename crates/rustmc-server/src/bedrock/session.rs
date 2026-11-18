@@ -299,30 +299,23 @@ impl BedrockSession {
         &mut self,
         login: &Login,
     ) -> Result<(PlayStatus, ResourcePacksInfo), BedrockSessionError> {
-        let mut packets = self.handle_login(login.clone())?;
-        if packets.len() == 2 {
-            let info = match packets.pop().unwrap() {
-                BedrockPacket::ResourcePacksInfo(i) => i,
-                _ => {
-                    return Err(BedrockSessionError::MalformedPacket(
-                        "expected ResourcePacksInfo".to_string(),
-                    ));
-                }
-            };
-            let status = match packets.pop().unwrap() {
-                BedrockPacket::PlayStatus(s) => s,
-                _ => {
-                    return Err(BedrockSessionError::MalformedPacket(
-                        "expected PlayStatus".to_string(),
-                    ));
-                }
-            };
-            Ok((status, info))
-        } else {
-            Err(BedrockSessionError::MalformedPacket(
+        let packets = self.handle_login(login.clone())?;
+        let Ok([first, second]) = <[BedrockPacket; 2]>::try_from(packets) else {
+            return Err(BedrockSessionError::MalformedPacket(
                 "unexpected login response count".to_string(),
-            ))
-        }
+            ));
+        };
+        let BedrockPacket::ResourcePacksInfo(info) = second else {
+            return Err(BedrockSessionError::MalformedPacket(
+                "expected ResourcePacksInfo".to_string(),
+            ));
+        };
+        let BedrockPacket::PlayStatus(status) = first else {
+            return Err(BedrockSessionError::MalformedPacket(
+                "expected PlayStatus".to_string(),
+            ));
+        };
+        Ok((status, info))
     }
 
     /// Handle client ResourcePackClientResponse (0x08).
@@ -401,30 +394,23 @@ impl BedrockSession {
     pub fn handle_pack_client_response_completed(
         &mut self,
     ) -> Result<(StartGame, PlayStatus), BedrockSessionError> {
-        let mut packets = self.handle_pack_client_response(ResponseStatus::Completed)?;
-        if packets.len() == 2 {
-            let status = match packets.pop().unwrap() {
-                BedrockPacket::PlayStatus(s) => s,
-                _ => {
-                    return Err(BedrockSessionError::MalformedPacket(
-                        "expected PlayStatus".to_string(),
-                    ));
-                }
-            };
-            let start = match packets.pop().unwrap() {
-                BedrockPacket::StartGame(g) => g,
-                _ => {
-                    return Err(BedrockSessionError::MalformedPacket(
-                        "expected StartGame".to_string(),
-                    ));
-                }
-            };
-            Ok((start, status))
-        } else {
-            Err(BedrockSessionError::MalformedPacket(
+        let packets = self.handle_pack_client_response(ResponseStatus::Completed)?;
+        let Ok([first, second]) = <[BedrockPacket; 2]>::try_from(packets) else {
+            return Err(BedrockSessionError::MalformedPacket(
                 "unexpected completed response count".to_string(),
-            ))
-        }
+            ));
+        };
+        let BedrockPacket::PlayStatus(status) = second else {
+            return Err(BedrockSessionError::MalformedPacket(
+                "expected PlayStatus".to_string(),
+            ));
+        };
+        let BedrockPacket::StartGame(start) = first else {
+            return Err(BedrockSessionError::MalformedPacket(
+                "expected StartGame".to_string(),
+            ));
+        };
+        Ok((start, status))
     }
 
     /// General packet dispatcher routing incoming Bedrock packets to appropriate handler.
