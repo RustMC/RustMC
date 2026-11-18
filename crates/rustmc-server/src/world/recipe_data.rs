@@ -740,6 +740,14 @@ impl RecipeData {
         Self::load_inner(root, tags, Some(items))
     }
 
+    pub(crate) fn load_with_registries(
+        root: &Path,
+        tags: &ItemTags,
+        items: Option<&ItemDefaults>,
+    ) -> Result<Self, RecipeDataError> {
+        Self::load_inner(root, tags, items)
+    }
+
     fn load_inner(
         root: &Path,
         tags: &ItemTags,
@@ -905,6 +913,14 @@ impl RecipeData {
     #[must_use]
     pub fn cooking(&self, kind: CookingKind) -> &[CookingRecipe] {
         self.cooking.get(&kind).map_or(&[], Vec::as_slice)
+    }
+
+    /// Finds a loaded cooking recipe of `kind` accepting `input_item`, if any.
+    #[must_use]
+    pub fn find_cooking(&self, kind: CookingKind, input_item: &str) -> Option<&CookingRecipe> {
+        self.cooking(kind)
+            .iter()
+            .find(|recipe| ingredient_matches_item(&recipe.ingredient, input_item))
     }
 
     /// Number of distinct input items covered by cooking recipes of `kind`.
