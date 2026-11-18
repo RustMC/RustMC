@@ -373,10 +373,18 @@ pub struct TransmuteRecipe {
     material: Ingredient,
     result: TransmuteResult,
     count: u16,
+    material_count: std::ops::RangeInclusive<u8>,
+    add_material_count_to_result: bool,
     group: Option<String>,
     category: Option<String>,
     show_notification: Option<bool>,
 }
+
+/// Bounds of `material_count` (minecraft.wiki `Recipe (Java Edition)` revision 3873625:
+/// "`min`: The minimum amount of slots, must be at least `1`." / "`max`: The maximum
+/// amount of slots, must be at most `8`." / "Defaults to `1`.").
+const TRANSMUTE_MATERIAL_COUNT_MIN: u8 = 1;
+const TRANSMUTE_MATERIAL_COUNT_MAX: u8 = 8;
 
 impl TransmuteRecipe {
     /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
@@ -430,8 +438,20 @@ impl TransmuteRecipe {
         self.show_notification
     }
 
-    /// Returns `true` if `grid` contains one `input` item and one `material` item
-    /// in any two non-empty positions.
+    /// Allowed number of grid slots holding the `material` ingredient.
+    #[must_use]
+    pub fn material_count(&self) -> &std::ops::RangeInclusive<u8> {
+        &self.material_count
+    }
+
+    /// Whether the number of material slots is added to the result count.
+    #[must_use]
+    pub fn adds_material_count_to_result(&self) -> bool {
+        self.add_material_count_to_result
+    }
+
+    /// Returns `true` if `grid` holds exactly one `input` item and a number of
+    /// `material` items within [`Self::material_count`], and nothing else.
     #[must_use]
     pub fn matches(&self, grid: &CraftingGrid) -> bool {
         self.evaluate(grid).is_some()
@@ -439,30 +459,49 @@ impl TransmuteRecipe {
 
     /// Evaluates `grid` against this transmute recipe.
     ///
-    /// Matches a crafting grid with one `input` item and one `material` item in
-    /// any positions, returning the result stack (`result.id` with count from
-    /// `result.count`, default `1`) with the matched `input` stack's
-    /// [`crate::item::ItemComponents`] copied onto it.
+    /// Matches a grid with exactly one `input` item and between `material_count`
+    /// bounds of `material` items in any positions (minecraft.wiki `Recipe (Java
+    /// Edition)` revision 3873625: "`material_count`: … The allowed amount of slots
+    /// containing the item matched by the `material` ingredient."). The result is
+    /// `result.id` (or the input's own item when `result` has no id) with the input
+    /// stack's [`crate::item::ItemComponents`]; with `add_material_count_to_result`
+    /// ("the amount of slots containing items matched by the `material` ingredient
+    /// will be added to the final count of the result") the material slot count is
+    /// added to the result count.
     #[must_use]
     pub fn evaluate(&self, grid: &CraftingGrid) -> Option<ItemStack> {
-        let non_empty = grid.non_empty_items();
-        let [first, second] = non_empty.as_slice() else {
+        let mut input_stack = None;
+        let mut materials: u8 = 0;
+        for stack in grid.non_empty_items() {
+            // An item matching both ingredients is the input only when no input
+            // has been found yet, so a grid of identical items still needs one input.
+            if input_stack.is_none() && self.input.matches(stack) {
+                input_stack = Some(stack);
+            } else if self.material.matches(stack) {
+                materials = materials.checked_add(1)?;
+            } else {
+                return None;
+            }
+        }
+        let input_stack = input_stack?;
+        if !self.material_count.contains(&materials) {
             return None;
-        };
-        let input_stack = if self.input.matches(first) && self.material.matches(second) {
-            *first
-        } else if self.input.matches(second) && self.material.matches(first) {
-            *second
-        } else {
-            return None;
-        };
+        }
         let base = match &self.result {
             TransmuteResult::Fixed(stack) => stack.clone(),
             TransmuteResult::KeepInput(by_input) => {
                 by_input.get(normalize_item_id(input_stack.item()))?.clone()
             }
         };
-        base.with_components(input_stack.components().clone()).ok()
+        let count = if self.add_material_count_to_result {
+            base.count().checked_add(u16::from(materials))?
+        } else {
+            base.count()
+        };
+        ItemStack::try_new(base.item(), count, base.max_stack())
+            .ok()?
+            .with_components(input_stack.components().clone())
+            .ok()
     }
 }
 
@@ -1494,7 +1533,9 @@ fn parse_transmute_recipe(
     let group = parse_optional_string(obj, "group", file)?;
     let category = parse_optional_string(obj, "category", file)?;
     let show_notification = parse_optional_bool(obj, "show_notification", file)?;
-    parse_optional_bool(obj, "add_material_count_to_result", file)?;
+    let add_material_count_to_result =
+        parse_optional_bool(obj, "add_material_count_to_result", file)?.unwrap_or(false);
+    let material_count = parse_material_count(obj, file)?;
 
     let result_val = obj
         .get("result")
@@ -1529,10 +1570,55 @@ fn parse_transmute_recipe(
         material,
         result,
         count,
+        material_count,
+        add_material_count_to_result,
         group,
         category,
         show_notification,
     }))
+}
+
+fn parse_material_count(
+    obj: &serde_json::Map<String, Value>,
+    file: &Path,
+) -> Result<std::ops::RangeInclusive<u8>, RecipeDataError> {
+    let bound = |value: Option<&Value>, name: &str| -> Result<u8, RecipeDataError> {
+        value
+            .and_then(Value::as_u64)
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| (TRANSMUTE_MATERIAL_COUNT_MIN..=TRANSMUTE_MATERIAL_COUNT_MAX).contains(n))
+            .ok_or_else(|| {
+                invalid(
+                    file,
+                    format!(
+                        "`material_count{name}` must be an integer in {TRANSMUTE_MATERIAL_COUNT_MIN}..={TRANSMUTE_MATERIAL_COUNT_MAX}"
+                    ),
+                )
+            })
+    };
+    match obj.get("material_count") {
+        None => Ok(TRANSMUTE_MATERIAL_COUNT_MIN..=TRANSMUTE_MATERIAL_COUNT_MIN),
+        Some(value @ Value::Number(_)) => {
+            let exact = bound(Some(value), "")?;
+            Ok(exact..=exact)
+        }
+        Some(Value::Object(range)) => {
+            reject_unknown_keys(range, &["min", "max"], "material_count", file)?;
+            let min = bound(range.get("min"), ".min")?;
+            let max = bound(range.get("max"), ".max")?;
+            if min > max {
+                return Err(invalid(
+                    file,
+                    "`material_count.min` exceeds `material_count.max`",
+                ));
+            }
+            Ok(min..=max)
+        }
+        Some(_) => Err(invalid(
+            file,
+            "`material_count` must be an integer or a {min, max} range",
+        )),
+    }
 }
 
 fn parse_repair_item_recipe(
@@ -3537,6 +3623,87 @@ mod tests {
             red_shulker.components().custom_name(),
             Some("Redstone Supplies")
         );
+
+        // 3. `minecraft:map_cloning`: one filled map plus 1..=8 empty maps yields the
+        //    filled map with the number of empty maps added to its count.
+        let map_recipe = data
+            .transmute()
+            .iter()
+            .find(|recipe| recipe.id() == "minecraft:map_cloning")
+            .expect("map_cloning loads");
+        assert_eq!(map_recipe.material_count(), &(1..=8));
+        assert!(map_recipe.adds_material_count_to_result());
+        let map_max = u16::from(items.max_stack_size("minecraft:map").unwrap());
+        let filled_max = u16::from(items.max_stack_size("minecraft:filled_map").unwrap());
+        let filled = ItemStack::try_new("minecraft:filled_map", 1, filled_max).unwrap();
+        let empty_map = ItemStack::try_new("minecraft:map", 1, map_max).unwrap();
+        for empty_maps in 0..=8usize {
+            let mut grid = CraftingGrid::table_3x3();
+            grid.set_slot(0, 0, filled.clone()).unwrap();
+            for slot in 1..=empty_maps {
+                grid.set_slot(slot % 3, slot / 3, empty_map.clone())
+                    .unwrap();
+            }
+            let found = data.find_crafting(&grid);
+            if empty_maps == 0 {
+                assert!(found.is_none(), "a filled map alone is not a recipe");
+            } else {
+                let (recipe_id, cloned) = found.expect("map cloning matches");
+                assert_eq!(recipe_id, "minecraft:map_cloning");
+                assert_eq!(cloned.item(), "minecraft:filled_map");
+                assert_eq!(usize::from(cloned.count()), 1 + empty_maps);
+            }
+        }
+    }
+
+    #[test]
+    fn transmute_material_count_bounds_and_count_addition() {
+        let root = scratch_root("transmute-material-count");
+        write(
+            &root.join("data/testns/recipe/clone.json"),
+            r#"{"type": "minecraft:crafting_transmute", "input": "testns:original",
+                "material": "testns:blank", "material_count": {"min": 2, "max": 3},
+                "add_material_count_to_result": true, "result": {}}"#,
+        );
+        let data = RecipeData::load(&root, &ItemTags::default()).expect("load");
+        let original = ItemStack::try_new("testns:original", 1, 64).unwrap();
+        let blank = ItemStack::try_new("testns:blank", 1, 64).unwrap();
+        let grid_with = |blanks: usize| {
+            let mut grid = CraftingGrid::table_3x3();
+            grid.set_slot(0, 0, original.clone()).unwrap();
+            for slot in 1..=blanks {
+                grid.set_slot(slot % 3, slot / 3, blank.clone()).unwrap();
+            }
+            grid
+        };
+        assert!(data.find_crafting(&grid_with(1)).is_none());
+        assert_eq!(data.find_crafting(&grid_with(2)).unwrap().1.count(), 3);
+        assert_eq!(data.find_crafting(&grid_with(3)).unwrap().1.count(), 4);
+        assert!(data.find_crafting(&grid_with(4)).is_none());
+
+        for (name, bad) in [
+            ("zero", r#"0"#),
+            ("nine", r#"9"#),
+            ("reversed", r#"{"min": 3, "max": 2}"#),
+            ("extra", r#"{"min": 1, "max": 2, "step": 1}"#),
+            ("text", r#""two""#),
+        ] {
+            let bad_root = scratch_root(&format!("transmute-bad-count-{name}"));
+            write(
+                &bad_root.join("data/testns/recipe/bad.json"),
+                &format!(
+                    r#"{{"type": "minecraft:crafting_transmute", "input": "testns:a",
+                        "material": "testns:b", "material_count": {bad},
+                        "result": {{"id": "testns:c"}}}}"#
+                ),
+            );
+            let error = RecipeData::load(&bad_root, &ItemTags::default())
+                .expect_err("invalid material_count must fail")
+                .to_string();
+            assert!(error.contains("bad.json"), "{name}: {error}");
+            fs::remove_dir_all(bad_root).expect("cleanup");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
