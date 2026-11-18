@@ -736,11 +736,8 @@ impl PlayerInfoUpdatePacket {
                 if has_chat {
                     let (session_id, n) = read_uuid(&payload[cursor..])?;
                     cursor += n;
-                    if payload[cursor..].len() < 8 {
-                        return Err(ProtocolError::UnexpectedEof);
-                    }
-                    let expires_at =
-                        i64::from_be_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+                    let (expires_at, _) = java_wire::read_i64_be(&payload[cursor..])
+                        .map_err(|_| ProtocolError::UnexpectedEof)?;
                     cursor += 8;
 
                     let (public_key, n) =
@@ -1223,21 +1220,7 @@ fn skip_nbt_payload(tag_type: u8, input: &[u8], depth: usize) -> Result<usize, P
         }
         7 => {
             // TAG_Byte_Array
-            if input.len() < 4 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
-            if len < 0 {
-                return Err(ProtocolError::InvalidPacketLength {
-                    expected: 0,
-                    received: len as usize,
-                });
-            }
-            let total = 4 + len as usize;
-            if input.len() < total {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            Ok(total)
+            skip_nbt_array(input, 1)
         }
         8 => {
             // TAG_String
@@ -1246,11 +1229,9 @@ fn skip_nbt_payload(tag_type: u8, input: &[u8], depth: usize) -> Result<usize, P
         9 => {
             // TAG_List
             check_nbt_depth(depth + 1)?;
-            if input.len() < 5 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let elem_type = input[0];
-            let count = i32::from_be_bytes(input[1..5].try_into().unwrap());
+            let (&elem_type, rest) = input.split_first().ok_or(ProtocolError::UnexpectedEof)?;
+            let (count, _) =
+                java_wire::read_i32_be(rest).map_err(|_| ProtocolError::UnexpectedEof)?;
             if count < 0 {
                 return Err(ProtocolError::InvalidPacketLength {
                     expected: 0,
@@ -1281,42 +1262,29 @@ fn skip_nbt_payload(tag_type: u8, input: &[u8], depth: usize) -> Result<usize, P
         }
         11 => {
             // TAG_Int_Array
-            if input.len() < 4 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
-            if len < 0 {
-                return Err(ProtocolError::InvalidPacketLength {
-                    expected: 0,
-                    received: len as usize,
-                });
-            }
-            let total = 4 + (len as usize * 4);
-            if input.len() < total {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            Ok(total)
+            skip_nbt_array(input, 4)
         }
         12 => {
             // TAG_Long_Array
-            if input.len() < 4 {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            let len = i32::from_be_bytes(input[0..4].try_into().unwrap());
-            if len < 0 {
-                return Err(ProtocolError::InvalidPacketLength {
-                    expected: 0,
-                    received: len as usize,
-                });
-            }
-            let total = 4 + (len as usize * 8);
-            if input.len() < total {
-                return Err(ProtocolError::UnexpectedEof);
-            }
-            Ok(total)
+            skip_nbt_array(input, 8)
         }
         other => Err(ProtocolError::InvalidNbtTag(other)),
     }
+}
+
+fn skip_nbt_array(input: &[u8], elem_bytes: usize) -> Result<usize, ProtocolError> {
+    let (len, _) = java_wire::read_i32_be(input).map_err(|_| ProtocolError::UnexpectedEof)?;
+    if len < 0 {
+        return Err(ProtocolError::InvalidPacketLength {
+            expected: 0,
+            received: len as usize,
+        });
+    }
+    let total = 4 + (len as usize * elem_bytes);
+    if input.len() < total {
+        return Err(ProtocolError::UnexpectedEof);
+    }
+    Ok(total)
 }
 
 /// Serializes a display name as an anonymous Network NBT text component.

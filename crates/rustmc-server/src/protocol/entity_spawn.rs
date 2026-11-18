@@ -265,6 +265,32 @@ fn is_in_radius(a: [f64; 3], b: [f64; 3], radius: f64) -> bool {
 // SpawnEntityPacket (0x01)
 // ---------------------------------------------------------------------------
 
+/// Core placement and identity fields shared by [`SpawnEntityPacket`] and [`TrackedEntityState`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntitySpawnFields {
+    pub entity_id: i32,
+    pub uuid: [u8; 16],
+    pub entity_type: i32,
+    pub position: [f64; 3],
+    pub pitch: u8,
+    pub yaw: u8,
+    pub head_yaw: u8,
+    pub data: i32,
+}
+
+/// Entity spawn fields taking angles in degrees for [`SpawnEntityPacket::with_angles`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntitySpawnAngles {
+    pub entity_id: i32,
+    pub uuid: [u8; 16],
+    pub entity_type: i32,
+    pub position: [f64; 3],
+    pub pitch_deg: f64,
+    pub yaw_deg: f64,
+    pub head_yaw_deg: f64,
+    pub data: i32,
+}
+
 /// Clientbound packet for spawning entities in Java Edition 26.3 (protocol 777).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnEntityPacket {
@@ -282,52 +308,32 @@ impl SpawnEntityPacket {
     pub const PACKET_ID: u32 = PACKET_ID_SPAWN_ENTITY;
 
     /// Creates a new `SpawnEntityPacket` at rest, with raw angle bytes.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        entity_id: i32,
-        uuid: [u8; 16],
-        entity_type: i32,
-        position: [f64; 3],
-        pitch: u8,
-        yaw: u8,
-        head_yaw: u8,
-        data: i32,
-    ) -> Result<Self, EntityProtocolError> {
-        validate_coordinates(position)?;
+    pub fn new(fields: EntitySpawnFields) -> Result<Self, EntityProtocolError> {
+        validate_coordinates(fields.position)?;
         Ok(Self {
-            entity_id,
-            uuid,
-            entity_type,
-            position,
-            pitch,
-            yaw,
-            head_yaw,
-            data,
+            entity_id: fields.entity_id,
+            uuid: fields.uuid,
+            entity_type: fields.entity_type,
+            position: fields.position,
+            pitch: fields.pitch,
+            yaw: fields.yaw,
+            head_yaw: fields.head_yaw,
+            data: fields.data,
         })
     }
 
     /// Creates a new `SpawnEntityPacket` at rest, converting angles in degrees.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_angles(
-        entity_id: i32,
-        uuid: [u8; 16],
-        entity_type: i32,
-        position: [f64; 3],
-        pitch_deg: f64,
-        yaw_deg: f64,
-        head_yaw_deg: f64,
-        data: i32,
-    ) -> Result<Self, EntityProtocolError> {
-        Self::new(
-            entity_id,
-            uuid,
-            entity_type,
-            position,
-            angle_to_byte(pitch_deg),
-            angle_to_byte(yaw_deg),
-            angle_to_byte(head_yaw_deg),
-            data,
-        )
+    pub fn with_angles(fields: EntitySpawnAngles) -> Result<Self, EntityProtocolError> {
+        Self::new(EntitySpawnFields {
+            entity_id: fields.entity_id,
+            uuid: fields.uuid,
+            entity_type: fields.entity_type,
+            position: fields.position,
+            pitch: angle_to_byte(fields.pitch_deg),
+            yaw: angle_to_byte(fields.yaw_deg),
+            head_yaw: angle_to_byte(fields.head_yaw_deg),
+            data: fields.data,
+        })
     }
 
     /// Encodes the packet payload (without outer packet length or packet ID frame).
@@ -411,16 +417,16 @@ impl SpawnEntityPacket {
             return Err(EntityProtocolError::TrailingData);
         }
 
-        Self::new(
+        Self::new(EntitySpawnFields {
             entity_id,
             uuid,
             entity_type,
-            [x, y, z],
+            position: [x, y, z],
             pitch,
             yaw,
             head_yaw,
-            data_val,
-        )
+            data: data_val,
+        })
     }
 
     /// Decodes a framed `SpawnEntityPacket` from network wire bytes.
@@ -988,54 +994,25 @@ pub struct TrackedEntityState {
 
 impl TrackedEntityState {
     /// Creates a new tracked entity state.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        entity_id: i32,
-        uuid: [u8; 16],
-        entity_type: i32,
-        position: [f64; 3],
-        pitch: u8,
-        yaw: u8,
-        head_yaw: u8,
-        data: i32,
-    ) -> Result<Self, EntityProtocolError> {
-        validate_coordinates(position)?;
-        Ok(Self {
-            entity_id,
-            uuid,
-            entity_type,
-            position,
-            pitch,
-            yaw,
-            head_yaw,
-            data,
-            metadata: Vec::new(),
-        })
+    pub fn new(fields: EntitySpawnFields) -> Result<Self, EntityProtocolError> {
+        Self::with_metadata(fields, Vec::new())
     }
 
     /// Creates a tracked entity state with initial metadata entries.
-    #[allow(clippy::too_many_arguments)]
     pub fn with_metadata(
-        entity_id: i32,
-        uuid: [u8; 16],
-        entity_type: i32,
-        position: [f64; 3],
-        pitch: u8,
-        yaw: u8,
-        head_yaw: u8,
-        data: i32,
+        fields: EntitySpawnFields,
         metadata: Vec<EntityMetadataEntry>,
     ) -> Result<Self, EntityProtocolError> {
-        validate_coordinates(position)?;
+        validate_coordinates(fields.position)?;
         Ok(Self {
-            entity_id,
-            uuid,
-            entity_type,
-            position,
-            pitch,
-            yaw,
-            head_yaw,
-            data,
+            entity_id: fields.entity_id,
+            uuid: fields.uuid,
+            entity_type: fields.entity_type,
+            position: fields.position,
+            pitch: fields.pitch,
+            yaw: fields.yaw,
+            head_yaw: fields.head_yaw,
+            data: fields.data,
             metadata,
         })
     }
@@ -1493,16 +1470,16 @@ mod tests {
 
     #[test]
     fn test_spawn_entity_packet_payload_and_framing() {
-        let packet = SpawnEntityPacket::new(
-            42,
-            [0x12; 16],
-            100,
-            [10.0, 64.0, -10.0],
-            0x40,
-            0x80,
-            0xC0,
-            7,
-        )
+        let packet = SpawnEntityPacket::new(EntitySpawnFields {
+            entity_id: 42,
+            uuid: [0x12; 16],
+            entity_type: 100,
+            position: [10.0, 64.0, -10.0],
+            pitch: 0x40,
+            yaw: 0x80,
+            head_yaw: 0xC0,
+            data: 7,
+        })
         .expect("valid coords");
 
         let fixture = spawn_fixture();
@@ -1516,7 +1493,19 @@ mod tests {
         assert_eq!(packet.encode(), framed);
         assert_eq!(SpawnEntityPacket::decode(&framed).unwrap(), packet);
 
-        assert!(SpawnEntityPacket::new(1, [0; 16], 1, [f64::NAN, 0.0, 0.0], 0, 0, 0, 0).is_err());
+        assert!(
+            SpawnEntityPacket::new(EntitySpawnFields {
+                entity_id: 1,
+                uuid: [0; 16],
+                entity_type: 1,
+                position: [f64::NAN, 0.0, 0.0],
+                pitch: 0,
+                yaw: 0,
+                head_yaw: 0,
+                data: 0,
+            })
+            .is_err()
+        );
         assert!(SpawnEntityPacket::decode_payload(&fixture[..fixture.len() - 1]).is_err());
 
         let mut trailing = fixture.clone();
@@ -1710,12 +1699,30 @@ mod tests {
         let uuid2 = [2u8; 16];
 
         // Register entity 1 at (10.0, 64.0, 10.0)
-        let entity1 =
-            TrackedEntityState::new(1, uuid1, 20, [10.0, 64.0, 10.0], 0, 0, 0, 0).unwrap();
+        let entity1 = TrackedEntityState::new(EntitySpawnFields {
+            entity_id: 1,
+            uuid: uuid1,
+            entity_type: 20,
+            position: [10.0, 64.0, 10.0],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        })
+        .unwrap();
 
         // Register entity 2 at (100.0, 64.0, 100.0)
-        let entity2 =
-            TrackedEntityState::new(2, uuid2, 21, [100.0, 64.0, 100.0], 0, 0, 0, 0).unwrap();
+        let entity2 = TrackedEntityState::new(EntitySpawnFields {
+            entity_id: 2,
+            uuid: uuid2,
+            entity_type: 21,
+            position: [100.0, 64.0, 100.0],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        })
+        .unwrap();
 
         tracker.add_entity(entity1).unwrap();
         tracker.add_entity(entity2).unwrap();
@@ -1809,7 +1816,17 @@ mod tests {
         let mut tracker = EntityVisualTracker::new();
 
         let uuid = [0x55; 16];
-        let entity = TrackedEntityState::new(10, uuid, 1, [0.0, 0.0, 0.0], 0, 0, 0, 0).unwrap();
+        let entity = TrackedEntityState::new(EntitySpawnFields {
+            entity_id: 10,
+            uuid,
+            entity_type: 1,
+            position: [0.0, 0.0, 0.0],
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: 0,
+        })
+        .unwrap();
         tracker.add_entity(entity).unwrap();
 
         // Player A at (20.0, 0.0, 0.0) with radius 15.0 -> out of range

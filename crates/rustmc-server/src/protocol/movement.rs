@@ -28,7 +28,7 @@
 //! - Guard against illegal speed and teleportation exploits by enforcing single-tick maximum
 //!   displacement ($\Delta d \le 100.0$ blocks) unless authorized by a confirmed teleport.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 
 use crate::java_wire::{self, frame, put_varint};
@@ -228,6 +228,21 @@ pub fn read_varint(input: &[u8]) -> Result<(i32, usize), MovementError> {
     }
 }
 
+#[inline]
+fn read_f64(input: &[u8]) -> Result<(f64, &[u8]), MovementError> {
+    java_wire::read_f64_be(input).map_err(|_| MovementError::UnexpectedEof)
+}
+
+#[inline]
+fn read_f32(input: &[u8]) -> Result<(f32, &[u8]), MovementError> {
+    java_wire::read_f32_be(input).map_err(|_| MovementError::UnexpectedEof)
+}
+
+#[inline]
+fn read_i32(input: &[u8]) -> Result<(i32, &[u8]), MovementError> {
+    java_wire::read_i32_be(input).map_err(|_| MovementError::UnexpectedEof)
+}
+
 /// Writes a VarInt to a byte buffer.
 pub fn write_varint(value: u32, out: &mut Vec<u8>) {
     put_varint(value, out);
@@ -378,11 +393,14 @@ impl MovePlayerPos {
                 received: data.len(),
             });
         }
-        let x = f64::from_be_bytes(data[0..8].try_into().unwrap());
-        let y = f64::from_be_bytes(data[8..16].try_into().unwrap());
-        let z = f64::from_be_bytes(data[16..24].try_into().unwrap());
+        let (x, rest) = read_f64(data)?;
+        let (y, rest) = read_f64(rest)?;
+        let (z, rest) = read_f64(rest)?;
         validate_coords(x, y, z)?;
-        let (on_ground, horizontal_collision) = parse_flags_byte(data[24])?;
+        let &[flags] = rest else {
+            return Err(MovementError::UnexpectedEof);
+        };
+        let (on_ground, horizontal_collision) = parse_flags_byte(flags)?;
 
         Ok(Self {
             x,
@@ -465,18 +483,21 @@ impl MovePlayerPosRot {
                 received: data.len(),
             });
         }
-        let x = f64::from_be_bytes(data[0..8].try_into().unwrap());
-        let y = f64::from_be_bytes(data[8..16].try_into().unwrap());
-        let z = f64::from_be_bytes(data[16..24].try_into().unwrap());
+        let (x, rest) = read_f64(data)?;
+        let (y, rest) = read_f64(rest)?;
+        let (z, rest) = read_f64(rest)?;
         validate_coords(x, y, z)?;
 
-        let raw_yaw = f32::from_be_bytes(data[24..28].try_into().unwrap());
-        let raw_pitch = f32::from_be_bytes(data[28..32].try_into().unwrap());
+        let (raw_yaw, rest) = read_f32(rest)?;
+        let (raw_pitch, rest) = read_f32(rest)?;
         validate_rotation(raw_yaw, raw_pitch)?;
 
         let yaw = normalize_yaw(raw_yaw);
         let pitch = normalize_pitch(raw_pitch);
-        let (on_ground, horizontal_collision) = parse_flags_byte(data[32])?;
+        let &[flags] = rest else {
+            return Err(MovementError::UnexpectedEof);
+        };
+        let (on_ground, horizontal_collision) = parse_flags_byte(flags)?;
 
         Ok(Self {
             x,
@@ -550,13 +571,16 @@ impl MovePlayerRot {
                 received: data.len(),
             });
         }
-        let raw_yaw = f32::from_be_bytes(data[0..4].try_into().unwrap());
-        let raw_pitch = f32::from_be_bytes(data[4..8].try_into().unwrap());
+        let (raw_yaw, rest) = read_f32(data)?;
+        let (raw_pitch, rest) = read_f32(rest)?;
         validate_rotation(raw_yaw, raw_pitch)?;
 
         let yaw = normalize_yaw(raw_yaw);
         let pitch = normalize_pitch(raw_pitch);
-        let (on_ground, horizontal_collision) = parse_flags_byte(data[8])?;
+        let &[flags] = rest else {
+            return Err(MovementError::UnexpectedEof);
+        };
+        let (on_ground, horizontal_collision) = parse_flags_byte(flags)?;
 
         Ok(Self {
             yaw,
@@ -682,11 +706,11 @@ impl AcceptTeleportation {
             });
         }
         if remainder.len() == 32 {
-            let x = f64::from_be_bytes(remainder[0..8].try_into().unwrap());
-            let y = f64::from_be_bytes(remainder[8..16].try_into().unwrap());
-            let z = f64::from_be_bytes(remainder[16..24].try_into().unwrap());
-            let yaw = f32::from_be_bytes(remainder[24..28].try_into().unwrap());
-            let pitch = f32::from_be_bytes(remainder[28..32].try_into().unwrap());
+            let (x, rest) = read_f64(remainder)?;
+            let (y, rest) = read_f64(rest)?;
+            let (z, rest) = read_f64(rest)?;
+            let (yaw, rest) = read_f32(rest)?;
+            let (pitch, _) = read_f32(rest)?;
             if !x.is_finite() || !y.is_finite() || !z.is_finite() {
                 return Err(MovementError::NonFiniteCoordinate);
             }
@@ -776,6 +800,21 @@ pub struct PlayerPositionSync {
     pub flags: i32,
 }
 
+/// Full position, velocity, orientation, and flag fields for [`PlayerPositionSync::with_velocity`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionSyncParams {
+    pub teleport_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub dx: f64,
+    pub dy: f64,
+    pub dz: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub flags: i32,
+}
+
 impl PlayerPositionSync {
     pub const PACKET_ID: u32 = PACKET_ID_PLAYER_POSITION_SYNC;
 
@@ -803,30 +842,18 @@ impl PlayerPositionSync {
     }
 
     /// Creates a position synchronization packet specifying velocities and relative flags.
-    #[allow(clippy::too_many_arguments)]
-    pub const fn with_velocity(
-        teleport_id: i32,
-        x: f64,
-        y: f64,
-        z: f64,
-        dx: f64,
-        dy: f64,
-        dz: f64,
-        yaw: f32,
-        pitch: f32,
-        flags: i32,
-    ) -> Self {
+    pub const fn with_velocity(params: PositionSyncParams) -> Self {
         Self {
-            teleport_id,
-            x,
-            y,
-            z,
-            dx,
-            dy,
-            dz,
-            yaw,
-            pitch,
-            flags,
+            teleport_id: params.teleport_id,
+            x: params.x,
+            y: params.y,
+            z: params.z,
+            dx: params.dx,
+            dy: params.dy,
+            dz: params.dz,
+            yaw: params.yaw,
+            pitch: params.pitch,
+            flags: params.flags,
         }
     }
 
@@ -870,15 +897,15 @@ impl PlayerPositionSync {
             });
         }
 
-        let x = f64::from_be_bytes(remaining[0..8].try_into().unwrap());
-        let y = f64::from_be_bytes(remaining[8..16].try_into().unwrap());
-        let z = f64::from_be_bytes(remaining[16..24].try_into().unwrap());
-        let dx = f64::from_be_bytes(remaining[24..32].try_into().unwrap());
-        let dy = f64::from_be_bytes(remaining[32..40].try_into().unwrap());
-        let dz = f64::from_be_bytes(remaining[40..48].try_into().unwrap());
-        let yaw = f32::from_be_bytes(remaining[48..52].try_into().unwrap());
-        let pitch = f32::from_be_bytes(remaining[52..56].try_into().unwrap());
-        let flags = i32::from_be_bytes(remaining[56..60].try_into().unwrap());
+        let (x, rest) = read_f64(remaining)?;
+        let (y, rest) = read_f64(rest)?;
+        let (z, rest) = read_f64(rest)?;
+        let (dx, rest) = read_f64(rest)?;
+        let (dy, rest) = read_f64(rest)?;
+        let (dz, rest) = read_f64(rest)?;
+        let (yaw, rest) = read_f32(rest)?;
+        let (pitch, rest) = read_f32(rest)?;
+        let (flags, _) = read_i32(rest)?;
 
         if !x.is_finite()
             || !y.is_finite()
@@ -1049,14 +1076,15 @@ impl TeleportTracker {
             });
         }
 
-        if !self.pending.contains_key(&teleport_id) {
-            if self.pending.is_empty() {
-                return Err(TeleportError::NoPendingTeleport);
-            }
-            return Err(TeleportError::UnknownTeleportId { id: teleport_id });
+        if self.pending.is_empty() {
+            return Err(TeleportError::NoPendingTeleport);
         }
 
         let latest_id = self.latest_issued_id.unwrap_or(teleport_id);
+        let Entry::Occupied(entry) = self.pending.entry(teleport_id) else {
+            return Err(TeleportError::UnknownTeleportId { id: teleport_id });
+        };
+
         if teleport_id < latest_id {
             return Err(TeleportError::ObsoleteTeleportId {
                 id: teleport_id,
@@ -1064,7 +1092,7 @@ impl TeleportTracker {
             });
         }
 
-        let confirmed = self.pending.remove(&teleport_id).unwrap();
+        let confirmed = entry.remove();
         // Clear any prior pending teleports up to this confirmed ID
         self.pending.retain(|&id, _| id > teleport_id);
         self.last_confirmed_id = Some(teleport_id);
@@ -1225,6 +1253,16 @@ impl MovementGuard {
         self.trigger_teleport(self.authoritative_pos, tick)
     }
 
+    fn reject_if_teleport_pending(&self) -> Result<(), MovementValidationError> {
+        if let Some(pending) = self.teleport_tracker.pending_teleport() {
+            return Err(MovementValidationError::TeleportPending {
+                pending_id: pending.teleport_id,
+                expected: (pending.x, pending.y, pending.z),
+            });
+        }
+        Ok(())
+    }
+
     /// Validates and applies a position-only update (`MovePlayerPos`).
     pub fn validate_and_apply_pos(
         &mut self,
@@ -1237,13 +1275,7 @@ impl MovementGuard {
             return Err(MovementValidationError::NonFiniteCoordinate);
         }
 
-        if self.teleport_tracker.has_pending_teleport() {
-            let pending = self.teleport_tracker.pending_teleport().unwrap();
-            return Err(MovementValidationError::TeleportPending {
-                pending_id: pending.teleport_id,
-                expected: (pending.x, pending.y, pending.z),
-            });
-        }
+        self.reject_if_teleport_pending()?;
 
         let step_displacement = calculate_displacement(
             self.authoritative_pos.0,
@@ -1286,13 +1318,7 @@ impl MovementGuard {
             return Err(MovementValidationError::NonFiniteRotation);
         }
 
-        if self.teleport_tracker.has_pending_teleport() {
-            let pending = self.teleport_tracker.pending_teleport().unwrap();
-            return Err(MovementValidationError::TeleportPending {
-                pending_id: pending.teleport_id,
-                expected: (pending.x, pending.y, pending.z),
-            });
-        }
+        self.reject_if_teleport_pending()?;
 
         let step_displacement = calculate_displacement(
             self.authoritative_pos.0,
@@ -1330,13 +1356,7 @@ impl MovementGuard {
             return Err(MovementValidationError::NonFiniteRotation);
         }
 
-        if self.teleport_tracker.has_pending_teleport() {
-            let pending = self.teleport_tracker.pending_teleport().unwrap();
-            return Err(MovementValidationError::TeleportPending {
-                pending_id: pending.teleport_id,
-                expected: (pending.x, pending.y, pending.z),
-            });
-        }
+        self.reject_if_teleport_pending()?;
 
         self.authoritative_rot = (yaw, pitch);
         self.authoritative_on_ground = on_ground;
@@ -1348,13 +1368,7 @@ impl MovementGuard {
         &mut self,
         on_ground: bool,
     ) -> Result<(), MovementValidationError> {
-        if self.teleport_tracker.has_pending_teleport() {
-            let pending = self.teleport_tracker.pending_teleport().unwrap();
-            return Err(MovementValidationError::TeleportPending {
-                pending_id: pending.teleport_id,
-                expected: (pending.x, pending.y, pending.z),
-            });
-        }
+        self.reject_if_teleport_pending()?;
 
         self.authoritative_on_ground = on_ground;
         Ok(())
@@ -1748,18 +1762,18 @@ mod tests {
 
     #[test]
     fn test_player_position_sync_serialization_and_framing() {
-        let sync = PlayerPositionSync::with_velocity(
-            7,
-            100.5,
-            65.0,
-            -200.75,
-            0.1,
-            -0.5,
-            0.0,
-            90.0,
-            -15.0,
-            position_sync_flags::RELATIVE_X | position_sync_flags::RELATIVE_Y_ROT,
-        );
+        let sync = PlayerPositionSync::with_velocity(PositionSyncParams {
+            teleport_id: 7,
+            x: 100.5,
+            y: 65.0,
+            z: -200.75,
+            dx: 0.1,
+            dy: -0.5,
+            dz: 0.0,
+            yaw: 90.0,
+            pitch: -15.0,
+            flags: position_sync_flags::RELATIVE_X | position_sync_flags::RELATIVE_Y_ROT,
+        });
 
         // Verify framed round-trip
         let framed = sync.encode_framed();

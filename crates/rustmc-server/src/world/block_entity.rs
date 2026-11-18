@@ -463,9 +463,8 @@ impl std::error::Error for SignError {}
 
 /// Authoritative block entities attached to block positions.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum BlockEntity {
-    Sign(SignBlockEntity),
+    Sign(Box<SignBlockEntity>),
     Chest,
     Furnace,
 }
@@ -538,7 +537,7 @@ impl BlockEntityRegistry {
     }
 
     pub fn insert_sign(&mut self, pos: BlockPos, sign: SignBlockEntity) -> Option<BlockEntity> {
-        self.insert(pos, BlockEntity::Sign(sign))
+        self.insert(pos, BlockEntity::Sign(Box::new(sign)))
     }
 
     pub fn remove(&mut self, pos: &BlockPos) -> Option<BlockEntity> {
@@ -1026,12 +1025,9 @@ impl BlockEntityDataPacket {
     }
 
     /// Decodes from the packet payload (unframed).
-    pub fn decode(mut input: &[u8]) -> Result<Self, BlockEntityError> {
-        if input.len() < 8 {
-            return Err(BlockEntityError::UnexpectedEof);
-        }
-        let pos_raw = i64::from_be_bytes(input[..8].try_into().unwrap());
-        input = &input[8..];
+    pub fn decode(input: &[u8]) -> Result<Self, BlockEntityError> {
+        let (pos_raw, mut input) =
+            java_wire::read_i64_be(input).map_err(|_| BlockEntityError::UnexpectedEof)?;
         let pos = BlockPos::unpack(pos_raw);
 
         let (type_id, varint_len) = read_varint(input)?;
@@ -1121,23 +1117,19 @@ impl UpdateSignPacket {
     }
 
     /// Decodes and validates a serverbound `UpdateSignPacket` payload.
-    pub fn decode(mut input: &[u8]) -> Result<Self, BlockEntityError> {
-        if input.len() < 9 {
-            return Err(BlockEntityError::UnexpectedEof);
-        }
-        let pos_raw = i64::from_be_bytes(input[..8].try_into().unwrap());
+    pub fn decode(input: &[u8]) -> Result<Self, BlockEntityError> {
+        let (pos_raw, rest) =
+            java_wire::read_i64_be(input).map_err(|_| BlockEntityError::UnexpectedEof)?;
+        let (&front_byte, mut input) = rest.split_first().ok_or(BlockEntityError::UnexpectedEof)?;
         let pos = BlockPos::unpack(pos_raw);
         if !pos.is_valid() {
             return Err(BlockEntityError::InvalidPosition(pos));
         }
-        input = &input[8..];
 
-        let front_byte = input[0];
         if front_byte > 1 {
             return Err(BlockEntityError::Malformed("is_front_text must be 0 or 1"));
         }
         let is_front_text = front_byte == 1;
-        input = &input[1..];
 
         let mut lines = [String::new(), String::new(), String::new(), String::new()];
         for line in &mut lines {
