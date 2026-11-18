@@ -3387,4 +3387,299 @@ mod tests {
             ]
         );
     }
+
+    fn vanilla_data_root() -> PathBuf {
+        std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root")
+    }
+
+    fn read_vanilla_block_table_json(root: &Path, block_name: &str) -> Value {
+        let path = root
+            .join("data")
+            .join("minecraft")
+            .join("loot_table")
+            .join("blocks")
+            .join(format!("{block_name}.json"));
+        read_json(&path).expect("read vanilla block loot table json")
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_stone_bare_and_silk_touch`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_stone_bare_and_silk_touch() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        let stone = tables.get("minecraft:stone").expect("stone loot table");
+        let raw = read_vanilla_block_table_json(&root, "stone");
+        let children = raw["pools"][0]["entries"][0]["children"]
+            .as_array()
+            .expect("stone alternatives children");
+        let silk_item = children[0]["name"].as_str().expect("silk stone drop");
+        let bare_item = children[1]["name"].as_str().expect("bare stone drop");
+
+        let bare_ctx = LootContext::for_block("minecraft:stone");
+        let mut rng = RandomSource::from_world_seed(1);
+        let bare_drops = stone.roll(&bare_ctx, &mut rng);
+        assert_eq!(bare_drops.len(), 1);
+        assert_eq!(bare_drops[0].item(), bare_item);
+        assert_eq!(bare_drops[0].count(), 1);
+
+        let mut silk_enchs = BTreeMap::new();
+        silk_enchs.insert("minecraft:silk_touch".to_owned(), 1);
+        let silk_ctx = LootContext {
+            block_state: ("minecraft:stone".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "minecraft:diamond_pickaxe".to_owned(),
+                enchantments: silk_enchs,
+            }),
+            explosion_radius: None,
+        };
+        let silk_drops = stone.roll(&silk_ctx, &mut rng);
+        assert_eq!(silk_drops.len(), 1);
+        assert_eq!(silk_drops[0].item(), silk_item);
+        assert_eq!(silk_drops[0].count(), 1);
+    }
+
+    /// Verifies `minecraft:diamond_ore` drops without enchantments and with Fortune III.
+    ///
+    /// Mirrors `minecraft.wiki` `Fortune` (revision 3864999):
+    /// `"The average drops multiplier is 1/(2+level) + (1+level)/2, so Fortune I gives 1.33 × drops on average, Fortune II gives 1.75 × drops on average, and Fortune III gives 2.2 × drops on average."`
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_diamond_ore_no_enchant_and_fortune_three`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_diamond_ore_no_enchant_and_fortune_three() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        let diamond_ore = tables
+            .get("minecraft:diamond_ore")
+            .expect("diamond_ore loot table");
+        let raw = read_vanilla_block_table_json(&root, "diamond_ore");
+        let expected_item = raw["pools"][0]["entries"][0]["children"][1]["name"]
+            .as_str()
+            .expect("diamond_ore normal drop");
+
+        let bare_pick = LootContext {
+            block_state: ("minecraft:diamond_ore".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "minecraft:iron_pickaxe".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+        };
+        for seed in 0..100_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = diamond_ore.roll(&bare_pick, &mut rng);
+            assert_eq!(drops.len(), 1);
+            assert_eq!(drops[0].item(), expected_item);
+            assert_eq!(drops[0].count(), 1);
+        }
+
+        let mut fortune_enchs = BTreeMap::new();
+        fortune_enchs.insert("minecraft:fortune".to_owned(), 3);
+        let fortune_ctx = LootContext {
+            block_state: ("minecraft:diamond_ore".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "minecraft:diamond_pickaxe".to_owned(),
+                enchantments: fortune_enchs,
+            }),
+            explosion_radius: None,
+        };
+        let total: u64 = (0..10_000_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                let drops = diamond_ore.roll(&fortune_ctx, &mut rng);
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].item(), expected_item);
+                u64::from(drops[0].count())
+            })
+            .sum();
+        let mean = total as f64 / 10_000.0;
+        assert!(
+            (2.1..=2.3).contains(&mean),
+            "expected diamond_ore Fortune III mean in 2.1..=2.3 (wiki 2.2), got {mean}"
+        );
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_gravel_flint_rates_match_table_bonus`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_gravel_flint_rates_match_table_bonus() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        let gravel = tables.get("minecraft:gravel").expect("gravel loot table");
+        let raw = read_vanilla_block_table_json(&root, "gravel");
+        let inner_alt = &raw["pools"][0]["entries"][0]["children"][1];
+        let flint_entry = &inner_alt["children"][0];
+        let gravel_entry = &inner_alt["children"][1];
+        let flint_item = flint_entry["name"].as_str().expect("flint name");
+        let gravel_item = gravel_entry["name"].as_str().expect("gravel name");
+        let chances: Vec<f64> = flint_entry["condition"]["chances"]
+            .as_array()
+            .expect("table_bonus chances array")
+            .iter()
+            .map(|v| v.as_f64().expect("chance float"))
+            .collect();
+        assert_eq!(chances.len(), 4);
+
+        for (fortune_level, expected_rate) in chances.iter().copied().enumerate() {
+            let mut enchantments = BTreeMap::new();
+            if fortune_level > 0 {
+                enchantments.insert("minecraft:fortune".to_owned(), fortune_level as u8);
+            }
+            let ctx = LootContext {
+                block_state: ("minecraft:gravel".to_owned(), BTreeMap::new()),
+                tool: Some(ToolContext {
+                    item: "minecraft:diamond_shovel".to_owned(),
+                    enchantments,
+                }),
+                explosion_radius: None,
+            };
+
+            let mut flint_count = 0_u64;
+            for seed in 0..20_000_u64 {
+                let mut rng = RandomSource::from_world_seed(seed);
+                let drops = gravel.roll(&ctx, &mut rng);
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].count(), 1);
+                if drops[0].item() == flint_item {
+                    flint_count += 1;
+                } else {
+                    assert_eq!(drops[0].item(), gravel_item);
+                }
+            }
+            let observed_rate = flint_count as f64 / 20_000.0;
+            assert!(
+                (observed_rate - expected_rate).abs() <= 0.01,
+                "fortune {fortune_level}: expected {expected_rate} +- 0.01, got {observed_rate}"
+            );
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_oak_leaves_shears_and_bare_hand`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_oak_leaves_shears_and_bare_hand() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        let oak_leaves = tables
+            .get("minecraft:oak_leaves")
+            .expect("oak_leaves loot table");
+        let raw = read_vanilla_block_table_json(&root, "oak_leaves");
+        let leaves_item = raw["pools"][0]["entries"][0]["children"][0]["name"]
+            .as_str()
+            .expect("oak_leaves drop name");
+
+        let shears_ctx = LootContext {
+            block_state: ("minecraft:oak_leaves".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "minecraft:shears".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+        };
+        let mut rng = RandomSource::from_world_seed(7);
+        let sheared = oak_leaves.roll(&shears_ctx, &mut rng);
+        assert_eq!(sheared.len(), 1);
+        assert_eq!(sheared[0].item(), leaves_item);
+        assert_eq!(sheared[0].count(), 1);
+
+        let bare_ctx = LootContext::for_block("minecraft:oak_leaves");
+        for seed in 0..500_u64 {
+            let mut bare_rng = RandomSource::from_world_seed(seed);
+            let bare_drops = oak_leaves.roll(&bare_ctx, &mut bare_rng);
+            assert!(
+                bare_drops.iter().all(|stack| stack.item() != leaves_item),
+                "oak_leaves must never drop leaves without shears/silk_touch (seed {seed})"
+            );
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_stone_explosion_radius_four`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_stone_explosion_radius_four() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        let stone = tables.get("minecraft:stone").expect("stone loot table");
+        let raw = read_vanilla_block_table_json(&root, "stone");
+        let cobblestone_item = raw["pools"][0]["entries"][0]["children"][1]["name"]
+            .as_str()
+            .expect("cobblestone drop name");
+
+        let ctx = LootContext {
+            block_state: ("minecraft:stone".to_owned(), BTreeMap::new()),
+            tool: None,
+            explosion_radius: Some(4.0),
+        };
+        let mut drops_count = 0_u32;
+        for seed in 0..10_000_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = stone.roll(&ctx, &mut rng);
+            if let Some(first) = drops.first() {
+                assert_eq!(drops.len(), 1);
+                assert_eq!(first.item(), cobblestone_item);
+                assert_eq!(first.count(), 1);
+                drops_count += 1;
+            }
+        }
+        assert!(
+            (2300..=2700).contains(&drops_count),
+            "expected 2300..=2700 cobblestone drops at radius 4, got {drops_count}"
+        );
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_all_tables_roll_without_panic_in_empty_context`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_all_tables_roll_without_panic_in_empty_context() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_blocks(&root).expect("load vanilla block loot tables");
+        assert_eq!(tables.len(), 1201);
+        let item_defaults = tables
+            .item_defaults()
+            .expect("vanilla data root includes ItemDefaults reports");
+
+        // Verify ItemDefaults max_stack_size is applied (for example shulker box = 1, sign = 16).
+        let shulker = tables
+            .get("minecraft:white_shulker_box")
+            .expect("white_shulker_box");
+        let shulker_roll = shulker.roll_with_notes(
+            &LootContext::for_block("minecraft:white_shulker_box"),
+            &mut RandomSource::from_world_seed(1),
+        );
+        assert_eq!(shulker_roll.items.len(), 1);
+        assert_eq!(shulker_roll.items[0].max_stack(), 1);
+        assert!(!shulker_roll.notes.is_empty());
+
+        let empty_ctx = LootContext::default();
+        let mut rng = RandomSource::from_world_seed(202_603);
+        let mut returned_nothing = 0_usize;
+        for (_id, table) in tables.iter() {
+            let outcome = table.roll_with_notes(&empty_ctx, &mut rng);
+            for stack in &outcome.items {
+                let expected_max = u16::from(
+                    item_defaults
+                        .max_stack_size(stack.item())
+                        .expect("every vanilla block drop exists in ItemDefaults"),
+                );
+                assert_eq!(stack.max_stack(), expected_max);
+            }
+            if outcome.items.is_empty() {
+                returned_nothing += 1;
+            }
+        }
+        println!(
+            "rolled {} vanilla tables in empty context; {} returned nothing",
+            tables.len(),
+            returned_nothing
+        );
+    }
 }
