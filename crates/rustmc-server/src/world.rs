@@ -61,6 +61,7 @@ pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
+pub mod anvil;
 pub mod brewing;
 pub mod container_data;
 pub mod furnace;
