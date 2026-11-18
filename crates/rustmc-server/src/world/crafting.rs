@@ -432,6 +432,9 @@ pub struct ShapedRecipe {
     ingredients: Vec<Option<Ingredient>>,
     result: ItemStack,
     allow_mirroring: bool,
+    group: Option<String>,
+    category: Option<String>,
+    show_notification: Option<bool>,
 }
 
 impl ShapedRecipe {
@@ -493,6 +496,9 @@ impl ShapedRecipe {
             ingredients: trimmed_ingredients,
             result,
             allow_mirroring: true,
+            group: None,
+            category: None,
+            show_notification: None,
         })
     }
 
@@ -556,10 +562,49 @@ impl ShapedRecipe {
         self
     }
 
+    /// Assigns an optional recipe-book group name.
+    #[must_use]
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    /// Assigns an optional recipe-book category name.
+    #[must_use]
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
+    /// Assigns the optional `show_notification` flag from the recipe data.
+    #[must_use]
+    pub fn with_show_notification(mut self, show: bool) -> Self {
+        self.show_notification = Some(show);
+        self
+    }
+
     /// Optional recipe identifier.
     #[must_use]
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
+    }
+
+    /// Optional recipe-book group name.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// Optional recipe-book category name.
+    #[must_use]
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+
+    /// Optional `show_notification` flag from the recipe data.
+    #[must_use]
+    pub fn show_notification(&self) -> Option<bool> {
+        self.show_notification
     }
 
     /// Pattern width in columns.
@@ -659,6 +704,8 @@ pub struct ShapelessRecipe {
     id: Option<String>,
     ingredients: Vec<Ingredient>,
     result: ItemStack,
+    group: Option<String>,
+    category: Option<String>,
 }
 
 impl ShapelessRecipe {
@@ -675,6 +722,8 @@ impl ShapelessRecipe {
             id: None,
             ingredients,
             result,
+            group: None,
+            category: None,
         })
     }
 
@@ -695,10 +744,36 @@ impl ShapelessRecipe {
         self
     }
 
+    /// Assigns an optional recipe-book group name.
+    #[must_use]
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    /// Assigns an optional recipe-book category name.
+    #[must_use]
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
     /// Optional recipe identifier.
     #[must_use]
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
+    }
+
+    /// Optional recipe-book group name.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// Optional recipe-book category name.
+    #[must_use]
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
     }
 
     /// Required multiset of ingredients.
