@@ -12,7 +12,10 @@
 //! `registries.json`.
 
 use super::container_data::SetContainerDataPacket;
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use super::recipe_data::RecipeData;
+use crate::item::{
+    DEFAULT_MAX_STACK, ItemStack, ItemStackError, default_max_stack, items_equal, normalize_item_id,
+};
 use std::fmt;
 
 /// Potion bottle slot 0 (left slot).
@@ -95,13 +98,6 @@ const VANILLA_POTION_TYPES: [&str; 46] = [
     "minecraft:wind_charged",
 ];
 
-/// Strips optional `minecraft:` namespace prefix for canonical item or potion matching.
-#[inline]
-#[must_use]
-pub fn normalize_item_id(item: &str) -> &str {
-    item.strip_prefix("minecraft:").unwrap_or(item)
-}
-
 /// Returns whether `item` is one of the three Java 26.3 potion container items.
 #[inline]
 #[must_use]
@@ -120,22 +116,6 @@ pub fn canonical_potion_type(potion_type: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|entry| normalize_item_id(entry) == bare)
-}
-
-/// Checks if two item identifiers match canonically in the `minecraft` namespace.
-#[must_use]
-pub fn items_equal(a: &str, b: &str) -> bool {
-    normalize_item_id(a) == normalize_item_id(b)
-}
-
-/// Returns the standard default maximum stack size for brewing items.
-#[must_use]
-pub fn default_max_stack(item: &str) -> u16 {
-    if is_potion_container_item(item) {
-        POTION_MAX_STACK
-    } else {
-        DEFAULT_MAX_STACK
-    }
 }
 
 /// Potion effect kind.
@@ -367,7 +347,8 @@ impl Potion {
     }
 }
 
-/// Evaluates Java Edition potion modifier transformations (minecraft.wiki `Brewing` rev 3885554).
+/// Offline fallback evaluator for Java Edition potion modifier transformations
+/// (minecraft.wiki `Brewing` rev 3885554), used when no loaded [`RecipeData`] is provided.
 #[must_use]
 pub fn evaluate_potion_modifier(ingredient: &str, input_potion_type: &str) -> Option<&'static str> {
     let ing = normalize_item_id(ingredient);
@@ -658,7 +639,7 @@ impl BrewingRecipe {
     }
 }
 
-/// Registry of brewing recipes for the brewing stand state machine.
+/// Offline fallback registry of brewing recipes used when no loaded [`RecipeData`] is provided.
 #[derive(Debug, Clone)]
 pub struct BrewingRecipeRegistry {
     recipes: Vec<BrewingRecipe>,
@@ -1127,9 +1108,27 @@ impl BrewingStandBlockEntity {
         true
     }
 
-    /// Checks if the current ingredient in slot 3 and at least one bottle in slots 0..=2 form a valid recipe.
-    #[must_use]
-    pub fn can_brew(&self) -> bool {
+    fn resolve_output_slot_item(
+        &self,
+        recipes: Option<&RecipeData>,
+        ingredient: &str,
+        bottle: &BrewingSlotItem,
+    ) -> Option<BrewingSlotItem> {
+        let (container_item, output_potion_type) = match recipes {
+            Some(data) => {
+                let potion_type = bottle.potion_type()?;
+                let recipe = data.find_brewing(bottle.item_id(), potion_type, ingredient)?;
+                (
+                    recipe.output_item().to_owned(),
+                    recipe.output_potion().to_owned(),
+                )
+            }
+            None => self.recipe_registry.find_output_item(ingredient, bottle)?,
+        };
+        BrewingSlotItem::potion_with_container(&container_item, &output_potion_type).ok()
+    }
+
+    fn can_brew_inner(&self, recipes: Option<&RecipeData>) -> bool {
         let Some(ref ingredient) = self.slots[INGREDIENT_SLOT] else {
             return false;
         };
@@ -1137,8 +1136,8 @@ impl BrewingStandBlockEntity {
         for slot_idx in POTION_SLOTS {
             if let Some(ref bottle) = self.slots[slot_idx]
                 && self
-                    .recipe_registry
-                    .has_recipe_for_item(ingredient.item_id(), bottle)
+                    .resolve_output_slot_item(recipes, ingredient.item_id(), bottle)
+                    .is_some()
             {
                 return true;
             }
@@ -1147,11 +1146,21 @@ impl BrewingStandBlockEntity {
         false
     }
 
-    /// Completes the current brewing cycle:
-    /// - Transforms matching input potions in slots 0..=2 into recipe output potions.
-    /// - Decrements the ingredient in slot 3 by 1.
-    /// - Resets `brew_time` to 0.
-    pub fn complete_brew(&mut self) {
+    /// Checks if slot 3 and at least one bottle in slots 0..=2 form a valid recipe
+    /// using the offline fallback [`BrewingRecipeRegistry`].
+    #[must_use]
+    pub fn can_brew(&self) -> bool {
+        self.can_brew_inner(None)
+    }
+
+    /// Checks if slot 3 and at least one bottle in slots 0..=2 form a valid recipe
+    /// in the loaded [`RecipeData`].
+    #[must_use]
+    pub fn can_brew_with_recipes(&self, recipes: &RecipeData) -> bool {
+        self.can_brew_inner(Some(recipes))
+    }
+
+    fn complete_brew_inner(&mut self, recipes: Option<&RecipeData>) {
         let Some(ingredient_item) = self.slots[INGREDIENT_SLOT]
             .as_ref()
             .map(|s| s.item_id().to_owned())
@@ -1163,14 +1172,10 @@ impl BrewingStandBlockEntity {
         // Transform all matching potion slots
         for slot_idx in POTION_SLOTS {
             if let Some(ref bottle) = self.slots[slot_idx]
-                && let Some((container_item, output_potion_type)) = self
-                    .recipe_registry
-                    .find_output_item(&ingredient_item, bottle)
+                && let Some(output_slot) =
+                    self.resolve_output_slot_item(recipes, &ingredient_item, bottle)
             {
-                self.slots[slot_idx] = Some(
-                    BrewingSlotItem::potion_with_container(&container_item, &output_potion_type)
-                        .expect("recipe outputs produce valid 26.3 potion container and type"),
-                );
+                self.slots[slot_idx] = Some(output_slot);
             }
         }
 
@@ -1181,10 +1186,31 @@ impl BrewingStandBlockEntity {
         self.brew_time = 0;
     }
 
-    /// Advances the brewing stand state machine by one server tick (1/20 second).
+    /// Completes the current brewing cycle using the offline fallback [`BrewingRecipeRegistry`]:
+    /// - Transforms matching input potions in slots 0..=2 into recipe output potions.
+    /// - Decrements the ingredient in slot 3 by 1.
+    /// - Resets `brew_time` to 0.
+    pub fn complete_brew(&mut self) {
+        self.complete_brew_inner(None);
+    }
+
+    /// Advances the brewing stand state machine by one server tick (1/20 second)
+    /// using the offline fallback [`BrewingRecipeRegistry`] (and [`evaluate_potion_modifier`]).
     ///
     /// Returns true if any state change occurred.
     pub fn tick(&mut self) -> bool {
+        self.tick_inner(None)
+    }
+
+    /// Advances the brewing stand state machine by one server tick (1/20 second)
+    /// using the loaded vanilla brewing recipes in [`RecipeData`].
+    ///
+    /// Returns true if any state change occurred.
+    pub fn tick_with_recipes(&mut self, recipes: &RecipeData) -> bool {
+        self.tick_inner(Some(recipes))
+    }
+
+    fn tick_inner(&mut self, recipes: Option<&RecipeData>) -> bool {
         // Step 1: replenish fuel charges from blaze powder slot if fuel is exhausted
         let replenished = self.fuel_charges == 0 && self.replenish_fuel();
 
@@ -1194,7 +1220,7 @@ impl BrewingStandBlockEntity {
             .map(|stack| normalize_item_id(stack.item_id()).to_owned());
         let ingredient_changed =
             self.brewing_ingredient.is_some() && self.brewing_ingredient != ingredient;
-        if !self.can_brew() || ingredient_changed {
+        if !self.can_brew_inner(recipes) || ingredient_changed {
             self.brewing_ingredient = None;
             if self.brew_time > 0 {
                 self.brew_time = 0;
@@ -1218,7 +1244,7 @@ impl BrewingStandBlockEntity {
 
         // Step 5: on reaching 0, transform potions and decrement ingredient
         if self.brew_time == 0 {
-            self.complete_brew();
+            self.complete_brew_inner(recipes);
             self.brewing_ingredient = None;
         }
 
@@ -1885,5 +1911,199 @@ mod tests {
         assert!(stand.tick());
         assert_eq!(stand.fuel_charges(), MAX_FUEL_CHARGES);
         assert!(!stand.tick());
+    }
+
+    #[test]
+    fn test_tick_with_recipes_uses_loaded_recipes_without_fallback() {
+        use crate::vanilla::feature::ItemTags;
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-brewing-recipes-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let recipe_path = root.join("data/testns/recipe/brewing/herb_splash.json");
+        fs::create_dir_all(recipe_path.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &recipe_path,
+            r#"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "minecraft:potion",
+                    "potion_contents": {"potions": "minecraft:water"}
+                },
+                "reagent": {"item": "testns:herb"},
+                "output": {
+                    "id": "minecraft:splash_potion",
+                    "components": {
+                        "minecraft:potion_contents": {"potion": "minecraft:healing"}
+                    }
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let data = RecipeData::load(&root, &ItemTags::default()).expect("load recipe data");
+
+        // Built-in fallback recipe not in `data` does not brew under `tick_with_recipes`.
+        let mut blocked = BrewingStandBlockEntity::new();
+        blocked.set_fuel_charges(5);
+        blocked
+            .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::water_bottle()))
+            .unwrap();
+        blocked.set_ingredient(Some(item("minecraft:nether_wart", 1)));
+        assert!(!blocked.can_brew_with_recipes(&data));
+        assert!(!blocked.tick_with_recipes(&data));
+        assert_eq!(blocked.brew_time(), 0);
+
+        // Loaded recipe brews in a full 400-tick cycle.
+        let mut stand = BrewingStandBlockEntity::new();
+        stand.set_fuel_charges(1);
+        stand
+            .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::water_bottle()))
+            .unwrap();
+        stand.set_ingredient(Some(item("testns:herb", 1)));
+        assert!(stand.can_brew_with_recipes(&data));
+        for _ in 0..BREW_TIME_MAX {
+            assert!(stand.tick_with_recipes(&data));
+        }
+        assert_eq!(stand.brew_time(), 0);
+        assert!(stand.ingredient().is_none());
+        let brewed = stand.potion_slot(POTION_SLOT_0).expect("brewed output");
+        assert_eq!(brewed.item_id(), "minecraft:splash_potion");
+        assert_eq!(brewed.potion_type(), Some("minecraft:healing"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_brewing_stand_brews_loaded_recipes_and_diffs_fallback --nocapture`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_brewing_stand_brews_loaded_recipes_and_diffs_fallback() {
+        use crate::item::ItemDefaults;
+        use crate::vanilla::feature::ItemTags;
+        use crate::vanilla::worldgen::read_json;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load vanilla recipes");
+
+        // 1. Full brew: minecraft:potion + minecraft:awkward + minecraft:blaze_powder -> minecraft:potion minecraft:strength
+        let mut strength_stand = BrewingStandBlockEntity::new();
+        strength_stand.set_fuel_charges(1);
+        strength_stand
+            .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::awkward_potion()))
+            .unwrap();
+        strength_stand.set_ingredient(Some(item("minecraft:blaze_powder", 1)));
+        for _ in 0..BREW_TIME_MAX {
+            assert!(strength_stand.tick_with_recipes(&data));
+        }
+        let strength_out = strength_stand
+            .potion_slot(POTION_SLOT_0)
+            .expect("strength potion");
+        assert_eq!(strength_out.item_id(), "minecraft:potion");
+        assert_eq!(strength_out.potion_type(), Some("minecraft:strength"));
+
+        // 2. Full brew: minecraft:potion + minecraft:awkward + minecraft:gunpowder -> expected output from file
+        let gunpowder_path =
+            root.join("data/minecraft/recipe/brewing/potion_awkward_gunpowder.json");
+        if gunpowder_path.exists() {
+            let doc = read_json(&gunpowder_path).expect("read potion_awkward_gunpowder.json");
+            let expected_item = doc["output"]["id"].as_str().expect("output id");
+            let expected_potion =
+                doc["output"]["components"]["minecraft:potion_contents"]["potion"]
+                    .as_str()
+                    .expect("output potion");
+
+            let mut splash_stand = BrewingStandBlockEntity::new();
+            splash_stand.set_fuel_charges(1);
+            splash_stand
+                .set_potion(POTION_SLOT_0, Some(BrewingSlotItem::awkward_potion()))
+                .unwrap();
+            splash_stand.set_ingredient(Some(item("minecraft:gunpowder", 1)));
+            for _ in 0..BREW_TIME_MAX {
+                assert!(splash_stand.tick_with_recipes(&data));
+            }
+            let splash_out = splash_stand
+                .potion_slot(POTION_SLOT_0)
+                .expect("splash awkward potion");
+            assert_eq!(splash_out.item_id(), expected_item);
+            assert_eq!(splash_out.potion_type(), Some(expected_potion));
+        }
+
+        // 3. Report every loaded recipe whose result differs from offline fallback `evaluate_potion_modifier`.
+        let mut modifier_diffs = Vec::new();
+        for recipe in data.brewing() {
+            for input_potion in recipe.input_potions() {
+                for reagent in recipe.reagent().allowed_items() {
+                    let fallback = evaluate_potion_modifier(reagent, input_potion)
+                        .map(|out_potion| (recipe.input_item(), out_potion));
+                    let loaded = (recipe.output_item(), recipe.output_potion());
+                    if fallback != Some(loaded) {
+                        modifier_diffs.push((
+                            recipe.id(),
+                            recipe.input_item(),
+                            input_potion.as_str(),
+                            reagent.as_str(),
+                            loaded,
+                            fallback,
+                        ));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "loaded brewing recipes differing from evaluate_potion_modifier ({}):",
+            modifier_diffs.len()
+        );
+        for (id, in_item, in_pot, reag, (out_item, out_pot), fb) in &modifier_diffs {
+            eprintln!(
+                "  {id}: ({in_item}, {in_pot}) + {reag} -> ({out_item}, {out_pot}); fallback={fb:?}"
+            );
+        }
+
+        // Also report differences against the full offline fallback registry.
+        let fallback_registry = BrewingRecipeRegistry::new();
+        let mut registry_diffs = Vec::new();
+        for recipe in data.brewing() {
+            for input_potion in recipe.input_potions() {
+                let bottle =
+                    BrewingSlotItem::potion_with_container(recipe.input_item(), input_potion)
+                        .expect("valid vanilla bottle");
+                for reagent in recipe.reagent().allowed_items() {
+                    let fb = fallback_registry.find_output_item(reagent, &bottle);
+                    let loaded = (
+                        recipe.output_item().to_owned(),
+                        recipe.output_potion().to_owned(),
+                    );
+                    if fb.as_ref() != Some(&loaded) {
+                        registry_diffs.push((
+                            recipe.id(),
+                            recipe.input_item(),
+                            input_potion.as_str(),
+                            reagent.as_str(),
+                            loaded,
+                            fb,
+                        ));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "loaded brewing recipes differing from BrewingRecipeRegistry::new() ({}):",
+            registry_diffs.len()
+        );
+        for (id, in_item, in_pot, reag, (out_item, out_pot), fb) in &registry_diffs {
+            eprintln!(
+                "  {id}: ({in_item}, {in_pot}) + {reag} -> ({out_item}, {out_pot}); registry={fb:?}"
+            );
+        }
     }
 }

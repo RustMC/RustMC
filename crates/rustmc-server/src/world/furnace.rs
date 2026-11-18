@@ -10,7 +10,8 @@
 
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::{CookingKind, RecipeData};
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+pub use crate::item::default_max_stack;
+use crate::item::{ItemStack, ItemStackError, normalize_item_id};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
@@ -22,14 +23,28 @@ pub const DEFAULT_COOKING_TOTAL_TIME: u16 = 200;
 
 /// Burn duration in ticks for coal and charcoal (minecraft.wiki `Smelting` rev 3829803: 1600 ticks = 8 smelts).
 const COAL_BURN_TIME: u16 = 1600;
+/// Burn duration in ticks for a block of coal (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 16000 ticks = 80 smelts).
+const COAL_BLOCK_BURN_TIME: u16 = 16_000;
+/// Burn duration in ticks for a dried kelp block (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 4000 ticks = 20 smelts).
+const DRIED_KELP_BLOCK_BURN_TIME: u16 = 4_000;
+/// Burn duration in ticks for a blaze rod (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 2400 ticks = 12 smelts).
+const BLAZE_ROD_BURN_TIME: u16 = 2_400;
 /// Burn duration in ticks for a lava bucket (minecraft.wiki `Smelting` rev 3829803: 20000 ticks = 100 smelts).
 const LAVA_BUCKET_BURN_TIME: u16 = 20_000;
+/// Burn duration in ticks for boats and chest boats (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 1200 ticks = 6 smelts).
+const BOAT_BURN_TIME: u16 = 1_200;
 /// Burn duration in ticks for wooden planks and flammable logs/wood (minecraft.wiki `Smelting` rev 3829803: 300 ticks = 1.5 smelts).
 const WOOD_BURN_TIME: u16 = 300;
+/// Burn duration in ticks for wooden doors, signs, hanging signs, and wooden tools/spear (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 200 ticks = 1 smelt).
+const WOODEN_DOOR_AND_TOOL_BURN_TIME: u16 = 200;
 /// Burn duration in ticks for flammable wooden slabs (minecraft.wiki `Smelting` rev 3829803: 150 ticks = 0.75 smelts).
 const WOODEN_SLAB_BURN_TIME: u16 = 150;
 /// Burn duration in ticks for sticks (minecraft.wiki `Smelting` rev 3829803: 100 ticks = 0.5 smelts).
 const STICK_BURN_TIME: u16 = 100;
+/// Burn duration in ticks for wool carpets in Java Edition (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 67 ticks).
+const CARPET_BURN_TIME: u16 = 67;
+/// Burn duration in ticks for bamboo, scaffolding, cushions, and wool slabs in Java Edition (minecraft.wiki `Smelting` rev 3896034 / `Template:Smelting_table` rev 3859871: 50 ticks = 0.25 smelts).
+const BAMBOO_BURN_TIME: u16 = 50;
 
 /// Experience yielded by smelting raw iron or iron ore (minecraft.wiki `Smelting` rev 3829803).
 const IRON_SMELT_XP: f32 = 0.7;
@@ -47,28 +62,6 @@ pub const INPUT_SLOT: usize = 0;
 pub const FUEL_SLOT: usize = 1;
 pub const OUTPUT_SLOT: usize = 2;
 pub const TOTAL_SLOTS: usize = 3;
-
-/// Strips optional `minecraft:` namespace prefix for canonical item matching.
-#[inline]
-pub fn normalize_item_id(item: &str) -> &str {
-    item.strip_prefix("minecraft:").unwrap_or(item)
-}
-
-/// Checks if two item identifiers match canonically regardless of `minecraft:` prefix.
-#[inline]
-pub fn items_equal(a: &str, b: &str) -> bool {
-    normalize_item_id(a) == normalize_item_id(b)
-}
-
-/// Returns the standard default maximum stack size for common items.
-#[must_use]
-pub fn default_max_stack(item: &str) -> u16 {
-    match normalize_item_id(item) {
-        "lava_bucket" | "water_bucket" | "milk_bucket" => 1,
-        "bucket" | "snowball" | "ender_pearl" | "egg" => 16,
-        _ => DEFAULT_MAX_STACK,
-    }
-}
 
 /// Registered fuel entry with burn duration in ticks and optional residual item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,13 +103,10 @@ impl FuelRegistry {
 
     /// Builds a fuel registry from operator-provisioned [`ItemTags`].
     ///
-    /// Registers coal, charcoal, lava bucket (with `minecraft:bucket` remainder),
-    /// and stick with their built-in burn-time constants; every member of
-    /// `minecraft:logs_that_burn`, `minecraft:planks`, and (when present)
-    /// `minecraft:bamboo_blocks` not in `minecraft:non_flammable_wood` at
-    /// `WOOD_BURN_TIME`; and every member of `minecraft:wooden_slabs` not in
-    /// `minecraft:non_flammable_wood` at `WOODEN_SLAB_BURN_TIME`. Does not
-    /// fall back to [`fuel_burn_time`].
+    /// Registers every Java Edition vanilla fuel from minecraft.wiki `Smelting`
+    /// rev 3896034 (`Template:Smelting_table` rev 3859871): tag-backed groups
+    /// (excluding `minecraft:non_flammable_wood` members) and explicit non-tag
+    /// fuel item identifiers. Does not fall back to [`fuel_burn_time`].
     #[must_use]
     pub fn from_item_tags(tags: &ItemTags) -> Self {
         let mut registry = Self {
@@ -126,19 +116,86 @@ impl FuelRegistry {
         let bucket =
             ItemStack::try_new("minecraft:bucket", 1, default_max_stack("minecraft:bucket"))
                 .expect("built-in bucket item id is valid");
-        registry.insert_entry("minecraft:coal", COAL_BURN_TIME, None);
-        registry.insert_entry("minecraft:charcoal", COAL_BURN_TIME, None);
         registry.insert_entry("minecraft:lava_bucket", LAVA_BUCKET_BURN_TIME, Some(bucket));
-        registry.insert_entry("minecraft:stick", STICK_BURN_TIME, None);
 
-        for tag in [
-            "minecraft:logs_that_burn",
-            "minecraft:planks",
-            "minecraft:bamboo_blocks",
-        ] {
-            registry.register_flammable_tag(tags, tag, WOOD_BURN_TIME);
+        const EXPLICIT_FUELS: [(&str, u16); 44] = [
+            ("minecraft:coal_block", COAL_BLOCK_BURN_TIME),
+            ("minecraft:dried_kelp_block", DRIED_KELP_BLOCK_BURN_TIME),
+            ("minecraft:blaze_rod", BLAZE_ROD_BURN_TIME),
+            ("minecraft:coal", COAL_BURN_TIME),
+            ("minecraft:charcoal", COAL_BURN_TIME),
+            ("minecraft:bamboo_mosaic", WOOD_BURN_TIME),
+            ("minecraft:bamboo_mosaic_stairs", WOOD_BURN_TIME),
+            ("minecraft:bamboo_mosaic_slab", WOODEN_SLAB_BURN_TIME),
+            ("minecraft:chiseled_bookshelf", WOOD_BURN_TIME),
+            ("minecraft:mangrove_roots", WOOD_BURN_TIME),
+            ("minecraft:ladder", WOOD_BURN_TIME),
+            ("minecraft:crafting_table", WOOD_BURN_TIME),
+            ("minecraft:cartography_table", WOOD_BURN_TIME),
+            ("minecraft:fletching_table", WOOD_BURN_TIME),
+            ("minecraft:smithing_table", WOOD_BURN_TIME),
+            ("minecraft:loom", WOOD_BURN_TIME),
+            ("minecraft:bookshelf", WOOD_BURN_TIME),
+            ("minecraft:lectern", WOOD_BURN_TIME),
+            ("minecraft:composter", WOOD_BURN_TIME),
+            ("minecraft:chest", WOOD_BURN_TIME),
+            ("minecraft:trapped_chest", WOOD_BURN_TIME),
+            ("minecraft:barrel", WOOD_BURN_TIME),
+            ("minecraft:daylight_detector", WOOD_BURN_TIME),
+            ("minecraft:jukebox", WOOD_BURN_TIME),
+            ("minecraft:note_block", WOOD_BURN_TIME),
+            ("minecraft:crossbow", WOOD_BURN_TIME),
+            ("minecraft:bow", WOOD_BURN_TIME),
+            ("minecraft:fishing_rod", WOOD_BURN_TIME),
+            ("minecraft:wooden_sword", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_pickaxe", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_axe", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_shovel", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_hoe", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_spear", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:bowl", STICK_BURN_TIME),
+            ("minecraft:stick", STICK_BURN_TIME),
+            ("minecraft:dead_bush", STICK_BURN_TIME),
+            ("minecraft:azalea", STICK_BURN_TIME),
+            ("minecraft:flowering_azalea", STICK_BURN_TIME),
+            ("minecraft:leaf_litter", STICK_BURN_TIME),
+            ("minecraft:short_dry_grass", STICK_BURN_TIME),
+            ("minecraft:tall_dry_grass", STICK_BURN_TIME),
+            ("minecraft:bamboo", BAMBOO_BURN_TIME),
+            ("minecraft:scaffolding", BAMBOO_BURN_TIME),
+        ];
+        for (item, burn_time) in EXPLICIT_FUELS {
+            registry.insert_entry(item, burn_time, None);
         }
-        registry.register_flammable_tag(tags, "minecraft:wooden_slabs", WOODEN_SLAB_BURN_TIME);
+
+        const TAG_FUELS: [(&str, u16); 23] = [
+            ("minecraft:boats", BOAT_BURN_TIME),
+            ("minecraft:chest_boats", BOAT_BURN_TIME),
+            ("minecraft:logs_that_burn", WOOD_BURN_TIME),
+            ("minecraft:planks", WOOD_BURN_TIME),
+            ("minecraft:bamboo_blocks", WOOD_BURN_TIME),
+            ("minecraft:wooden_stairs", WOOD_BURN_TIME),
+            ("minecraft:wooden_fences", WOOD_BURN_TIME),
+            ("minecraft:fence_gates", WOOD_BURN_TIME),
+            ("minecraft:wooden_trapdoors", WOOD_BURN_TIME),
+            ("minecraft:wooden_pressure_plates", WOOD_BURN_TIME),
+            ("minecraft:wooden_shelves", WOOD_BURN_TIME),
+            ("minecraft:banners", WOOD_BURN_TIME),
+            ("minecraft:wooden_doors", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:signs", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:hanging_signs", WOODEN_DOOR_AND_TOOL_BURN_TIME),
+            ("minecraft:wooden_slabs", WOODEN_SLAB_BURN_TIME),
+            ("minecraft:wooden_buttons", STICK_BURN_TIME),
+            ("minecraft:saplings", STICK_BURN_TIME),
+            ("minecraft:wool", STICK_BURN_TIME),
+            ("minecraft:wool_stairs", STICK_BURN_TIME),
+            ("minecraft:wool_carpets", CARPET_BURN_TIME),
+            ("minecraft:wool_slabs", BAMBOO_BURN_TIME),
+            ("minecraft:cushions", BAMBOO_BURN_TIME),
+        ];
+        for (tag, burn_time) in TAG_FUELS {
+            registry.register_flammable_tag(tags, tag, burn_time);
+        }
         registry
     }
 
@@ -1680,15 +1737,240 @@ mod tests {
             eprintln!("  - {item}: {burn} ticks");
         }
 
-        // `minecraft:bamboo_mosaic_slab` is listed in `fuel_burn_time` (150 ticks)
-        // but is absent from `#minecraft:wooden_slabs` in the 26.3 tag data.
-        assert_eq!(
-            fallback_only,
-            vec![("minecraft:bamboo_mosaic_slab", WOODEN_SLAB_BURN_TIME)]
+        // Every fallback fuel (including `minecraft:bamboo_mosaic_slab`) is now registered.
+        assert!(
+            fallback_only.is_empty(),
+            "unexpected fallback-only fuels: {fallback_only:?}"
         );
         assert_eq!(
             tag_reg.remainder("minecraft:lava_bucket"),
             FuelRegistry::new().remainder("minecraft:lava_bucket")
         );
+    }
+
+    #[test]
+    fn test_fuel_registry_from_item_tags_covers_all_wiki_tags_and_explicit_fuels() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-fuel-full-table-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, text).expect("write");
+        };
+
+        write(
+            "data/minecraft/tags/item/non_flammable_wood.json",
+            r#"{"values": ["testns:nether_door", "testns:nether_fence", "testns:nether_sign"]}"#,
+        );
+        for (tag, items) in [
+            ("boats", r#"["testns:cedar_boat"]"#),
+            ("chest_boats", r#"["testns:cedar_chest_boat"]"#),
+            ("wooden_stairs", r#"["testns:cedar_stairs"]"#),
+            (
+                "wooden_fences",
+                r#"["testns:cedar_fence", "testns:nether_fence"]"#,
+            ),
+            ("fence_gates", r#"["testns:cedar_fence_gate"]"#),
+            ("wooden_trapdoors", r#"["testns:cedar_trapdoor"]"#),
+            (
+                "wooden_doors",
+                r#"["testns:cedar_door", "testns:nether_door"]"#,
+            ),
+            (
+                "wooden_pressure_plates",
+                r#"["testns:cedar_pressure_plate"]"#,
+            ),
+            ("wooden_buttons", r#"["testns:cedar_button"]"#),
+            ("wooden_shelves", r#"["testns:cedar_shelf"]"#),
+            ("signs", r#"["testns:cedar_sign", "testns:nether_sign"]"#),
+            ("hanging_signs", r#"["testns:cedar_hanging_sign"]"#),
+            ("banners", r#"["testns:dyed_banner"]"#),
+            ("wool", r#"["testns:dyed_wool"]"#),
+            ("wool_carpets", r#"["testns:dyed_carpet"]"#),
+            ("wool_slabs", r#"["testns:dyed_wool_slab"]"#),
+            ("wool_stairs", r#"["testns:dyed_wool_stairs"]"#),
+            ("saplings", r#"["testns:cedar_sapling"]"#),
+            ("cushions", r#"["testns:dyed_cushion"]"#),
+        ] {
+            write(
+                &format!("data/minecraft/tags/item/{tag}.json"),
+                &format!(r#"{{"values": {items}}}"#),
+            );
+        }
+
+        let tags = ItemTags::load(&root).expect("load synthetic tags");
+        let reg = FuelRegistry::from_item_tags(&tags);
+
+        assert_eq!(reg.burn_time("minecraft:coal_block"), 16_000);
+        assert_eq!(reg.burn_time("minecraft:dried_kelp_block"), 4_000);
+        assert_eq!(reg.burn_time("minecraft:blaze_rod"), 2_400);
+        assert_eq!(reg.burn_time("minecraft:bamboo_mosaic_slab"), 150);
+        assert_eq!(reg.burn_time("minecraft:wooden_spear"), 200);
+        assert_eq!(reg.burn_time("minecraft:crossbow"), 300);
+        assert_eq!(reg.burn_time("minecraft:bow"), 300);
+        assert_eq!(reg.burn_time("minecraft:bowl"), 100);
+        assert_eq!(reg.burn_time("minecraft:bamboo"), 50);
+
+        assert_eq!(reg.burn_time("testns:cedar_boat"), 1_200);
+        assert_eq!(reg.burn_time("testns:cedar_chest_boat"), 1_200);
+        assert_eq!(reg.burn_time("testns:cedar_stairs"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_fence"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_fence_gate"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_trapdoor"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_pressure_plate"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_shelf"), 300);
+        assert_eq!(reg.burn_time("testns:dyed_banner"), 300);
+        assert_eq!(reg.burn_time("testns:cedar_door"), 200);
+        assert_eq!(reg.burn_time("testns:cedar_sign"), 200);
+        assert_eq!(reg.burn_time("testns:cedar_hanging_sign"), 200);
+        assert_eq!(reg.burn_time("testns:cedar_button"), 100);
+        assert_eq!(reg.burn_time("testns:cedar_sapling"), 100);
+        assert_eq!(reg.burn_time("testns:dyed_wool"), 100);
+        assert_eq!(reg.burn_time("testns:dyed_wool_stairs"), 100);
+        assert_eq!(reg.burn_time("testns:dyed_carpet"), 67);
+        assert_eq!(reg.burn_time("testns:dyed_wool_slab"), 50);
+        assert_eq!(reg.burn_time("testns:dyed_cushion"), 50);
+
+        assert_eq!(reg.burn_time("testns:nether_door"), 0);
+        assert_eq!(reg.burn_time("testns:nether_fence"), 0);
+        assert_eq!(reg.burn_time("testns:nether_sign"), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_fuel_registry_pins_every_wiki_fuel_row_and_item_report`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_fuel_registry_pins_every_wiki_fuel_row_and_item_report() {
+        use crate::item::ItemDefaults;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let reg = FuelRegistry::from_item_tags(&tags);
+
+        // Every registered fuel id must exist in the official item report.
+        for id in reg.custom.keys() {
+            assert!(
+                items.max_stack_size(id).is_some(),
+                "registered fuel `{id}` does not exist in reports/minecraft/components/item/"
+            );
+        }
+
+        // Pin at least one item per Java Edition row in Template:Smelting_table rev 3859871.
+        let expected_fuels = [
+            ("minecraft:lava_bucket", 20_000),
+            ("minecraft:coal_block", 16_000),
+            ("minecraft:dried_kelp_block", 4_000),
+            ("minecraft:blaze_rod", 2_400),
+            ("minecraft:coal", 1_600),
+            ("minecraft:charcoal", 1_600),
+            ("minecraft:oak_boat", 1_200),
+            ("minecraft:bamboo_raft", 1_200),
+            ("minecraft:oak_chest_boat", 1_200),
+            ("minecraft:bamboo_chest_raft", 1_200),
+            ("minecraft:bamboo_mosaic", 300),
+            ("minecraft:bamboo_mosaic_slab", 150),
+            ("minecraft:bamboo_mosaic_stairs", 300),
+            ("minecraft:chiseled_bookshelf", 300),
+            ("minecraft:bamboo_block", 300),
+            ("minecraft:stripped_bamboo_block", 300),
+            ("minecraft:oak_log", 300),
+            ("minecraft:stripped_oak_log", 300),
+            ("minecraft:oak_wood", 300),
+            ("minecraft:stripped_oak_wood", 300),
+            ("minecraft:oak_planks", 300),
+            ("minecraft:oak_slab", 150),
+            ("minecraft:oak_stairs", 300),
+            ("minecraft:oak_pressure_plate", 300),
+            ("minecraft:oak_button", 100),
+            ("minecraft:oak_trapdoor", 300),
+            ("minecraft:oak_fence_gate", 300),
+            ("minecraft:oak_fence", 300),
+            ("minecraft:mangrove_roots", 300),
+            ("minecraft:ladder", 300),
+            ("minecraft:crafting_table", 300),
+            ("minecraft:cartography_table", 300),
+            ("minecraft:fletching_table", 300),
+            ("minecraft:smithing_table", 300),
+            ("minecraft:loom", 300),
+            ("minecraft:bookshelf", 300),
+            ("minecraft:lectern", 300),
+            ("minecraft:composter", 300),
+            ("minecraft:chest", 300),
+            ("minecraft:trapped_chest", 300),
+            ("minecraft:barrel", 300),
+            ("minecraft:daylight_detector", 300),
+            ("minecraft:jukebox", 300),
+            ("minecraft:note_block", 300),
+            ("minecraft:oak_shelf", 300),
+            ("minecraft:white_banner", 300),
+            ("minecraft:crossbow", 300),
+            ("minecraft:bow", 300),
+            ("minecraft:fishing_rod", 300),
+            ("minecraft:oak_door", 200),
+            ("minecraft:oak_sign", 200),
+            ("minecraft:oak_hanging_sign", 200),
+            ("minecraft:wooden_pickaxe", 200),
+            ("minecraft:wooden_shovel", 200),
+            ("minecraft:wooden_hoe", 200),
+            ("minecraft:wooden_axe", 200),
+            ("minecraft:wooden_sword", 200),
+            ("minecraft:wooden_spear", 200),
+            ("minecraft:bowl", 100),
+            ("minecraft:oak_sapling", 100),
+            ("minecraft:mangrove_propagule", 100),
+            ("minecraft:stick", 100),
+            ("minecraft:dead_bush", 100),
+            ("minecraft:azalea", 100),
+            ("minecraft:flowering_azalea", 100),
+            ("minecraft:leaf_litter", 100),
+            ("minecraft:short_dry_grass", 100),
+            ("minecraft:tall_dry_grass", 100),
+            ("minecraft:white_wool", 100),
+            ("minecraft:white_carpet", 67),
+            ("minecraft:white_wool_slab", 50),
+            ("minecraft:white_wool_stairs", 100),
+            ("minecraft:white_cushion", 50),
+            ("minecraft:bamboo", 50),
+            ("minecraft:scaffolding", 50),
+        ];
+        for (item, expected) in expected_fuels {
+            assert_eq!(reg.burn_time(item), expected, "{item}");
+        }
+
+        // Non-flammable nether woods and non-fuel lookalikes must stay at 0.
+        for non_fuel in [
+            "minecraft:crimson_fence",
+            "minecraft:warped_fence",
+            "minecraft:crimson_fence_gate",
+            "minecraft:warped_door",
+            "minecraft:crimson_trapdoor",
+            "minecraft:warped_pressure_plate",
+            "minecraft:crimson_button",
+            "minecraft:warped_shelf",
+            "minecraft:crimson_sign",
+            "minecraft:warped_hanging_sign",
+            "minecraft:crimson_stairs",
+            "minecraft:warped_planks",
+            "minecraft:crimson_slab",
+            "minecraft:warped_stem",
+            "minecraft:stone_button",
+            "minecraft:iron_door",
+            "minecraft:iron_trapdoor",
+            "minecraft:ender_chest",
+        ] {
+            assert_eq!(reg.burn_time(non_fuel), 0, "{non_fuel}");
+        }
     }
 }
