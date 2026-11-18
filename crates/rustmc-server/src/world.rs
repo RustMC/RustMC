@@ -74,6 +74,7 @@ pub mod anvil;
 pub mod brewing;
 pub mod container_data;
 pub mod furnace;
+pub mod loot;
 pub mod recipe_data;
 
 pub use brewing::{
