@@ -90,7 +90,8 @@ pub use furnace::{
     FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
 };
 pub use recipe_data::{
-    CookingKind, CookingRecipe, RecipeData, RecipeDataError, SkipReason, StonecuttingRecipe,
+    CRAFTING_REPAIR_BONUS_DIVISOR, CookingKind, CookingRecipe, RecipeData, RecipeDataError,
+    RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe,
 };
 pub use vanilla_rules::{
     CookingSummary, RecipeSummary, TagSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,

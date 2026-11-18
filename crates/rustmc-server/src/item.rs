@@ -991,6 +991,16 @@ impl ItemDefaults {
             .and_then(|entry| entry.consumable.as_ref())
     }
 
+    /// Returns an iterator over `(item_id_without_prefix, max_damage, max_stack_size)`
+    /// for every item in the report that has a `minecraft:max_damage` component.
+    pub fn damageable_items(&self) -> impl Iterator<Item = (&str, u32, u8)> {
+        self.entries.iter().filter_map(|(id, entry)| {
+            entry
+                .max_damage
+                .map(|max_damage| (id.as_str(), max_damage, entry.max_stack_size))
+        })
+    }
+
     /// Returns the number of items loaded from the report.
     #[must_use]
     pub fn len(&self) -> usize {

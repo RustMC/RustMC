@@ -13,10 +13,29 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::item::{ArmorTrim, ItemDefaults, ItemStack, items_equal, normalize_item_id};
-use crate::vanilla::feature::ItemTags;
+use crate::vanilla::feature::{EnchantmentTags, ItemTags};
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
 use crate::world::furnace::default_max_stack;
+
+/// Divisor for the 5% maximum-durability bonus granted when combining two
+/// damaged items in a crafting grid (`floor(Max uses / 20)`).
+///
+/// Source: minecraft.wiki `Item repair` (revision 3791643):
+/// - "The durability of the repaired item equals the sum of the old items'
+///   durability plus a 'repair bonus' of 5% of the item's maximum uses, up to
+///   a limit of the maximum durability for that item."
+/// - "`min(Item A uses + Item B uses + floor(Max uses / 20), Max uses)` where
+///   \"floor\" means round down to the smaller integer, and \"min(x,y)\" means
+///   the smallest of x or y."
+pub const CRAFTING_REPAIR_BONUS_DIVISOR: u32 = 20;
+
+/// Output stack count produced by combining two damaged items in a crafting grid.
+///
+/// Source: minecraft.wiki `Item repair` (revision 3791643):
+/// "Two items of the same type and material can be placed anywhere on the
+/// crafting grid or grindstone, which results in a single repaired item."
+const CRAFTING_REPAIR_RESULT_COUNT: u16 = 1;
 
 /// Cooking recipe category matching the four vanilla furnace-family block types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -324,6 +343,288 @@ pub enum SmithingResult {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransmuteResult {
+    /// `result.id` is specified in the recipe file (for example bundle and shulker box dyeing).
+    Fixed(ItemStack),
+    /// `result.id` is omitted (`"result": {}`, as in `minecraft:map_cloning`), so the
+    /// output stack preserves the matched `input` item's identifier.
+    KeepInput(BTreeMap<String, ItemStack>),
+}
+
+/// A parsed `minecraft:crafting_transmute` recipe.
+///
+/// Sources:
+/// - minecraft.wiki `Recipe (Java Edition)` (revision 3873625, `crafting_transmute`):
+///   - "When matched, output copies the input item stack, changing the item type or, optionally, the original stack components."
+///   - "`input`: Ingredient for item to copy. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+///   - "`material`: Additional ingredient to use. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+///   - "`material_count`: Optional. The allowed amount of slots containing the item matched by the `material` ingredient. ... Defaults to `1`."
+///   - "`result`: The output item of the recipe, keeping the components of the `input` ingredient."
+///   - "`count`: Optional. The amount of the item. Defaults to `1`."
+/// - minecraft.wiki `Shulker Box` (revision 3863460):
+///   - "`Any Shulker Box + Matching Dye -> Matching Shulker Box`: When you dye the shulker box, it retains its contents. If it is renamed on an anvil, it also retains its contents."
+/// - minecraft.wiki `Bundle` (revision 3853242):
+///   - "`Any Bundle + Matching Dye` (`shapeless = 1`) -> `Matching Dyed Bundle`".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransmuteRecipe {
+    id: String,
+    input: Ingredient,
+    material: Ingredient,
+    result: TransmuteResult,
+    count: u16,
+    material_count: std::ops::RangeInclusive<u8>,
+    add_material_count_to_result: bool,
+    group: Option<String>,
+    category: Option<String>,
+    show_notification: Option<bool>,
+}
+
+/// Bounds of `material_count` (minecraft.wiki `Recipe (Java Edition)` revision 3873625:
+/// "`min`: The minimum amount of slots, must be at least `1`." / "`max`: The maximum
+/// amount of slots, must be at most `8`." / "Defaults to `1`.").
+const TRANSMUTE_MATERIAL_COUNT_MIN: u8 = 1;
+const TRANSMUTE_MATERIAL_COUNT_MAX: u8 = 8;
+
+impl TransmuteRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Resolved `input` ingredient supplying the components copied to the output.
+    #[must_use]
+    pub fn input(&self) -> &Ingredient {
+        &self.input
+    }
+
+    /// Resolved `material` ingredient consumed alongside `input`.
+    #[must_use]
+    pub fn material(&self) -> &Ingredient {
+        &self.material
+    }
+
+    /// Base result item stack when `result.id` is explicitly defined in the recipe JSON.
+    #[must_use]
+    pub fn result(&self) -> Option<&ItemStack> {
+        match &self.result {
+            TransmuteResult::Fixed(stack) => Some(stack),
+            TransmuteResult::KeepInput(_) => None,
+        }
+    }
+
+    /// Output stack count specified by `result.count` (defaulting to `1`).
+    #[must_use]
+    pub fn count(&self) -> u16 {
+        self.count
+    }
+
+    /// Optional recipe-book group name.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// Optional recipe-book category name.
+    #[must_use]
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+
+    /// Optional `show_notification` flag from the recipe data.
+    #[must_use]
+    pub fn show_notification(&self) -> Option<bool> {
+        self.show_notification
+    }
+
+    /// Allowed number of grid slots holding the `material` ingredient.
+    #[must_use]
+    pub fn material_count(&self) -> &std::ops::RangeInclusive<u8> {
+        &self.material_count
+    }
+
+    /// Whether the number of material slots is added to the result count.
+    #[must_use]
+    pub fn adds_material_count_to_result(&self) -> bool {
+        self.add_material_count_to_result
+    }
+
+    /// Returns `true` if `grid` holds exactly one `input` item and a number of
+    /// `material` items within [`Self::material_count`], and nothing else.
+    #[must_use]
+    pub fn matches(&self, grid: &CraftingGrid) -> bool {
+        self.evaluate(grid).is_some()
+    }
+
+    /// Evaluates `grid` against this transmute recipe.
+    ///
+    /// Matches a grid with exactly one `input` item and between `material_count`
+    /// bounds of `material` items in any positions (minecraft.wiki `Recipe (Java
+    /// Edition)` revision 3873625: "`material_count`: … The allowed amount of slots
+    /// containing the item matched by the `material` ingredient."). The result is
+    /// `result.id` (or the input's own item when `result` has no id) with the input
+    /// stack's [`crate::item::ItemComponents`]; with `add_material_count_to_result`
+    /// ("the amount of slots containing items matched by the `material` ingredient
+    /// will be added to the final count of the result") the material slot count is
+    /// added to the result count.
+    #[must_use]
+    pub fn evaluate(&self, grid: &CraftingGrid) -> Option<ItemStack> {
+        let mut input_stack = None;
+        let mut materials: u8 = 0;
+        for stack in grid.non_empty_items() {
+            // An item matching both ingredients is the input only when no input
+            // has been found yet, so a grid of identical items still needs one input.
+            if input_stack.is_none() && self.input.matches(stack) {
+                input_stack = Some(stack);
+            } else if self.material.matches(stack) {
+                materials = materials.checked_add(1)?;
+            } else {
+                return None;
+            }
+        }
+        let input_stack = input_stack?;
+        if !self.material_count.contains(&materials) {
+            return None;
+        }
+        let base = match &self.result {
+            TransmuteResult::Fixed(stack) => stack.clone(),
+            TransmuteResult::KeepInput(by_input) => {
+                by_input.get(normalize_item_id(input_stack.item()))?.clone()
+            }
+        };
+        let count = if self.add_material_count_to_result {
+            base.count().checked_add(u16::from(materials))?
+        } else {
+            base.count()
+        };
+        ItemStack::try_new(base.item(), count, base.max_stack())
+            .ok()?
+            .with_components(input_stack.components().clone())
+            .ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DamageableItemInfo {
+    max_damage: u32,
+    max_stack: u16,
+}
+
+/// A parsed `minecraft:crafting_special_repairitem` recipe.
+///
+/// Combines two items of the same damageable item kind in any two slots of a
+/// crafting grid into a single repaired item stack, using [`ItemDefaults`] for
+/// `minecraft:max_damage` and `minecraft:max_stack_size`.
+///
+/// Sources:
+/// - minecraft.wiki `Recipe (Java Edition)` (revision 3873625, `crafting_special_*`):
+///   - "Represents a crafting recipe in a crafting table, a crafter and the survival inventory that is handled with built-in logic instead of being data-driven."
+///   - "`crafting_special_repairitem`: The item repair recipe. Regular recipes cannot update damage data associated to the tool item."
+/// - minecraft.wiki `Item repair` (revision 3791643):
+///   - "Two items of the same type and material can be placed anywhere on the crafting grid or grindstone, which results in a single repaired item. The durability of the repaired item equals the sum of the old items' durability plus a 'repair bonus' of 5% of the item's maximum uses, up to a limit of the maximum durability for that item."
+///   - "The repaired object is never enchanted even if both items were to have the exact same enchantments, with the exception of curse enchantments, which are transferred to the repaired item."
+///   - "Tools made of different materials (for example, a wood and a stone pickaxe) cannot be combined."
+///   - "All items with durability can be repaired this way."
+///   - "`min(Item A uses + Item B uses + floor(Max uses / 20), Max uses)` where \"floor\" means round down to the smaller integer, and \"min(x,y)\" means the smallest of x or y."
+///   - "Example: Two stone axes have 10 and 45 uses. A newly crafted stone axe would have 61 uses."
+///   - Note: `Item repair` (revision 3791643) also includes a gallery caption stating
+///     "Attempting to combine two enchanted items in a crafting table always results in
+///     an unenchanted item, even if the two items have the same enchantments." RustMC
+///     follows the main `Usage` section rule: all non-curse enchantments are dropped,
+///     curse enchantments (`#minecraft:curse`, i.e. `minecraft:binding_curse` and
+///     `minecraft:vanishing_curse`) are transferred, and other per-stack components
+///     (`custom_name`, `repair_cost`, `trim`) are dropped on the newly crafted result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairItemRecipe {
+    id: String,
+    category: Option<String>,
+    damageable_items: BTreeMap<String, DamageableItemInfo>,
+    curse_enchantments: HashSet<String>,
+}
+
+impl RepairItemRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Optional recipe-book category name.
+    #[must_use]
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+
+    /// Returns `true` if `grid` contains two items of the same damageable item kind.
+    #[must_use]
+    pub fn matches(&self, grid: &CraftingGrid) -> bool {
+        self.evaluate(grid).is_some()
+    }
+
+    /// Evaluates `grid` against this repair-item recipe.
+    ///
+    /// Matches a crafting grid containing two items of the same damageable kind
+    /// (known via [`ItemDefaults::max_damage`]), returning a newly crafted item
+    /// whose remaining durability is
+    /// `min(uses_a + uses_b + floor(max_damage / 20), max_damage)` (stored as
+    /// `minecraft:damage = max_damage - remaining_durability` when positive),
+    /// transferring only curse enchantments and dropping non-curse enchantments
+    /// and `custom_name`.
+    #[must_use]
+    pub fn evaluate(&self, grid: &CraftingGrid) -> Option<ItemStack> {
+        let non_empty = grid.non_empty_items();
+        let [first, second] = non_empty.as_slice() else {
+            return None;
+        };
+        if !items_equal(first.item(), second.item()) {
+            return None;
+        }
+        let norm_id = normalize_item_id(first.item());
+        let info = self.damageable_items.get(norm_id)?;
+        let max_damage = info.max_damage;
+        if max_damage == 0 {
+            return None;
+        }
+
+        let damage_a = first.components().damage().unwrap_or(0);
+        let damage_b = second.components().damage().unwrap_or(0);
+        let uses_a = max_damage.saturating_sub(damage_a);
+        let uses_b = max_damage.saturating_sub(damage_b);
+        let bonus = max_damage / CRAFTING_REPAIR_BONUS_DIVISOR;
+        let repaired_uses = uses_a
+            .saturating_add(uses_b)
+            .saturating_add(bonus)
+            .min(max_damage);
+        let result_damage = max_damage.saturating_sub(repaired_uses);
+
+        let mut result =
+            ItemStack::try_new(first.item(), CRAFTING_REPAIR_RESULT_COUNT, info.max_stack).ok()?;
+        if result_damage > 0 {
+            result.components_mut().set_damage(Some(result_damage));
+        }
+        for stack in [first, second] {
+            for (ench_id, &level) in stack.components().enchantments() {
+                if self.curse_enchantments.contains(normalize_item_id(ench_id)) {
+                    let existing = result
+                        .components()
+                        .enchantments()
+                        .get(ench_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if level > existing {
+                        result
+                            .components_mut()
+                            .set_enchantment(ench_id.clone(), level)
+                            .ok()?;
+                    }
+                }
+            }
+        }
+        Some(result)
+    }
+}
+
 /// Reason a recipe file was skipped instead of loaded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkipReason {
@@ -408,6 +709,8 @@ impl From<WorldgenError> for RecipeDataError {
 pub struct RecipeData {
     cooking: BTreeMap<CookingKind, Vec<CookingRecipe>>,
     crafting: Vec<Recipe>,
+    transmute: Vec<TransmuteRecipe>,
+    repair_item: Vec<RepairItemRecipe>,
     stonecutting: Vec<StonecuttingRecipe>,
     brewing: Vec<BrewingRecipe>,
     brewing_by_reagent: HashMap<String, Vec<usize>>,
@@ -464,6 +767,7 @@ impl RecipeData {
 
         let mut seen_cooking: BTreeMap<CookingKind, HashMap<String, String>> = BTreeMap::new();
         let mut seen_brewing: HashMap<(String, String, String), String> = HashMap::new();
+        let enchantment_tags = EnchantmentTags::load(root).unwrap_or_default();
 
         for ns_path in ns_dirs {
             let ns = ns_path
@@ -521,6 +825,15 @@ impl RecipeData {
                             data.crafting.push(Recipe::Shapeless(recipe))
                         }
                     }
+                } else if recipe_type == "minecraft:crafting_transmute" {
+                    match parse_transmute_recipe(&id, obj, tags, items, &entry)? {
+                        ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
+                        ParsedOrSkipped::Loaded(recipe) => data.transmute.push(recipe),
+                    }
+                } else if recipe_type == "minecraft:crafting_special_repairitem" {
+                    let recipe =
+                        parse_repair_item_recipe(&id, obj, items, &enchantment_tags, &entry)?;
+                    data.repair_item.push(recipe);
                 } else if recipe_type == "minecraft:stonecutting" {
                     match parse_stonecutting_recipe(&id, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
@@ -580,6 +893,9 @@ impl RecipeData {
         }
 
         data.crafting.sort_by(|a, b| a.id().cmp(&b.id()));
+        data.transmute.sort_by(|a, b| a.id().cmp(b.id()));
+        data.repair_item.sort_by(|a, b| a.id().cmp(b.id()));
+        data.stonecutting.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_transform.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_trim.sort_by(|a, b| a.id().cmp(b.id()));
         Ok(data)
@@ -621,6 +937,30 @@ impl RecipeData {
             Recipe::Shapeless(shapeless) => Some(shapeless),
             Recipe::Shaped(_) => None,
         })
+    }
+
+    /// Loaded `minecraft:crafting_transmute` recipes, sorted by recipe id.
+    #[must_use]
+    pub fn transmute(&self) -> &[TransmuteRecipe] {
+        &self.transmute
+    }
+
+    /// Finds a loaded `minecraft:crafting_transmute` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_transmute_by_id(&self, id: &str) -> Option<&TransmuteRecipe> {
+        self.transmute.iter().find(|recipe| recipe.id() == id)
+    }
+
+    /// Loaded `minecraft:crafting_special_repairitem` recipes, sorted by recipe id.
+    #[must_use]
+    pub fn repair_item(&self) -> &[RepairItemRecipe] {
+        &self.repair_item
+    }
+
+    /// Finds a loaded `minecraft:crafting_special_repairitem` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_repair_item_by_id(&self, id: &str) -> Option<&RepairItemRecipe> {
+        self.repair_item.iter().find(|recipe| recipe.id() == id)
     }
 
     /// Loaded `minecraft:stonecutting` recipes.
@@ -700,21 +1040,64 @@ impl RecipeData {
         self.stonecutting.iter().find(|recipe| recipe.id() == id)
     }
 
+    /// Lists every loaded `minecraft:stonecutting` recipe whose ingredient
+    /// accepts `input_item` (ignoring an optional `minecraft:` prefix),
+    /// returning `(recipe_id, result)` pairs sorted by `recipe_id`.
+    ///
+    /// Sources:
+    /// - minecraft.wiki `Stonecutter` (revision 3892466):
+    ///   - "All of its recipes require just one ingredient and produce one product (in varying quantities)."
+    ///   - "The GUI contains a block selection menu that is empty. The menu is populated with blocks that can be crafted from that particular material, only if a block is inserted into its input."
+    /// - minecraft.wiki `Recipe (Java Edition)` (revision 3873625, `stonecutting`):
+    ///   - "`ingredient`: The ingredient for the recipe. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+    ///   - "`result`: The output item of the recipe."
+    ///
+    /// Neither page states a vanilla ordering for the stonecutter output list;
+    /// sorting by `recipe_id` is RustMC's deterministic order.
+    #[must_use]
+    pub fn stonecutting_results(&self, input_item: &str) -> Vec<(&str, ItemStack)> {
+        let mut results: Vec<(&str, ItemStack)> = self
+            .stonecutting
+            .iter()
+            .filter(|recipe| ingredient_matches_item(&recipe.ingredient, input_item))
+            .map(|recipe| (recipe.id(), recipe.result().clone()))
+            .collect();
+        results.sort_by_key(|(id, _)| *id);
+        results
+    }
+
     /// Finds a loaded crafting recipe matching `grid`, returning `(recipe_id, result)`.
     ///
     /// Uses `world::crafting` matching (shaped recipes match at any offset and
-    /// horizontally mirrored; shapeless recipes match in any order). If more
-    /// than one recipe matches, returns the one with the lexicographically
-    /// smallest recipe id. This is RustMC's deterministic tie-break, not a
-    /// claim about vanilla Java Edition.
+    /// horizontally mirrored; shapeless recipes match in any order; transmute
+    /// recipes match one `input` and one `material` in any positions and copy
+    /// the matched `input` stack's components onto the result; special
+    /// `minecraft:crafting_special_repairitem` recipes have no JSON ingredient
+    /// list and match any two items of the same damageable kind via
+    /// [`ItemDefaults`]). If more than one recipe matches, returns the one with
+    /// the lexicographically smallest recipe id (including a matching special
+    /// recipe's file-derived recipe id, such as `"minecraft:repair_item"`).
+    /// This is RustMC's deterministic tie-break, not a claim about vanilla Java
+    /// Edition.
     #[must_use]
     pub fn find_crafting(&self, grid: &CraftingGrid) -> Option<(&str, ItemStack)> {
-        self.crafting
+        let regular = self
+            .crafting
             .iter()
             .filter(|recipe| recipe.matches(grid))
-            .filter_map(|recipe| recipe.id().map(|id| (id, recipe)))
+            .filter_map(|recipe| recipe.id().map(|id| (id, recipe.output().clone())));
+        let transmute = self
+            .transmute
+            .iter()
+            .filter_map(|recipe| recipe.evaluate(grid).map(|out| (recipe.id(), out)));
+        let repair_item = self
+            .repair_item
+            .iter()
+            .filter_map(|recipe| recipe.evaluate(grid).map(|out| (recipe.id(), out)));
+        regular
+            .chain(transmute)
+            .chain(repair_item)
             .min_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b))
-            .map(|(id, recipe)| (id, recipe.output().clone()))
     }
 
     /// Loaded `minecraft:smithing_transform` recipes, sorted by recipe id.
@@ -871,6 +1254,27 @@ fn build_result_stack(
         .map_err(|error| invalid(file, format!("invalid `result` stack: {error}")))
 }
 
+/// Default `result.count` when omitted in a recipe JSON object
+/// (minecraft.wiki `Recipe (Java Edition)` revision 3873625:
+/// "`count`: Optional. The amount of the item. Defaults to `1`.").
+const DEFAULT_RESULT_COUNT: u16 = 1;
+
+fn parse_result_count(
+    result_obj: &serde_json::Map<String, Value>,
+    file: &Path,
+) -> Result<u16, RecipeDataError> {
+    match result_obj.get("count") {
+        None => Ok(DEFAULT_RESULT_COUNT),
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| invalid(file, "`result.count` must be a positive integer"))?;
+            u16::try_from(raw)
+                .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))
+        }
+    }
+}
+
 fn parse_result(
     obj: &serde_json::Map<String, Value>,
     items: Option<&ItemDefaults>,
@@ -889,16 +1293,7 @@ fn parse_result(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(file, "missing or non-string `result.id`"))?;
-    let count = match result_obj.get("count") {
-        None => 1,
-        Some(value) => {
-            let raw = value
-                .as_u64()
-                .ok_or_else(|| invalid(file, "`result.count` must be a positive integer"))?;
-            u16::try_from(raw)
-                .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))?
-        }
-    };
+    let count = parse_result_count(result_obj, file)?;
     let stack = build_result_stack(id, count, items, file)?;
     Ok(ParsedOrSkipped::Loaded(stack))
 }
@@ -1108,6 +1503,168 @@ fn parse_shapeless_recipe(
         recipe = recipe.with_category(category);
     }
     Ok(ParsedOrSkipped::Loaded(recipe))
+}
+
+fn parse_transmute_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    tags: &ItemTags,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<ParsedOrSkipped<TransmuteRecipe>, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &[
+            "type",
+            "input",
+            "material",
+            "material_count",
+            "add_material_count_to_result",
+            "result",
+            "group",
+            "category",
+            "show_notification",
+        ],
+        "crafting_transmute recipe",
+        file,
+    )?;
+    let input = parse_required_ingredient(obj, "input", tags, file)?;
+    let material = parse_required_ingredient(obj, "material", tags, file)?;
+    let group = parse_optional_string(obj, "group", file)?;
+    let category = parse_optional_string(obj, "category", file)?;
+    let show_notification = parse_optional_bool(obj, "show_notification", file)?;
+    let add_material_count_to_result =
+        parse_optional_bool(obj, "add_material_count_to_result", file)?.unwrap_or(false);
+    let material_count = parse_material_count(obj, file)?;
+
+    let result_val = obj
+        .get("result")
+        .ok_or_else(|| invalid(file, "missing `result` field"))?;
+    let result_obj = result_val
+        .as_object()
+        .ok_or_else(|| invalid(file, "`result` must be a JSON object"))?;
+    if result_obj.contains_key("components") {
+        return Ok(ParsedOrSkipped::Skipped(SkipReason::ResultHasComponents));
+    }
+    let count = parse_result_count(result_obj, file)?;
+    let result = match result_obj.get("id") {
+        Some(id_val) => {
+            let result_id = id_val
+                .as_str()
+                .ok_or_else(|| invalid(file, "missing or non-string `result.id`"))?;
+            TransmuteResult::Fixed(build_result_stack(result_id, count, items, file)?)
+        }
+        None => {
+            let mut by_input = BTreeMap::new();
+            for allowed in input.allowed_items() {
+                let stack = build_result_stack(allowed, count, items, file)?;
+                by_input.insert(normalize_item_id(allowed).to_owned(), stack);
+            }
+            TransmuteResult::KeepInput(by_input)
+        }
+    };
+
+    Ok(ParsedOrSkipped::Loaded(TransmuteRecipe {
+        id: id.to_owned(),
+        input,
+        material,
+        result,
+        count,
+        material_count,
+        add_material_count_to_result,
+        group,
+        category,
+        show_notification,
+    }))
+}
+
+fn parse_material_count(
+    obj: &serde_json::Map<String, Value>,
+    file: &Path,
+) -> Result<std::ops::RangeInclusive<u8>, RecipeDataError> {
+    let bound = |value: Option<&Value>, name: &str| -> Result<u8, RecipeDataError> {
+        value
+            .and_then(Value::as_u64)
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| (TRANSMUTE_MATERIAL_COUNT_MIN..=TRANSMUTE_MATERIAL_COUNT_MAX).contains(n))
+            .ok_or_else(|| {
+                invalid(
+                    file,
+                    format!(
+                        "`material_count{name}` must be an integer in {TRANSMUTE_MATERIAL_COUNT_MIN}..={TRANSMUTE_MATERIAL_COUNT_MAX}"
+                    ),
+                )
+            })
+    };
+    match obj.get("material_count") {
+        None => Ok(TRANSMUTE_MATERIAL_COUNT_MIN..=TRANSMUTE_MATERIAL_COUNT_MIN),
+        Some(value @ Value::Number(_)) => {
+            let exact = bound(Some(value), "")?;
+            Ok(exact..=exact)
+        }
+        Some(Value::Object(range)) => {
+            reject_unknown_keys(range, &["min", "max"], "material_count", file)?;
+            let min = bound(range.get("min"), ".min")?;
+            let max = bound(range.get("max"), ".max")?;
+            if min > max {
+                return Err(invalid(
+                    file,
+                    "`material_count.min` exceeds `material_count.max`",
+                ));
+            }
+            Ok(min..=max)
+        }
+        Some(_) => Err(invalid(
+            file,
+            "`material_count` must be an integer or a {min, max} range",
+        )),
+    }
+}
+
+fn parse_repair_item_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    items: Option<&ItemDefaults>,
+    enchantment_tags: &EnchantmentTags,
+    file: &Path,
+) -> Result<RepairItemRecipe, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &["type", "category"],
+        "crafting_special_repairitem recipe",
+        file,
+    )?;
+    let category = parse_optional_string(obj, "category", file)?;
+    let mut damageable_items = BTreeMap::new();
+    if let Some(items) = items {
+        for (item_id, max_damage, max_stack) in items.damageable_items() {
+            damageable_items.insert(
+                item_id.to_owned(),
+                DamageableItemInfo {
+                    max_damage,
+                    max_stack: u16::from(max_stack),
+                },
+            );
+        }
+    }
+    let mut curse_enchantments = HashSet::new();
+    if let Some(members) = enchantment_tags.members("minecraft:curse") {
+        for member in members {
+            curse_enchantments.insert(normalize_item_id(member).to_owned());
+        }
+    } else {
+        // Fallback to the two vanilla curse enchantments in `data/minecraft/tags/enchantment/curse.json`
+        // when no enchantment tags directory is present in a synthetic test root.
+        curse_enchantments.insert("binding_curse".to_owned());
+        curse_enchantments.insert("vanishing_curse".to_owned());
+    }
+
+    Ok(RepairItemRecipe {
+        id: id.to_owned(),
+        category,
+        damageable_items,
+        curse_enchantments,
+    })
 }
 
 fn parse_stonecutting_recipe(
@@ -1458,6 +2015,7 @@ fn parse_smithing_trim_recipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item::DEFAULT_MAX_STACK;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1628,8 +2186,8 @@ mod tests {
     fn skips_unsupported_types_and_component_results() {
         let root = scratch_root("skipped");
         write(
-            &root.join("data/testns/recipe/transmute.json"),
-            r#"{"type": "minecraft:crafting_transmute"}"#,
+            &root.join("data/testns/recipe/pot.json"),
+            r#"{"type": "minecraft:crafting_decorated_pot"}"#,
         );
         write(
             &root.join("data/testns/recipe/stew.json"),
@@ -1650,11 +2208,11 @@ mod tests {
         assert_eq!(
             data.skipped(),
             &[
-                ("testns:stew".to_owned(), SkipReason::ResultHasComponents),
                 (
-                    "testns:transmute".to_owned(),
-                    SkipReason::UnsupportedType("minecraft:crafting_transmute".to_owned())
+                    "testns:pot".to_owned(),
+                    SkipReason::UnsupportedType("minecraft:crafting_decorated_pot".to_owned())
                 ),
+                ("testns:stew".to_owned(), SkipReason::ResultHasComponents),
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
@@ -2727,5 +3285,725 @@ mod tests {
         assert!(error.contains("coast_trim.json"), "{error}");
         assert!(error.contains("minecraft:stick"), "{error}");
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stonecutting_results_filters_and_sorts_by_recipe_id() {
+        let root = scratch_root("stonecutting-results");
+        write(
+            &root.join("data/testns/tags/item/cuttable_stones.json"),
+            r#"{"values": ["minecraft:stone", "testns:granite"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/z_slab.json"),
+            r##"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "#testns:cuttable_stones",
+                "result": {"id": "testns:cut_slab", "count": 2}
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/a_stairs.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "minecraft:stone",
+                "result": {"id": "testns:cut_stairs"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/m_wall.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": ["testns:other", "minecraft:stone"],
+                "result": {"id": "testns:cut_wall"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/other_only.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "testns:other",
+                "result": {"id": "testns:other_slab", "count": 2}
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+
+        let expected = vec![
+            (
+                "testns:a_stairs",
+                ItemStack::try_new("testns:cut_stairs", 1, DEFAULT_MAX_STACK).unwrap(),
+            ),
+            (
+                "testns:m_wall",
+                ItemStack::try_new("testns:cut_wall", 1, DEFAULT_MAX_STACK).unwrap(),
+            ),
+            (
+                "testns:z_slab",
+                ItemStack::try_new("testns:cut_slab", 2, DEFAULT_MAX_STACK).unwrap(),
+            ),
+        ];
+        assert_eq!(data.stonecutting_results("minecraft:stone"), expected);
+        assert_eq!(data.stonecutting_results("stone"), expected);
+        assert!(data.stonecutting_results("minecraft:dirt").is_empty());
+        assert!(data.stonecutting_results("").is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_stonecutting_results_match_vanilla_recipes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_stonecutting_results_match_vanilla_recipes() {
+        // Number of vanilla Java 26.3 `minecraft:stonecutting` recipe files
+        // under `data/minecraft/recipe` whose ingredient accepts `minecraft:stone`.
+        const VANILLA_STONE_STONECUTTING_COUNT: usize = 11;
+        // Slab output count per block cut in a stonecutter
+        // (minecraft.wiki `Stonecutter` revision 3892466: "Andesite -> Andesite Slab, 2").
+        const STONECUTTER_SLAB_COUNT: u16 = 2;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        let recipe_dir = root.join("data/minecraft/recipe");
+        let mut expected_stone: Vec<(String, ItemStack)> = Vec::new();
+        for entry in walk_json(&recipe_dir).expect("walk vanilla recipes") {
+            let doc = read_json(&entry).expect("read recipe json");
+            if doc.get("type").and_then(Value::as_str) != Some("minecraft:stonecutting") {
+                continue;
+            }
+            let ing = parse_ingredient(&doc["ingredient"], &tags, &entry).expect("ingredient");
+            if !ingredient_matches_item(&ing, "minecraft:stone") {
+                continue;
+            }
+            let id = recipe_id("minecraft", &recipe_dir, &entry);
+            let ParsedOrSkipped::Loaded(stack) =
+                parse_result(doc.as_object().unwrap(), Some(&items), &entry).expect("result")
+            else {
+                continue;
+            };
+            expected_stone.push((id, stack));
+        }
+        expected_stone.sort_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b));
+
+        assert_eq!(expected_stone.len(), VANILLA_STONE_STONECUTTING_COUNT);
+
+        let actual_stone = data.stonecutting_results("minecraft:stone");
+        assert_eq!(actual_stone.len(), VANILLA_STONE_STONECUTTING_COUNT);
+        let expected_refs: Vec<(&str, ItemStack)> = expected_stone
+            .iter()
+            .map(|(id, stack)| (id.as_str(), stack.clone()))
+            .collect();
+        assert_eq!(actual_stone, expected_refs);
+        assert_eq!(data.stonecutting_results("stone"), expected_refs);
+
+        let andesite_results = data.stonecutting_results("minecraft:andesite");
+        let expected_andesite_slab = ItemStack::try_new(
+            "minecraft:andesite_slab",
+            STONECUTTER_SLAB_COUNT,
+            u16::from(
+                items
+                    .max_stack_size("minecraft:andesite_slab")
+                    .expect("andesite_slab max stack"),
+            ),
+        )
+        .expect("andesite_slab stack");
+        assert!(
+            andesite_results.contains(&(
+                "minecraft:andesite_slab_from_andesite_stonecutting",
+                expected_andesite_slab
+            )),
+            "andesite stonecutting results must include andesite_slab x2: {andesite_results:?}"
+        );
+
+        assert!(data.stonecutting_results("minecraft:dirt").is_empty());
+    }
+
+    #[test]
+    fn transmute_preserves_input_components_rejects_extra_items_and_tie_breaks_by_id() {
+        use crate::item::ItemComponents;
+
+        let root = scratch_root("transmute");
+        write(
+            &root.join("data/testns/tags/item/pouches.json"),
+            r#"{"values": ["testns:pouch", "testns:white_pouch"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/dye_blue_pouch.json"),
+            r##"{
+                "type": "minecraft:crafting_transmute",
+                "input": "#testns:pouches",
+                "material": "testns:blue_dye",
+                "result": {"id": "testns:blue_pouch", "count": 2},
+                "group": "pouch_dye",
+                "category": "equipment"
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/a_tie_transmute.json"),
+            r#"{
+                "type": "minecraft:crafting_transmute",
+                "input": "testns:pouch",
+                "material": "testns:gold_dye",
+                "result": {"id": "testns:gold_pouch"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/b_tie_shapeless.json"),
+            r#"{
+                "type": "minecraft:crafting_shapeless",
+                "ingredients": ["testns:pouch", "testns:gold_dye"],
+                "result": {"id": "testns:shapeless_pouch"}
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+        assert_eq!(data.transmute().len(), 2);
+        assert!(data.skipped().is_empty());
+
+        let blue_recipe = data
+            .get_transmute_by_id("testns:dye_blue_pouch")
+            .expect("dye_blue_pouch recipe");
+        assert_eq!(blue_recipe.group(), Some("pouch_dye"));
+        assert_eq!(blue_recipe.category(), Some("equipment"));
+        assert_eq!(blue_recipe.count(), 2);
+
+        let input_comps = ItemComponents::new()
+            .with_custom_name("Adventurer Pouch")
+            .with_enchantment("minecraft:unbreaking", 3)
+            .expect("valid enchantment")
+            .with_enchantment("minecraft:mending", 1)
+            .expect("valid enchantment");
+        let named_enchanted_pouch = ItemStack::try_new("testns:white_pouch", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(input_comps.clone())
+            .unwrap();
+        let blue_dye = ItemStack::try_new("testns:blue_dye", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Ignored Dye Name"))
+            .unwrap();
+
+        // Any two positions in the 3x3 grid (material before input or input before material).
+        let mut grid = CraftingGrid::table_3x3();
+        grid.set_slot(2, 0, blue_dye.clone()).unwrap();
+        grid.set_slot(0, 2, named_enchanted_pouch.clone()).unwrap();
+        let (recipe_id, result) = data.find_crafting(&grid).expect("transmute match");
+        assert_eq!(recipe_id, "testns:dye_blue_pouch");
+        assert_eq!(result.item(), "testns:blue_pouch");
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.components(), &input_comps);
+        assert_eq!(result.components().custom_name(), Some("Adventurer Pouch"));
+        assert_eq!(
+            result
+                .components()
+                .enchantments()
+                .get("minecraft:unbreaking"),
+            Some(&3)
+        );
+        assert_eq!(
+            result.components().enchantments().get("minecraft:mending"),
+            Some(&1)
+        );
+
+        // Extra item in the grid -> no match.
+        grid.set_slot(
+            1,
+            1,
+            ItemStack::try_new("testns:blue_dye", 1, DEFAULT_MAX_STACK).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data.find_crafting(&grid), None);
+
+        // Single item in the grid -> no match.
+        let mut single_grid = CraftingGrid::inventory_2x2();
+        single_grid
+            .set_slot(0, 0, named_enchanted_pouch.clone())
+            .unwrap();
+        assert_eq!(data.find_crafting(&single_grid), None);
+
+        // Tie-break between `testns:a_tie_transmute` and `testns:b_tie_shapeless` picks smallest id.
+        let mut tie_grid = CraftingGrid::inventory_2x2();
+        let plain_pouch = ItemStack::try_new("testns:pouch", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Gilded"))
+            .unwrap();
+        let gold_dye = ItemStack::try_new("testns:gold_dye", 1, DEFAULT_MAX_STACK).unwrap();
+        tie_grid.set_slot(0, 1, plain_pouch).unwrap();
+        tie_grid.set_slot(1, 0, gold_dye).unwrap();
+        let (tie_id, tie_result) = data.find_crafting(&tie_grid).expect("tie-break match");
+        assert_eq!(tie_id, "testns:a_tie_transmute");
+        assert_eq!(tie_result.item(), "testns:gold_pouch");
+        assert_eq!(tie_result.count(), 1);
+        assert_eq!(tie_result.components().custom_name(), Some("Gilded"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_transmute_recipes_load_and_preserve_components`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_transmute_recipes_load_and_preserve_components() {
+        use crate::item::ItemComponents;
+
+        // 16 bundle dye + 16 shulker box dye + 1 map_cloning = 33 `minecraft:crafting_transmute` files.
+        const VANILLA_TRANSMUTE_RECIPE_COUNT: usize = 33;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        assert_eq!(data.transmute().len(), VANILLA_TRANSMUTE_RECIPE_COUNT);
+        assert!(
+            !data.skipped().iter().any(|(_, reason)| {
+                *reason == SkipReason::UnsupportedType("minecraft:crafting_transmute".to_owned())
+            }),
+            "no crafting_transmute recipes may remain in skipped()"
+        );
+
+        // 1. `minecraft:bundle` + `minecraft:black_dye` -> `minecraft:black_bundle`
+        let mut bundle_grid = CraftingGrid::table_3x3();
+        let bundle = ItemStack::try_new(
+            "minecraft:bundle",
+            1,
+            u16::from(items.max_stack_size("minecraft:bundle").unwrap()),
+        )
+        .unwrap();
+        let black_dye = ItemStack::try_new(
+            "minecraft:black_dye",
+            1,
+            u16::from(items.max_stack_size("minecraft:black_dye").unwrap()),
+        )
+        .unwrap();
+        bundle_grid.set_slot(0, 1, bundle).unwrap();
+        bundle_grid.set_slot(2, 2, black_dye).unwrap();
+        let (bundle_recipe_id, black_bundle) =
+            data.find_crafting(&bundle_grid).expect("dye bundle black");
+        assert_eq!(bundle_recipe_id, "minecraft:black_bundle");
+        assert_eq!(black_bundle.item(), "minecraft:black_bundle");
+        assert_eq!(black_bundle.count(), 1);
+        assert_eq!(black_bundle.max_stack(), 1);
+
+        // 2. Named `minecraft:shulker_box` + `minecraft:red_dye` -> `minecraft:red_shulker_box` keeping name
+        let mut shulker_grid = CraftingGrid::inventory_2x2();
+        let named_shulker = ItemStack::try_new(
+            "minecraft:shulker_box",
+            1,
+            u16::from(items.max_stack_size("minecraft:shulker_box").unwrap()),
+        )
+        .unwrap()
+        .with_components(ItemComponents::new().with_custom_name("Redstone Supplies"))
+        .unwrap();
+        let red_dye = ItemStack::try_new(
+            "minecraft:red_dye",
+            1,
+            u16::from(items.max_stack_size("minecraft:red_dye").unwrap()),
+        )
+        .unwrap();
+        shulker_grid.set_slot(1, 0, red_dye).unwrap();
+        shulker_grid.set_slot(0, 1, named_shulker).unwrap();
+        let (shulker_recipe_id, red_shulker) = data
+            .find_crafting(&shulker_grid)
+            .expect("dye shulker box red");
+        assert_eq!(shulker_recipe_id, "minecraft:red_shulker_box");
+        assert_eq!(red_shulker.item(), "minecraft:red_shulker_box");
+        assert_eq!(red_shulker.count(), 1);
+        assert_eq!(red_shulker.max_stack(), 1);
+        assert_eq!(
+            red_shulker.components().custom_name(),
+            Some("Redstone Supplies")
+        );
+
+        // 3. `minecraft:map_cloning`: one filled map plus 1..=8 empty maps yields the
+        //    filled map with the number of empty maps added to its count.
+        let map_recipe = data
+            .transmute()
+            .iter()
+            .find(|recipe| recipe.id() == "minecraft:map_cloning")
+            .expect("map_cloning loads");
+        assert_eq!(map_recipe.material_count(), &(1..=8));
+        assert!(map_recipe.adds_material_count_to_result());
+        let map_max = u16::from(items.max_stack_size("minecraft:map").unwrap());
+        let filled_max = u16::from(items.max_stack_size("minecraft:filled_map").unwrap());
+        let filled = ItemStack::try_new("minecraft:filled_map", 1, filled_max).unwrap();
+        let empty_map = ItemStack::try_new("minecraft:map", 1, map_max).unwrap();
+        for empty_maps in 0..=8usize {
+            let mut grid = CraftingGrid::table_3x3();
+            grid.set_slot(0, 0, filled.clone()).unwrap();
+            for slot in 1..=empty_maps {
+                grid.set_slot(slot % 3, slot / 3, empty_map.clone())
+                    .unwrap();
+            }
+            let found = data.find_crafting(&grid);
+            if empty_maps == 0 {
+                assert!(found.is_none(), "a filled map alone is not a recipe");
+            } else {
+                let (recipe_id, cloned) = found.expect("map cloning matches");
+                assert_eq!(recipe_id, "minecraft:map_cloning");
+                assert_eq!(cloned.item(), "minecraft:filled_map");
+                assert_eq!(usize::from(cloned.count()), 1 + empty_maps);
+            }
+        }
+    }
+
+    #[test]
+    fn transmute_material_count_bounds_and_count_addition() {
+        let root = scratch_root("transmute-material-count");
+        write(
+            &root.join("data/testns/recipe/clone.json"),
+            r#"{"type": "minecraft:crafting_transmute", "input": "testns:original",
+                "material": "testns:blank", "material_count": {"min": 2, "max": 3},
+                "add_material_count_to_result": true, "result": {}}"#,
+        );
+        let data = RecipeData::load(&root, &ItemTags::default()).expect("load");
+        let original = ItemStack::try_new("testns:original", 1, 64).unwrap();
+        let blank = ItemStack::try_new("testns:blank", 1, 64).unwrap();
+        let grid_with = |blanks: usize| {
+            let mut grid = CraftingGrid::table_3x3();
+            grid.set_slot(0, 0, original.clone()).unwrap();
+            for slot in 1..=blanks {
+                grid.set_slot(slot % 3, slot / 3, blank.clone()).unwrap();
+            }
+            grid
+        };
+        assert!(data.find_crafting(&grid_with(1)).is_none());
+        assert_eq!(data.find_crafting(&grid_with(2)).unwrap().1.count(), 3);
+        assert_eq!(data.find_crafting(&grid_with(3)).unwrap().1.count(), 4);
+        assert!(data.find_crafting(&grid_with(4)).is_none());
+
+        for (name, bad) in [
+            ("zero", r#"0"#),
+            ("nine", r#"9"#),
+            ("reversed", r#"{"min": 3, "max": 2}"#),
+            ("extra", r#"{"min": 1, "max": 2, "step": 1}"#),
+            ("text", r#""two""#),
+        ] {
+            let bad_root = scratch_root(&format!("transmute-bad-count-{name}"));
+            write(
+                &bad_root.join("data/testns/recipe/bad.json"),
+                &format!(
+                    r#"{{"type": "minecraft:crafting_transmute", "input": "testns:a",
+                        "material": "testns:b", "material_count": {bad},
+                        "result": {{"id": "testns:c"}}}}"#
+                ),
+            );
+            let error = RecipeData::load(&bad_root, &ItemTags::default())
+                .expect_err("invalid material_count must fail")
+                .to_string();
+            assert!(error.contains("bad.json"), "{name}: {error}");
+            fs::remove_dir_all(bad_root).expect("cleanup");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn repair_item_combines_two_damaged_items_applies_five_percent_bonus_and_component_rules() {
+        use crate::item::ItemComponents;
+
+        // `minecraft:iron_pickaxe` max_damage in `reports/minecraft/components/item/iron_pickaxe.json`.
+        const IRON_PICKAXE_MAX_DAMAGE: u32 = 250;
+        // `minecraft:stone_axe` max_damage in `reports/minecraft/components/item/stone_axe.json`
+        // (minecraft.wiki `Item repair` revision 3791643 example: 10 + 45 + floor(131 / 20) = 61 uses).
+        const STONE_AXE_MAX_DAMAGE: u32 = 131;
+
+        let root = scratch_root("repair-item");
+        write(
+            &root.join("reports/minecraft/components/item/iron_pickaxe.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 250}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/stone_axe.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 131}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/stick.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+        write(
+            &root.join("data/minecraft/tags/enchantment/curse.json"),
+            r#"{"values": ["minecraft:binding_curse", "minecraft:vanishing_curse"]}"#,
+        );
+        write(
+            &root.join("data/minecraft/recipe/repair_item.json"),
+            r#"{"type": "minecraft:crafting_special_repairitem"}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let items = ItemDefaults::load(&root).expect("load item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+        assert_eq!(data.repair_item().len(), 1);
+        assert!(data.skipped().is_empty());
+
+        // 1. Two `minecraft:iron_pickaxe`: damage 200 (50 uses) + damage 150 (100 uses)
+        //    + floor(250 / 20) (12 bonus uses) = 162 uses -> damage 250 - 162 = 88.
+        let pick_a = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(200)
+                    .with_custom_name("Named Pick A")
+                    .with_repair_cost(3)
+                    .with_enchantment("minecraft:efficiency", 4)
+                    .unwrap()
+                    .with_enchantment("minecraft:unbreaking", 3)
+                    .unwrap(),
+            )
+            .unwrap();
+        let pick_b = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(150)
+                    .with_custom_name("Named Pick B")
+                    .with_enchantment("minecraft:efficiency", 4)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let mut grid = CraftingGrid::table_3x3();
+        grid.set_slot(0, 0, pick_a.clone()).unwrap();
+        grid.set_slot(2, 1, pick_b.clone()).unwrap();
+        let (recipe_id, repaired) = data.find_crafting(&grid).expect("repair iron pickaxes");
+        assert_eq!(recipe_id, "minecraft:repair_item");
+        assert_eq!(repaired.item(), "minecraft:iron_pickaxe");
+        assert_eq!(repaired.count(), 1);
+        assert_eq!(repaired.max_stack(), 1);
+        let expected_uses = (IRON_PICKAXE_MAX_DAMAGE - 200)
+            + (IRON_PICKAXE_MAX_DAMAGE - 150)
+            + (IRON_PICKAXE_MAX_DAMAGE / CRAFTING_REPAIR_BONUS_DIVISOR);
+        assert_eq!(expected_uses, 162);
+        assert_eq!(
+            repaired.components().damage(),
+            Some(IRON_PICKAXE_MAX_DAMAGE - expected_uses)
+        );
+        assert_eq!(repaired.components().damage(), Some(88));
+        // Non-curse enchantments, custom_name, and repair_cost are dropped.
+        assert_eq!(repaired.components().custom_name(), None);
+        assert_eq!(repaired.components().repair_cost(), None);
+        assert!(repaired.components().enchantments().is_empty());
+
+        // 2. Curse enchantment (`minecraft:vanishing_curse`) is transferred while non-curse
+        //    enchantment and custom_name are dropped (minecraft.wiki `Item repair` revision 3791643).
+        let cursed_pick = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(200)
+                    .with_custom_name("Cursed Pick")
+                    .with_enchantment("minecraft:fortune", 3)
+                    .unwrap()
+                    .with_enchantment("minecraft:vanishing_curse", 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut cursed_grid = CraftingGrid::inventory_2x2();
+        cursed_grid.set_slot(0, 1, cursed_pick).unwrap();
+        cursed_grid.set_slot(1, 0, pick_b).unwrap();
+        let (_, cursed_repaired) = data.find_crafting(&cursed_grid).expect("cursed repair");
+        assert_eq!(cursed_repaired.components().damage(), Some(88));
+        assert_eq!(cursed_repaired.components().custom_name(), None);
+        assert_eq!(cursed_repaired.components().enchantments().len(), 1);
+        assert_eq!(
+            cursed_repaired
+                .components()
+                .enchantments()
+                .get("minecraft:vanishing_curse"),
+            Some(&1)
+        );
+
+        // 3. Wiki example: two `minecraft:stone_axe` (`max_damage = 131`) with 10 and 45 uses
+        //    (damage 121 and 86) -> 10 + 45 + floor(131 / 20) = 61 uses -> damage 131 - 61 = 70.
+        let axe_a = ItemStack::try_new("minecraft:stone_axe", 1, 1)
+            .unwrap()
+            .with_components(ItemComponents::new().with_damage(STONE_AXE_MAX_DAMAGE - 10))
+            .unwrap();
+        let axe_b = ItemStack::try_new("minecraft:stone_axe", 1, 1)
+            .unwrap()
+            .with_components(ItemComponents::new().with_damage(STONE_AXE_MAX_DAMAGE - 45))
+            .unwrap();
+        let mut axe_grid = CraftingGrid::inventory_2x2();
+        axe_grid.set_slot(0, 0, axe_a.clone()).unwrap();
+        axe_grid.set_slot(1, 1, axe_b).unwrap();
+        let (_, repaired_axe) = data.find_crafting(&axe_grid).expect("repair stone axes");
+        assert_eq!(
+            repaired_axe.components().damage(),
+            Some(STONE_AXE_MAX_DAMAGE - 61)
+        );
+        assert_eq!(repaired_axe.components().damage(), Some(70));
+
+        // 4. Sum + bonus exceeding max_damage is capped at max_damage (`damage` = None / 0).
+        let light_a = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(ItemComponents::new().with_damage(5))
+            .unwrap();
+        let light_b = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(ItemComponents::new().with_damage(10))
+            .unwrap();
+        let mut cap_grid = CraftingGrid::inventory_2x2();
+        cap_grid.set_slot(0, 0, light_a).unwrap();
+        cap_grid.set_slot(0, 1, light_b).unwrap();
+        let (_, capped) = data.find_crafting(&cap_grid).expect("capped repair");
+        assert_eq!(capped.components().damage(), None);
+
+        // 5. Different damageable items -> no match.
+        let mut diff_grid = CraftingGrid::inventory_2x2();
+        diff_grid.set_slot(0, 0, pick_a.clone()).unwrap();
+        diff_grid.set_slot(1, 0, axe_a).unwrap();
+        assert_eq!(data.find_crafting(&diff_grid), None);
+
+        // 6. Undamageable items -> no match.
+        let mut stick_grid = CraftingGrid::inventory_2x2();
+        stick_grid
+            .set_slot(
+                0,
+                0,
+                ItemStack::try_new("minecraft:stick", 1, DEFAULT_MAX_STACK).unwrap(),
+            )
+            .unwrap();
+        stick_grid
+            .set_slot(
+                1,
+                1,
+                ItemStack::try_new("minecraft:stick", 1, DEFAULT_MAX_STACK).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(data.find_crafting(&stick_grid), None);
+
+        // 7. Three items of the same damageable kind -> no match.
+        let mut three_grid = CraftingGrid::table_3x3();
+        three_grid.set_slot(0, 0, pick_a.clone()).unwrap();
+        three_grid.set_slot(1, 0, pick_a.clone()).unwrap();
+        three_grid.set_slot(2, 0, pick_a).unwrap();
+        assert_eq!(data.find_crafting(&three_grid), None);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_repair_item_recipe_combines_damaged_tools`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_repair_item_recipe_combines_damaged_tools() {
+        use crate::item::ItemComponents;
+
+        // `minecraft:iron_pickaxe` has `minecraft:max_damage = 250` in the 26.3 item report.
+        const VANILLA_IRON_PICKAXE_MAX_DAMAGE: u32 = 250;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        assert_eq!(data.repair_item().len(), 1);
+        assert!(
+            data.get_repair_item_by_id("minecraft:repair_item")
+                .is_some()
+        );
+        assert!(
+            !data.skipped().iter().any(|(_, reason)| {
+                *reason
+                    == SkipReason::UnsupportedType(
+                        "minecraft:crafting_special_repairitem".to_owned(),
+                    )
+            }),
+            "crafting_special_repairitem must not be in skipped()"
+        );
+        assert_eq!(
+            items.max_damage("minecraft:iron_pickaxe"),
+            Some(VANILLA_IRON_PICKAXE_MAX_DAMAGE)
+        );
+
+        // 1. Two damaged `minecraft:iron_pickaxe` (damage 180 -> 70 uses, damage 110 -> 140 uses):
+        //    repaired uses = min(70 + 140 + floor(250 / 20), 250) = min(210 + 12, 250) = 222
+        //    -> result damage = 250 - 222 = 28.
+        let pick_one = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(180)
+                    .with_custom_name("Miner I")
+                    .with_enchantment("minecraft:efficiency", 3)
+                    .unwrap(),
+            )
+            .unwrap();
+        let pick_two = ItemStack::try_new("minecraft:iron_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(110)
+                    .with_custom_name("Miner II")
+                    .with_enchantment("minecraft:unbreaking", 2)
+                    .unwrap()
+                    .with_enchantment("minecraft:vanishing_curse", 1)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let mut grid = CraftingGrid::table_3x3();
+        grid.set_slot(0, 2, pick_one.clone()).unwrap();
+        grid.set_slot(2, 0, pick_two).unwrap();
+        let (recipe_id, repaired) = data
+            .find_crafting(&grid)
+            .expect("repair two damaged iron pickaxes");
+        assert_eq!(recipe_id, "minecraft:repair_item");
+        assert_eq!(repaired.item(), "minecraft:iron_pickaxe");
+        assert_eq!(repaired.count(), 1);
+        assert_eq!(repaired.max_stack(), 1);
+        assert_eq!(repaired.components().damage(), Some(28));
+        assert_eq!(repaired.components().custom_name(), None);
+        assert_eq!(
+            repaired
+                .components()
+                .enchantments()
+                .get("minecraft:efficiency"),
+            None
+        );
+        assert_eq!(
+            repaired
+                .components()
+                .enchantments()
+                .get("minecraft:unbreaking"),
+            None
+        );
+        assert_eq!(
+            repaired
+                .components()
+                .enchantments()
+                .get("minecraft:vanishing_curse"),
+            Some(&1)
+        );
+
+        // 2. Different damageable items (`minecraft:iron_pickaxe` + `minecraft:diamond_pickaxe`) -> no match.
+        let diamond_pick = ItemStack::try_new("minecraft:diamond_pickaxe", 1, 1)
+            .unwrap()
+            .with_components(ItemComponents::new().with_damage(100))
+            .unwrap();
+        let mut diff_grid = CraftingGrid::inventory_2x2();
+        diff_grid.set_slot(0, 0, pick_one).unwrap();
+        diff_grid.set_slot(1, 1, diamond_pick).unwrap();
+        assert_eq!(data.find_crafting(&diff_grid), None);
+
+        // 3. Undamageable items (two `minecraft:dirt` or two `minecraft:iron_ingot`) -> no match.
+        let mut dirt_grid = CraftingGrid::inventory_2x2();
+        dirt_grid
+            .set_slot(0, 0, ItemStack::try_new("minecraft:dirt", 1, 64).unwrap())
+            .unwrap();
+        dirt_grid
+            .set_slot(1, 1, ItemStack::try_new("minecraft:dirt", 1, 64).unwrap())
+            .unwrap();
+        assert_eq!(data.find_crafting(&dirt_grid), None);
     }
 }
