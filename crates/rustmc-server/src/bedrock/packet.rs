@@ -16,6 +16,7 @@
 //! combines `int8` with `Compression`. No Bedrock client has exercised this code.
 
 use crate::bedrock::session::BedrockSessionError;
+use crate::bedrock::wire::{self, BedrockWireError};
 use crate::discovery_bedrock::{PROTOCOL, VERSION};
 use std::fmt;
 
@@ -38,90 +39,45 @@ pub const ID_REQUEST_NETWORK_SETTINGS: u32 = 0xC1;
 
 // --- LEB128 and ZigZag wire helpers ---
 
-pub fn put_varuint32(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+fn map_wire_error(width: &str, err: BedrockWireError) -> BedrockSessionError {
+    let kind = match err {
+        BedrockWireError::Truncated => "truncated",
+        BedrockWireError::Overflow => "overflow",
+        BedrockWireError::NonCanonical => "non-canonical",
+    };
+    BedrockSessionError::MalformedPacket(format!("{kind} {width}"))
+}
+
+pub fn put_varuint32(value: u32, out: &mut Vec<u8>) {
+    wire::put_varuint32(value, out);
 }
 
 pub fn read_varuint32(input: &[u8]) -> Result<(u32, usize), BedrockSessionError> {
-    let mut value = 0u32;
-    for (i, byte) in input.iter().take(5).enumerate() {
-        if i == 4 && byte & 0xf0 != 0 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "varuint32 overflow".to_string(),
-            ));
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
-        }
-    }
-    Err(BedrockSessionError::MalformedPacket(
-        "truncated varuint32".to_string(),
-    ))
+    wire::read_varuint32(input).map_err(|err| map_wire_error("varuint32", err))
 }
 
 pub fn put_varint32(value: i32, out: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 31)) as u32;
-    put_varuint32(zigzag, out);
+    wire::put_varint32(value, out);
 }
 
 pub fn read_varint32(input: &[u8]) -> Result<(i32, usize), BedrockSessionError> {
-    let (zigzag, len) = read_varuint32(input)?;
-    let val = ((zigzag >> 1) as i32) ^ (-((zigzag & 1) as i32));
-    Ok((val, len))
+    wire::read_varint32(input).map_err(|err| map_wire_error("varint32", err))
 }
 
-pub fn put_varuint64(mut value: u64, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+pub fn put_varuint64(value: u64, out: &mut Vec<u8>) {
+    wire::put_varuint64(value, out);
 }
 
 pub fn read_varuint64(input: &[u8]) -> Result<(u64, usize), BedrockSessionError> {
-    let mut value = 0u64;
-    for (i, byte) in input.iter().take(10).enumerate() {
-        if i == 9 && byte & 0xfe != 0 {
-            return Err(BedrockSessionError::MalformedPacket(
-                "varuint64 overflow".to_string(),
-            ));
-        }
-        value |= u64::from(byte & 0x7f) << (i * 7);
-        if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
-        }
-    }
-    Err(BedrockSessionError::MalformedPacket(
-        "truncated varuint64".to_string(),
-    ))
+    wire::read_varuint64(input).map_err(|err| map_wire_error("varuint64", err))
 }
 
 pub fn put_varint64(value: i64, out: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    put_varuint64(zigzag, out);
+    wire::put_varint64(value, out);
 }
 
 pub fn read_varint64(input: &[u8]) -> Result<(i64, usize), BedrockSessionError> {
-    let (zigzag, len) = read_varuint64(input)?;
-    let val = ((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64));
-    Ok((val, len))
+    wire::read_varint64(input).map_err(|err| map_wire_error("varint64", err))
 }
 
 pub fn put_bedrock_string(value: &str, out: &mut Vec<u8>) {
