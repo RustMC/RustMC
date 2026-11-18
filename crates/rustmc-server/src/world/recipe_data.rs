@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::item::ItemStack;
+use crate::item::{ItemDefaults, ItemStack};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
@@ -229,8 +229,29 @@ pub struct RecipeData {
 
 impl RecipeData {
     /// Loads every `data/<namespace>/recipe/**/*.json` file under `root`,
-    /// resolving `#tag` ingredients against `tags`.
+    /// resolving `#tag` ingredients against `tags` and result stack limits
+    /// against the offline fallback table.
     pub fn load(root: &Path, tags: &ItemTags) -> Result<Self, RecipeDataError> {
+        Self::load_inner(root, tags, None)
+    }
+
+    /// Loads every `data/<namespace>/recipe/**/*.json` file under `root`,
+    /// resolving `#tag` ingredients against `tags` and result stack limits
+    /// against `items`. Unknown result items fail with an error naming the
+    /// recipe file.
+    pub fn load_with_items(
+        root: &Path,
+        tags: &ItemTags,
+        items: &ItemDefaults,
+    ) -> Result<Self, RecipeDataError> {
+        Self::load_inner(root, tags, Some(items))
+    }
+
+    fn load_inner(
+        root: &Path,
+        tags: &ItemTags,
+        items: Option<&ItemDefaults>,
+    ) -> Result<Self, RecipeDataError> {
         let mut data = Self::default();
         let data_dir = root.join("data");
         let Some(namespaces) = read_dir_optional(&data_dir)? else {
@@ -277,7 +298,7 @@ impl RecipeData {
                 })?;
 
                 if let Some(kind) = CookingKind::from_recipe_type(recipe_type) {
-                    match parse_cooking_recipe(&id, kind, obj, tags, &entry)? {
+                    match parse_cooking_recipe(&id, kind, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
                         ParsedOrSkipped::Loaded(recipe) => {
                             let by_item = seen_cooking.entry(kind).or_default();
@@ -296,21 +317,21 @@ impl RecipeData {
                         }
                     }
                 } else if recipe_type == "minecraft:crafting_shaped" {
-                    match parse_shaped_recipe(&id, obj, tags, &entry)? {
+                    match parse_shaped_recipe(&id, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
                         ParsedOrSkipped::Loaded(recipe) => {
                             data.crafting.push(Recipe::Shaped(recipe))
                         }
                     }
                 } else if recipe_type == "minecraft:crafting_shapeless" {
-                    match parse_shapeless_recipe(&id, obj, tags, &entry)? {
+                    match parse_shapeless_recipe(&id, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
                         ParsedOrSkipped::Loaded(recipe) => {
                             data.crafting.push(Recipe::Shapeless(recipe))
                         }
                     }
                 } else if recipe_type == "minecraft:stonecutting" {
-                    match parse_stonecutting_recipe(&id, obj, tags, &entry)? {
+                    match parse_stonecutting_recipe(&id, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
                         ParsedOrSkipped::Loaded(recipe) => data.stonecutting.push(recipe),
                     }
@@ -459,6 +480,7 @@ fn parse_optional_string(
 
 fn parse_result(
     obj: &serde_json::Map<String, Value>,
+    items: Option<&ItemDefaults>,
     file: &Path,
 ) -> Result<ParsedOrSkipped<ItemStack>, RecipeDataError> {
     let result_val = obj
@@ -484,7 +506,16 @@ fn parse_result(
                 .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))?
         }
     };
-    let stack = ItemStack::try_new(id, count, default_max_stack(id))
+    let max_stack = match items {
+        Some(defaults) => {
+            let max = defaults
+                .max_stack_size(id)
+                .ok_or_else(|| invalid(file, format!("unknown result item `{id}`")))?;
+            u16::from(max)
+        }
+        None => default_max_stack(id),
+    };
+    let stack = ItemStack::try_new(id, count, max_stack)
         .map_err(|error| invalid(file, format!("invalid `result` stack: {error}")))?;
     Ok(ParsedOrSkipped::Loaded(stack))
 }
@@ -553,9 +584,10 @@ fn parse_cooking_recipe(
     kind: CookingKind,
     obj: &serde_json::Map<String, Value>,
     tags: &ItemTags,
+    items: Option<&ItemDefaults>,
     file: &Path,
 ) -> Result<ParsedOrSkipped<CookingRecipe>, RecipeDataError> {
-    let result = match parse_result(obj, file)? {
+    let result = match parse_result(obj, items, file)? {
         ParsedOrSkipped::Skipped(reason) => return Ok(ParsedOrSkipped::Skipped(reason)),
         ParsedOrSkipped::Loaded(stack) => stack,
     };
@@ -607,9 +639,10 @@ fn parse_shaped_recipe(
     id: &str,
     obj: &serde_json::Map<String, Value>,
     tags: &ItemTags,
+    items: Option<&ItemDefaults>,
     file: &Path,
 ) -> Result<ParsedOrSkipped<ShapedRecipe>, RecipeDataError> {
-    let result = match parse_result(obj, file)? {
+    let result = match parse_result(obj, items, file)? {
         ParsedOrSkipped::Skipped(reason) => return Ok(ParsedOrSkipped::Skipped(reason)),
         ParsedOrSkipped::Loaded(stack) => stack,
     };
@@ -670,9 +703,10 @@ fn parse_shapeless_recipe(
     id: &str,
     obj: &serde_json::Map<String, Value>,
     tags: &ItemTags,
+    items: Option<&ItemDefaults>,
     file: &Path,
 ) -> Result<ParsedOrSkipped<ShapelessRecipe>, RecipeDataError> {
-    let result = match parse_result(obj, file)? {
+    let result = match parse_result(obj, items, file)? {
         ParsedOrSkipped::Skipped(reason) => return Ok(ParsedOrSkipped::Skipped(reason)),
         ParsedOrSkipped::Loaded(stack) => stack,
     };
@@ -704,9 +738,10 @@ fn parse_stonecutting_recipe(
     id: &str,
     obj: &serde_json::Map<String, Value>,
     tags: &ItemTags,
+    items: Option<&ItemDefaults>,
     file: &Path,
 ) -> Result<ParsedOrSkipped<StonecuttingRecipe>, RecipeDataError> {
-    let result = match parse_result(obj, file)? {
+    let result = match parse_result(obj, items, file)? {
         ParsedOrSkipped::Skipped(reason) => return Ok(ParsedOrSkipped::Skipped(reason)),
         ParsedOrSkipped::Loaded(stack) => stack,
     };
@@ -1209,5 +1244,119 @@ mod tests {
             .set_slot(1, 1, stack("minecraft:stick"))
             .unwrap();
         assert_eq!(data.find_crafting(&single_stick), None);
+    }
+
+    #[test]
+    fn load_with_items_uses_item_defaults_and_rejects_unknown_result() {
+        let root = scratch_root("with-items");
+        write(
+            &root.join("reports/minecraft/components/item/widget_sign.json"),
+            r#"{"components": {"minecraft:max_stack_size": 16}}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/make_sign.json"),
+            r#"{
+                "type": "minecraft:crafting_shapeless",
+                "ingredients": ["testns:plank"],
+                "result": {"id": "minecraft:widget_sign", "count": 3}
+            }"#,
+        );
+
+        let items = ItemDefaults::load(&root).expect("load item defaults");
+        let tags = ItemTags::default();
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load with items");
+        let recipe = data
+            .get_crafting_by_id("testns:make_sign")
+            .expect("make_sign recipe");
+        assert_eq!(recipe.output().count(), 3);
+        assert_eq!(recipe.output().max_stack(), 16);
+
+        // Fallback load still uses default_max_stack (64 for unknown custom items).
+        let fallback = RecipeData::load(&root, &tags).expect("fallback load");
+        assert_eq!(
+            fallback
+                .get_crafting_by_id("testns:make_sign")
+                .expect("fallback recipe")
+                .output()
+                .max_stack(),
+            64
+        );
+
+        // Unknown result item fails with an error naming the recipe file.
+        write(
+            &root.join("data/testns/recipe/bad_result.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "testns:plank",
+                "result": {"id": "testns:unknown_widget"}
+            }"#,
+        );
+        let err = RecipeData::load_with_items(&root, &tags, &items)
+            .expect_err("unknown result item must fail")
+            .to_string();
+        assert!(
+            err.contains("bad_result.json"),
+            "error must name recipe file: {err}"
+        );
+        assert!(
+            err.contains("testns:unknown_widget"),
+            "error must name unknown item: {err}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_recipes_load_with_items_pin_stack_sizes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_recipes_load_with_items_pin_stack_sizes() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        let raw_iron = data
+            .get_cooking_by_id("minecraft:iron_ingot_from_smelting_raw_iron")
+            .expect("raw_iron smelting recipe");
+        assert_eq!(raw_iron.result().max_stack(), 64);
+
+        for kind in CookingKind::ALL {
+            for recipe in data.cooking(kind) {
+                let expected = items
+                    .max_stack_size(recipe.result().item())
+                    .expect("cooking result item in ItemDefaults");
+                assert_eq!(
+                    recipe.result().max_stack(),
+                    u16::from(expected),
+                    "cooking recipe {}",
+                    recipe.id()
+                );
+            }
+        }
+        for recipe in data.crafting() {
+            let expected = items
+                .max_stack_size(recipe.output().item())
+                .expect("crafting result item in ItemDefaults");
+            assert_eq!(
+                recipe.output().max_stack(),
+                u16::from(expected),
+                "crafting recipe {:?}",
+                recipe.id()
+            );
+        }
+        for recipe in data.stonecutting() {
+            let expected = items
+                .max_stack_size(recipe.result().item())
+                .expect("stonecutting result item in ItemDefaults");
+            assert_eq!(
+                recipe.result().max_stack(),
+                u16::from(expected),
+                "stonecutting recipe {}",
+                recipe.id()
+            );
+        }
     }
 }

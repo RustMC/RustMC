@@ -2,6 +2,14 @@
 //! Per-item components (durability, names, enchantments) are deliberately not
 //! modelled yet.
 
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
+
 /// Default stack limit for standard items.
 pub const DEFAULT_MAX_STACK: u16 = 64;
 
@@ -153,6 +161,183 @@ impl ItemStack {
         };
         Ok((taken, Some(rest)))
     }
+}
+
+/// Errors encountered while loading default item components from vanilla server reports.
+#[derive(Debug)]
+pub enum ItemDefaultsError {
+    /// The `reports` directory or its `minecraft/components/item` subdirectory is missing.
+    MissingReports(PathBuf),
+    /// Reading or parsing a report JSON file failed.
+    Worldgen(WorldgenError),
+    /// A report JSON file had missing, malformed, or out-of-range fields.
+    Invalid { file: PathBuf, message: String },
+}
+
+impl fmt::Display for ItemDefaultsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingReports(path) => write!(
+                f,
+                "missing vanilla reports directory `{}` (generate with: java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --reports)",
+                path.display()
+            ),
+            Self::Worldgen(error) => write!(f, "{error}"),
+            Self::Invalid { file, message } => {
+                write!(f, "invalid item report {}: {message}", file.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ItemDefaultsError {}
+
+impl From<WorldgenError> for ItemDefaultsError {
+    fn from(error: WorldgenError) -> Self {
+        Self::Worldgen(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemDefaultEntry {
+    max_stack_size: u8,
+    max_damage: Option<u32>,
+}
+
+/// Default per-item components read from `reports/minecraft/components/item/*.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemDefaults {
+    entries: BTreeMap<String, ItemDefaultEntry>,
+}
+
+impl ItemDefaults {
+    /// Loads default item components from every `reports/minecraft/components/item/*.json`
+    /// under `root`.
+    pub fn load(root: &Path) -> Result<Self, ItemDefaultsError> {
+        let reports_dir = root.join("reports");
+        if read_dir_optional(&reports_dir)?.is_none() {
+            return Err(ItemDefaultsError::MissingReports(reports_dir));
+        }
+        let items_dir = reports_dir
+            .join("minecraft")
+            .join("components")
+            .join("item");
+        if read_dir_optional(&items_dir)?.is_none() {
+            return Err(ItemDefaultsError::MissingReports(items_dir));
+        }
+
+        let mut entries = BTreeMap::new();
+        for path in walk_json(&items_dir)? {
+            let (id, entry) = parse_item_report(&path)?;
+            entries.insert(id, entry);
+        }
+        Ok(Self { entries })
+    }
+
+    /// Returns the default `minecraft:max_stack_size` component for `item`, if known.
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn max_stack_size(&self, item: &str) -> Option<u8> {
+        self.entries
+            .get(normalize_item_id(item))
+            .map(|entry| entry.max_stack_size)
+    }
+
+    /// Returns the default `minecraft:max_damage` component for `item`, if present.
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn max_damage(&self, item: &str) -> Option<u32> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.max_damage)
+    }
+
+    /// Returns the number of items loaded from the report.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` when no items have been loaded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn item_report_invalid(file: &Path, message: impl Into<String>) -> ItemDefaultsError {
+    ItemDefaultsError::Invalid {
+        file: file.to_path_buf(),
+        message: message.into(),
+    }
+}
+
+fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefaultsError> {
+    let item_stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| item_report_invalid(file, "missing or non-UTF-8 item filename stem"))?;
+    let full_id = format!("minecraft:{item_stem}");
+    if !valid_item_id(&full_id) {
+        return Err(item_report_invalid(
+            file,
+            format!("invalid item identifier `{full_id}`"),
+        ));
+    }
+
+    let document = read_json(file)?;
+    let obj = document
+        .as_object()
+        .ok_or_else(|| item_report_invalid(file, "item report root must be a JSON object"))?;
+    let components = obj
+        .get("components")
+        .and_then(Value::as_object)
+        .ok_or_else(|| item_report_invalid(file, "missing or non-object `components` field"))?;
+
+    let raw_stack = components
+        .get("minecraft:max_stack_size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            item_report_invalid(
+                file,
+                "missing or invalid integer `components[\"minecraft:max_stack_size\"]`",
+            )
+        })?;
+    let max_stack_size = u8::try_from(raw_stack)
+        .ok()
+        .filter(|&n| (1..=MAX_STACK_LIMIT).contains(&u16::from(n)))
+        .ok_or_else(|| {
+            item_report_invalid(
+                file,
+                format!("`minecraft:max_stack_size` {raw_stack} must be in 1..={MAX_STACK_LIMIT}"),
+            )
+        })?;
+
+    let max_damage = match components.get("minecraft:max_damage") {
+        None => None,
+        Some(value) => {
+            let raw_damage = value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| {
+                    item_report_invalid(
+                        file,
+                        "`components[\"minecraft:max_damage\"]` must be a positive 32-bit integer",
+                    )
+                })?;
+            Some(raw_damage)
+        }
+    };
+
+    Ok((
+        item_stem.to_owned(),
+        ItemDefaultEntry {
+            max_stack_size,
+            max_damage,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -354,5 +539,124 @@ mod tests {
             assert_eq!(default_max_stack(sixteen), 16, "{sixteen}");
         }
         assert_eq!(default_max_stack("minecraft:stone"), DEFAULT_MAX_STACK);
+    }
+
+    fn scratch_root(label: &str) -> PathBuf {
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rustmc-item-{label}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create scratch dir");
+        path
+    }
+
+    fn write_file(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, text).expect("write");
+    }
+
+    #[test]
+    fn item_defaults_loads_and_supports_prefix_insensitive_lookup() {
+        let root = scratch_root("defaults-ok");
+        write_file(
+            &root.join("reports/minecraft/components/item/widget.json"),
+            r#"{"components": {"minecraft:max_stack_size": 16, "minecraft:rarity": "common"}}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/gadget.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 238}}"#,
+        );
+
+        let defaults = ItemDefaults::load(&root).expect("load item defaults");
+        assert_eq!(defaults.len(), 2);
+        assert!(!defaults.is_empty());
+
+        assert_eq!(defaults.max_stack_size("minecraft:widget"), Some(16));
+        assert_eq!(defaults.max_stack_size("widget"), Some(16));
+        assert_eq!(defaults.max_damage("widget"), None);
+
+        assert_eq!(defaults.max_stack_size("minecraft:gadget"), Some(1));
+        assert_eq!(defaults.max_stack_size("gadget"), Some(1));
+        assert_eq!(defaults.max_damage("minecraft:gadget"), Some(238));
+        assert_eq!(defaults.max_damage("gadget"), Some(238));
+
+        assert_eq!(defaults.max_stack_size("testns:widget"), None);
+        assert_eq!(defaults.max_stack_size("missing"), None);
+        assert_eq!(defaults.max_damage("missing"), None);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn item_defaults_rejects_out_of_range_stack_size_naming_file() {
+        for (name, value) in [("too_low.json", "0"), ("too_high.json", "100")] {
+            let root = scratch_root(name);
+            write_file(
+                &root.join("reports/minecraft/components/item").join(name),
+                &format!(r#"{{"components": {{"minecraft:max_stack_size": {value}}}}}"#),
+            );
+            let err = ItemDefaults::load(&root)
+                .expect_err("out of range stack size must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn item_defaults_missing_reports_dir_mentions_reports_flag() {
+        let root = scratch_root("missing-reports");
+        let err = ItemDefaults::load(&root)
+            .expect_err("missing reports dir must fail")
+            .to_string();
+        assert!(
+            err.contains(
+                "java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --reports"
+            ),
+            "error must describe how to generate reports: {err}"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_item_defaults_pin_vanilla_counts`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_item_defaults_pin_vanilla_counts() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+
+        assert_eq!(defaults.len(), 1658);
+        let count_64 = defaults
+            .entries
+            .values()
+            .filter(|e| e.max_stack_size == 64)
+            .count();
+        let count_1 = defaults
+            .entries
+            .values()
+            .filter(|e| e.max_stack_size == 1)
+            .count();
+        let count_16 = defaults
+            .entries
+            .values()
+            .filter(|e| e.max_stack_size == 16)
+            .count();
+        assert_eq!(count_64, 1342);
+        assert_eq!(count_1, 248);
+        assert_eq!(count_16, 68);
+
+        assert_eq!(defaults.max_stack_size("minecraft:shears"), Some(1));
+        assert_eq!(defaults.max_stack_size("shears"), Some(1));
+        assert_eq!(defaults.max_damage("minecraft:shears"), Some(238));
+        assert_eq!(defaults.max_damage("shears"), Some(238));
+        assert_eq!(defaults.max_stack_size("minecraft:ender_pearl"), Some(16));
+        assert_eq!(defaults.max_damage("minecraft:ender_pearl"), None);
     }
 }
