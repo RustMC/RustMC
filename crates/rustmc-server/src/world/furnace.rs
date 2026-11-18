@@ -9,7 +9,10 @@
 //! from minecraft.wiki `Smelting` revision 3829803 and `Furnace` revision 3882524.
 
 use super::container_data::SetContainerDataPacket;
+use super::recipe_data::{CookingKind, RecipeData};
 use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::vanilla::feature::ItemTags;
+use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -82,16 +85,82 @@ pub struct FuelEntry {
 /// - Sticks: 100 ticks (0.5 smelts).
 /// - Lava bucket: 20000 ticks (100 smelts), leaves empty bucket (`minecraft:bucket`).
 /// - Non-fuel items: 0 ticks (rejected).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FuelRegistry {
     custom: BTreeMap<String, FuelEntry>,
+    fallback: bool,
+}
+
+impl Default for FuelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FuelRegistry {
-    /// Creates an empty registry relying on default vanilla fuel specifications.
+    /// Offline fallback registry used when no operator-provisioned data root is loaded.
+    ///
+    /// Creates an empty registry relying on [`fuel_burn_time`] and [`fuel_remainder`].
     pub fn new() -> Self {
         Self {
             custom: BTreeMap::new(),
+            fallback: true,
+        }
+    }
+
+    /// Builds a fuel registry from operator-provisioned [`ItemTags`].
+    ///
+    /// Registers coal, charcoal, lava bucket (with `minecraft:bucket` remainder),
+    /// and stick with their built-in burn-time constants; every member of
+    /// `minecraft:logs_that_burn`, `minecraft:planks`, and (when present)
+    /// `minecraft:bamboo_blocks` not in `minecraft:non_flammable_wood` at
+    /// `WOOD_BURN_TIME`; and every member of `minecraft:wooden_slabs` not in
+    /// `minecraft:non_flammable_wood` at `WOODEN_SLAB_BURN_TIME`. Does not
+    /// fall back to [`fuel_burn_time`].
+    #[must_use]
+    pub fn from_item_tags(tags: &ItemTags) -> Self {
+        let mut registry = Self {
+            custom: BTreeMap::new(),
+            fallback: false,
+        };
+        let bucket =
+            ItemStack::try_new("minecraft:bucket", 1, default_max_stack("minecraft:bucket"))
+                .expect("built-in bucket item id is valid");
+        registry.insert_entry("minecraft:coal", COAL_BURN_TIME, None);
+        registry.insert_entry("minecraft:charcoal", COAL_BURN_TIME, None);
+        registry.insert_entry("minecraft:lava_bucket", LAVA_BUCKET_BURN_TIME, Some(bucket));
+        registry.insert_entry("minecraft:stick", STICK_BURN_TIME, None);
+
+        for tag in [
+            "minecraft:logs_that_burn",
+            "minecraft:planks",
+            "minecraft:bamboo_blocks",
+        ] {
+            registry.register_flammable_tag(tags, tag, WOOD_BURN_TIME);
+        }
+        registry.register_flammable_tag(tags, "minecraft:wooden_slabs", WOODEN_SLAB_BURN_TIME);
+        registry
+    }
+
+    fn insert_entry(&mut self, item_id: &str, burn_time: u16, remainder: Option<ItemStack>) {
+        let key = normalize_item_id(item_id).to_string();
+        self.custom.insert(
+            key,
+            FuelEntry {
+                burn_time,
+                remainder,
+            },
+        );
+    }
+
+    fn register_flammable_tag(&mut self, tags: &ItemTags, tag: &str, burn_time: u16) {
+        let Some(members) = tags.members(tag) else {
+            return;
+        };
+        for item in members {
+            if !tags.contains("minecraft:non_flammable_wood", item) {
+                self.insert_entry(item, burn_time, None);
+            }
         }
     }
 
@@ -109,14 +178,7 @@ impl FuelRegistry {
             })
             .transpose()?;
         let item_id = item_id.into();
-        let key = normalize_item_id(&item_id).to_string();
-        self.custom.insert(
-            key,
-            FuelEntry {
-                burn_time,
-                remainder,
-            },
-        );
+        self.insert_entry(&item_id, burn_time, remainder);
         Ok(())
     }
 
@@ -127,7 +189,11 @@ impl FuelRegistry {
         if let Some(entry) = self.custom.get(normalized) {
             return entry.burn_time;
         }
-        fuel_burn_time(normalized)
+        if self.fallback {
+            fuel_burn_time(normalized)
+        } else {
+            0
+        }
     }
 
     /// Returns the remainder item left behind when consuming fuel, if any.
@@ -137,10 +203,14 @@ impl FuelRegistry {
         if let Some(entry) = self.custom.get(normalized) {
             return entry.remainder.clone();
         }
-        fuel_remainder(normalized).map(|rem| {
-            ItemStack::try_new(rem, 1, default_max_stack(rem))
-                .expect("built-in fuel remainders use valid item ids")
-        })
+        if self.fallback {
+            fuel_remainder(normalized).map(|rem| {
+                ItemStack::try_new(rem, 1, default_max_stack(rem))
+                    .expect("built-in fuel remainders use valid item ids")
+            })
+        } else {
+            None
+        }
     }
 
     /// Whether an item is recognized as valid fuel.
@@ -150,6 +220,8 @@ impl FuelRegistry {
     }
 }
 
+/// Offline fallback burn-time lookup used when no operator-provisioned data root is loaded.
+///
 /// Returns the standard vanilla fuel burn duration in ticks for a given item identifier.
 ///
 /// Only real Java 26.3 item IDs from `registries.json` and the server's
@@ -245,7 +317,7 @@ pub struct SmeltingRecipe {
 }
 
 impl SmeltingRecipe {
-    /// Creates a new smelting recipe, validating the one-item output stack.
+    /// Creates a new smelting recipe, validating a single-item output stack.
     pub fn new(
         input: impl Into<String>,
         output: impl Into<String>,
@@ -255,12 +327,23 @@ impl SmeltingRecipe {
         let output = output.into();
         let max_stack = default_max_stack(&output);
         let output = ItemStack::try_new(output, 1, max_stack)?;
-        Ok(Self {
+        Ok(Self::with_output(input, output, experience, cooking_time))
+    }
+
+    /// Creates a new smelting recipe with an explicit output stack (keeping counts above 1).
+    #[must_use]
+    pub fn with_output(
+        input: impl Into<String>,
+        output: ItemStack,
+        experience: f32,
+        cooking_time: u16,
+    ) -> Self {
+        Self {
             input: input.into(),
             output,
             experience,
             cooking_time,
-        })
+        }
     }
 
     /// Returns the input item identifier.
@@ -269,7 +352,7 @@ impl SmeltingRecipe {
         &self.input
     }
 
-    /// Returns the one-item output stack produced by this recipe.
+    /// Returns the output stack produced by this recipe.
     #[must_use]
     pub fn output(&self) -> &ItemStack {
         &self.output
@@ -307,6 +390,8 @@ impl SmeltingRecipeRegistry {
         self.register(recipe);
     }
 
+    /// Offline fallback registry used when no operator-provisioned data root is provisioned.
+    ///
     /// Constructs a new recipe registry pre-populated with standard vanilla smelting recipes:
     /// - Raw Iron / Iron Ore -> Iron Ingot (0.7 XP).
     /// - Raw Gold / Gold Ore -> Gold Ingot (1.0 XP).
@@ -376,6 +461,25 @@ impl SmeltingRecipeRegistry {
             registry.register_builtin(input, output, experience, DEFAULT_COOKING_TOTAL_TIME);
         }
 
+        registry
+    }
+
+    /// Builds a cooking recipe registry for `kind` from loaded [`RecipeData`].
+    #[must_use]
+    pub fn from_recipe_data(data: &RecipeData, kind: CookingKind) -> Self {
+        let mut registry = Self {
+            recipes: BTreeMap::new(),
+        };
+        for recipe in data.cooking(kind) {
+            for input in recipe.ingredient().allowed_items() {
+                registry.register(SmeltingRecipe::with_output(
+                    input,
+                    recipe.result().clone(),
+                    recipe.experience(),
+                    recipe.cooking_time(),
+                ));
+            }
+        }
         registry
     }
 
@@ -509,13 +613,20 @@ impl FurnaceBlockEntity {
 
     /// Withdraws accumulated experience points.
     ///
-    /// Returns integer experience points to drop/give player and the total accumulated
-    /// float experience, then resets `stored_experience` to 0.0.
-    pub fn withdraw_experience(&mut self) -> (u32, f32) {
+    /// Awards `floor(total)` points plus one extra point when
+    /// `random.next_float() < fraction` (minecraft.wiki `Smelting` rev 3896034;
+    /// `Experience` rev 3891320). Returns `(points, total)` and resets
+    /// `stored_experience` to `0.0`.
+    pub fn withdraw_experience(&mut self, random: &mut RandomSource) -> (u32, f32) {
         let total = self.stored_experience;
-        let points = total.floor() as u32;
         self.stored_experience = 0.0;
-        (points, total)
+        if !total.is_finite() || total <= 0.0 {
+            return (0, total);
+        }
+        let floor = total.floor();
+        let fraction = total - floor;
+        let extra = u32::from(fraction > 0.0 && random.next_float() < fraction);
+        ((floor as u32).saturating_add(extra), total)
     }
 
     /// Executes one authoritative tick of furnace smelting using default fuel and recipe registries.
@@ -553,7 +664,10 @@ impl FurnaceBlockEntity {
             self.cooking_total_time = rec.cooking_time();
             let output_ready = match &self.output {
                 None => true,
-                Some(out) => out.can_stack_with(rec.output()) && out.count() < out.max_stack(),
+                Some(out) => {
+                    out.can_stack_with(rec.output())
+                        && out.count().saturating_add(rec.output().count()) <= out.max_stack()
+                }
             };
             output_ready.then_some(rec)
         } else {
@@ -588,10 +702,10 @@ impl FurnaceBlockEntity {
                     // Decrement 1 input from slot 0
                     consume_one(&mut self.input);
 
-                    // Increment output stack by 1 in slot 2
+                    // Increment output stack by recipe result count in slot 2
                     match &mut self.output {
                         Some(out) => {
-                            let overflow = out.add(1);
+                            let overflow = out.add(rec.output().count());
                             debug_assert_eq!(overflow, 0);
                         }
                         None => {
@@ -921,14 +1035,15 @@ mod tests {
         // Total experience: 1.4 + 1.0 = 2.4
         assert!((furnace.stored_experience - 2.4).abs() < 1e-4);
 
-        // Withdraw experience
-        let (points, total_float) = furnace.withdraw_experience();
-        assert_eq!(points, 2);
+        // Withdraw experience with a seeded random source whose first draw is < 0.4 -> floor(2.4) + 1 = 3.
+        let mut rng = RandomSource::from_world_seed(0);
+        let (points, total_float) = furnace.withdraw_experience(&mut rng);
+        assert_eq!(points, 3);
         assert!((total_float - 2.4).abs() < 1e-4);
         assert_eq!(furnace.stored_experience, 0.0);
 
         // Second withdrawal yields 0
-        let (p2, f2) = furnace.withdraw_experience();
+        let (p2, f2) = furnace.withdraw_experience(&mut rng);
         assert_eq!(p2, 0);
         assert_eq!(f2, 0.0);
     }
@@ -1222,5 +1337,358 @@ mod tests {
         assert_eq!(output.item(), "minecraft:cooked_beef");
         assert_eq!(output.count(), 2);
         assert!((furnace.stored_experience() - (MEAT_SMELT_XP * 2.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_smelting_registry_from_recipe_data_keeps_count_above_one_and_isolates_kinds() {
+        use crate::vanilla::feature::ItemTags;
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-furnace-recipes-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, text).expect("write");
+        };
+
+        write(
+            "data/testns/tags/item/ores.json",
+            r#"{"values": ["testns:ore_a", "testns:ore_b"]}"#,
+        );
+        write(
+            "data/testns/recipe/double_ingot.json",
+            r##"{
+                "type": "minecraft:smelting",
+                "ingredient": "#testns:ores",
+                "result": {"id": "testns:ingot", "count": 2},
+                "experience": 0.4,
+                "cookingtime": 5
+            }"##,
+        );
+        write(
+            "data/testns/recipe/smoke_only.json",
+            r#"{
+                "type": "minecraft:smoking",
+                "ingredient": "testns:raw_food",
+                "result": {"id": "testns:cooked_food"},
+                "experience": 0.25,
+                "cookingtime": 4
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipe data");
+        let smelting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smelting);
+        let smoking = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smoking);
+        let blasting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Blasting);
+
+        assert!(smelting.find_recipe("testns:ore_a").is_some());
+        assert!(smelting.find_recipe("testns:ore_b").is_some());
+        assert!(smelting.find_recipe("testns:raw_food").is_none());
+        assert!(smoking.find_recipe("testns:raw_food").is_some());
+        assert!(blasting.find_recipe("testns:ore_a").is_none());
+        assert!(blasting.find_recipe("testns:raw_food").is_none());
+
+        let fuels = FuelRegistry::new();
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.input = Some(stack("testns:ore_a", 2));
+        furnace.fuel = Some(stack("minecraft:coal", 1));
+
+        for _ in 0..5 {
+            furnace.tick_with_registries(&fuels, &smelting);
+        }
+        assert_eq!(furnace.output.as_ref().expect("first cook").count(), 2);
+        assert!((furnace.stored_experience() - 0.4).abs() < 1e-6);
+
+        for _ in 0..5 {
+            furnace.tick_with_registries(&fuels, &smelting);
+        }
+        assert_eq!(furnace.output.as_ref().expect("second cook").count(), 4);
+        assert!((furnace.stored_experience() - 0.8).abs() < 1e-6);
+
+        // Output stack at 63 cannot fit a 2-item recipe result (63 + 2 > 64).
+        furnace.input = Some(stack("testns:ore_b", 1));
+        furnace.output = Some(stack("testns:ingot", 63));
+        furnace.tick_with_registries(&fuels, &smelting);
+        assert_eq!(furnace.cooking_progress, 0);
+        assert_eq!(furnace.output.as_ref().expect("blocked").count(), 63);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_furnace_registries_cook_vanilla_recipes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_furnace_registries_cook_vanilla_recipes() {
+        use crate::vanilla::feature::ItemTags;
+        use crate::vanilla::worldgen::read_json;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+        let fuels = FuelRegistry::new();
+
+        let gold_json =
+            read_json(&root.join("data/minecraft/recipe/gold_ingot_from_smelting_raw_gold.json"))
+                .expect("read gold smelting json");
+        let gold_time = gold_json["cookingtime"].as_u64().expect("gold cookingtime") as u16;
+        let gold_xp = gold_json["experience"].as_f64().expect("gold xp") as f32;
+        let gold_out = gold_json["result"]["id"].as_str().expect("gold result id");
+
+        let smelting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smelting);
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.input = Some(stack("minecraft:raw_gold", 1));
+        furnace.fuel = Some(stack("minecraft:coal", 1));
+        for _ in 0..(gold_time - 1) {
+            furnace.tick_with_registries(&fuels, &smelting);
+            assert!(furnace.output.is_none());
+        }
+        furnace.tick_with_registries(&fuels, &smelting);
+        let out = furnace.output.as_ref().expect("smelted gold");
+        assert_eq!(out.item(), gold_out);
+        assert_eq!(out.count(), 1);
+        assert!((furnace.stored_experience() - gold_xp).abs() < 1e-6);
+
+        let beef_json =
+            read_json(&root.join("data/minecraft/recipe/cooked_beef_from_smoking.json"))
+                .expect("read beef smoking json");
+        let beef_time = beef_json["cookingtime"].as_u64().expect("beef cookingtime") as u16;
+        let beef_xp = beef_json["experience"].as_f64().expect("beef xp") as f32;
+        let beef_out = beef_json["result"]["id"].as_str().expect("beef result id");
+
+        let smoking = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smoking);
+        let mut smoker = FurnaceBlockEntity::new();
+        smoker.input = Some(stack("minecraft:beef", 1));
+        smoker.fuel = Some(stack("minecraft:coal", 1));
+        for _ in 0..(beef_time - 1) {
+            smoker.tick_with_registries(&fuels, &smoking);
+            assert!(smoker.output.is_none());
+        }
+        smoker.tick_with_registries(&fuels, &smoking);
+        let beef_stack = smoker.output.as_ref().expect("smoked beef");
+        assert_eq!(beef_stack.item(), beef_out);
+        assert_eq!(beef_stack.count(), 1);
+        assert!((smoker.stored_experience() - beef_xp).abs() < 1e-6);
+
+        let blasting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Blasting);
+        assert!(blasting.find_recipe("minecraft:beef").is_none());
+    }
+
+    #[test]
+    fn test_withdraw_experience_fractional_chance() {
+        // Seed 0's first next_float() is < 0.7, so 0.7 awards 1 point;
+        // find a concrete seed whose first next_float() >= 0.7 for the 0-point branch too.
+        let low_seed = 0_u64;
+        let high_seed = (1_u64..1000)
+            .find(|&s| RandomSource::from_world_seed(s).next_float() >= 0.7)
+            .expect("seed with next_float >= 0.7");
+
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.stored_experience = 0.7;
+        let (pts_awarded, tot_awarded) =
+            furnace.withdraw_experience(&mut RandomSource::from_world_seed(low_seed));
+        assert_eq!(pts_awarded, 1);
+        assert!((tot_awarded - 0.7).abs() < 1e-6);
+        assert_eq!(furnace.stored_experience(), 0.0);
+
+        furnace.stored_experience = 0.7;
+        let (pts_skipped, tot_skipped) =
+            furnace.withdraw_experience(&mut RandomSource::from_world_seed(high_seed));
+        assert_eq!(pts_skipped, 0);
+        assert!((tot_skipped - 0.7).abs() < 1e-6);
+
+        // Exact integer totals never award an extra point.
+        let mut rng = RandomSource::from_world_seed(42);
+        for _ in 0..100 {
+            furnace.stored_experience = 2.0;
+            let (pts, tot) = furnace.withdraw_experience(&mut rng);
+            assert_eq!(pts, 2);
+            assert_eq!(tot, 2.0);
+
+            furnace.stored_experience = 0.0;
+            let (pts_zero, tot_zero) = furnace.withdraw_experience(&mut rng);
+            assert_eq!(pts_zero, 0);
+            assert_eq!(tot_zero, 0.0);
+        }
+
+        // Over 10,000 seeded withdrawals of 0.35, the extra point occurs ~3,500 times.
+        let mut stat_rng = RandomSource::from_world_seed(2026);
+        let mut extra_count = 0_u32;
+        for _ in 0..10_000 {
+            furnace.stored_experience = 0.35;
+            let (pts, _) = furnace.withdraw_experience(&mut stat_rng);
+            assert!(pts <= 1);
+            extra_count += pts;
+        }
+        assert!(
+            (3_200..=3_800).contains(&extra_count),
+            "expected extra point count in 3200..=3800, got {extra_count}"
+        );
+    }
+
+    #[test]
+    fn test_fuel_registry_from_item_tags_respects_tags_and_non_flammable_exclusions() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Empty tags register only the four scalar built-in fuels without falling back to `fuel_burn_time`.
+        let empty_reg = FuelRegistry::from_item_tags(&ItemTags::default());
+        assert_eq!(empty_reg.burn_time("minecraft:coal"), COAL_BURN_TIME);
+        assert_eq!(empty_reg.burn_time("minecraft:charcoal"), COAL_BURN_TIME);
+        assert_eq!(
+            empty_reg.burn_time("minecraft:lava_bucket"),
+            LAVA_BUCKET_BURN_TIME
+        );
+        assert_eq!(
+            empty_reg.remainder("minecraft:lava_bucket"),
+            Some(stack("minecraft:bucket", 1))
+        );
+        assert_eq!(empty_reg.burn_time("minecraft:stick"), STICK_BURN_TIME);
+        assert_eq!(empty_reg.burn_time("minecraft:oak_planks"), 0);
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-fuel-tags-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, text).expect("write");
+        };
+
+        write(
+            "data/minecraft/tags/item/logs_that_burn.json",
+            r#"{"values": ["testns:cedar_log", "testns:nether_log"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/planks.json",
+            r#"{"values": ["testns:cedar_planks", "testns:nether_planks"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/wooden_slabs.json",
+            r#"{"values": ["testns:cedar_slab", "testns:nether_slab"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/bamboo_blocks.json",
+            r#"{"values": ["testns:bamboo_log"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/non_flammable_wood.json",
+            r#"{"values": ["testns:nether_log", "testns:nether_planks", "testns:nether_slab"]}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let reg = FuelRegistry::from_item_tags(&tags);
+        assert_eq!(reg.burn_time("testns:cedar_log"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:cedar_planks"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:bamboo_log"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:cedar_slab"), WOODEN_SLAB_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:nether_log"), 0);
+        assert_eq!(reg.burn_time("testns:nether_planks"), 0);
+        assert_eq!(reg.burn_time("testns:nether_slab"), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_fuel_registry_matches_fallback_and_reports_diffs --nocapture`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_fuel_registry_matches_fallback_and_reports_diffs() {
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let data = RecipeData::load(&root, &tags).expect("load vanilla recipes");
+        let tag_reg = FuelRegistry::from_item_tags(&tags);
+
+        assert!(
+            tags.members("minecraft:bamboo_blocks").is_some(),
+            "26.3 data includes minecraft:bamboo_blocks"
+        );
+
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for item in [
+            "minecraft:coal",
+            "minecraft:charcoal",
+            "minecraft:lava_bucket",
+            "minecraft:stick",
+            "minecraft:bamboo_mosaic_slab",
+        ] {
+            candidates.insert(item.to_owned());
+        }
+        for tag in [
+            "minecraft:logs_that_burn",
+            "minecraft:planks",
+            "minecraft:wooden_slabs",
+            "minecraft:bamboo_blocks",
+            "minecraft:non_flammable_wood",
+        ] {
+            if let Some(members) = tags.members(tag) {
+                candidates.extend(members.iter().cloned());
+            }
+        }
+        for kind in CookingKind::ALL {
+            for recipe in data.cooking(kind) {
+                candidates.extend(recipe.ingredient().allowed_items().iter().cloned());
+                candidates.insert(recipe.result().item().to_owned());
+            }
+        }
+        for recipe in data.crafting() {
+            candidates.insert(recipe.output().item().to_owned());
+        }
+
+        let mut tag_only = Vec::new();
+        let mut fallback_only = Vec::new();
+        for item in &candidates {
+            let tag_burn = tag_reg.burn_time(item);
+            let fallback_burn = fuel_burn_time(item);
+            if tag_burn > 0 && fallback_burn == 0 {
+                tag_only.push((item.as_str(), tag_burn));
+            } else if fallback_burn > 0 && tag_burn == 0 {
+                fallback_only.push((item.as_str(), fallback_burn));
+            } else {
+                assert_eq!(
+                    tag_burn, fallback_burn,
+                    "burn time mismatch for {item}: tag={tag_burn}, fallback={fallback_burn}"
+                );
+            }
+        }
+
+        eprintln!("tag registry fuels not in fallback ({}):", tag_only.len());
+        for (item, burn) in &tag_only {
+            eprintln!("  + {item}: {burn} ticks");
+        }
+        eprintln!(
+            "fallback fuels not in tag registry ({}):",
+            fallback_only.len()
+        );
+        for (item, burn) in &fallback_only {
+            eprintln!("  - {item}: {burn} ticks");
+        }
+
+        // `minecraft:bamboo_mosaic_slab` is listed in `fuel_burn_time` (150 ticks)
+        // but is absent from `#minecraft:wooden_slabs` in the 26.3 tag data.
+        assert_eq!(
+            fallback_only,
+            vec![("minecraft:bamboo_mosaic_slab", WOODEN_SLAB_BURN_TIME)]
+        );
+        assert_eq!(
+            tag_reg.remainder("minecraft:lava_bucket"),
+            FuelRegistry::new().remainder("minecraft:lava_bucket")
+        );
     }
 }

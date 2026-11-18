@@ -74,6 +74,7 @@ pub mod anvil;
 pub mod brewing;
 pub mod container_data;
 pub mod furnace;
+pub mod recipe_data;
 
 pub use brewing::{
     BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
@@ -84,6 +85,9 @@ pub use container_data::{
 };
 pub use furnace::{
     FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
+};
+pub use recipe_data::{
+    CookingKind, CookingRecipe, RecipeData, RecipeDataError, SkipReason, StonecuttingRecipe,
 };
 pub mod inventory;
 pub use inventory::{
