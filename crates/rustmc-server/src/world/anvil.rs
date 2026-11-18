@@ -8,11 +8,17 @@
 //! Sources: the level costs, the 40-level "Too Expensive!" cap, the 12%
 //! durability bonus, the 25%-per-unit material repair, the `2 * penalty + 1`
 //! prior work penalty, the 12% degradation chance, and the 50-character name
-//! limit follow the public minecraft.wiki `Anvil_mechanics` and `Anvil`
-//! articles; item durabilities follow the minecraft.wiki `Durability` article.
+//! limit follow the public minecraft.wiki `Anvil_mechanics` (revision 3804134),
+//! `Anvil` (revision 3902804), and `Item_repair` (revision 3791643) articles;
+//! offline fallback item durabilities follow the minecraft.wiki `Durability`
+//! article, while [`AnvilRules`] reads `minecraft:max_damage` and
+//! `minecraft:repairable` from [`ItemDefaults`] and [`ItemTags`].
 //! Enchantment combination costs are not modelled.
 
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError, items_equal, normalize_item_id};
+use crate::item::{
+    DEFAULT_MAX_STACK, ItemDefaults, ItemStack, ItemStackError, items_equal, normalize_item_id,
+};
+use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
 use std::fmt;
 
@@ -93,6 +99,9 @@ impl AnvilState {
 }
 
 /// Returns the standard vanilla max durability for a known tool, weapon, or armor piece.
+///
+/// Offline fallback table used when no [`ItemDefaults`] report is loaded.
+/// Prefer [`AnvilRules`] for data-backed durability lookups.
 #[must_use]
 pub fn default_max_durability(item: &str) -> Option<u32> {
     match normalize_item_id(item) {
@@ -165,6 +174,9 @@ pub fn default_max_durability(item: &str) -> Option<u32> {
 }
 
 /// Checks whether `material` is a valid repair ingredient for `tool`.
+///
+/// Offline fallback table used when no [`ItemDefaults`] / [`ItemTags`] data is loaded.
+/// Prefer [`AnvilRules`] for data-backed repair-material lookups.
 #[must_use]
 pub fn is_repair_material(tool: &str, material: &str) -> bool {
     let t = normalize_item_id(tool);
@@ -248,12 +260,12 @@ impl From<ItemStackError> for AnvilItemError {
 }
 
 fn validate_anvil_item_invariants(
-    item: &str,
+    is_known_damageable: bool,
     durability: u32,
     max_durability: u32,
     custom_name: Option<&str>,
 ) -> Result<(), AnvilItemError> {
-    if default_max_durability(item).is_some() && max_durability == 0 {
+    if is_known_damageable && max_durability == 0 {
         return Err(AnvilItemError::ZeroMaxDurability);
     }
     if durability > max_durability {
@@ -288,6 +300,9 @@ pub struct AnvilItem {
 
 impl AnvilItem {
     /// Creates a validated [`AnvilItem`] from a shared [`ItemStack`] and explicit metadata.
+    ///
+    /// Uses the offline [`default_max_durability`] table to reject zero max durability on
+    /// known fallback damageable items; for data-backed validation, use [`AnvilRules::new_item`].
     pub fn new(
         stack: ItemStack,
         durability: u32,
@@ -296,7 +311,7 @@ impl AnvilItem {
         custom_name: Option<String>,
     ) -> Result<Self, AnvilItemError> {
         validate_anvil_item_invariants(
-            stack.item(),
+            default_max_durability(stack.item()).is_some(),
             durability,
             max_durability,
             custom_name.as_deref(),
@@ -312,6 +327,9 @@ impl AnvilItem {
 
     /// Creates an [`AnvilItem`] from an existing shared [`ItemStack`], populating
     /// default durability if the item is a known damageable tool, weapon, or armor piece.
+    ///
+    /// Offline fallback constructor using [`default_max_durability`]; prefer
+    /// [`AnvilRules::item_from_stack`] when item report data is loaded.
     #[must_use]
     pub fn from_stack(stack: ItemStack) -> Self {
         let max_durability = default_max_durability(stack.item()).unwrap_or(0);
@@ -325,6 +343,9 @@ impl AnvilItem {
     }
 
     /// Creates a validated [`AnvilItem`], checking item ID and count via [`ItemStack::try_new`].
+    ///
+    /// Offline fallback constructor using [`default_max_durability`]; prefer
+    /// [`AnvilRules::try_new_item`] when item report data is loaded.
     pub fn try_new(item: impl Into<String>, count: u16) -> Result<Self, ItemStackError> {
         let item = item.into();
         let max_durability = default_max_durability(&item).unwrap_or(0);
@@ -404,7 +425,7 @@ impl AnvilItem {
     /// Updates maximum durability, enforcing invariants for damageable items and current durability.
     pub fn with_max_durability(mut self, max_durability: u32) -> Result<Self, AnvilItemError> {
         validate_anvil_item_invariants(
-            self.stack.item(),
+            default_max_durability(self.stack.item()).is_some(),
             self.durability,
             max_durability,
             self.custom_name.as_deref(),
@@ -424,7 +445,7 @@ impl AnvilItem {
     pub fn with_custom_name(mut self, name: impl Into<String>) -> Result<Self, AnvilItemError> {
         let name = name.into();
         validate_anvil_item_invariants(
-            self.stack.item(),
+            default_max_durability(self.stack.item()).is_some(),
             self.durability,
             self.max_durability,
             Some(&name),
@@ -570,6 +591,237 @@ impl fmt::Display for AnvilError {
 
 impl std::error::Error for AnvilError {}
 
+/// Data-backed anvil durability and repair-material rules built from
+/// [`ItemDefaults`] and [`ItemTags`].
+///
+/// Uses the official item report (`minecraft:max_damage` and resolved
+/// `minecraft:repairable` components) instead of the offline fallback tables
+/// [`default_max_durability`] and [`is_repair_material`].
+///
+/// Sources:
+/// - minecraft.wiki `Anvil` (revision 3902804): "one material repairs 1/4 of
+///   the item's maximum durability."
+/// - minecraft.wiki `Anvil mechanics` (revision 3804134): "Each unit restores
+///   up to 25% total durability of the item (rounded down) and costs 1 level
+///   per unit of material used in addition to any applicable prior work
+///   penalties."
+#[derive(Debug, Clone, Default)]
+pub struct AnvilRules {
+    defaults: ItemDefaults,
+    tags: ItemTags,
+}
+
+impl AnvilRules {
+    /// Builds data-backed anvil rules from loaded [`ItemDefaults`] and [`ItemTags`].
+    #[must_use]
+    pub fn new(defaults: &ItemDefaults, tags: &ItemTags) -> Self {
+        Self {
+            defaults: defaults.clone(),
+            tags: tags.clone(),
+        }
+    }
+
+    /// Returns the underlying [`ItemDefaults`] report.
+    #[must_use]
+    pub fn defaults(&self) -> &ItemDefaults {
+        &self.defaults
+    }
+
+    /// Returns the underlying [`ItemTags`] registry.
+    #[must_use]
+    pub fn tags(&self) -> &ItemTags {
+        &self.tags
+    }
+
+    /// Returns the report `minecraft:max_damage` for `item`, if damageable.
+    #[must_use]
+    pub fn max_durability(&self, item: &str) -> Option<u32> {
+        self.defaults.max_damage(item)
+    }
+
+    /// Returns the report `minecraft:max_stack_size` for `item`, if known.
+    #[must_use]
+    pub fn max_stack_size(&self, item: &str) -> Option<u8> {
+        self.defaults.max_stack_size(item)
+    }
+
+    /// Returns the resolved repair material identifiers for `item`, if repairable.
+    #[must_use]
+    pub fn repair_materials(&self, item: &str) -> Option<Vec<String>> {
+        self.defaults.repair_materials(item, &self.tags)
+    }
+
+    /// Checks whether `material` is a valid repair ingredient for `tool` in the report.
+    #[must_use]
+    pub fn is_repair_material(&self, tool: &str, material: &str) -> bool {
+        self.repair_materials(tool).is_some_and(|materials| {
+            materials
+                .iter()
+                .any(|candidate| items_equal(candidate, material))
+        })
+    }
+
+    /// Returns the report `minecraft:enchantable` value for `item`, if present.
+    #[must_use]
+    pub fn enchantability(&self, item: &str) -> Option<u32> {
+        self.defaults.enchantability(item)
+    }
+
+    /// Creates a validated [`AnvilItem`] from a shared [`ItemStack`] and explicit metadata,
+    /// enforcing non-zero `max_durability` when `item` has `minecraft:max_damage` in the report.
+    pub fn new_item(
+        &self,
+        stack: ItemStack,
+        durability: u32,
+        max_durability: u32,
+        repair_cost: u32,
+        custom_name: Option<String>,
+    ) -> Result<AnvilItem, AnvilItemError> {
+        validate_anvil_item_invariants(
+            self.max_durability(stack.item()).is_some(),
+            durability,
+            max_durability,
+            custom_name.as_deref(),
+        )?;
+        Ok(AnvilItem {
+            stack,
+            durability,
+            max_durability,
+            repair_cost,
+            custom_name,
+        })
+    }
+
+    /// Creates an [`AnvilItem`] from an existing [`ItemStack`], populating
+    /// `max_durability` from `minecraft:max_damage` in the report.
+    #[must_use]
+    pub fn item_from_stack(&self, stack: ItemStack) -> AnvilItem {
+        let max_durability = self.max_durability(stack.item()).unwrap_or(0);
+        AnvilItem {
+            stack,
+            durability: max_durability,
+            max_durability,
+            repair_cost: 0,
+            custom_name: None,
+        }
+    }
+
+    /// Creates a validated [`AnvilItem`] using `minecraft:max_damage` and
+    /// `minecraft:max_stack_size` from the report.
+    pub fn try_new_item(
+        &self,
+        item: impl Into<String>,
+        count: u16,
+    ) -> Result<AnvilItem, ItemStackError> {
+        let item = item.into();
+        let max_durability = self.max_durability(&item).unwrap_or(0);
+        let max_stack = self
+            .max_stack_size(&item)
+            .map(u16::from)
+            .unwrap_or_else(|| {
+                if max_durability > 0 {
+                    1
+                } else {
+                    DEFAULT_MAX_STACK
+                }
+            });
+        let stack = ItemStack::try_new(item, count, max_stack)?;
+        Ok(AnvilItem {
+            stack,
+            durability: max_durability,
+            max_durability,
+            repair_cost: 0,
+            custom_name: None,
+        })
+    }
+
+    /// Calculates the anvil repair result in preview mode (`degraded_state = None`)
+    /// using the report durability and repair-material rules.
+    pub fn calculate_repair(
+        &self,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        calculate_repair_internal(
+            input,
+            AnvilState::Undamaged,
+            is_creative,
+            None,
+            RepairSource::Data(self),
+        )
+    }
+
+    /// Executes an anvil repair with a specified degradation roll `[0.0, 1.0)`
+    /// using the report durability and repair-material rules.
+    pub fn repair_with_roll(
+        &self,
+        input: &AnvilRepairInput,
+        anvil_state: AnvilState,
+        is_creative: bool,
+        roll: f64,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        calculate_repair_internal(
+            input,
+            anvil_state,
+            is_creative,
+            Some(roll),
+            RepairSource::Data(self),
+        )
+    }
+
+    /// Executes an anvil repair on an `Undamaged` anvil using the caller's random source
+    /// and the report durability and repair-material rules.
+    pub fn repair(
+        &self,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.repair_with_state(input, AnvilState::Undamaged, is_creative, rng)
+    }
+
+    /// Executes an anvil repair with the given `anvil_state` using the caller's random
+    /// source and the report durability and repair-material rules.
+    pub fn repair_with_state(
+        &self,
+        input: &AnvilRepairInput,
+        anvil_state: AnvilState,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        let roll = rng.next_double();
+        calculate_repair_internal(
+            input,
+            anvil_state,
+            is_creative,
+            Some(roll),
+            RepairSource::Data(self),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RepairSource<'a> {
+    Fallback,
+    Data(&'a AnvilRules),
+}
+
+impl RepairSource<'_> {
+    fn is_repair_material(self, tool: &str, material: &str) -> bool {
+        match self {
+            Self::Fallback => is_repair_material(tool, material),
+            Self::Data(rules) => rules.is_repair_material(tool, material),
+        }
+    }
+
+    fn is_known_damageable(self, item: &str) -> bool {
+        match self {
+            Self::Fallback => default_max_durability(item).is_some(),
+            Self::Data(rules) => rules.max_durability(item).is_some(),
+        }
+    }
+}
+
 /// Calculates and executes the anvil operation with full validation, durability combination math,
 /// level calculation, and deterministic degradation roll.
 fn calculate_repair_internal(
@@ -577,6 +829,7 @@ fn calculate_repair_internal(
     anvil_state: AnvilState,
     is_creative: bool,
     roll: Option<f64>,
+    source: RepairSource<'_>,
 ) -> Result<AnvilRepairResult, AnvilError> {
     if anvil_state.is_broken() {
         return Err(AnvilError::AnvilBroken);
@@ -623,7 +876,7 @@ fn calculate_repair_internal(
         }
         Some(sacrifice) => {
             let is_same_item = items_equal(input.base_item.item(), sacrifice.item());
-            let is_mat = is_repair_material(input.base_item.item(), sacrifice.item());
+            let is_mat = source.is_repair_material(input.base_item.item(), sacrifice.item());
 
             if !is_same_item && !is_mat {
                 return Err(AnvilError::IncompatibleSacrificeItem);
@@ -720,17 +973,24 @@ fn calculate_repair_internal(
     ) else {
         return Err(AnvilError::NoOperation);
     };
-    let result_item = AnvilItem::new(
-        result_stack,
+    let result_max_durability = input.base_item.max_durability();
+    validate_anvil_item_invariants(
+        source.is_known_damageable(result_stack.item()),
         result_durability,
-        input.base_item.max_durability(),
-        next_prior_work_penalty,
-        final_custom_name,
+        result_max_durability,
+        final_custom_name.as_deref(),
     )
     .map_err(|err| match err {
         AnvilItemError::NameTooLong { len, max } => AnvilError::NameTooLong { len, max },
         _ => AnvilError::NoOperation,
     })?;
+    let result_item = AnvilItem {
+        stack: result_stack,
+        durability: result_durability,
+        max_durability: result_max_durability,
+        repair_cost: next_prior_work_penalty,
+        custom_name: final_custom_name,
+    };
 
     let degraded_state = roll.and_then(|r| anvil_state.roll_degradation(r));
 
@@ -744,24 +1004,45 @@ fn calculate_repair_internal(
 }
 
 /// Calculates the anvil repair result in preview mode without degrading the anvil (`degraded_state = None`).
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::calculate_repair`] when item report data is loaded.
 pub fn calculate_repair(
     input: &AnvilRepairInput,
     is_creative: bool,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    calculate_repair_internal(input, AnvilState::Undamaged, is_creative, None)
+    calculate_repair_internal(
+        input,
+        AnvilState::Undamaged,
+        is_creative,
+        None,
+        RepairSource::Fallback,
+    )
 }
 
 /// Executes an anvil repair with a specified degradation roll `[0.0, 1.0)`.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair_with_roll`] when item report data is loaded.
 pub fn repair_with_roll(
     input: &AnvilRepairInput,
     anvil_state: AnvilState,
     is_creative: bool,
     roll: f64,
 ) -> Result<AnvilRepairResult, AnvilError> {
-    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
+    calculate_repair_internal(
+        input,
+        anvil_state,
+        is_creative,
+        Some(roll),
+        RepairSource::Fallback,
+    )
 }
 
 /// Executes an anvil repair on an `Undamaged` anvil using the caller's random source.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair`] when item report data is loaded.
 pub fn repair(
     input: &AnvilRepairInput,
     is_creative: bool,
@@ -771,6 +1052,9 @@ pub fn repair(
 }
 
 /// Executes an anvil repair with the given `anvil_state` using the caller's random source.
+///
+/// Offline fallback function using [`default_max_durability`] and [`is_repair_material`];
+/// prefer [`AnvilRules::repair_with_state`] when item report data is loaded.
 pub fn repair_with_state(
     input: &AnvilRepairInput,
     anvil_state: AnvilState,
@@ -778,7 +1062,13 @@ pub fn repair_with_state(
     rng: &mut RandomSource,
 ) -> Result<AnvilRepairResult, AnvilError> {
     let roll = rng.next_double();
-    calculate_repair_internal(input, anvil_state, is_creative, Some(roll))
+    calculate_repair_internal(
+        input,
+        anvil_state,
+        is_creative,
+        Some(roll),
+        RepairSource::Fallback,
+    )
 }
 
 /// Anvil block instance tracking its current state in the world.
@@ -800,28 +1090,53 @@ impl Anvil {
         }
     }
 
-    /// Performs a repair, updating the anvil's state if degradation occurs.
+    /// Performs a repair using offline fallback rules, updating the anvil's state if degradation occurs.
     pub fn repair_with_roll(
         &mut self,
         input: &AnvilRepairInput,
         is_creative: bool,
         roll: f64,
     ) -> Result<AnvilRepairResult, AnvilError> {
-        let result = repair_with_roll(input, self.state, is_creative, roll)?;
-        if let Some(new_state) = result.degraded_state {
-            self.state = new_state;
-        }
-        Ok(result)
+        self.apply_repair(repair_with_roll(input, self.state, is_creative, roll))
     }
 
-    /// Performs a repair with a random source, updating the anvil's state if degradation occurs.
+    /// Performs a repair using offline fallback rules and a random source, updating the anvil's state if degradation occurs.
     pub fn repair(
         &mut self,
         input: &AnvilRepairInput,
         is_creative: bool,
         rng: &mut RandomSource,
     ) -> Result<AnvilRepairResult, AnvilError> {
-        let result = repair_with_state(input, self.state, is_creative, rng)?;
+        self.apply_repair(repair_with_state(input, self.state, is_creative, rng))
+    }
+
+    /// Performs a repair using data-backed [`AnvilRules`] and a roll, updating the anvil's state if degradation occurs.
+    pub fn repair_with_rules_and_roll(
+        &mut self,
+        rules: &AnvilRules,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        roll: f64,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.apply_repair(rules.repair_with_roll(input, self.state, is_creative, roll))
+    }
+
+    /// Performs a repair using data-backed [`AnvilRules`] and a random source, updating the anvil's state if degradation occurs.
+    pub fn repair_with_rules(
+        &mut self,
+        rules: &AnvilRules,
+        input: &AnvilRepairInput,
+        is_creative: bool,
+        rng: &mut RandomSource,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        self.apply_repair(rules.repair_with_state(input, self.state, is_creative, rng))
+    }
+
+    fn apply_repair(
+        &mut self,
+        outcome: Result<AnvilRepairResult, AnvilError>,
+    ) -> Result<AnvilRepairResult, AnvilError> {
+        let result = outcome?;
         if let Some(new_state) = result.degraded_state {
             self.state = new_state;
         }
@@ -1265,5 +1580,197 @@ mod tests {
                 max: MAX_NAME_LENGTH,
             })
         );
+    }
+
+    fn scratch_root(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rustmc-anvil-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        path
+    }
+
+    fn write_scratch_file(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, text).expect("write");
+    }
+
+    #[test]
+    fn anvil_rules_uses_report_durability_and_repair_materials_instead_of_fallback() {
+        let root = scratch_root("rules");
+        write_scratch_file(
+            &root.join("data/testns/tags/item/ingots.json"),
+            r#"{"values": ["testns:ingot_a"]}"#,
+        );
+        // Intentionally diverge from offline fallback (42 vs 1561, testns:gem vs diamond)
+        // to prove AnvilRules reads from the report rather than default tables.
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/diamond_sword.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 42,
+                "minecraft:repairable": {"items": "testns:gem"}
+            }}"#,
+        );
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/copper_blade.json"),
+            r##"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:max_damage": 100,
+                "minecraft:repairable": {"items": "#testns:ingots"}
+            }}"##,
+        );
+        write_scratch_file(
+            &root.join("reports/minecraft/components/item/diamond_horse_armor.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load synthetic item tags");
+        let defaults = ItemDefaults::load(&root).expect("load synthetic item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        assert_eq!(rules.max_durability("minecraft:diamond_sword"), Some(42));
+        assert_eq!(rules.max_durability("minecraft:iron_sword"), None);
+        assert!(!rules.is_repair_material("minecraft:diamond_sword", "minecraft:diamond"));
+        assert!(rules.is_repair_material("minecraft:diamond_sword", "testns:gem"));
+
+        let sword = rules
+            .try_new_item("minecraft:diamond_sword", 1)
+            .expect("construct report sword")
+            .with_durability(10)
+            .expect("damage sword");
+        assert_eq!(sword.max_durability(), 42);
+        let gem = rules.try_new_item("testns:gem", 1).expect("gem");
+        let sword_rep = rules
+            .calculate_repair(&AnvilRepairInput::combine(sword, gem), false)
+            .expect("repair with report material");
+        // floor(42 * 0.25) = 10 -> 10 + 10 = 20
+        assert_eq!(sword_rep.result_item.durability(), 20);
+        assert_eq!(sword_rep.material_cost, 1);
+
+        let blade = rules
+            .try_new_item("minecraft:copper_blade", 1)
+            .expect("construct copper_blade")
+            .with_durability(50)
+            .expect("damage blade");
+        let ingot = rules.try_new_item("testns:ingot_a", 1).expect("ingot");
+        let blade_rep = rules
+            .calculate_repair(&AnvilRepairInput::combine(blade, ingot), false)
+            .expect("repair with tagged material");
+        // floor(100 * 0.25) = 25 -> 50 + 25 = 75
+        assert_eq!(blade_rep.result_item.durability(), 75);
+        assert_eq!(blade_rep.material_cost, 1);
+
+        let horse_armor = rules
+            .try_new_item("minecraft:diamond_horse_armor", 1)
+            .expect("horse armor");
+        let diamond = AnvilItem::try_new("minecraft:diamond", 1).expect("diamond");
+        assert_eq!(
+            rules.calculate_repair(&AnvilRepairInput::combine(horse_armor, diamond), false),
+            Err(AnvilError::IncompatibleSacrificeItem)
+        );
+
+        let mut anvil = Anvil::undamaged();
+        let blade2 = rules
+            .try_new_item("minecraft:copper_blade", 1)
+            .expect("blade2")
+            .with_durability(50)
+            .expect("damage");
+        let ingot2 = rules.try_new_item("testns:ingot_a", 1).expect("ingot2");
+        let mut rng = RandomSource::from_world_seed(18);
+        let res = anvil
+            .repair_with_rules(
+                &rules,
+                &AnvilRepairInput::combine(blade2, ingot2),
+                false,
+                &mut rng,
+            )
+            .expect("repair through Anvil struct");
+        assert_eq!(res.result_item.durability(), 75);
+        assert_eq!(anvil.state, AnvilState::Chipped);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_anvil_rules_diamond_sword_mace_and_all_max_damage_items`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_anvil_rules_diamond_sword_mace_and_all_max_damage_items() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        assert_eq!(rules.max_durability("minecraft:diamond_sword"), Some(1561));
+        assert!(rules.is_repair_material("minecraft:diamond_sword", "minecraft:diamond"));
+        assert!(!rules.is_repair_material("minecraft:diamond_sword", "minecraft:iron_ingot"));
+
+        assert_eq!(rules.max_durability("minecraft:mace"), Some(500));
+        assert!(rules.is_repair_material("minecraft:mace", "minecraft:breeze_rod"));
+        assert!(!rules.is_repair_material("minecraft:mace", "minecraft:diamond"));
+
+        let items_dir = root.join("reports/minecraft/components/item");
+        let report_files = crate::vanilla::worldgen::walk_json(&items_dir).expect("walk reports");
+        let mut checked_max_damage = 0usize;
+        for file in report_files {
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("valid item stem");
+            let doc = crate::vanilla::worldgen::read_json(&file).expect("read item report");
+            let components = doc["components"].as_object().expect("components object");
+            let full_id = format!("minecraft:{stem}");
+            if let Some(expected_damage) = components
+                .get("minecraft:max_damage")
+                .and_then(serde_json::Value::as_u64)
+            {
+                let expected = u32::try_from(expected_damage).expect("u32 max_damage");
+                assert_eq!(rules.max_durability(&full_id), Some(expected), "{full_id}");
+                let built = rules.try_new_item(&full_id, 1).expect("build anvil item");
+                assert_eq!(built.max_durability(), expected, "{full_id}");
+                checked_max_damage += 1;
+            } else {
+                assert_eq!(rules.max_durability(&full_id), None, "{full_id}");
+            }
+        }
+        assert_eq!(checked_max_damage, 84);
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_anvil_rules_full_material_repair_diamond_pickaxe`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_anvil_rules_full_material_repair_diamond_pickaxe() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let rules = AnvilRules::new(&defaults, &tags);
+
+        // Diamond pickaxe max durability = 1561; 25% per diamond = floor(1561 * 0.25) = 390.
+        // Starting at 1171 (missing exactly 390), 1 diamond restores full durability (1561).
+        let pickaxe = rules
+            .try_new_item("minecraft:diamond_pickaxe", 1)
+            .expect("diamond_pickaxe")
+            .with_durability(1171)
+            .expect("damaged pickaxe");
+        let diamond = rules.try_new_item("minecraft:diamond", 1).expect("diamond");
+
+        let result = rules
+            .calculate_repair(&AnvilRepairInput::combine(pickaxe, diamond), false)
+            .expect("full repair with 1 diamond");
+        assert_eq!(result.result_item.durability(), 1561);
+        assert_eq!(result.result_item.max_durability(), 1561);
+        assert_eq!(result.material_cost, 1);
+        assert_eq!(result.repair_cost_levels, 1);
+        assert_eq!(result.next_prior_work_penalty, 1);
     }
 }
