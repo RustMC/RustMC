@@ -244,7 +244,9 @@ fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Res
     hasher.update(PACKET_SOURCE_FINGERPRINT.as_bytes());
     hasher.update(seed.to_be_bytes());
     let mut paths = Vec::new();
-    collect_files(data_root, &mut paths)?;
+    for directory in generator_input_dirs(data_root)? {
+        collect_files(&directory, &mut paths)?;
+    }
     if paths.len() > MAX_INPUT_FILES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -254,7 +256,12 @@ fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Res
     paths.sort();
     let mut total = 0u64;
     for path in paths {
-        let relative = path.strip_prefix(data_root).expect("collected under root");
+        let relative = path.strip_prefix(data_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worldgen path outside data root",
+            )
+        })?;
         let name = relative.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 worldgen path")
         })?;
@@ -281,6 +288,42 @@ fn input_identity(data_root: &Path, registry_table: &Path, seed: i64) -> io::Res
     hasher.update((registry.len() as u64).to_be_bytes());
     hasher.update(registry);
     Ok(hasher.finalize().into())
+}
+
+/// The data-root subtrees the vanilla generator reads: `data/<ns>/worldgen`,
+/// `data/<ns>/tags/block`, and RustMC's `rustmc/` biome placement tables.
+/// Recipes, loot tables, reports and other rule data provisioned in the same
+/// root do not shape generated chunks, so they neither count toward
+/// [`MAX_INPUT_FILES`] nor invalidate cached packets.
+fn generator_input_dirs(data_root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    let data = data_root.join("data");
+    match fs::read_dir(&data) {
+        Ok(namespaces) => {
+            for namespace in namespaces {
+                let namespace = namespace?;
+                if !namespace.file_type()?.is_dir() {
+                    continue;
+                }
+                for sub in [
+                    namespace.path().join("worldgen"),
+                    namespace.path().join("tags").join("block"),
+                ] {
+                    if sub.is_dir() {
+                        directories.push(sub);
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let placement = data_root.join("rustmc");
+    if placement.is_dir() {
+        directories.push(placement);
+    }
+    directories.sort();
+    Ok(directories)
 }
 
 fn collect_files(directory: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -397,9 +440,10 @@ mod tests {
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let data = root.join("data");
-        fs::create_dir_all(&data).unwrap();
+        let worldgen = data.join("data/minecraft/worldgen");
+        fs::create_dir_all(&worldgen).unwrap();
         let registry = root.join("registry.json");
-        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(worldgen.join("world.json"), b"alpha").unwrap();
         fs::write(&registry, b"registry-a").unwrap();
         let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
         assert_eq!(cache.read(-2, 3).unwrap(), None);
@@ -425,7 +469,7 @@ mod tests {
                 .cached_count(),
             0
         );
-        fs::write(data.join("world.json"), b"beta").unwrap();
+        fs::write(worldgen.join("world.json"), b"beta").unwrap();
         assert_eq!(
             PreviewCache::open(&root.join("cache"), &data, &registry, 2026)
                 .unwrap()
@@ -443,6 +487,45 @@ mod tests {
     }
 
     #[test]
+    fn only_generator_inputs_shape_the_cache_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "rustmc-preview-cache-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data = root.join("data");
+        let worldgen = data.join("data/minecraft/worldgen");
+        let block_tags = data.join("data/minecraft/tags/block");
+        let recipes = data.join("data/minecraft/recipe");
+        let reports = data.join("reports/minecraft/components/item");
+        for directory in [&worldgen, &block_tags, &recipes, &reports] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let registry = root.join("registry.json");
+        fs::write(worldgen.join("world.json"), b"alpha").unwrap();
+        fs::write(block_tags.join("stones.json"), b"stones").unwrap();
+        fs::write(&registry, b"registry-a").unwrap();
+        let identity = input_identity(&data, &registry, 2026).unwrap();
+
+        // Rule data beside the worldgen files does not change the identity, even
+        // when there are more such files than the generator input limit.
+        for index in 0..=MAX_INPUT_FILES {
+            fs::write(recipes.join(format!("r{index}.json")), b"{}").unwrap();
+        }
+        fs::write(reports.join("stone.json"), b"{}").unwrap();
+        assert_eq!(input_identity(&data, &registry, 2026).unwrap(), identity);
+
+        // Generator inputs still do.
+        fs::write(block_tags.join("stones.json"), b"more stones").unwrap();
+        assert_ne!(input_identity(&data, &registry, 2026).unwrap(), identity);
+        fs::create_dir_all(data.join("rustmc/biome_placement")).unwrap();
+        let tagged = input_identity(&data, &registry, 2026).unwrap();
+        fs::write(data.join("rustmc/biome_placement/overworld.psv"), b"p").unwrap();
+        assert_ne!(input_identity(&data, &registry, 2026).unwrap(), tagged);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn prune_returns_evicted_paths_without_unlinking() {
         let root = std::env::temp_dir().join(format!(
             "rustmc-preview-cache-{}-{}",
@@ -450,9 +533,10 @@ mod tests {
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let data = root.join("data");
-        fs::create_dir_all(&data).unwrap();
+        let worldgen = data.join("data/minecraft/worldgen");
+        fs::create_dir_all(&worldgen).unwrap();
         let registry = root.join("registry.json");
-        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(worldgen.join("world.json"), b"alpha").unwrap();
         fs::write(&registry, b"registry-a").unwrap();
         let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
 
@@ -489,9 +573,10 @@ mod tests {
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let data = root.join("data");
-        fs::create_dir_all(&data).unwrap();
+        let worldgen = data.join("data/minecraft/worldgen");
+        fs::create_dir_all(&worldgen).unwrap();
         let registry = root.join("registry.json");
-        fs::write(data.join("world.json"), b"alpha").unwrap();
+        fs::write(worldgen.join("world.json"), b"alpha").unwrap();
         fs::write(&registry, b"registry-a").unwrap();
         let cache = PreviewCache::open(&root.join("cache"), &data, &registry, 2026).unwrap();
 
