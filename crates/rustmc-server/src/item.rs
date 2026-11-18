@@ -25,6 +25,36 @@ pub const MAX_STACK_LIMIT: u16 = 99;
 /// "`default_mining_speed`: The default mining speed of this tool, used if no rules override it. Defaults to 1.0."
 pub const DEFAULT_TOOL_MINING_SPEED: f32 = 1.0;
 
+/// Default consumption duration in seconds for `minecraft:consumable` when
+/// `consume_seconds` is omitted.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/consumable` revision 3852491):
+/// "`consume_seconds`: The amount of seconds it takes for a player to consume the item. Defaults to 1.6."
+pub const DEFAULT_CONSUME_SECONDS: f32 = 1.6;
+
+/// Default sound event for `minecraft:consumable` when `sound` is omitted.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/consumable` revision 3852491):
+/// "`sound`: ... Defaults to `entity.generic.eat`."
+pub const DEFAULT_CONSUME_SOUND: &str = "minecraft:entity.generic.eat";
+
+/// Default consumption particle setting for `minecraft:consumable` when
+/// `has_consume_particles` is omitted.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/consumable` revision 3852491):
+/// "`has_consume_particles`: Whether consumption particles are emitted while consuming this item. Defaults to `true`."
+pub const DEFAULT_CONSUME_PARTICLES: bool = true;
+
+/// Default `can_always_eat` flag for `minecraft:food` when omitted.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/food` revision 3432839):
+/// "`can_always_eat`: If `true`, this item can be eaten even if the player is not hungry. Defaults to `false`."
+pub const DEFAULT_FOOD_CAN_ALWAYS_EAT: bool = false;
+
 /// Strips an optional `minecraft:` namespace prefix for canonical item comparison.
 #[inline]
 #[must_use]
@@ -241,6 +271,78 @@ struct ToolComponent {
     rules: Vec<ToolRule>,
 }
 
+/// Nutritional properties from an item's `minecraft:food` component.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/food` revision 3432839).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FoodValues {
+    /// Food points restored when eaten by a player.
+    pub nutrition: u32,
+    /// Saturation restored when eaten by a player.
+    pub saturation: f32,
+    /// Whether the item can be eaten even when the player is not hungry.
+    pub can_always_eat: bool,
+}
+
+/// Consumption animations allowed by `minecraft:consumable.animation`.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/consumable` revision 3852491):
+/// "Must be one of `none`, `eat`, `drink`, `block`, `bow`, `spear`, `crossbow`, `spyglass`, `toot_horn`, `brush`, `bundle`, or `trident`. Defaults to `eat`."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeAnimation {
+    None,
+    Eat,
+    Drink,
+    Block,
+    Bow,
+    Spear,
+    Crossbow,
+    Spyglass,
+    TootHorn,
+    Brush,
+    Bundle,
+    Trident,
+}
+
+impl ConsumeAnimation {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(Self::None),
+            "eat" => Some(Self::Eat),
+            "drink" => Some(Self::Drink),
+            "block" => Some(Self::Block),
+            "bow" => Some(Self::Bow),
+            "spear" => Some(Self::Spear),
+            "crossbow" => Some(Self::Crossbow),
+            "spyglass" => Some(Self::Spyglass),
+            "toot_horn" => Some(Self::TootHorn),
+            "brush" => Some(Self::Brush),
+            "bundle" => Some(Self::Bundle),
+            "trident" => Some(Self::Trident),
+            _ => None,
+        }
+    }
+}
+
+/// Scalar consumption properties from an item's `minecraft:consumable` component,
+/// with wiki defaults applied when keys are omitted.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/consumable` revision 3852491).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsumableValues {
+    /// Seconds required for a player to consume the item (defaults to `1.6`).
+    pub consume_seconds: f32,
+    /// Animation played during consumption (defaults to [`ConsumeAnimation::Eat`]).
+    pub animation: ConsumeAnimation,
+    /// Sound event id played during/upon consumption (defaults to `"minecraft:entity.generic.eat"`).
+    pub sound: String,
+    /// Whether particles are emitted while consuming (defaults to `true`).
+    pub has_consume_particles: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ItemDefaultEntry {
     max_stack_size: u8,
@@ -248,6 +350,8 @@ struct ItemDefaultEntry {
     repairable: Option<IdSet>,
     enchantability: Option<u32>,
     tool: Option<ToolComponent>,
+    food: Option<FoodValues>,
+    consumable: Option<ConsumableValues>,
 }
 
 /// Default per-item components read from `reports/minecraft/components/item/*.json`.
@@ -380,6 +484,42 @@ impl ItemDefaults {
         Some(matched)
     }
 
+    /// Returns the nutritional values from `item`'s `minecraft:food` component, if present.
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    ///
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/food` revision 3432839).
+    #[must_use]
+    pub fn food(&self, item: &str) -> Option<FoodValues> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.food)
+    }
+
+    /// Returns the consumption duration in seconds from `item`'s `minecraft:consumable`
+    /// component (defaulting to [`DEFAULT_CONSUME_SECONDS`] = `1.6` when `consume_seconds`
+    /// is omitted inside `minecraft:consumable`), or `None` if `item` is unknown or lacks
+    /// `minecraft:consumable`. Accepts identifiers with or without the `minecraft:` prefix.
+    ///
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/consumable` revision 3852491):
+    /// "`consume_seconds`: The amount of seconds it takes for a player to consume the item. Defaults to 1.6."
+    #[must_use]
+    pub fn consume_seconds(&self, item: &str) -> Option<f32> {
+        self.consumable(item).map(|c| c.consume_seconds)
+    }
+
+    /// Returns the scalar consumption properties from `item`'s `minecraft:consumable`
+    /// component with wiki defaults applied when keys are omitted, or `None` if `item`
+    /// is unknown or lacks `minecraft:consumable`.
+    /// Accepts identifiers with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn consumable(&self, item: &str) -> Option<&ConsumableValues> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.consumable.as_ref())
+    }
+
     /// Returns the number of items loaded from the report.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -474,6 +614,16 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
         Some(value) => Some(parse_tool(value, file)?),
     };
 
+    let food = match components.get("minecraft:food") {
+        None => None,
+        Some(value) => Some(parse_food(value, file)?),
+    };
+
+    let consumable = match components.get("minecraft:consumable") {
+        None => None,
+        Some(value) => Some(parse_consumable(value, file)?),
+    };
+
     Ok((
         item_stem.to_owned(),
         ItemDefaultEntry {
@@ -482,6 +632,8 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
             repairable,
             enchantability,
             tool,
+            food,
+            consumable,
         },
     ))
 }
@@ -585,27 +737,73 @@ fn parse_enchantable(value: &Value, file: &Path) -> Result<u32, ItemDefaultsErro
         })
 }
 
-fn parse_tool_rule(value: &Value, file: &Path) -> Result<ToolRule, ItemDefaultsError> {
-    let obj = value.as_object().ok_or_else(|| {
-        item_report_invalid(
-            file,
-            "`components[\"minecraft:tool\"].rules[]` entries must be JSON objects",
-        )
-    })?;
+fn require_object<'a>(
+    value: &'a Value,
+    file: &Path,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, Value>, ItemDefaultsError> {
+    value
+        .as_object()
+        .ok_or_else(|| item_report_invalid(file, format!("{context} must be a JSON object")))
+}
+
+fn reject_unknown_keys(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    file: &Path,
+    context: &str,
+) -> Result<(), ItemDefaultsError> {
     for key in obj.keys() {
-        if !matches!(key.as_str(), "blocks" | "speed" | "correct_for_drops") {
+        if !allowed.contains(&key.as_str()) {
             return Err(item_report_invalid(
                 file,
-                format!("unknown key `{key}` in `components[\"minecraft:tool\"].rules[]`"),
+                format!("unknown key `{key}` in {context}"),
             ));
         }
     }
-    let blocks_val = obj.get("blocks").ok_or_else(|| {
-        item_report_invalid(
-            file,
-            "missing `blocks` field in `components[\"minecraft:tool\"].rules[]`",
-        )
-    })?;
+    Ok(())
+}
+
+fn parse_optional_bool(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    file: &Path,
+    context: &str,
+) -> Result<Option<bool>, ItemDefaultsError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(val) => val
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| item_report_invalid(file, format!("{context}.{key} must be a boolean"))),
+    }
+}
+
+fn parse_non_negative_u32(
+    value: &Value,
+    file: &Path,
+    context: &str,
+) -> Result<u32, ItemDefaultsError> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            item_report_invalid(file, format!("{context} must be a non-negative integer"))
+        })
+}
+
+fn parse_tool_rule(value: &Value, file: &Path) -> Result<ToolRule, ItemDefaultsError> {
+    let context = "`components[\"minecraft:tool\"].rules[]`";
+    let obj = require_object(value, file, context)?;
+    reject_unknown_keys(
+        obj,
+        &["blocks", "speed", "correct_for_drops"],
+        file,
+        context,
+    )?;
+    let blocks_val = obj
+        .get("blocks")
+        .ok_or_else(|| item_report_invalid(file, format!("missing `blocks` field in {context}")))?;
     let blocks = parse_id_set(
         blocks_val,
         file,
@@ -619,18 +817,7 @@ fn parse_tool_rule(value: &Value, file: &Path) -> Result<ToolRule, ItemDefaultsE
             "`components[\"minecraft:tool\"].rules[].speed`",
         )?),
     };
-    let correct_for_drops = match obj.get("correct_for_drops") {
-        None => None,
-        Some(val) => {
-            let b = val.as_bool().ok_or_else(|| {
-                item_report_invalid(
-                    file,
-                    "`components[\"minecraft:tool\"].rules[].correct_for_drops` must be a boolean",
-                )
-            })?;
-            Some(b)
-        }
-    };
+    let correct_for_drops = parse_optional_bool(obj, "correct_for_drops", file, context)?;
     Ok(ToolRule {
         blocks,
         speed,
@@ -639,26 +826,19 @@ fn parse_tool_rule(value: &Value, file: &Path) -> Result<ToolRule, ItemDefaultsE
 }
 
 fn parse_tool(value: &Value, file: &Path) -> Result<ToolComponent, ItemDefaultsError> {
-    let obj = value.as_object().ok_or_else(|| {
-        item_report_invalid(
-            file,
-            "`components[\"minecraft:tool\"]` must be a JSON object",
-        )
-    })?;
-    for key in obj.keys() {
-        if !matches!(
-            key.as_str(),
-            "rules"
-                | "default_mining_speed"
-                | "damage_per_block"
-                | "can_destroy_blocks_in_creative"
-        ) {
-            return Err(item_report_invalid(
-                file,
-                format!("unknown key `{key}` in `components[\"minecraft:tool\"]`"),
-            ));
-        }
-    }
+    let context = "`components[\"minecraft:tool\"]`";
+    let obj = require_object(value, file, context)?;
+    reject_unknown_keys(
+        obj,
+        &[
+            "rules",
+            "default_mining_speed",
+            "damage_per_block",
+            "can_destroy_blocks_in_creative",
+        ],
+        file,
+        context,
+    )?;
     let default_mining_speed = match obj.get("default_mining_speed") {
         None => DEFAULT_TOOL_MINING_SPEED,
         Some(val) => parse_finite_f32(
@@ -668,27 +848,17 @@ fn parse_tool(value: &Value, file: &Path) -> Result<ToolComponent, ItemDefaultsE
         )?,
     };
     if let Some(val) = obj.get("damage_per_block") {
-        val.as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| {
-                item_report_invalid(
-                    file,
-                    "`components[\"minecraft:tool\"].damage_per_block` must be a non-negative 32-bit integer",
-                )
-            })?;
-    }
-    if let Some(val) = obj.get("can_destroy_blocks_in_creative")
-        && !val.is_boolean()
-    {
-        return Err(item_report_invalid(
+        parse_non_negative_u32(
+            val,
             file,
-            "`components[\"minecraft:tool\"].can_destroy_blocks_in_creative` must be a boolean",
-        ));
+            "`components[\"minecraft:tool\"].damage_per_block`",
+        )?;
     }
+    parse_optional_bool(obj, "can_destroy_blocks_in_creative", file, context)?;
     let raw_rules = obj.get("rules").and_then(Value::as_array).ok_or_else(|| {
         item_report_invalid(
             file,
-            "missing or non-array `rules` field in `components[\"minecraft:tool\"]`",
+            format!("missing or non-array `rules` field in {context}"),
         )
     })?;
     let mut rules = Vec::with_capacity(raw_rules.len());
@@ -698,6 +868,128 @@ fn parse_tool(value: &Value, file: &Path) -> Result<ToolComponent, ItemDefaultsE
     Ok(ToolComponent {
         default_mining_speed,
         rules,
+    })
+}
+
+fn parse_food(value: &Value, file: &Path) -> Result<FoodValues, ItemDefaultsError> {
+    let context = "`components[\"minecraft:food\"]`";
+    let obj = require_object(value, file, context)?;
+    reject_unknown_keys(
+        obj,
+        &["nutrition", "saturation", "can_always_eat"],
+        file,
+        context,
+    )?;
+    let nutrition_val = obj.get("nutrition").ok_or_else(|| {
+        item_report_invalid(file, format!("missing `nutrition` field in {context}"))
+    })?;
+    let nutrition = parse_non_negative_u32(
+        nutrition_val,
+        file,
+        "`components[\"minecraft:food\"].nutrition`",
+    )?;
+    let saturation_val = obj.get("saturation").ok_or_else(|| {
+        item_report_invalid(file, format!("missing `saturation` field in {context}"))
+    })?;
+    let saturation = parse_finite_f32(
+        saturation_val,
+        file,
+        "`components[\"minecraft:food\"].saturation`",
+    )?;
+    let can_always_eat = parse_optional_bool(obj, "can_always_eat", file, context)?
+        .unwrap_or(DEFAULT_FOOD_CAN_ALWAYS_EAT);
+    Ok(FoodValues {
+        nutrition,
+        saturation,
+        can_always_eat,
+    })
+}
+
+fn parse_consumable(value: &Value, file: &Path) -> Result<ConsumableValues, ItemDefaultsError> {
+    let context = "`components[\"minecraft:consumable\"]`";
+    let obj = require_object(value, file, context)?;
+    reject_unknown_keys(
+        obj,
+        &[
+            "consume_seconds",
+            "animation",
+            "sound",
+            "has_consume_particles",
+            "on_consume_effects",
+        ],
+        file,
+        context,
+    )?;
+    let consume_seconds = match obj.get("consume_seconds") {
+        None => DEFAULT_CONSUME_SECONDS,
+        Some(val) => {
+            let seconds = parse_finite_f32(
+                val,
+                file,
+                "`components[\"minecraft:consumable\"].consume_seconds`",
+            )?;
+            if seconds < 0.0 {
+                return Err(item_report_invalid(
+                    file,
+                    "`components[\"minecraft:consumable\"].consume_seconds` must be non-negative",
+                ));
+            }
+            seconds
+        }
+    };
+    let animation = match obj.get("animation") {
+        None => ConsumeAnimation::Eat,
+        Some(val) => {
+            let raw = val.as_str().ok_or_else(|| {
+                item_report_invalid(file, format!("{context}.animation must be a string"))
+            })?;
+            ConsumeAnimation::parse(raw).ok_or_else(|| {
+                item_report_invalid(
+                    file,
+                    format!("unknown animation `{raw}` in {context}.animation"),
+                )
+            })?
+        }
+    };
+    let sound = match obj.get("sound") {
+        None => DEFAULT_CONSUME_SOUND.to_owned(),
+        Some(val) => {
+            let raw = val.as_str().ok_or_else(|| {
+                item_report_invalid(
+                    file,
+                    format!("{context}.sound must be a sound event string"),
+                )
+            })?;
+            if !valid_item_id(raw) {
+                return Err(item_report_invalid(
+                    file,
+                    format!("invalid sound id `{raw}` in {context}.sound"),
+                ));
+            }
+            raw.to_owned()
+        }
+    };
+    let has_consume_particles = parse_optional_bool(obj, "has_consume_particles", file, context)?
+        .unwrap_or(DEFAULT_CONSUME_PARTICLES);
+    if let Some(effects_val) = obj.get("on_consume_effects") {
+        let arr = effects_val.as_array().ok_or_else(|| {
+            item_report_invalid(
+                file,
+                format!("{context}.on_consume_effects must be an array"),
+            )
+        })?;
+        if !arr.iter().all(Value::is_object) {
+            return Err(item_report_invalid(
+                file,
+                format!("{context}.on_consume_effects entries must be JSON objects"),
+            ));
+        }
+    }
+    Ok(ConsumableValues {
+        consume_seconds,
+        animation,
+        sound,
+        has_consume_particles,
     })
 }
 
@@ -1524,5 +1816,312 @@ mod tests {
             defaults.is_correct_for_drops("minecraft:stick", "minecraft:stone", &block_tags),
             None
         );
+    }
+
+    #[test]
+    fn item_defaults_reads_food_and_consumable_with_defaults() {
+        let root = scratch_root("food-consumable");
+        write_file(
+            &root.join("reports/minecraft/components/item/snack.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 64,
+                "minecraft:food": {"nutrition": 5, "saturation": 6.0},
+                "minecraft:consumable": {}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/elixir.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 16,
+                "minecraft:food": {"nutrition": 2, "saturation": 1.5, "can_always_eat": true},
+                "minecraft:consumable": {
+                    "consume_seconds": 0.8,
+                    "animation": "drink",
+                    "sound": "testns:gulp",
+                    "has_consume_particles": false,
+                    "on_consume_effects": [{"type": "testns:heal"}]
+                }
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/drink_only.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:consumable": {"animation": "drink", "has_consume_particles": false}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/feed_only.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:food": {"nutrition": 1, "saturation": 0.2}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/plain.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+
+        let defaults = ItemDefaults::load(&root).expect("load synthetic food defaults");
+
+        let snack_food = defaults.food("minecraft:snack").expect("snack food");
+        assert_eq!(
+            snack_food,
+            FoodValues {
+                nutrition: 5,
+                saturation: 6.0,
+                can_always_eat: DEFAULT_FOOD_CAN_ALWAYS_EAT,
+            }
+        );
+        assert_eq!(defaults.food("snack"), Some(snack_food));
+        assert_eq!(
+            defaults.consume_seconds("snack"),
+            Some(DEFAULT_CONSUME_SECONDS)
+        );
+        assert_eq!(
+            defaults.consumable("minecraft:snack"),
+            Some(&ConsumableValues {
+                consume_seconds: DEFAULT_CONSUME_SECONDS,
+                animation: ConsumeAnimation::Eat,
+                sound: DEFAULT_CONSUME_SOUND.to_owned(),
+                has_consume_particles: DEFAULT_CONSUME_PARTICLES,
+            })
+        );
+
+        assert_eq!(
+            defaults.food("elixir"),
+            Some(FoodValues {
+                nutrition: 2,
+                saturation: 1.5,
+                can_always_eat: true,
+            })
+        );
+        assert_eq!(defaults.consume_seconds("minecraft:elixir"), Some(0.8));
+        assert_eq!(
+            defaults.consumable("elixir"),
+            Some(&ConsumableValues {
+                consume_seconds: 0.8,
+                animation: ConsumeAnimation::Drink,
+                sound: "testns:gulp".to_owned(),
+                has_consume_particles: false,
+            })
+        );
+
+        assert_eq!(defaults.food("drink_only"), None);
+        assert_eq!(
+            defaults.consume_seconds("drink_only"),
+            Some(DEFAULT_CONSUME_SECONDS)
+        );
+        assert_eq!(
+            defaults.consumable("drink_only"),
+            Some(&ConsumableValues {
+                consume_seconds: DEFAULT_CONSUME_SECONDS,
+                animation: ConsumeAnimation::Drink,
+                sound: DEFAULT_CONSUME_SOUND.to_owned(),
+                has_consume_particles: false,
+            })
+        );
+
+        assert_eq!(
+            defaults.food("feed_only"),
+            Some(FoodValues {
+                nutrition: 1,
+                saturation: 0.2,
+                can_always_eat: false,
+            })
+        );
+        assert_eq!(defaults.consume_seconds("feed_only"), None);
+        assert_eq!(defaults.consumable("feed_only"), None);
+
+        assert_eq!(defaults.food("plain"), None);
+        assert_eq!(defaults.consume_seconds("plain"), None);
+        assert_eq!(defaults.food("missing"), None);
+        assert_eq!(defaults.consume_seconds("missing"), None);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn item_defaults_rejects_malformed_food_and_consumable_naming_file() {
+        let cases = [
+            (
+                "bad_food_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": "bad"}}"#,
+            ),
+            (
+                "missing_nutrition.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"saturation": 1.0}}}"#,
+            ),
+            (
+                "negative_nutrition.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": -1, "saturation": 1.0}}}"#,
+            ),
+            (
+                "missing_saturation.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 2}}}"#,
+            ),
+            (
+                "bad_saturation.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 2, "saturation": "high"}}}"#,
+            ),
+            (
+                "overflow_saturation.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 2, "saturation": 1e39}}}"#,
+            ),
+            (
+                "bad_can_always_eat.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 2, "saturation": 1.0, "can_always_eat": 1}}}"#,
+            ),
+            (
+                "unknown_food_key.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 2, "saturation": 1.0, "extra": true}}}"#,
+            ),
+            (
+                "bad_consumable_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": []}}"#,
+            ),
+            (
+                "negative_consume_seconds.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"consume_seconds": -0.1}}}"#,
+            ),
+            (
+                "bad_consume_seconds.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"consume_seconds": "fast"}}}"#,
+            ),
+            (
+                "bad_animation.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"animation": "dance"}}}"#,
+            ),
+            (
+                "bad_sound_id.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"sound": "bad"}}}"#,
+            ),
+            (
+                "bad_particles.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"has_consume_particles": "no"}}}"#,
+            ),
+            (
+                "bad_effects_array.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"on_consume_effects": "none"}}}"#,
+            ),
+            (
+                "bad_effects_entry.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"on_consume_effects": [123]}}}"#,
+            ),
+            (
+                "unknown_consumable_key.json",
+                r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:consumable": {"extra": 1}}}"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write_file(
+                &root.join("reports/minecraft/components/item").join(name),
+                body,
+            );
+            let err = ItemDefaults::load(&root)
+                .expect_err("malformed food or consumable component must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_item_defaults_pin_food_and_consumable`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_item_defaults_pin_food_and_consumable() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+
+        let food_count = defaults
+            .entries
+            .values()
+            .filter(|entry| entry.food.is_some())
+            .count();
+        assert_eq!(food_count, 44);
+
+        let consumable_count = defaults
+            .entries
+            .values()
+            .filter(|entry| entry.consumable.is_some())
+            .count();
+        assert_eq!(consumable_count, 43);
+
+        let bread = defaults.food("minecraft:bread").expect("bread food");
+        assert_eq!(bread.nutrition, 5);
+        assert_eq!(bread.saturation, 6.0);
+        assert!(!bread.can_always_eat);
+        assert_eq!(
+            defaults.consume_seconds("minecraft:bread"),
+            Some(DEFAULT_CONSUME_SECONDS)
+        );
+
+        let golden_apple_report = read_json(
+            &root
+                .join("reports/minecraft/components/item")
+                .join("golden_apple.json"),
+        )
+        .expect("read golden_apple report");
+        let expected_golden_apple_always =
+            golden_apple_report["components"]["minecraft:food"]["can_always_eat"]
+                .as_bool()
+                .expect("golden_apple can_always_eat");
+        assert_eq!(
+            defaults
+                .food("minecraft:golden_apple")
+                .expect("golden_apple food")
+                .can_always_eat,
+            expected_golden_apple_always
+        );
+
+        // Verify every item report with minecraft:food and/or minecraft:consumable matches its file.
+        for path in walk_json(&root.join("reports/minecraft/components/item")).expect("walk items")
+        {
+            let item = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("item file stem");
+            let doc = read_json(&path).expect("read item report");
+            let components = doc["components"].as_object().expect("components object");
+
+            match components.get("minecraft:food") {
+                None => assert_eq!(defaults.food(item), None, "{item}"),
+                Some(raw_food) => {
+                    let expected = FoodValues {
+                        nutrition: u32::try_from(
+                            raw_food["nutrition"].as_u64().expect("food nutrition"),
+                        )
+                        .expect("u32 nutrition"),
+                        saturation: raw_food["saturation"].as_f64().expect("food saturation")
+                            as f32,
+                        can_always_eat: raw_food
+                            .get("can_always_eat")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(DEFAULT_FOOD_CAN_ALWAYS_EAT),
+                    };
+                    assert_eq!(defaults.food(item), Some(expected), "{item}");
+                }
+            }
+
+            match components.get("minecraft:consumable") {
+                None => assert_eq!(defaults.consume_seconds(item), None, "{item}"),
+                Some(raw_consumable) => {
+                    let expected_seconds = raw_consumable
+                        .get("consume_seconds")
+                        .and_then(Value::as_f64)
+                        .map_or(DEFAULT_CONSUME_SECONDS, |v| v as f32);
+                    assert_eq!(
+                        defaults.consume_seconds(item),
+                        Some(expected_seconds),
+                        "{item}"
+                    );
+                }
+            }
+        }
     }
 }
