@@ -1163,6 +1163,16 @@ pub fn sample_profiles(
 /// One column read from a stored chunk root, shared by the samplers.
 type ColumnReader<T> = fn(&Tag, i32, i32, u8, u8) -> Result<Option<T>, String>;
 
+fn chunk_cell_coords(x: i64, z: i64) -> Result<(i32, i32, u8, u8), String> {
+    let chunk_x =
+        i32::try_from(x.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
+    let chunk_z =
+        i32::try_from(z.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
+    let lx = (x & 0x0f) as u8;
+    let lz = (z & 0x0f) as u8;
+    Ok((chunk_x, chunk_z, lx, lz))
+}
+
 fn sample_grid<T>(
     store: &mut RegionStore,
     min_x: i64,
@@ -1182,12 +1192,7 @@ fn sample_grid<T>(
     while z <= max_z {
         let mut x = min_x;
         while x <= max_x {
-            let chunk_x =
-                i32::try_from(x.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-            let chunk_z =
-                i32::try_from(z.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-            let lx = u8::try_from(x.rem_euclid(16)).expect("rem_euclid(16) fits u8");
-            let lz = u8::try_from(z.rem_euclid(16)).expect("rem_euclid(16) fits u8");
+            let (chunk_x, chunk_z, lx, lz) = chunk_cell_coords(x, z)?;
             match store.chunk_root(chunk_x, chunk_z) {
                 Ok(None) => gaps.missing_chunks += 1,
                 Ok(Some(root)) => {
@@ -1218,12 +1223,7 @@ pub fn read_profile(
     x: i64,
     z: i64,
 ) -> Result<Option<ColumnProfile>, String> {
-    let chunk_x =
-        i32::try_from(x.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-    let chunk_z =
-        i32::try_from(z.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-    let lx = u8::try_from(x.rem_euclid(16)).expect("rem_euclid(16) fits u8");
-    let lz = u8::try_from(z.rem_euclid(16)).expect("rem_euclid(16) fits u8");
+    let (chunk_x, chunk_z, lx, lz) = chunk_cell_coords(x, z)?;
     match store.chunk_root(chunk_x, chunk_z)? {
         None => Ok(None),
         Some(root) => column_profile(&root, chunk_x, chunk_z, lx, lz),
@@ -1464,11 +1464,19 @@ pub fn section_name_counts(section: &Tag) -> Result<Vec<(String, usize)>, String
     }
     for bits in widths {
         let slots = unpack_non_spanning(packed, bits, SLOTS);
-        if slots.iter().all(|slot| (*slot as usize) < palette.len()) {
-            let mut counts = vec![0usize; palette.len()];
-            for slot in slots {
-                counts[usize::try_from(slot).expect("slot width <= 16 bits")] += 1;
-            }
+        let mut counts = vec![0usize; palette.len()];
+        let mut valid = true;
+        for slot in slots {
+            let Some(entry) = usize::try_from(slot)
+                .ok()
+                .and_then(|idx| counts.get_mut(idx))
+            else {
+                valid = false;
+                break;
+            };
+            *entry += 1;
+        }
+        if valid {
             let mut out = Vec::new();
             for (entry, count) in palette.iter().zip(counts) {
                 if count == 0 {
@@ -1661,12 +1669,7 @@ pub fn read_columns(
     let mut out = Vec::new();
     for &(x, z) in points {
         let result = (|| {
-            let chunk_x =
-                i32::try_from(x.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-            let chunk_z =
-                i32::try_from(z.div_euclid(16)).map_err(|_| "coordinate too large".to_string())?;
-            let lx = u8::try_from(x.rem_euclid(16)).expect("rem_euclid(16) fits u8");
-            let lz = u8::try_from(z.rem_euclid(16)).expect("rem_euclid(16) fits u8");
+            let (chunk_x, chunk_z, lx, lz) = chunk_cell_coords(x, z)?;
             match store.chunk_root(chunk_x, chunk_z)? {
                 None => Ok(None),
                 Some(root) => column_truth(&root, chunk_x, chunk_z, lx, lz),

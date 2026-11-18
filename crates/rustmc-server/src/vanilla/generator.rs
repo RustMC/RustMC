@@ -660,15 +660,17 @@ impl VanillaGenerator {
         };
         filled.reverse();
         self.heights.borrow_mut().insert((x, z), top);
-        let rules = self.surface.as_ref();
-        let mut ctx = rules.map(|rules| {
-            SurfaceContext::new(
+        let mut ctx = self.surface.as_ref().map(|rules| {
+            (
                 rules,
-                self.router.chunk_surface_level.as_ref(),
-                x,
-                z,
-                |hx, hz| self.surface_height(hx, hz),
-                |bx, by, bz| self.biome(bx, bz, by),
+                SurfaceContext::new(
+                    rules,
+                    self.router.chunk_surface_level.as_ref(),
+                    x,
+                    z,
+                    |hx, hz| self.surface_height(hx, hz),
+                    |bx, by, bz| self.biome(bx, bz, by),
+                ),
             )
         });
         let mut stone_above = 0i32;
@@ -708,11 +710,9 @@ impl VanillaGenerator {
                     }
                     stone_above += 1;
                     ids[offset] = Some(match &mut ctx {
-                        Some(ctx) => {
+                        Some((rules, ctx)) => {
                             ctx.set_y(stone_above, y - run_bottom + 1, water_height, y);
-                            // `rules` is `Some` whenever the context is.
                             rules
-                                .expect("surface rules")
                                 .apply(ctx)
                                 .unwrap_or_else(|| self.router.default_block.clone())
                         }

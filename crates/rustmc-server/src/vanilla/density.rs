@@ -653,14 +653,16 @@ impl Density {
                     x_in_cell as f32 / *cell_size_xz as f32,
                     y_in_cell as f32 / *cell_size_y as f32,
                     z_in_cell as f32 / *cell_size_xz as f32,
-                    at(0, 0, 0),
-                    at(1, 0, 0),
-                    at(0, 1, 0),
-                    at(1, 1, 0),
-                    at(0, 0, 1),
-                    at(1, 0, 1),
-                    at(0, 1, 1),
-                    at(1, 1, 1),
+                    Lerp3Values {
+                        x000: at(0, 0, 0),
+                        x100: at(1, 0, 0),
+                        x010: at(0, 1, 0),
+                        x110: at(1, 1, 0),
+                        x001: at(0, 0, 1),
+                        x101: at(1, 0, 1),
+                        x011: at(0, 1, 1),
+                        x111: at(1, 1, 1),
+                    },
                 )
             }
             Node::Slice {
@@ -1099,6 +1101,14 @@ fn sample_interpolated_block_step(
 
     let xz_inv = 1.0f32 / cell_size_xz as f32;
     let y_inv = 1.0f32 / cell_size_y as f32;
+    let cell_params = InterpolatedCellParams {
+        volume,
+        cell_volume: &cell_volume,
+        xz_inv,
+        y_inv,
+        cell_size_xz,
+        cell_size_y,
+    };
     for cell_z in 0..cell_count[2] {
         let next_z = (cell_z + 1).min(cell_size[2] - 1);
         for cell_x in 0..cell_count[0] {
@@ -1118,24 +1128,19 @@ fn sample_interpolated_block_step(
                 let v111 = cell_buffer
                     [cell_volume.index(next_x as usize, next_y as usize, next_z as usize)];
                 fill_interpolated_cell(
-                    volume,
+                    &cell_params,
                     out,
-                    &cell_volume,
-                    xz_inv,
-                    y_inv,
-                    cell_size_xz,
-                    cell_size_y,
-                    cell_x,
-                    cell_y,
-                    cell_z,
-                    v000,
-                    v100,
-                    v010,
-                    v110,
-                    v001,
-                    v101,
-                    v011,
-                    v111,
+                    [cell_x, cell_y, cell_z],
+                    CellCorners {
+                        v000,
+                        v100,
+                        v010,
+                        v110,
+                        v001,
+                        v101,
+                        v011,
+                        v111,
+                    },
                 );
                 v000 = v010;
                 v100 = v110;
@@ -1146,21 +1151,16 @@ fn sample_interpolated_block_step(
     }
 }
 
-/// `InterpolatedFunction.Sampler.fillCell`: horizontal axes interpolate
-/// with the reciprocal-cell multiply, and the vertical direction is a
-/// repeated addition of `valueStep` — not per-point lerp evaluation.
-#[allow(clippy::too_many_arguments)]
-fn fill_interpolated_cell(
-    volume: &DensityVolume,
-    out: &mut [f32],
-    cell_volume: &DensityVolume,
+struct InterpolatedCellParams<'a> {
+    volume: &'a DensityVolume,
+    cell_volume: &'a DensityVolume,
     xz_inv: f32,
     y_inv: f32,
     cell_size_xz: i32,
     cell_size_y: i32,
-    cell_x: i32,
-    cell_y: i32,
-    cell_z: i32,
+}
+
+struct CellCorners {
     v000: f32,
     v100: f32,
     v010: f32,
@@ -1169,7 +1169,35 @@ fn fill_interpolated_cell(
     v101: f32,
     v011: f32,
     v111: f32,
+}
+
+/// `InterpolatedFunction.Sampler.fillCell`: horizontal axes interpolate
+/// with the reciprocal-cell multiply, and the vertical direction is a
+/// repeated addition of `valueStep` — not per-point lerp evaluation.
+fn fill_interpolated_cell(
+    params: &InterpolatedCellParams<'_>,
+    out: &mut [f32],
+    [cell_x, cell_y, cell_z]: [i32; 3],
+    corners: CellCorners,
 ) {
+    let &InterpolatedCellParams {
+        volume,
+        cell_volume,
+        xz_inv,
+        y_inv,
+        cell_size_xz,
+        cell_size_y,
+    } = params;
+    let CellCorners {
+        v000,
+        v100,
+        v010,
+        v110,
+        v001,
+        v101,
+        v011,
+        v111,
+    } = corners;
     let cell_output_x = cell_volume.block(0, cell_x) - volume.min[0];
     let cell_output_y = cell_volume.block(1, cell_y) - volume.min[1];
     let cell_output_z = cell_volume.block(2, cell_z) - volume.min[2];
@@ -1265,12 +1293,7 @@ fn lerp2(a1: f32, a2: f32, x00: f32, x10: f32, x01: f32, x11: f32) -> f32 {
     lerp(a2, lerp(a1, x00, x10), lerp(a1, x01, x11))
 }
 
-/// `Mth.lerp3` with the same nesting order as the Java helper.
-#[allow(clippy::too_many_arguments)]
-fn lerp3(
-    a1: f32,
-    a2: f32,
-    a3: f32,
+struct Lerp3Values {
     x000: f32,
     x100: f32,
     x010: f32,
@@ -1279,11 +1302,14 @@ fn lerp3(
     x101: f32,
     x011: f32,
     x111: f32,
-) -> f32 {
+}
+
+/// `Mth.lerp3` with the same nesting order as the Java helper.
+fn lerp3(a1: f32, a2: f32, a3: f32, values: Lerp3Values) -> f32 {
     lerp(
         a3,
-        lerp2(a1, a2, x000, x100, x010, x110),
-        lerp2(a1, a2, x001, x101, x011, x111),
+        lerp2(a1, a2, values.x000, values.x100, values.x010, values.x110),
+        lerp2(a1, a2, values.x001, values.x101, values.x011, values.x111),
     )
 }
 

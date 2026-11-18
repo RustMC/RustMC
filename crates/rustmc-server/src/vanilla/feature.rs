@@ -1392,12 +1392,11 @@ impl FeatureData {
         let mut successors: HashMap<Node, Vec<Node>> = HashMap::new();
         for chain in &chains {
             for (index, node) in chain.iter().enumerate() {
-                successors.entry(*node).or_default();
-                if let Some(next) = chain.get(index + 1) {
-                    let edges = successors.get_mut(node).expect("node just entered");
-                    if !edges.contains(next) {
-                        edges.push(*next);
-                    }
+                let edges = successors.entry(*node).or_default();
+                if let Some(next) = chain.get(index + 1)
+                    && !edges.contains(next)
+                {
+                    edges.push(*next);
                 }
             }
         }
@@ -1565,7 +1564,9 @@ fn depth_first_visit(
             pending = Some(next);
             continue;
         }
-        let (done, _) = path.pop().expect("a frame to finish");
+        let Some((done, _)) = path.pop() else {
+            return false;
+        };
         in_progress.remove(&done);
         visited.insert(done);
         emitted.push(done);
@@ -2010,12 +2011,16 @@ pub(crate) fn parse_configured_feature(
                 .get("size")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| WorldgenError::Invalid("ore feature without a size".to_string()))?;
+            let Ok(size) = i32::try_from(size) else {
+                return Err(WorldgenError::Invalid(format!(
+                    "ore feature size must be in 1..=128, got {size}"
+                )));
+            };
             if !(1..=128).contains(&size) {
                 return Err(WorldgenError::Invalid(format!(
                     "ore feature size must be in 1..=128, got {size}"
                 )));
             }
-            let size = i32::try_from(size).expect("checked ore size");
             let discard_chance_on_air_exposure = body
                 .get("discard_chance_on_air_exposure")
                 .and_then(Value::as_f64)
@@ -2447,18 +2452,27 @@ fn is_valid_block(block: Option<&str>, valid_blocks: &[String], tags: &BlockTags
     })
 }
 
+struct DiskFeature<'a> {
+    state_provider: &'a StateProvider,
+    target_predicate: &'a BlockPredicate,
+    radius: &'a RangeProvider,
+    half_height: i32,
+}
+
 /// Places a circular disk feature around `pos`.
-#[allow(clippy::too_many_arguments)]
 fn place_disk(
     target: &mut dyn DecorationTarget,
     random: &mut DecorationRandom,
     tags: &BlockTags,
-    state_provider: &StateProvider,
-    target_predicate: &BlockPredicate,
-    radius: &RangeProvider,
-    half_height: i32,
+    disk: DiskFeature<'_>,
     pos: DecorationPos,
 ) -> usize {
+    let DiskFeature {
+        state_provider,
+        target_predicate,
+        radius,
+        half_height,
+    } = disk;
     let r = radius.sample(target.min_y(), target.height(), random);
     if r < 0 || half_height < 0 {
         return 0;
@@ -2500,22 +2514,32 @@ fn place_disk(
     placed
 }
 
+struct SpringFeature<'a> {
+    state: &'a str,
+    rock_count: i32,
+    hole_count: i32,
+    requires_block_below: bool,
+    valid_blocks: &'a [String],
+}
+
 /// Places a fluid spring feature at `pos`: the ceiling must be valid, the block
 /// below too when the feature requires it, and the four sides and the block
 /// below must then hold exactly `rock_count` valid blocks and `hole_count` air
 /// cells. Neighbours past the chunk edge are read from the terrain, so a pocket
 /// on a border is judged as it would be anywhere else.
-#[allow(clippy::too_many_arguments)]
 fn place_spring(
     target: &mut dyn DecorationTarget,
     tags: &BlockTags,
-    state: &str,
-    rock_count: i32,
-    hole_count: i32,
-    requires_block_below: bool,
-    valid_blocks: &[String],
+    spring: SpringFeature<'_>,
     pos: DecorationPos,
 ) -> usize {
+    let SpringFeature {
+        state,
+        rock_count,
+        hole_count,
+        requires_block_below,
+        valid_blocks,
+    } = spring;
     if !target.writable(pos.x, pos.y, pos.z) {
         return 0;
     }
@@ -3356,10 +3380,12 @@ impl FeatureData {
                     target,
                     random,
                     &self.tags,
-                    state_provider,
-                    target_predicate,
-                    radius,
-                    *half_height,
+                    DiskFeature {
+                        state_provider,
+                        target_predicate,
+                        radius,
+                        half_height: *half_height,
+                    },
                     pos,
                 ),
                 ConfiguredFeature::Spring {
@@ -3371,11 +3397,13 @@ impl FeatureData {
                 } => place_spring(
                     target,
                     &self.tags,
-                    state,
-                    *rock_count,
-                    *hole_count,
-                    *requires_block_below,
-                    valid_blocks,
+                    SpringFeature {
+                        state,
+                        rock_count: *rock_count,
+                        hole_count: *hole_count,
+                        requires_block_below: *requires_block_below,
+                        valid_blocks,
+                    },
                     pos,
                 ),
                 ConfiguredFeature::SimpleRandomSelector { features } => {
@@ -6302,11 +6330,13 @@ mod tests {
         let placed = place_spring(
             &mut CornerPocket,
             &tags,
-            "minecraft:water",
-            4,
-            1,
-            true,
-            &valid,
+            SpringFeature {
+                state: "minecraft:water",
+                rock_count: 4,
+                hole_count: 1,
+                requires_block_below: true,
+                valid_blocks: &valid,
+            },
             corner,
         );
         assert_eq!(placed, 1, "east and south are stone in the next chunks");

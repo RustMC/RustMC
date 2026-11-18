@@ -65,11 +65,7 @@ fn lerp2(a1: f32, a2: f32, x00: f32, x10: f32, x01: f32, x11: f32) -> f32 {
     lerp(a2, lerp(a1, x00, x10), lerp(a1, x01, x11))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lerp3(
-    a1: f32,
-    a2: f32,
-    a3: f32,
+struct Lerp3Values {
     x000: f32,
     x100: f32,
     x010: f32,
@@ -78,12 +74,24 @@ fn lerp3(
     x101: f32,
     x011: f32,
     x111: f32,
-) -> f32 {
+}
+
+fn lerp3(a1: f32, a2: f32, a3: f32, values: Lerp3Values) -> f32 {
     lerp(
         a3,
-        lerp2(a1, a2, x000, x100, x010, x110),
-        lerp2(a1, a2, x001, x101, x011, x111),
+        lerp2(a1, a2, values.x000, values.x100, values.x010, values.x110),
+        lerp2(a1, a2, values.x001, values.x101, values.x011, values.x111),
     )
+}
+
+struct SamplePoint {
+    x: i32,
+    y: i32,
+    z: i32,
+    relative_x: f32,
+    relative_y: f32,
+    relative_z: f32,
+    original_relative_y: f32,
 }
 
 #[derive(Clone)]
@@ -129,9 +137,15 @@ impl PerlinNoise {
         let relative_x = (x - floor_x as f64) as f32;
         let relative_y = (y - floor_y as f64) as f32;
         let relative_z = (z - floor_z as f64) as f32;
-        self.sample_and_lerp(
-            floor_x, floor_y, floor_z, relative_x, relative_y, relative_z, relative_y,
-        )
+        self.sample_and_lerp(SamplePoint {
+            x: floor_x,
+            y: floor_y,
+            z: floor_z,
+            relative_x,
+            relative_y,
+            relative_z,
+            original_relative_y: relative_y,
+        })
     }
 
     /// Point evaluation of the y-smeared Perlin variant used by the base-3D
@@ -148,32 +162,31 @@ impl PerlinNoise {
         let relative_y = y - floor_y as f64;
         let relative_z = (z - floor_z as f64) as f32;
         let fudged = (relative_y - compute_fudge_y(_y, relative_y, fudge_y_scale)) as f32;
-        self.sample_and_lerp(
-            floor_x,
-            floor_y,
-            floor_z,
+        self.sample_and_lerp(SamplePoint {
+            x: floor_x,
+            y: floor_y,
+            z: floor_z,
             relative_x,
-            fudged,
+            relative_y: fudged,
             relative_z,
-            relative_y as f32,
-        )
+            original_relative_y: relative_y as f32,
+        })
     }
 
     pub fn get_2d(&self, x: f64, y: f64) -> f32 {
         self.get(wrap(x), 0.0, wrap(y))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn sample_and_lerp(
-        &self,
-        x: i32,
-        y: i32,
-        z: i32,
-        relative_x: f32,
-        relative_y: f32,
-        relative_z: f32,
-        original_relative_y: f32,
-    ) -> f32 {
+    fn sample_and_lerp(&self, point: SamplePoint) -> f32 {
+        let SamplePoint {
+            x,
+            y,
+            z,
+            relative_x,
+            relative_y,
+            relative_z,
+            original_relative_y,
+        } = point;
         let x0 = self.permute(x);
         let x1 = self.permute(x.wrapping_add(1));
         let xy00 = self.permute(x0.wrapping_add(y));
@@ -232,14 +245,16 @@ impl PerlinNoise {
             smoothstep(relative_x),
             smoothstep(original_relative_y),
             smoothstep(relative_z),
-            d000,
-            d100,
-            d010,
-            d110,
-            d001,
-            d101,
-            d011,
-            d111,
+            Lerp3Values {
+                x000: d000,
+                x100: d100,
+                x010: d010,
+                x110: d110,
+                x001: d001,
+                x101: d101,
+                x011: d011,
+                x111: d111,
+            },
         )
     }
 }
