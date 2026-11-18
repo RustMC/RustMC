@@ -136,6 +136,9 @@ mod runtime_cli {
         time::Duration,
     };
 
+    // Guard timeout to bound a hung server process, not normal startup latency.
+    const SERVER_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+
     struct Running {
         child: Child,
         lines: Receiver<String>,
@@ -168,7 +171,7 @@ mod runtime_cli {
 
         fn wait_for(&self, text: &str) -> String {
             loop {
-                let line = self.lines.recv_timeout(Duration::from_secs(3)).unwrap();
+                let line = self.lines.recv_timeout(SERVER_LINE_TIMEOUT).unwrap();
                 if line.contains(text) {
                     return line;
                 }
