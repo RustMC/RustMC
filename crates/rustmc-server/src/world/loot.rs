@@ -1,8 +1,10 @@
-//! Typed block loot table model and runtime loader for Java 26.3 datapacks.
+//! Typed block and entity loot table model and runtime loader for Java 26.3 datapacks.
 //!
-//! Reads `data/<namespace>/loot_table/blocks/**/*.json` from an
+//! Reads `data/<namespace>/loot_table/blocks/**/*.json` or
+//! `data/<namespace>/loot_table/entities/**/*.json` from an
 //! operator-provisioned vanilla data root and resolves named predicate strings
-//! against `data/<namespace>/predicate/**/*.json`.
+//! against `data/<namespace>/predicate/**/*.json` as well as `loot_table`
+//! entry references against `data/<namespace>/loot_table/**/*.json`.
 //!
 //! Verified 26.3 block loot format facts (checked across all 1,201 vanilla
 //! block loot tables and 3 predicate files):
@@ -17,19 +19,42 @@
 //!   `location_check` occurs 4 times (`large_fern`, `tall_grass`, checking
 //!   `offsetY` ±1 with `predicate.block` `blocks` + `state`).
 //!
+//! Verified 26.3 entity loot format facts (checked across all 109 JSON files
+//! under `data/minecraft/loot_table/entities/**`: 93 top-level files plus 16
+//! `sheep/<color>.json` sub-tables):
+//! - Uses the same singular `condition` and `modifier` keys, optional `pools`
+//!   (30 entity tables omit `pools`), and pool-level `modifier` (`ghast`).
+//! - Entry types used: `item` (137), `loot_table` (18: `sheep` referencing
+//!   `minecraft:entities/sheep/*` and `guardian`/`elder_guardian` referencing
+//!   `minecraft:gameplay/fishing/fish` with type `minecraft:fishing`),
+//!   `empty` (3), `tag` (1 in `creeper`, using `"items": "#minecraft:creeper_drop_music_discs"`
+//!   and `"expand": true`), and `alternatives` (1). Singleton entries may carry `weight`.
+//! - Modifiers used: `set_count` (89), `enchanted_count_increase` (80, with
+//!   optional `limit`), `furnace_smelt` (19), `set_potion` (3), and
+//!   `set_ominous_bottle_amplifier` (1 in `pillager`, left `Unsupported`).
+//! - Conditions used: `entity_properties` (61, testing `this`, `attacker`,
+//!   `direct_attacker`), `killed_by_player` (24), `any_of` (19), `all_of` (13),
+//!   `random_chance_with_enchanted_bonus` (11, using `minecraft:linear`),
+//!   `damage_source_properties` (8), `random_chance` (4), and `inverted` (2).
+//!
 //! Schema definitions follow `minecraft.wiki`:
 //! - `Loot table` (revision 3893957): root fields `type`, `modifier`, `pools`,
 //!   `random_sequence`; pool fields `condition`, `modifier`, `rolls`, `entries`;
-//!   entry types `item`, `alternatives`, `dynamic`.
+//!   entry types `item`, `loot_table`, `empty`, `tag`, `alternatives`, `dynamic`,
+//!   and `weight`.
 //! - `Predicate` (revision 3888899): `all_of`, `any_of`, `inverted`,
 //!   `location_check` (with `Advancement/Conditions/location` revision 3684921 &
 //!   `Advancement/Conditions/block` revision 3684708), `match_block`,
-//!   `match_tool`, `random_chance`, `survives_explosion`, `table_bonus`,
-//!   `entity_properties`.
+//!   `match_tool`, `random_chance`, `random_chance_with_enchanted_bonus`,
+//!   `killed_by_player`, `survives_explosion`, `table_bonus`,
+//!   `entity_properties` (`Advancement/Conditions/entity` revision 3825655),
+//!   and `damage_source_properties` (`Advancement/Conditions/damage type` revision 3778836).
 //! - `Item modifier` (revision 3896146): `apply_bonus`, `copy_components`,
-//!   `copy_state`, `explosion_decay`, `limit_count`, `set_count`.
+//!   `copy_state`, `enchanted_count_increase`, `explosion_decay`,
+//!   `furnace_smelt`, `limit_count`, `set_count`, `set_potion`.
 //! - `Number provider` (revision 3869456): constant numbers, `uniform`, and
 //!   `binomial`.
+//! - `Enchantment definition` (revision 3843772): `Level-based value` (`linear`, etc.).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -46,7 +71,10 @@ use crate::vanilla::feature::{BlockTags, ItemTags};
 use crate::vanilla::random::RandomSource;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 
-/// Errors encountered while loading or parsing block loot tables.
+/// Maximum nesting depth allowed when resolving or evaluating `loot_table` entries.
+pub const MAX_LOOT_TABLE_DEPTH: usize = 32;
+
+/// Errors encountered while loading or parsing loot tables.
 #[derive(Debug)]
 pub enum LootError {
     /// Reading or parsing a JSON file failed.
@@ -58,6 +86,12 @@ pub enum LootError {
         table_file: PathBuf,
         predicate: String,
         predicate_file: PathBuf,
+    },
+    /// A loot table referenced another loot table id that does not exist.
+    MissingLootTable {
+        table_file: PathBuf,
+        loot_table: String,
+        loot_table_file: PathBuf,
     },
     /// A loot table or predicate file had invalid syntax, types, or unknown shape.
     Invalid { file: PathBuf, message: String },
@@ -77,6 +111,16 @@ impl fmt::Display for LootError {
                 "loot table {} references missing predicate `{predicate}` (expected {})",
                 table_file.display(),
                 predicate_file.display()
+            ),
+            Self::MissingLootTable {
+                table_file,
+                loot_table,
+                loot_table_file,
+            } => write!(
+                f,
+                "loot table {} references missing loot table `{loot_table}` (expected {})",
+                table_file.display(),
+                loot_table_file.display()
             ),
             Self::Invalid { file, message } => {
                 write!(f, "invalid loot table {}: {message}", file.display())
@@ -133,11 +177,117 @@ pub struct ToolPredicate {
     pub enchantments: Vec<EnchantmentPredicate>,
 }
 
+/// Enchantment level-based float calculation (`minecraft.wiki` `Enchantment definition`,
+/// revision `3843772`, `Level-based value`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LevelBasedValue {
+    /// Fixed constant independent of enchantment level.
+    Constant(f64),
+    /// `minecraft:linear` — `base + per_level_above_first * (level - 1)`.
+    Linear {
+        base: f64,
+        per_level_above_first: f64,
+    },
+    /// `minecraft:levels_squared` — `level^2 + added`.
+    LevelsSquared { added: f64 },
+    /// `minecraft:clamped` — clamps `value` to `[min, max]`.
+    Clamped {
+        value: Box<LevelBasedValue>,
+        min: f64,
+        max: f64,
+    },
+    /// `minecraft:fraction` — `numerator / denominator`.
+    Fraction {
+        numerator: Box<LevelBasedValue>,
+        denominator: Box<LevelBasedValue>,
+    },
+    /// `minecraft:exponent` — `base ^ power`.
+    Exponent {
+        base: Box<LevelBasedValue>,
+        power: Box<LevelBasedValue>,
+    },
+    /// `minecraft:lookup` — `values[level - 1]` or `fallback` when out of bounds.
+    Lookup {
+        values: Vec<f64>,
+        fallback: Box<LevelBasedValue>,
+    },
+}
+
+/// Inclusive integer range matcher (exact value or optional `min`/`max` bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IntRange {
+    /// Inclusive minimum bound, if specified.
+    pub min: Option<i32>,
+    /// Inclusive maximum bound, if specified.
+    pub max: Option<i32>,
+}
+
+/// Entity boolean flags checked by `minecraft:flags` inside `entity_properties`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EntityFlagsPredicate {
+    /// Matches whether the entity is on fire (`is_on_fire`).
+    pub is_on_fire: Option<bool>,
+    /// Matches whether the entity is a baby (`is_baby`).
+    pub is_baby: Option<bool>,
+}
+
+/// Entity equipment matcher checked by `minecraft:equipment` inside `entity_properties`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntityEquipmentPredicate {
+    /// Required predicate on the entity's `mainhand` item.
+    pub mainhand: Option<ToolPredicate>,
+}
+
+/// Typed entity predicate for the fields tested by vanilla entity loot tables.
+///
+/// Any unmodeled `entity_properties` predicate field causes the parser to emit
+/// [`LootCondition::Unsupported`] so coverage gaps remain visible.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntityPredicate {
+    /// `minecraft:flags` (`is_on_fire`, `is_baby`).
+    pub flags: Option<EntityFlagsPredicate>,
+    /// `minecraft:entity_type` (single id, id list, or `#`-prefixed tag).
+    pub entity_types: Vec<String>,
+    /// `minecraft:vehicle` (recursive predicate on mounted vehicle).
+    pub vehicle: Option<Box<EntityPredicate>>,
+    /// `minecraft:equipment` (`mainhand`).
+    pub equipment: Option<EntityEquipmentPredicate>,
+    /// `minecraft:components` exact string component checks (e.g. `minecraft:sheep/color`).
+    pub components: BTreeMap<String, String>,
+    /// `minecraft:type_specific/sheep.sheared`.
+    pub sheep_sheared: Option<bool>,
+    /// `minecraft:type_specific/cube_mob.size`.
+    pub cube_mob_size: Option<IntRange>,
+    /// `minecraft:type_specific/raider.is_captain`.
+    pub raider_is_captain: Option<bool>,
+}
+
+/// Damage type tag membership requirement inside `minecraft:damage_source_properties`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamageTypeTagPredicate {
+    /// Damage type id or `#`-prefixed damage type tag id (for example `"#minecraft:is_projectile"`).
+    pub id: String,
+    /// Whether the damage type is expected to match `id`.
+    pub expected: bool,
+}
+
+/// Typed damage-source predicate for the fields tested by vanilla entity loot tables.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DamageSourcePredicate {
+    /// `direct_entity` predicate.
+    pub direct_entity: Option<EntityPredicate>,
+    /// `source_entity` predicate.
+    pub source_entity: Option<EntityPredicate>,
+    /// `tags` membership checks (`id`, `expected`).
+    pub tags: Vec<DamageTypeTagPredicate>,
+}
+
 /// Predicate condition attached to pools, entries, or modifiers.
 ///
 /// Mirrors `minecraft.wiki` `Predicate` (revision 3888899). Unsupported
-/// condition types or unsupported `location_check` predicate fields are
-/// retained as [`LootCondition::Unsupported`] so callers can inspect coverage gaps.
+/// condition types or unsupported `location_check` / `entity_properties` /
+/// `damage_source_properties` predicate fields are retained as
+/// [`LootCondition::Unsupported`] so callers can inspect coverage gaps.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LootCondition {
     /// `minecraft:survives_explosion` — survival test under an explosion radius.
@@ -169,12 +319,25 @@ pub enum LootCondition {
     Inverted { term: Box<LootCondition> },
     /// `minecraft:random_chance` — fixed Bernoulli pass probability in `0.0..=1.0`.
     RandomChance { chance: f64 },
+    /// `minecraft:random_chance_with_enchanted_bonus` — Bernoulli pass probability
+    /// scaled by an enchantment on `attacker`.
+    RandomChanceWithEnchantedBonus {
+        enchantment: String,
+        unenchanted_chance: f64,
+        enchanted_chance: LevelBasedValue,
+    },
+    /// `minecraft:killed_by_player` — passes when `attacking_player` is present.
+    KilledByPlayer,
     /// `minecraft:match_tool` — checks breaking tool item/tag and enchantments.
     MatchTool { predicate: ToolPredicate },
     /// `minecraft:entity_properties` — checks entity context properties (`entity`, `predicate`).
     EntityProperties {
         entity: String,
-        predicate: BTreeMap<String, Value>,
+        predicate: Box<EntityPredicate>,
+    },
+    /// `minecraft:damage_source_properties` — checks damage source properties (`predicate`).
+    DamageSourceProperties {
+        predicate: Box<DamageSourcePredicate>,
     },
     /// Condition type without a typed runtime model.
     Unsupported { what: String },
@@ -202,6 +365,21 @@ pub enum LootModifier {
     SetCount {
         count: NumberProvider,
         add: bool,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:enchanted_count_increase` — adds `round(count * level)` items
+    /// based on `enchantment` on `attacker`, capped at `limit` when `limit > 0`.
+    EnchantedCountIncrease {
+        enchantment: String,
+        count: NumberProvider,
+        limit: u32,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:furnace_smelt` — smelts the dropped item via furnace smelting recipes.
+    FurnaceSmelt { conditions: Vec<LootCondition> },
+    /// `minecraft:set_potion` — sets the `minecraft:potion_contents` base potion id.
+    SetPotion {
+        id: String,
         conditions: Vec<LootCondition>,
     },
     /// `minecraft:explosion_decay` — reduces stack count during explosions.
@@ -239,6 +417,9 @@ impl LootModifier {
     fn conditions(&self) -> &[LootCondition] {
         match self {
             Self::SetCount { conditions, .. }
+            | Self::EnchantedCountIncrease { conditions, .. }
+            | Self::FurnaceSmelt { conditions }
+            | Self::SetPotion { conditions, .. }
             | Self::ExplosionDecay { conditions }
             | Self::ApplyBonus { conditions, .. }
             | Self::LimitCount { conditions, .. }
@@ -249,16 +430,53 @@ impl LootModifier {
     }
 }
 
+/// Target of a [`LootEntry::LootTable`] entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LootTableSource {
+    /// Reference to another loot table by namespaced id (resolved at load time).
+    Reference {
+        id: String,
+        table: Option<Arc<LootTable>>,
+    },
+    /// Inline loot table embedded directly inside the entry.
+    Inline(Box<LootTable>),
+}
+
 /// Entry inside a [`LootPool`].
 ///
 /// Mirrors `minecraft.wiki` `Loot table` (revision 3893957): `"alternatives —
 /// Extracts only the first successful (conditions are met) entry."`, `"item —
-/// Drops a single item stack."`, and `"dynamic — Drops block-specific loot."`
+/// Drops a single item stack."`, `"loot_table — Drops the loot from another
+/// loot table."`, `"empty — Drops nothing."`, `"tag"`, and `"dynamic — Drops
+/// block-specific loot."`
 #[derive(Debug, Clone, PartialEq)]
 pub enum LootEntry {
     /// `minecraft:item` — drops a single item stack.
     Item {
         name: String,
+        weight: u32,
+        conditions: Vec<LootCondition>,
+        modifiers: Vec<LootModifier>,
+    },
+    /// `minecraft:loot_table` — rolls another loot table (referenced by id or inline).
+    LootTable {
+        source: LootTableSource,
+        weight: u32,
+        conditions: Vec<LootCondition>,
+        modifiers: Vec<LootModifier>,
+    },
+    /// `minecraft:empty` — drops nothing.
+    Empty {
+        weight: u32,
+        conditions: Vec<LootCondition>,
+        modifiers: Vec<LootModifier>,
+    },
+    /// `minecraft:tag` — expands into one entry per tag item (`expand == true`)
+    /// or drops all tag items together (`expand == false`).
+    Tag {
+        tag: String,
+        expand: bool,
+        weight: u32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -271,6 +489,7 @@ pub enum LootEntry {
     /// `minecraft:dynamic` — block-specific dynamic drop (such as `minecraft:sherds`).
     Dynamic {
         name: String,
+        weight: u32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -296,6 +515,9 @@ impl LootEntry {
     fn conditions(&self) -> &[LootCondition] {
         match self {
             Self::Item { conditions, .. }
+            | Self::LootTable { conditions, .. }
+            | Self::Empty { conditions, .. }
+            | Self::Tag { conditions, .. }
             | Self::Alternatives { conditions, .. }
             | Self::Dynamic { conditions, .. } => conditions,
         }
@@ -634,25 +856,44 @@ impl LootTable {
     }
 }
 
-/// Loaded collection of block loot tables keyed by `<ns>:blocks/<path>`.
+/// Loaded collection of loot tables for one category (for example `blocks` or `entities`).
 #[derive(Debug, Clone, Default)]
 pub struct LootTables {
     tables: BTreeMap<String, LootTable>,
+    external_tables: BTreeMap<String, LootTable>,
     registries: LootRegistries,
 }
 
 impl PartialEq for LootTables {
     fn eq(&self, other: &Self) -> bool {
-        self.tables == other.tables
+        self.tables == other.tables && self.external_tables == other.external_tables
     }
 }
 
 impl LootTables {
     /// Loads every `data/<ns>/loot_table/blocks/**/*.json` file under `root`,
     /// resolves string condition references through `data/<ns>/predicate/**`,
-    /// and loads `ItemTags`, `BlockTags`, and optional `ItemDefaults` (when
+    /// resolves any `loot_table` entry references, and loads `ItemTags`,
+    /// `BlockTags`, and optional `ItemDefaults` (when
     /// `reports/minecraft/components/item` is present).
     pub fn load_blocks(root: &Path) -> Result<Self, LootError> {
+        Self::load_category(root, "blocks", Some("block"))
+    }
+
+    /// Loads every `data/<ns>/loot_table/entities/**/*.json` file under `root`
+    /// with table ids `<ns>:entities/<path>`, resolves predicate and
+    /// `loot_table` references (including external sub-tables such as
+    /// `minecraft:gameplay/fishing/fish`), and loads `ItemTags`, `BlockTags`,
+    /// and optional `ItemDefaults`.
+    pub fn load_entities(root: &Path) -> Result<Self, LootError> {
+        Self::load_category(root, "entities", Some("entity"))
+    }
+
+    fn load_category(
+        root: &Path,
+        category: &str,
+        expected_type: Option<&str>,
+    ) -> Result<Self, LootError> {
         let data_dir = root.join("data");
         let Some(namespaces) = read_dir_optional(&data_dir)? else {
             return Ok(Self::default());
@@ -695,39 +936,80 @@ impl LootTables {
             }
         }
 
-        let mut resolver = PredicateResolver {
+        let mut pred_resolver = PredicateResolver {
             root,
             paths: predicate_paths,
             cache: HashMap::new(),
         };
 
-        let mut tables = BTreeMap::new();
-        for ns_path in ns_dirs {
-            let ns = dir_name(&ns_path);
-            let blocks_dir = ns_path.join("loot_table").join("blocks");
-            for file in walk_json(&blocks_dir)? {
-                let id = format!("{ns}:blocks/{}", relative_stem(&file, &blocks_dir));
+        let mut raw_tables: HashMap<String, (PathBuf, LootTable)> = HashMap::new();
+        let mut ordered_ids = Vec::new();
+        for ns_path in &ns_dirs {
+            let ns = dir_name(ns_path);
+            let cat_dir = ns_path.join("loot_table").join(category);
+            for file in walk_json(&cat_dir)? {
+                let id = format!("{ns}:{category}/{}", relative_stem(&file, &cat_dir));
                 let value = read_json(&file)?;
-                let mut table = parse_loot_table(&value, &file, &mut resolver)?;
+                let mut table =
+                    parse_loot_table_inner(&value, &file, &mut pred_resolver, expected_type)?;
                 table.registries = registries.clone();
-                tables.insert(id, table);
+                ordered_ids.push(id.clone());
+                raw_tables.insert(id, (file, table));
             }
         }
 
-        Ok(Self { tables, registries })
+        let mut table_resolver = LootTableResolver {
+            root,
+            registries: &registries,
+            pred_resolver: &mut pred_resolver,
+            raw_category: raw_tables,
+            resolved_category: BTreeMap::new(),
+            external_cache: BTreeMap::new(),
+        };
+        let mut visiting = HashSet::new();
+        for id in ordered_ids {
+            table_resolver.resolve_category_id(&id, &mut visiting, 0)?;
+        }
+
+        let tables = table_resolver
+            .resolved_category
+            .into_iter()
+            .map(|(id, arc)| (id, (*arc).clone()))
+            .collect();
+        let external_tables = table_resolver
+            .external_cache
+            .into_iter()
+            .map(|(id, arc)| (id, (*arc).clone()))
+            .collect();
+
+        Ok(Self {
+            tables,
+            external_tables,
+            registries,
+        })
     }
 
-    /// Looks up the loot table for `block_id`.
+    /// Looks up the block loot table for `block_id`.
     ///
     /// Accepts `"minecraft:stone"`, `"stone"`, or `"minecraft:blocks/stone"`
     /// (and similarly `"ns:block"` or `"ns:blocks/block"` for custom namespaces).
     #[must_use]
     pub fn get(&self, block_id: &str) -> Option<&LootTable> {
-        let key = normalize_block_table_id(block_id);
+        let key = normalize_category_table_id(block_id, "blocks");
         self.tables.get(&key)
     }
 
-    /// Rolls the loot table for `block_id` if present, returning stacks and typed notes.
+    /// Looks up the entity loot table for `entity_id`.
+    ///
+    /// Accepts `"minecraft:cow"`, `"cow"`, or `"minecraft:entities/cow"`
+    /// (and similarly `"ns:mob"` or `"ns:entities/mob"` for custom namespaces).
+    #[must_use]
+    pub fn get_entity(&self, entity_id: &str) -> Option<&LootTable> {
+        let key = normalize_category_table_id(entity_id, "entities");
+        self.tables.get(&key)
+    }
+
+    /// Rolls the block loot table for `block_id` if present, returning stacks and typed notes.
     pub fn roll(
         &self,
         block_id: &str,
@@ -735,6 +1017,17 @@ impl LootTables {
         random: &mut RandomSource,
     ) -> Option<LootRoll> {
         self.get(block_id)
+            .map(|table| table.roll_with_notes(ctx, random))
+    }
+
+    /// Rolls the entity loot table for `entity_id` if present, returning stacks and typed notes.
+    pub fn roll_entity(
+        &self,
+        entity_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get_entity(entity_id)
             .map(|table| table.roll_with_notes(ctx, random))
     }
 
@@ -756,13 +1049,13 @@ impl LootTables {
         self.registries.item_defaults.as_deref()
     }
 
-    /// Returns the number of loaded block loot tables.
+    /// Returns the number of loaded primary loot tables.
     #[must_use]
     pub fn len(&self) -> usize {
         self.tables.len()
     }
 
-    /// Returns `true` when no block loot tables were loaded.
+    /// Returns `true` when no primary loot tables were loaded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
@@ -774,16 +1067,164 @@ impl LootTables {
     }
 
     /// Lists `(table_id, what)` for every [`LootCondition::Unsupported`] and
-    /// [`LootModifier::Unsupported`] node across all loaded tables.
+    /// [`LootModifier::Unsupported`] node across all loaded tables (including
+    /// any externally referenced sub-tables).
     #[must_use]
     pub fn unsupported(&self) -> Vec<(&str, &str)> {
         let mut out = Vec::new();
-        for (id, table) in &self.tables {
+        for (id, table) in self.tables.iter().chain(self.external_tables.iter()) {
             for what in table.unsupported() {
                 out.push((id.as_str(), what));
             }
         }
         out
+    }
+}
+
+struct LootTableResolver<'a> {
+    root: &'a Path,
+    registries: &'a LootRegistries,
+    pred_resolver: &'a mut PredicateResolver<'a>,
+    raw_category: HashMap<String, (PathBuf, LootTable)>,
+    resolved_category: BTreeMap<String, Arc<LootTable>>,
+    external_cache: BTreeMap<String, Arc<LootTable>>,
+}
+
+impl LootTableResolver<'_> {
+    fn resolve_category_id(
+        &mut self,
+        id: &str,
+        visiting: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<Arc<LootTable>, LootError> {
+        if let Some(existing) = self.resolved_category.get(id) {
+            return Ok(Arc::clone(existing));
+        }
+        let Some((file, mut table)) = self.raw_category.remove(id) else {
+            return Err(invalid(
+                Path::new(id),
+                format!("internal error resolving loot table `{id}`"),
+            ));
+        };
+        if depth > MAX_LOOT_TABLE_DEPTH {
+            return Err(invalid(
+                &file,
+                format!("loot_table nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+            ));
+        }
+        visiting.insert(id.to_owned());
+        let res = self.resolve_table(&mut table, &file, visiting, depth);
+        visiting.remove(id);
+        res?;
+        let arc = Arc::new(table);
+        self.resolved_category
+            .insert(id.to_owned(), Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    fn resolve_reference(
+        &mut self,
+        target_id: &str,
+        referrer_file: &Path,
+        visiting: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<Arc<LootTable>, LootError> {
+        let normalized = ensure_namespaced(target_id);
+        validate_resource_id(&normalized, "loot_table", referrer_file)?;
+        if depth > MAX_LOOT_TABLE_DEPTH {
+            return Err(invalid(
+                referrer_file,
+                format!("loot_table nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+            ));
+        }
+        if visiting.contains(&normalized) {
+            return Err(invalid(
+                referrer_file,
+                format!("cyclic loot_table reference `{normalized}`"),
+            ));
+        }
+        if let Some(existing) = self.resolved_category.get(&normalized) {
+            return Ok(Arc::clone(existing));
+        }
+        if let Some(existing) = self.external_cache.get(&normalized) {
+            return Ok(Arc::clone(existing));
+        }
+        if self.raw_category.contains_key(&normalized) {
+            return self.resolve_category_id(&normalized, visiting, depth);
+        }
+
+        let target_file = expected_loot_table_path(self.root, &normalized);
+        if !target_file.exists() {
+            return Err(LootError::MissingLootTable {
+                table_file: referrer_file.to_path_buf(),
+                loot_table: normalized,
+                loot_table_file: target_file,
+            });
+        }
+        let value = read_json(&target_file)?;
+        let mut table = parse_loot_table_inner(&value, &target_file, self.pred_resolver, None)?;
+        table.registries = self.registries.clone();
+        visiting.insert(normalized.clone());
+        let res = self.resolve_table(&mut table, &target_file, visiting, depth);
+        visiting.remove(&normalized);
+        res?;
+        let arc = Arc::new(table);
+        self.external_cache.insert(normalized, Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    fn resolve_table(
+        &mut self,
+        table: &mut LootTable,
+        file: &Path,
+        visiting: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), LootError> {
+        for pool in &mut table.pools {
+            for entry in &mut pool.entries {
+                self.resolve_entry(entry, file, visiting, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_entry(
+        &mut self,
+        entry: &mut LootEntry,
+        file: &Path,
+        visiting: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), LootError> {
+        match entry {
+            LootEntry::Alternatives { children, .. } => {
+                for child in children {
+                    self.resolve_entry(child, file, visiting, depth)?;
+                }
+            }
+            LootEntry::LootTable { source, .. } => match source {
+                LootTableSource::Reference { id, table } => {
+                    let resolved = self.resolve_reference(id, file, visiting, depth + 1)?;
+                    *id = ensure_namespaced(id);
+                    *table = Some(resolved);
+                }
+                LootTableSource::Inline(inline) => {
+                    if depth + 1 > MAX_LOOT_TABLE_DEPTH {
+                        return Err(invalid(
+                            file,
+                            format!(
+                                "loot_table nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"
+                            ),
+                        ));
+                    }
+                    self.resolve_table(inline, file, visiting, depth + 1)?;
+                }
+            },
+            LootEntry::Item { .. }
+            | LootEntry::Dynamic { .. }
+            | LootEntry::Empty { .. }
+            | LootEntry::Tag { .. } => {}
+        }
+        Ok(())
     }
 }
 
@@ -801,7 +1242,7 @@ impl PredicateResolver<'_> {
         stack: &mut HashSet<String>,
     ) -> Result<LootCondition, LootError> {
         let normalized = ensure_namespaced(id);
-        validate_predicate_id(&normalized, table_file)?;
+        validate_resource_id(&normalized, "predicate", table_file)?;
         if let Some(cached) = self.cache.get(&normalized) {
             return Ok(cached.clone());
         }
@@ -856,40 +1297,49 @@ fn ensure_namespaced(id: &str) -> String {
     }
 }
 
-fn normalize_block_table_id(block_id: &str) -> String {
-    if let Some((ns, path)) = block_id.split_once(':') {
-        if path.starts_with("blocks/") {
+fn normalize_category_table_id(id: &str, category: &str) -> String {
+    let prefix = format!("{category}/");
+    if let Some((ns, path)) = id.split_once(':') {
+        if path.starts_with(&prefix) {
             format!("{ns}:{path}")
         } else {
-            format!("{ns}:blocks/{path}")
+            format!("{ns}:{prefix}{path}")
         }
     } else {
-        format!("minecraft:blocks/{block_id}")
+        format!("minecraft:{prefix}{id}")
     }
 }
 
-fn validate_predicate_id(id: &str, file: &Path) -> Result<(), LootError> {
+fn validate_resource_id(id: &str, kind: &str, file: &Path) -> Result<(), LootError> {
     let Some((ns, path)) = id.split_once(':') else {
-        return Err(invalid(file, format!("invalid predicate id `{id}`")));
+        return Err(invalid(file, format!("invalid {kind} id `{id}`")));
     };
     if ns.is_empty()
         || path.is_empty()
         || ns.contains("..")
         || path.split('/').any(|seg| seg.is_empty() || seg == "..")
     {
-        return Err(invalid(file, format!("invalid predicate id `{id}`")));
+        return Err(invalid(file, format!("invalid {kind} id `{id}`")));
     }
     Ok(())
 }
 
-fn expected_predicate_path(root: &Path, id: &str) -> PathBuf {
+fn expected_resource_path(root: &Path, subdir: &str, id: &str) -> PathBuf {
     let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
-    let mut out = root.join("data").join(ns).join("predicate");
+    let mut out = root.join("data").join(ns).join(subdir);
     for segment in path.split('/') {
         out.push(segment);
     }
     out.set_extension("json");
     out
+}
+
+fn expected_predicate_path(root: &Path, id: &str) -> PathBuf {
+    expected_resource_path(root, "predicate", id)
+}
+
+fn expected_loot_table_path(root: &Path, id: &str) -> PathBuf {
+    expected_resource_path(root, "loot_table", id)
 }
 
 fn invalid(file: &Path, message: impl Into<String>) -> LootError {
@@ -999,10 +1449,11 @@ fn parse_i32(value: &Value, context: &str, file: &Path) -> Result<i32, LootError
         .map_err(|_| invalid(file, format!("integer {raw} overflows i32 in {context}")))
 }
 
-fn parse_loot_table(
+fn parse_loot_table_inner(
     value: &Value,
     file: &Path,
     resolver: &mut PredicateResolver<'_>,
+    expected_type: Option<&str>,
 ) -> Result<LootTable, LootError> {
     let obj = value
         .as_object()
@@ -1015,12 +1466,13 @@ fn parse_loot_table(
     )?;
 
     let table_type = optional_str(obj, "type", "loot table", file)?.map(str::to_owned);
-    if let Some(ref kind) = table_type
-        && normalize_item_id(kind) != "block"
+    if let Some(expected) = expected_type
+        && let Some(ref kind) = table_type
+        && normalize_item_id(kind) != expected
     {
         return Err(invalid(
             file,
-            format!("expected block loot table type, found `{kind}`"),
+            format!("expected {expected} loot table type, found `{kind}`"),
         ));
     }
     let random_sequence =
@@ -1074,7 +1526,7 @@ fn parse_pool(
         .ok_or_else(|| invalid(file, "loot pool missing or non-array `entries`"))?;
     let entries = raw_entries
         .iter()
-        .map(|entry| parse_entry(entry, file, resolver))
+        .map(|entry| parse_entry(entry, file, resolver, 0))
         .collect::<Result<Vec<_>, _>>()?;
 
     let conditions = parse_optional_conditions(obj.get("condition"), file, resolver)?;
@@ -1088,11 +1540,29 @@ fn parse_pool(
     })
 }
 
+fn parse_optional_weight(
+    obj: &Map<String, Value>,
+    context: &str,
+    file: &Path,
+) -> Result<u32, LootError> {
+    match obj.get("weight") {
+        None => Ok(1),
+        Some(v) => parse_u32(v, &format!("{context}.weight"), file),
+    }
+}
+
 fn parse_entry(
     value: &Value,
     file: &Path,
     resolver: &mut PredicateResolver<'_>,
+    depth: usize,
 ) -> Result<LootEntry, LootError> {
+    if depth > MAX_LOOT_TABLE_DEPTH {
+        return Err(invalid(
+            file,
+            format!("loot entry nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+        ));
+    }
     let obj = value
         .as_object()
         .ok_or_else(|| invalid(file, "loot entry must be a JSON object"))?;
@@ -1104,13 +1574,111 @@ fn parse_entry(
         "item" => {
             check_allowed_keys(
                 obj,
-                &["type", "name", "condition", "modifier"],
+                &["type", "name", "weight", "condition", "modifier"],
                 "item entry",
                 file,
             )?;
             let name = required_str(obj, "name", "item entry", file)?.to_owned();
+            let weight = parse_optional_weight(obj, "item entry", file)?;
             Ok(LootEntry::Item {
                 name,
+                weight,
+                conditions,
+                modifiers,
+            })
+        }
+        "loot_table" => {
+            check_allowed_keys(
+                obj,
+                &["type", "value", "weight", "condition", "modifier"],
+                "loot_table entry",
+                file,
+            )?;
+            let weight = parse_optional_weight(obj, "loot_table entry", file)?;
+            let raw_value = obj
+                .get("value")
+                .ok_or_else(|| invalid(file, "loot_table entry missing `value`"))?;
+            let source = match raw_value {
+                Value::String(id) => {
+                    let normalized = ensure_namespaced(id);
+                    validate_resource_id(&normalized, "loot_table", file)?;
+                    LootTableSource::Reference {
+                        id: normalized,
+                        table: None,
+                    }
+                }
+                Value::Object(_) => LootTableSource::Inline(Box::new(parse_loot_table_inner(
+                    raw_value, file, resolver, None,
+                )?)),
+                _ => {
+                    return Err(invalid(
+                        file,
+                        "loot_table `value` must be a string id or inline loot table object",
+                    ));
+                }
+            };
+            Ok(LootEntry::LootTable {
+                source,
+                weight,
+                conditions,
+                modifiers,
+            })
+        }
+        "empty" => {
+            check_allowed_keys(
+                obj,
+                &["type", "weight", "condition", "modifier"],
+                "empty entry",
+                file,
+            )?;
+            let weight = parse_optional_weight(obj, "empty entry", file)?;
+            Ok(LootEntry::Empty {
+                weight,
+                conditions,
+                modifiers,
+            })
+        }
+        "tag" => {
+            check_allowed_keys(
+                obj,
+                &[
+                    "type",
+                    "items",
+                    "name",
+                    "expand",
+                    "weight",
+                    "condition",
+                    "modifier",
+                ],
+                "tag entry",
+                file,
+            )?;
+            let raw_tag = match (obj.get("items"), obj.get("name")) {
+                (Some(v), None) | (None, Some(v)) => v
+                    .as_str()
+                    .ok_or_else(|| invalid(file, "tag entry item tag must be a string"))?,
+                (Some(_), Some(_)) => {
+                    return Err(invalid(
+                        file,
+                        "tag entry cannot specify both `items` and `name`",
+                    ));
+                }
+                (None, None) => {
+                    return Err(invalid(file, "tag entry missing `items` or `name`"));
+                }
+            };
+            let stripped = raw_tag.strip_prefix('#').unwrap_or(raw_tag);
+            let tag = ensure_namespaced(stripped);
+            validate_resource_id(&tag, "tag", file)?;
+            let expand = obj
+                .get("expand")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid(file, "tag entry missing or non-boolean `expand`"))?;
+            let weight = parse_optional_weight(obj, "tag entry", file)?;
+            Ok(LootEntry::Tag {
+                tag,
+                expand,
+                weight,
                 conditions,
                 modifiers,
             })
@@ -1130,7 +1698,7 @@ fn parse_entry(
                 })?;
             let children = raw_children
                 .iter()
-                .map(|child| parse_entry(child, file, resolver))
+                .map(|child| parse_entry(child, file, resolver, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(LootEntry::Alternatives {
                 children,
@@ -1141,13 +1709,15 @@ fn parse_entry(
         "dynamic" => {
             check_allowed_keys(
                 obj,
-                &["type", "name", "condition", "modifier"],
+                &["type", "name", "weight", "condition", "modifier"],
                 "dynamic entry",
                 file,
             )?;
             let name = required_str(obj, "name", "dynamic entry", file)?.to_owned();
+            let weight = parse_optional_weight(obj, "dynamic entry", file)?;
             Ok(LootEntry::Dynamic {
                 name,
+                weight,
                 conditions,
                 modifiers,
             })
@@ -1291,9 +1861,15 @@ fn parse_single_condition(
             let chance = parse_probability(raw_chance, "random_chance.chance", file)?;
             Ok(LootCondition::RandomChance { chance })
         }
+        "random_chance_with_enchanted_bonus" => parse_random_chance_with_enchanted_bonus(obj, file),
+        "killed_by_player" => {
+            check_allowed_keys(obj, &["type"], "killed_by_player condition", file)?;
+            Ok(LootCondition::KilledByPlayer)
+        }
         "match_tool" => parse_match_tool(obj, file),
         "location_check" => parse_location_check(obj, kind, file),
-        "entity_properties" => parse_entity_properties(obj, file),
+        "entity_properties" => parse_entity_properties(obj, kind, file),
+        "damage_source_properties" => parse_damage_source_properties(obj, kind, file),
         _ => Ok(LootCondition::Unsupported {
             what: kind.to_owned(),
         }),
@@ -1446,43 +2022,50 @@ fn parse_composite_condition(
     }
 }
 
-fn parse_match_tool(obj: &Map<String, Value>, file: &Path) -> Result<LootCondition, LootError> {
-    check_allowed_keys(obj, &["type", "predicate"], "match_tool condition", file)?;
-    let pred_obj = obj
-        .get("predicate")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid(file, "match_tool missing or non-object `predicate`"))?;
-    check_allowed_keys(
-        pred_obj,
-        &["items", "predicates"],
-        "match_tool.predicate",
-        file,
-    )?;
+fn parse_tool_predicate_fields(
+    pred_obj: &Map<String, Value>,
+    context: &str,
+    reject_unknown_keys: bool,
+    file: &Path,
+) -> Result<Option<ToolPredicate>, LootError> {
+    for key in pred_obj.keys() {
+        if key != "items" && key != "predicates" {
+            if reject_unknown_keys {
+                return Err(invalid(
+                    file,
+                    format!("unexpected key `{key}` in {context}"),
+                ));
+            }
+            return Ok(None);
+        }
+    }
 
     let items = match pred_obj.get("items") {
         None => Vec::new(),
-        Some(raw_items) => parse_string_or_list(raw_items, "match_tool.predicate.items", file)?,
+        Some(raw_items) => parse_string_or_list(raw_items, &format!("{context}.items"), file)?,
     };
 
     let mut enchantments = Vec::new();
     if let Some(raw_preds) = pred_obj.get("predicates") {
-        let preds_obj = raw_preds.as_object().ok_or_else(|| {
-            invalid(
-                file,
-                "match_tool.predicate.predicates must be a JSON object",
-            )
-        })?;
-        check_allowed_keys(
-            preds_obj,
-            &["minecraft:enchantments"],
-            "match_tool.predicate.predicates",
-            file,
-        )?;
+        let preds_obj = raw_preds
+            .as_object()
+            .ok_or_else(|| invalid(file, format!("{context}.predicates must be a JSON object")))?;
+        for key in preds_obj.keys() {
+            if key != "minecraft:enchantments" {
+                if reject_unknown_keys {
+                    return Err(invalid(
+                        file,
+                        format!("unexpected key `{key}` in {context}.predicates"),
+                    ));
+                }
+                return Ok(None);
+            }
+        }
         if let Some(raw_enchs) = preds_obj.get("minecraft:enchantments") {
             let ench_arr = raw_enchs.as_array().ok_or_else(|| {
                 invalid(
                     file,
-                    "match_tool.predicate.predicates.minecraft:enchantments must be an array",
+                    format!("{context}.predicates.minecraft:enchantments must be an array"),
                 )
             })?;
             for entry in ench_arr {
@@ -1491,12 +2074,21 @@ fn parse_match_tool(obj: &Map<String, Value>, file: &Path) -> Result<LootConditi
         }
     }
 
-    Ok(LootCondition::MatchTool {
-        predicate: ToolPredicate {
-            items,
-            enchantments,
-        },
-    })
+    Ok(Some(ToolPredicate {
+        items,
+        enchantments,
+    }))
+}
+
+fn parse_match_tool(obj: &Map<String, Value>, file: &Path) -> Result<LootCondition, LootError> {
+    check_allowed_keys(obj, &["type", "predicate"], "match_tool condition", file)?;
+    let pred_obj = obj
+        .get("predicate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "match_tool missing or non-object `predicate`"))?;
+    let predicate = parse_tool_predicate_fields(pred_obj, "match_tool.predicate", true, file)?
+        .ok_or_else(|| invalid(file, "unexpected key in match_tool.predicate"))?;
+    Ok(LootCondition::MatchTool { predicate })
 }
 
 fn parse_enchantment_predicate(
@@ -1556,8 +2148,168 @@ fn parse_enchantment_predicate(
     })
 }
 
+fn parse_int_range(value: &Value, context: &str, file: &Path) -> Result<IntRange, LootError> {
+    if value.is_i64() {
+        let exact = parse_i32(value, context, file)?;
+        return Ok(IntRange {
+            min: Some(exact),
+            max: Some(exact),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid(file, format!("{context} must be an integer or object")))?;
+    check_allowed_keys(obj, &["min", "max"], context, file)?;
+    let min = match obj.get("min") {
+        None => None,
+        Some(v) => Some(parse_i32(v, &format!("{context}.min"), file)?),
+    };
+    let max = match obj.get("max") {
+        None => None,
+        Some(v) => Some(parse_i32(v, &format!("{context}.max"), file)?),
+    };
+    Ok(IntRange { min, max })
+}
+
+fn parse_bool_field(
+    obj: &Map<String, Value>,
+    key: &str,
+    context: &str,
+    file: &Path,
+) -> Result<Option<bool>, LootError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| invalid(file, format!("{context}.{key} must be a boolean"))),
+    }
+}
+
+fn parse_entity_predicate(
+    pred_obj: &Map<String, Value>,
+    file: &Path,
+    depth: usize,
+) -> Result<Option<EntityPredicate>, LootError> {
+    if depth > MAX_LOOT_TABLE_DEPTH {
+        return Err(invalid(
+            file,
+            format!("entity predicate nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+        ));
+    }
+    let mut out = EntityPredicate::default();
+    for (key, value) in pred_obj {
+        match normalize_item_id(key) {
+            "flags" => {
+                let flags_obj = value
+                    .as_object()
+                    .ok_or_else(|| invalid(file, "entity predicate `flags` must be an object"))?;
+                if flags_obj
+                    .keys()
+                    .any(|k| k != "is_on_fire" && k != "is_baby")
+                {
+                    return Ok(None);
+                }
+                out.flags = Some(EntityFlagsPredicate {
+                    is_on_fire: parse_bool_field(flags_obj, "is_on_fire", "flags", file)?,
+                    is_baby: parse_bool_field(flags_obj, "is_baby", "flags", file)?,
+                });
+            }
+            "entity_type" => {
+                out.entity_types = parse_string_or_list(value, "entity_type", file)?;
+            }
+            "vehicle" => {
+                let veh_obj = value.as_object().ok_or_else(|| {
+                    invalid(file, "entity predicate `vehicle` must be a JSON object")
+                })?;
+                let Some(veh_pred) = parse_entity_predicate(veh_obj, file, depth + 1)? else {
+                    return Ok(None);
+                };
+                out.vehicle = Some(Box::new(veh_pred));
+            }
+            "equipment" => {
+                let eq_obj = value.as_object().ok_or_else(|| {
+                    invalid(file, "entity predicate `equipment` must be a JSON object")
+                })?;
+                if eq_obj.keys().any(|k| k != "mainhand") {
+                    return Ok(None);
+                }
+                let mainhand = match eq_obj.get("mainhand") {
+                    None => None,
+                    Some(raw_hand) => {
+                        let hand_obj = raw_hand.as_object().ok_or_else(|| {
+                            invalid(file, "equipment `mainhand` must be a JSON object")
+                        })?;
+                        let Some(tool_pred) = parse_tool_predicate_fields(
+                            hand_obj,
+                            "equipment.mainhand",
+                            false,
+                            file,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        Some(tool_pred)
+                    }
+                };
+                out.equipment = Some(EntityEquipmentPredicate { mainhand });
+            }
+            "components" => {
+                let comp_obj = value.as_object().ok_or_else(|| {
+                    invalid(file, "entity predicate `components` must be a JSON object")
+                })?;
+                for (comp_key, comp_val) in comp_obj {
+                    let Some(val_str) = comp_val.as_str() else {
+                        return Ok(None);
+                    };
+                    out.components
+                        .insert(ensure_namespaced(comp_key), val_str.to_owned());
+                }
+            }
+            "type_specific/sheep" => {
+                let sheep_obj = value
+                    .as_object()
+                    .ok_or_else(|| invalid(file, "type_specific/sheep must be a JSON object"))?;
+                if sheep_obj.keys().any(|k| k != "sheared") {
+                    return Ok(None);
+                }
+                out.sheep_sheared =
+                    parse_bool_field(sheep_obj, "sheared", "type_specific/sheep", file)?;
+            }
+            "type_specific/cube_mob" => {
+                let cube_obj = value
+                    .as_object()
+                    .ok_or_else(|| invalid(file, "type_specific/cube_mob must be a JSON object"))?;
+                if cube_obj.keys().any(|k| k != "size") {
+                    return Ok(None);
+                }
+                if let Some(size_val) = cube_obj.get("size") {
+                    out.cube_mob_size = Some(parse_int_range(
+                        size_val,
+                        "type_specific/cube_mob.size",
+                        file,
+                    )?);
+                }
+            }
+            "type_specific/raider" => {
+                let raider_obj = value
+                    .as_object()
+                    .ok_or_else(|| invalid(file, "type_specific/raider must be a JSON object"))?;
+                if raider_obj.keys().any(|k| k != "is_captain") {
+                    return Ok(None);
+                }
+                out.raider_is_captain =
+                    parse_bool_field(raider_obj, "is_captain", "type_specific/raider", file)?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
 fn parse_entity_properties(
     obj: &Map<String, Value>,
+    kind: &str,
     file: &Path,
 ) -> Result<LootCondition, LootError> {
     check_allowed_keys(
@@ -1566,16 +2318,338 @@ fn parse_entity_properties(
         "entity_properties condition",
         file,
     )?;
-    let entity = required_str(obj, "entity", "entity_properties condition", file)?.to_owned();
+    let entity = required_str(obj, "entity", "entity_properties condition", file)?;
+    if !matches!(
+        entity,
+        "this"
+            | "attacker"
+            | "direct_attacker"
+            | "attacking_player"
+            | "target_entity"
+            | "interacting_entity"
+    ) {
+        return Err(invalid(
+            file,
+            format!("unknown entity target `{entity}` in entity_properties"),
+        ));
+    }
     let pred_obj = obj
         .get("predicate")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(file, "entity_properties missing or non-object `predicate`"))?;
-    let predicate = pred_obj
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    Ok(LootCondition::EntityProperties { entity, predicate })
+    let Some(predicate) = parse_entity_predicate(pred_obj, file, 0)? else {
+        return Ok(LootCondition::Unsupported {
+            what: kind.to_owned(),
+        });
+    };
+    Ok(LootCondition::EntityProperties {
+        entity: entity.to_owned(),
+        predicate: Box::new(predicate),
+    })
+}
+
+fn parse_damage_source_properties(
+    obj: &Map<String, Value>,
+    kind: &str,
+    file: &Path,
+) -> Result<LootCondition, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "predicate"],
+        "damage_source_properties condition",
+        file,
+    )?;
+    let pred_obj = obj
+        .get("predicate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(
+                file,
+                "damage_source_properties missing or non-object `predicate`",
+            )
+        })?;
+    let mut out = DamageSourcePredicate::default();
+    for (key, value) in pred_obj {
+        match key.as_str() {
+            "direct_entity" => {
+                let ent_obj = value.as_object().ok_or_else(|| {
+                    invalid(
+                        file,
+                        "damage_source_properties `direct_entity` must be an object",
+                    )
+                })?;
+                let Some(ent_pred) = parse_entity_predicate(ent_obj, file, 0)? else {
+                    return Ok(LootCondition::Unsupported {
+                        what: kind.to_owned(),
+                    });
+                };
+                out.direct_entity = Some(ent_pred);
+            }
+            "source_entity" => {
+                let ent_obj = value.as_object().ok_or_else(|| {
+                    invalid(
+                        file,
+                        "damage_source_properties `source_entity` must be an object",
+                    )
+                })?;
+                let Some(ent_pred) = parse_entity_predicate(ent_obj, file, 0)? else {
+                    return Ok(LootCondition::Unsupported {
+                        what: kind.to_owned(),
+                    });
+                };
+                out.source_entity = Some(ent_pred);
+            }
+            "tags" => {
+                let arr = value.as_array().ok_or_else(|| {
+                    invalid(file, "damage_source_properties `tags` must be an array")
+                })?;
+                for item in arr {
+                    let tag_obj = item.as_object().ok_or_else(|| {
+                        invalid(
+                            file,
+                            "damage_source_properties tag entry must be a JSON object",
+                        )
+                    })?;
+                    check_allowed_keys(
+                        tag_obj,
+                        &["id", "expected"],
+                        "damage_source_properties tag",
+                        file,
+                    )?;
+                    let id = required_str(tag_obj, "id", "damage_source_properties tag", file)?
+                        .to_owned();
+                    let expected = tag_obj
+                        .get("expected")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| {
+                            invalid(
+                                file,
+                                "damage_source_properties tag missing or non-boolean `expected`",
+                            )
+                        })?;
+                    out.tags.push(DamageTypeTagPredicate { id, expected });
+                }
+            }
+            _ => {
+                return Ok(LootCondition::Unsupported {
+                    what: kind.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(LootCondition::DamageSourceProperties {
+        predicate: Box::new(out),
+    })
+}
+
+fn parse_level_based_value(
+    value: &Value,
+    file: &Path,
+    depth: usize,
+) -> Result<LevelBasedValue, LootError> {
+    if depth > MAX_LOOT_TABLE_DEPTH {
+        return Err(invalid(
+            file,
+            format!("level-based value nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+        ));
+    }
+    if value.is_number() {
+        return Ok(LevelBasedValue::Constant(parse_finite_f64(
+            value,
+            "constant level-based value",
+            file,
+        )?));
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid(file, "level-based value must be a number or JSON object"))?;
+    let kind = required_str(obj, "type", "level-based value", file)?;
+    match normalize_item_id(kind) {
+        "constant" => {
+            check_allowed_keys(obj, &["type", "value"], "constant level-based value", file)?;
+            let raw = obj
+                .get("value")
+                .ok_or_else(|| invalid(file, "constant level-based value missing `value`"))?;
+            Ok(LevelBasedValue::Constant(parse_finite_f64(
+                raw,
+                "constant.value",
+                file,
+            )?))
+        }
+        "linear" => {
+            check_allowed_keys(
+                obj,
+                &["type", "base", "per_level_above_first"],
+                "linear level-based value",
+                file,
+            )?;
+            let raw_base = obj
+                .get("base")
+                .ok_or_else(|| invalid(file, "linear level-based value missing `base`"))?;
+            let raw_step = obj.get("per_level_above_first").ok_or_else(|| {
+                invalid(
+                    file,
+                    "linear level-based value missing `per_level_above_first`",
+                )
+            })?;
+            Ok(LevelBasedValue::Linear {
+                base: parse_finite_f64(raw_base, "linear.base", file)?,
+                per_level_above_first: parse_finite_f64(
+                    raw_step,
+                    "linear.per_level_above_first",
+                    file,
+                )?,
+            })
+        }
+        "levels_squared" => {
+            check_allowed_keys(
+                obj,
+                &["type", "added"],
+                "levels_squared level-based value",
+                file,
+            )?;
+            let raw_added = obj
+                .get("added")
+                .ok_or_else(|| invalid(file, "levels_squared level-based value missing `added`"))?;
+            Ok(LevelBasedValue::LevelsSquared {
+                added: parse_finite_f64(raw_added, "levels_squared.added", file)?,
+            })
+        }
+        "clamped" => {
+            check_allowed_keys(
+                obj,
+                &["type", "value", "min", "max"],
+                "clamped level-based value",
+                file,
+            )?;
+            let raw_val = obj
+                .get("value")
+                .ok_or_else(|| invalid(file, "clamped level-based value missing `value`"))?;
+            let raw_min = obj
+                .get("min")
+                .ok_or_else(|| invalid(file, "clamped level-based value missing `min`"))?;
+            let raw_max = obj
+                .get("max")
+                .ok_or_else(|| invalid(file, "clamped level-based value missing `max`"))?;
+            Ok(LevelBasedValue::Clamped {
+                value: Box::new(parse_level_based_value(raw_val, file, depth + 1)?),
+                min: parse_finite_f64(raw_min, "clamped.min", file)?,
+                max: parse_finite_f64(raw_max, "clamped.max", file)?,
+            })
+        }
+        "fraction" => {
+            check_allowed_keys(
+                obj,
+                &["type", "numerator", "denominator"],
+                "fraction level-based value",
+                file,
+            )?;
+            let raw_num = obj
+                .get("numerator")
+                .ok_or_else(|| invalid(file, "fraction level-based value missing `numerator`"))?;
+            let raw_den = obj
+                .get("denominator")
+                .ok_or_else(|| invalid(file, "fraction level-based value missing `denominator`"))?;
+            Ok(LevelBasedValue::Fraction {
+                numerator: Box::new(parse_level_based_value(raw_num, file, depth + 1)?),
+                denominator: Box::new(parse_level_based_value(raw_den, file, depth + 1)?),
+            })
+        }
+        "exponent" => {
+            check_allowed_keys(
+                obj,
+                &["type", "base", "power"],
+                "exponent level-based value",
+                file,
+            )?;
+            let raw_base = obj
+                .get("base")
+                .ok_or_else(|| invalid(file, "exponent level-based value missing `base`"))?;
+            let raw_power = obj
+                .get("power")
+                .ok_or_else(|| invalid(file, "exponent level-based value missing `power`"))?;
+            Ok(LevelBasedValue::Exponent {
+                base: Box::new(parse_level_based_value(raw_base, file, depth + 1)?),
+                power: Box::new(parse_level_based_value(raw_power, file, depth + 1)?),
+            })
+        }
+        "lookup" => {
+            check_allowed_keys(
+                obj,
+                &["type", "values", "fallback"],
+                "lookup level-based value",
+                file,
+            )?;
+            let raw_vals = obj.get("values").and_then(Value::as_array).ok_or_else(|| {
+                invalid(
+                    file,
+                    "lookup level-based value missing or non-array `values`",
+                )
+            })?;
+            let values = raw_vals
+                .iter()
+                .map(|v| parse_finite_f64(v, "lookup.values", file))
+                .collect::<Result<Vec<_>, _>>()?;
+            let raw_fallback = obj
+                .get("fallback")
+                .ok_or_else(|| invalid(file, "lookup level-based value missing `fallback`"))?;
+            Ok(LevelBasedValue::Lookup {
+                values,
+                fallback: Box::new(parse_level_based_value(raw_fallback, file, depth + 1)?),
+            })
+        }
+        _ => Err(invalid(
+            file,
+            format!("unknown level-based value type `{kind}`"),
+        )),
+    }
+}
+
+fn parse_random_chance_with_enchanted_bonus(
+    obj: &Map<String, Value>,
+    file: &Path,
+) -> Result<LootCondition, LootError> {
+    check_allowed_keys(
+        obj,
+        &[
+            "type",
+            "enchantment",
+            "unenchanted_chance",
+            "enchanted_chance",
+        ],
+        "random_chance_with_enchanted_bonus condition",
+        file,
+    )?;
+    let enchantment = required_str(
+        obj,
+        "enchantment",
+        "random_chance_with_enchanted_bonus condition",
+        file,
+    )?
+    .to_owned();
+    let raw_unenchanted = obj.get("unenchanted_chance").ok_or_else(|| {
+        invalid(
+            file,
+            "random_chance_with_enchanted_bonus missing `unenchanted_chance`",
+        )
+    })?;
+    let unenchanted_chance = parse_probability(
+        raw_unenchanted,
+        "random_chance_with_enchanted_bonus.unenchanted_chance",
+        file,
+    )?;
+    let raw_enchanted = obj.get("enchanted_chance").ok_or_else(|| {
+        invalid(
+            file,
+            "random_chance_with_enchanted_bonus missing `enchanted_chance`",
+        )
+    })?;
+    let enchanted_chance = parse_level_based_value(raw_enchanted, file, 0)?;
+    Ok(LootCondition::RandomChanceWithEnchantedBonus {
+        enchantment,
+        unenchanted_chance,
+        enchanted_chance,
+    })
 }
 
 fn parse_optional_modifiers(
@@ -1633,6 +2707,49 @@ fn parse_single_modifier(
                 add,
                 conditions,
             })
+        }
+        "enchanted_count_increase" => {
+            check_allowed_keys(
+                obj,
+                &["type", "enchantment", "count", "limit", "condition"],
+                "enchanted_count_increase modifier",
+                file,
+            )?;
+            let enchantment = required_str(
+                obj,
+                "enchantment",
+                "enchanted_count_increase modifier",
+                file,
+            )?
+            .to_owned();
+            let raw_count = obj.get("count").ok_or_else(|| {
+                invalid(file, "enchanted_count_increase modifier missing `count`")
+            })?;
+            let count = parse_number_provider(raw_count, file)?;
+            let limit = match obj.get("limit") {
+                None => 0,
+                Some(v) => parse_u32(v, "enchanted_count_increase.limit", file)?,
+            };
+            Ok(LootModifier::EnchantedCountIncrease {
+                enchantment,
+                count,
+                limit,
+                conditions,
+            })
+        }
+        "furnace_smelt" => {
+            check_allowed_keys(obj, &["type", "condition"], "furnace_smelt modifier", file)?;
+            Ok(LootModifier::FurnaceSmelt { conditions })
+        }
+        "set_potion" => {
+            check_allowed_keys(
+                obj,
+                &["type", "id", "condition"],
+                "set_potion modifier",
+                file,
+            )?;
+            let id = required_str(obj, "id", "set_potion modifier", file)?.to_owned();
+            Ok(LootModifier::SetPotion { id, conditions })
         }
         "explosion_decay" => {
             check_allowed_keys(
@@ -1866,8 +2983,11 @@ fn collect_unsupported_condition<'a>(condition: &'a LootCondition, out: &mut Vec
         | LootCondition::LocationCheck { .. }
         | LootCondition::TableBonus { .. }
         | LootCondition::RandomChance { .. }
+        | LootCondition::RandomChanceWithEnchantedBonus { .. }
+        | LootCondition::KilledByPlayer
         | LootCondition::MatchTool { .. }
-        | LootCondition::EntityProperties { .. } => {}
+        | LootCondition::EntityProperties { .. }
+        | LootCondition::DamageSourceProperties { .. } => {}
     }
 }
 
@@ -1887,6 +3007,16 @@ fn collect_unsupported_entry<'a>(entry: &'a LootEntry, out: &mut Vec<&'a str>) {
             modifiers,
             ..
         }
+        | LootEntry::Empty {
+            conditions,
+            modifiers,
+            ..
+        }
+        | LootEntry::Tag {
+            conditions,
+            modifiers,
+            ..
+        }
         | LootEntry::Dynamic {
             conditions,
             modifiers,
@@ -1897,6 +3027,22 @@ fn collect_unsupported_entry<'a>(entry: &'a LootEntry, out: &mut Vec<&'a str>) {
             }
             for modifier in modifiers {
                 collect_unsupported_modifier(modifier, out);
+            }
+        }
+        LootEntry::LootTable {
+            source,
+            conditions,
+            modifiers,
+            ..
+        } => {
+            for condition in conditions {
+                collect_unsupported_condition(condition, out);
+            }
+            for modifier in modifiers {
+                collect_unsupported_modifier(modifier, out);
+            }
+            if let LootTableSource::Inline(inline) = source {
+                out.extend(inline.unsupported());
             }
         }
         LootEntry::Alternatives {
@@ -1961,6 +3107,7 @@ fn expand_entry<'a>(
             });
             true
         }
+        LootEntry::LootTable { .. } | LootEntry::Empty { .. } | LootEntry::Tag { .. } => false,
         LootEntry::Alternatives {
             children,
             modifiers,
@@ -2029,7 +3176,11 @@ fn eval_condition(condition: &LootCondition, ctx: &EvalCtx<'_>, random: &mut Ran
         LootCondition::RandomChance { chance } => sample_probability(*chance, random),
         LootCondition::MatchTool { predicate } => match_tool(predicate, ctx),
         // Reviewer decision: with no entity in LootContext, entity_properties is false.
-        LootCondition::EntityProperties { .. } | LootCondition::Unsupported { .. } => false,
+        LootCondition::EntityProperties { .. }
+        | LootCondition::DamageSourceProperties { .. }
+        | LootCondition::RandomChanceWithEnchantedBonus { .. }
+        | LootCondition::KilledByPlayer
+        | LootCondition::Unsupported { .. } => false,
     }
 }
 
@@ -2204,6 +3355,9 @@ fn apply_modifier(
                 properties: properties.clone(),
             });
         }
+        LootModifier::EnchantedCountIncrease { .. }
+        | LootModifier::FurnaceSmelt { .. }
+        | LootModifier::SetPotion { .. } => {}
         LootModifier::Unsupported { what } => {
             notes.push(LootNote::UnsupportedModifier {
                 item: ensure_namespaced(item_name),
@@ -2540,6 +3694,7 @@ mod tests {
             gadget.pools[0].entries[0],
             LootEntry::Item {
                 name: "testns:gadget".to_owned(),
+                weight: 1,
                 conditions: vec![LootCondition::MatchTool {
                     predicate: ToolPredicate {
                         items: vec!["testns:wrench".to_owned()],
@@ -2731,6 +3886,7 @@ mod tests {
             listy.pools[0].entries[0],
             LootEntry::Item {
                 name: "testns:listy".to_owned(),
+                weight: 1,
                 conditions: Vec::new(),
                 modifiers: vec![LootModifier::LimitCount {
                     min: Some(3),
@@ -4226,5 +5382,310 @@ mod tests {
         assert_eq!(fern_drops.len(), 1);
         assert_eq!(fern_drops[0].item(), "minecraft:fern");
         assert_eq!(fern_drops[0].count(), 2);
+    }
+
+    #[test]
+    fn parses_entity_loot_entries_conditions_modifiers_and_resolves_references() {
+        let root = scratch_root("entity_model");
+        write(
+            &root.join("data/testns/loot_table/gameplay/bonus_fish.json"),
+            r#"{
+                "type": "minecraft:fishing",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {"type": "minecraft:item", "name": "testns:cod", "weight": 3},
+                        {"type": "minecraft:empty", "weight": 2}
+                    ]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/entities/sheep/red.json"),
+            r#"{
+                "type": "minecraft:entity",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "testns:red_wool"}]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/entities/mob.json"),
+            r##"{
+                "type": "minecraft:entity",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "condition": {
+                            "type": "minecraft:all_of",
+                            "terms": [
+                                {"type": "minecraft:killed_by_player"},
+                                {
+                                    "type": "minecraft:random_chance_with_enchanted_bonus",
+                                    "enchantment": "minecraft:looting",
+                                    "unenchanted_chance": 0.025,
+                                    "enchanted_chance": {
+                                        "type": "minecraft:linear",
+                                        "base": 0.035,
+                                        "per_level_above_first": 0.01
+                                    }
+                                }
+                            ]
+                        },
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "testns:raw_meat",
+                                "weight": 2,
+                                "modifier": [
+                                    {"type": "minecraft:set_count", "count": {"type": "minecraft:uniform", "min": 1, "max": 3}},
+                                    {
+                                        "type": "minecraft:enchanted_count_increase",
+                                        "enchantment": "minecraft:looting",
+                                        "count": {"type": "minecraft:uniform", "min": 0.0, "max": 1.0},
+                                        "limit": 4
+                                    },
+                                    {
+                                        "type": "minecraft:furnace_smelt",
+                                        "condition": {
+                                            "type": "minecraft:any_of",
+                                            "terms": [
+                                                {"type": "minecraft:entity_properties", "entity": "this", "predicate": {"minecraft:flags": {"is_on_fire": true}}},
+                                                {"type": "minecraft:entity_properties", "entity": "direct_attacker", "predicate": {"minecraft:equipment": {"mainhand": {"predicates": {"minecraft:enchantments": [{"enchantments": "#minecraft:smelts_loot"}]}}}}}
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "minecraft:item",
+                                "name": "minecraft:tipped_arrow",
+                                "modifier": {"type": "minecraft:set_potion", "id": "minecraft:poison"}
+                            },
+                            {
+                                "type": "minecraft:tag",
+                                "items": "#testns:discs",
+                                "expand": true
+                            },
+                            {
+                                "type": "minecraft:loot_table",
+                                "value": "testns:gameplay/bonus_fish",
+                                "condition": {
+                                    "type": "minecraft:damage_source_properties",
+                                    "predicate": {
+                                        "direct_entity": {"minecraft:entity_type": "minecraft:fireball"},
+                                        "source_entity": {"minecraft:entity_type": "minecraft:frog", "minecraft:components": {"minecraft:frog/variant": "minecraft:warm"}},
+                                        "tags": [{"id": "#minecraft:is_projectile", "expected": true}]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "minecraft:loot_table",
+                                "value": {
+                                    "pools": [{
+                                        "rolls": 1,
+                                        "entries": [{"type": "minecraft:empty"}]
+                                    }]
+                                }
+                            },
+                            {
+                                "type": "minecraft:alternatives",
+                                "children": [{
+                                    "type": "minecraft:loot_table",
+                                    "value": "testns:entities/sheep/red",
+                                    "condition": {
+                                        "type": "minecraft:entity_properties",
+                                        "entity": "this",
+                                        "predicate": {
+                                            "minecraft:components": {"minecraft:sheep/color": "red"},
+                                            "minecraft:type_specific/sheep": {"sheared": false},
+                                            "minecraft:type_specific/cube_mob": {"size": {"min": 2}},
+                                            "minecraft:type_specific/raider": {"is_captain": true},
+                                            "minecraft:flags": {"is_baby": true},
+                                            "minecraft:vehicle": {"minecraft:entity_type": "minecraft:chicken"}
+                                        }
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:ominous_bottle",
+                            "modifier": {"type": "minecraft:set_ominous_bottle_amplifier", "amplifier": {"type": "minecraft:uniform", "min": 0, "max": 4}}
+                        }]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_entities(&root).expect("load entity tables");
+        assert_eq!(tables.len(), 2);
+        assert!(tables.get_entity("testns:mob").is_some());
+        assert!(tables.get_entity("testns:entities/mob").is_some());
+        assert!(tables.get_entity("testns:sheep/red").is_some());
+        assert!(tables.get_entity("testns:entities/sheep/red").is_some());
+        assert_eq!(
+            tables.unsupported(),
+            vec![(
+                "testns:entities/mob",
+                "minecraft:set_ominous_bottle_amplifier"
+            )]
+        );
+
+        let mob = tables.get_entity("testns:mob").expect("mob table");
+        match &mob.pools[0].entries[2] {
+            LootEntry::Tag { tag, expand, .. } => {
+                assert_eq!(tag, "testns:discs");
+                assert!(*expand);
+            }
+            other => panic!("expected Tag entry, got {other:?}"),
+        }
+        match &mob.pools[0].entries[3] {
+            LootEntry::LootTable {
+                source: LootTableSource::Reference { id, table },
+                ..
+            } => {
+                assert_eq!(id, "testns:gameplay/bonus_fish");
+                assert!(
+                    table.is_some(),
+                    "external loot_table reference must resolve"
+                );
+            }
+            other => panic!("expected resolved LootTable Reference entry, got {other:?}"),
+        }
+        match &mob.pools[0].entries[4] {
+            LootEntry::LootTable {
+                source: LootTableSource::Inline(inline),
+                ..
+            } => {
+                assert!(matches!(
+                    inline.pools[0].entries[0],
+                    LootEntry::Empty { .. }
+                ));
+            }
+            other => panic!("expected Inline LootTable entry, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_and_cyclic_loot_table_references_error_naming_file() {
+        let missing_root = scratch_root("missing_lt_ref");
+        write(
+            &missing_root.join("data/testns/loot_table/entities/broken.json"),
+            r#"{
+                "type": "minecraft:entity",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:loot_table", "value": "testns:entities/nope"}]
+                }]
+            }"#,
+        );
+        let err = LootTables::load_entities(&missing_root)
+            .expect_err("missing loot_table reference must fail")
+            .to_string();
+        assert!(
+            err.contains("broken.json"),
+            "error must name referring file: {err}"
+        );
+        assert!(
+            err.contains("testns:entities/nope"),
+            "error must name missing target id: {err}"
+        );
+        fs::remove_dir_all(&missing_root).expect("cleanup");
+
+        let cycle_root = scratch_root("cyclic_lt_ref");
+        write(
+            &cycle_root.join("data/testns/loot_table/entities/a.json"),
+            r#"{
+                "type": "minecraft:entity",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:loot_table", "value": "testns:entities/b"}]
+                }]
+            }"#,
+        );
+        write(
+            &cycle_root.join("data/testns/loot_table/entities/b.json"),
+            r#"{
+                "type": "minecraft:entity",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:loot_table", "value": "testns:entities/a"}]
+                }]
+            }"#,
+        );
+        let err = LootTables::load_entities(&cycle_root)
+            .expect_err("cyclic loot_table reference must fail")
+            .to_string();
+        assert!(
+            err.contains("cyclic loot_table reference"),
+            "error must report cycle: {err}"
+        );
+        fs::remove_dir_all(&cycle_root).expect("cleanup");
+    }
+
+    fn assert_entry_loot_table_refs_resolved(entry: &LootEntry) {
+        match entry {
+            LootEntry::LootTable { source, .. } => match source {
+                LootTableSource::Reference { id, table } => {
+                    assert!(table.is_some(), "unresolved loot_table reference `{id}`");
+                }
+                LootTableSource::Inline(inline) => {
+                    for pool in &inline.pools {
+                        for sub in &pool.entries {
+                            assert_entry_loot_table_refs_resolved(sub);
+                        }
+                    }
+                }
+            },
+            LootEntry::Alternatives { children, .. } => {
+                for child in children {
+                    assert_entry_loot_table_refs_resolved(child);
+                }
+            }
+            LootEntry::Item { .. }
+            | LootEntry::Dynamic { .. }
+            | LootEntry::Empty { .. }
+            | LootEntry::Tag { .. } => {}
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored loads_all_vanilla_entity_loot_tables`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn loads_all_vanilla_entity_loot_tables() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_entities(&root).expect("load vanilla entity loot tables");
+        // 93 top-level entity files + 16 `sheep/<color>.json` sub-tables = 109 files.
+        assert_eq!(tables.len(), 109);
+        assert!(tables.get_entity("minecraft:cow").is_some());
+        assert!(tables.get_entity("cow").is_some());
+        assert!(tables.get_entity("minecraft:entities/cow").is_some());
+        assert!(tables.get_entity("minecraft:sheep/white").is_some());
+
+        for (_id, table) in tables.iter() {
+            for pool in &table.pools {
+                for entry in &pool.entries {
+                    assert_entry_loot_table_refs_resolved(entry);
+                }
+            }
+        }
+
+        let unsupported = tables.unsupported();
+        println!("entity loot unsupported nodes: {unsupported:?}");
+        assert_eq!(
+            unsupported,
+            vec![(
+                "minecraft:entities/pillager",
+                "minecraft:set_ominous_bottle_amplifier",
+            )]
+        );
     }
 }
