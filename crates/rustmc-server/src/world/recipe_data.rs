@@ -2,7 +2,7 @@
 //!
 //! Reads `data/<namespace>/recipe/**/*.json` at runtime, resolves item tag
 //! ingredients via [`ItemTags`], converts crafting recipes into
-//! [`crate::world::crafting`] types, indexes cooking and stonecutting recipes,
+//! [`crate::world::crafting`] types, indexes cooking, stonecutting, and brewing recipes,
 //! and records unsupported recipe types or component-bearing results in
 //! [`RecipeData::skipped`].
 
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::item::{ItemDefaults, ItemStack};
+use crate::item::{ItemDefaults, ItemStack, items_equal, normalize_item_id};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
@@ -155,10 +155,65 @@ impl StonecuttingRecipe {
     }
 }
 
+/// A parsed `minecraft:brewing` recipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrewingRecipe {
+    id: String,
+    input_item: String,
+    input_potions: Vec<String>,
+    reagent: Ingredient,
+    output: ItemStack,
+    output_potion: String,
+}
+
+impl BrewingRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Input potion container item identifier (for example `minecraft:potion`).
+    #[must_use]
+    pub fn input_item(&self) -> &str {
+        &self.input_item
+    }
+
+    /// Accepted input `minecraft:potion` registry identifier(s).
+    #[must_use]
+    pub fn input_potions(&self) -> &[String] {
+        &self.input_potions
+    }
+
+    /// Resolved reagent item(s).
+    #[must_use]
+    pub fn reagent(&self) -> &Ingredient {
+        &self.reagent
+    }
+
+    /// Output container item stack produced per brew.
+    #[must_use]
+    pub fn output(&self) -> &ItemStack {
+        &self.output
+    }
+
+    /// Output container item identifier (for example `minecraft:splash_potion`).
+    #[must_use]
+    pub fn output_item(&self) -> &str {
+        self.output.item()
+    }
+
+    /// Output `minecraft:potion` registry identifier.
+    #[must_use]
+    pub fn output_potion(&self) -> &str {
+        &self.output_potion
+    }
+}
+
 /// Reason a recipe file was skipped instead of loaded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkipReason {
-    /// Recipe `type` is outside the supported crafting/cooking/stonecutting kinds.
+    /// Recipe `type` is outside the supported crafting/cooking/stonecutting/brewing kinds.
     UnsupportedType(String),
     /// Recipe `result` carries item `components`, which are not modeled yet.
     ResultHasComponents,
@@ -187,6 +242,13 @@ pub enum RecipeDataError {
         first_recipe: String,
         second_recipe: String,
     },
+    DuplicateBrewingInput {
+        input_item: String,
+        input_potion: String,
+        reagent: String,
+        first_recipe: String,
+        second_recipe: String,
+    },
 }
 
 impl fmt::Display for RecipeDataError {
@@ -204,6 +266,16 @@ impl fmt::Display for RecipeDataError {
             } => write!(
                 f,
                 "duplicate {kind} input `{item}` in recipes `{first_recipe}` and `{second_recipe}`"
+            ),
+            Self::DuplicateBrewingInput {
+                input_item,
+                input_potion,
+                reagent,
+                first_recipe,
+                second_recipe,
+            } => write!(
+                f,
+                "duplicate brewing input ({input_item}, {input_potion}, {reagent}) in recipes `{first_recipe}` and `{second_recipe}`"
             ),
         }
     }
@@ -223,6 +295,8 @@ pub struct RecipeData {
     cooking: BTreeMap<CookingKind, Vec<CookingRecipe>>,
     crafting: Vec<Recipe>,
     stonecutting: Vec<StonecuttingRecipe>,
+    brewing: Vec<BrewingRecipe>,
+    brewing_by_reagent: HashMap<String, Vec<usize>>,
     skipped: Vec<(String, SkipReason)>,
     total_files: usize,
 }
@@ -273,6 +347,7 @@ impl RecipeData {
         ns_dirs.sort();
 
         let mut seen_cooking: BTreeMap<CookingKind, HashMap<String, String>> = BTreeMap::new();
+        let mut seen_brewing: HashMap<(String, String, String), String> = HashMap::new();
 
         for ns_path in ns_dirs {
             let ns = ns_path
@@ -335,6 +410,44 @@ impl RecipeData {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
                         ParsedOrSkipped::Loaded(recipe) => data.stonecutting.push(recipe),
                     }
+                } else if recipe_type == "minecraft:brewing" {
+                    let recipe = parse_brewing_recipe(&id, obj, tags, items, &entry)?;
+                    let norm_input_item = normalize_item_id(recipe.input_item()).to_owned();
+                    for input_potion in recipe.input_potions() {
+                        let norm_potion = normalize_item_id(input_potion).to_owned();
+                        for reagent in recipe.reagent().allowed_items() {
+                            let key = (
+                                norm_input_item.clone(),
+                                norm_potion.clone(),
+                                normalize_item_id(reagent).to_owned(),
+                            );
+                            if let Some(first_recipe) = seen_brewing.get(&key) {
+                                if first_recipe != &id {
+                                    return Err(RecipeDataError::DuplicateBrewingInput {
+                                        input_item: recipe.input_item().to_owned(),
+                                        input_potion: input_potion.clone(),
+                                        reagent: reagent.clone(),
+                                        first_recipe: first_recipe.clone(),
+                                        second_recipe: id,
+                                    });
+                                }
+                            } else {
+                                seen_brewing.insert(key, id.clone());
+                            }
+                        }
+                    }
+                    let idx = data.brewing.len();
+                    let mut seen_reagent_keys = HashSet::new();
+                    for reagent in recipe.reagent().allowed_items() {
+                        let norm_reagent = normalize_item_id(reagent).to_owned();
+                        if seen_reagent_keys.insert(norm_reagent.clone()) {
+                            data.brewing_by_reagent
+                                .entry(norm_reagent)
+                                .or_default()
+                                .push(idx);
+                        }
+                    }
+                    data.brewing.push(recipe);
                 } else {
                     data.skipped
                         .push((id, SkipReason::UnsupportedType(recipe_type.to_owned())));
@@ -388,6 +501,44 @@ impl RecipeData {
     #[must_use]
     pub fn stonecutting(&self) -> &[StonecuttingRecipe] {
         &self.stonecutting
+    }
+
+    /// Loaded `minecraft:brewing` recipes.
+    #[must_use]
+    pub fn brewing(&self) -> &[BrewingRecipe] {
+        &self.brewing
+    }
+
+    /// Finds a loaded `minecraft:brewing` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_brewing_by_id(&self, id: &str) -> Option<&BrewingRecipe> {
+        self.brewing.iter().find(|recipe| recipe.id() == id)
+    }
+
+    /// Finds a loaded `minecraft:brewing` recipe matching `input_item`,
+    /// `input_potion`, and `reagent`, ignoring optional `minecraft:` prefixes.
+    #[must_use]
+    pub fn find_brewing(
+        &self,
+        input_item: &str,
+        input_potion: &str,
+        reagent: &str,
+    ) -> Option<&BrewingRecipe> {
+        let indices = self.brewing_by_reagent.get(normalize_item_id(reagent))?;
+        indices.iter().find_map(|&idx| {
+            let recipe = &self.brewing[idx];
+            (items_equal(recipe.input_item(), input_item)
+                && recipe
+                    .input_potions()
+                    .iter()
+                    .any(|p| items_equal(p, input_potion))
+                && recipe
+                    .reagent()
+                    .allowed_items()
+                    .iter()
+                    .any(|r| items_equal(r, reagent)))
+            .then_some(recipe)
+        })
     }
 
     /// Recipes skipped due to unsupported `type` or `result.components`.
@@ -478,6 +629,25 @@ fn parse_optional_string(
     }
 }
 
+fn build_result_stack(
+    id: &str,
+    count: u16,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<ItemStack, RecipeDataError> {
+    let max_stack = match items {
+        Some(defaults) => {
+            let max = defaults
+                .max_stack_size(id)
+                .ok_or_else(|| invalid(file, format!("unknown result item `{id}`")))?;
+            u16::from(max)
+        }
+        None => default_max_stack(id),
+    };
+    ItemStack::try_new(id, count, max_stack)
+        .map_err(|error| invalid(file, format!("invalid `result` stack: {error}")))
+}
+
 fn parse_result(
     obj: &serde_json::Map<String, Value>,
     items: Option<&ItemDefaults>,
@@ -506,17 +676,7 @@ fn parse_result(
                 .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))?
         }
     };
-    let max_stack = match items {
-        Some(defaults) => {
-            let max = defaults
-                .max_stack_size(id)
-                .ok_or_else(|| invalid(file, format!("unknown result item `{id}`")))?;
-            u16::from(max)
-        }
-        None => default_max_stack(id),
-    };
-    let stack = ItemStack::try_new(id, count, max_stack)
-        .map_err(|error| invalid(file, format!("invalid `result` stack: {error}")))?;
+    let stack = build_result_stack(id, count, items, file)?;
     Ok(ParsedOrSkipped::Loaded(stack))
 }
 
@@ -755,6 +915,187 @@ fn parse_stonecutting_recipe(
         ingredient,
         result,
     }))
+}
+
+fn reject_unknown_keys(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    context: &str,
+    file: &Path,
+) -> Result<(), RecipeDataError> {
+    if let Some(unknown) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(invalid(
+            file,
+            format!("unknown key `{unknown}` in {context}"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_non_tag_id<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    key: &str,
+    context: &str,
+    file: &Path,
+) -> Result<&'a str, RecipeDataError> {
+    let val = obj
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .ok_or_else(|| invalid(file, format!("missing or invalid id `{context}`")))?;
+    ItemStack::try_new(val, 1, 1)
+        .map_err(|error| invalid(file, format!("invalid id in `{context}`: {error}")))?;
+    Ok(val)
+}
+
+fn parse_potion_list(value: &Value, file: &Path) -> Result<Vec<String>, RecipeDataError> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_id = |raw: &str| -> Result<(), RecipeDataError> {
+        if raw.is_empty() || raw.starts_with('#') {
+            return Err(invalid(
+                file,
+                "brewing `input.potion_contents.potions` entries must be potion id strings",
+            ));
+        }
+        ItemStack::try_new(raw, 1, 1).map_err(|error| {
+            invalid(
+                file,
+                format!("invalid potion id `{raw}` in `input.potion_contents.potions`: {error}"),
+            )
+        })?;
+        if seen.insert(raw.to_owned()) {
+            out.push(raw.to_owned());
+        }
+        Ok(())
+    };
+    match value {
+        Value::String(s) => push_id(s)?,
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(invalid(
+                    file,
+                    "`input.potion_contents.potions` list must not be empty",
+                ));
+            }
+            for entry in items {
+                let s = entry.as_str().ok_or_else(|| {
+                    invalid(
+                        file,
+                        "`input.potion_contents.potions` list entries must be strings",
+                    )
+                })?;
+                push_id(s)?;
+            }
+        }
+        _ => {
+            return Err(invalid(
+                file,
+                "`input.potion_contents.potions` must be a potion id string or list of strings",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_brewing_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    tags: &ItemTags,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<BrewingRecipe, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &["type", "input", "reagent", "output"],
+        "brewing recipe",
+        file,
+    )?;
+
+    let input_obj = obj
+        .get("input")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "missing or non-object `input` field"))?;
+    reject_unknown_keys(
+        input_obj,
+        &["item", "potion_contents"],
+        "brewing `input`",
+        file,
+    )?;
+    let input_item = parse_non_tag_id(input_obj, "item", "input.item", file)?.to_owned();
+    let input_pc_obj = input_obj
+        .get("potion_contents")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "missing or non-object `input.potion_contents`"))?;
+    reject_unknown_keys(
+        input_pc_obj,
+        &["potions"],
+        "brewing `input.potion_contents`",
+        file,
+    )?;
+    let potions_val = input_pc_obj
+        .get("potions")
+        .ok_or_else(|| invalid(file, "missing `input.potion_contents.potions`"))?;
+    let input_potions = parse_potion_list(potions_val, file)?;
+
+    let reagent_obj = obj
+        .get("reagent")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "missing or non-object `reagent` field"))?;
+    reject_unknown_keys(reagent_obj, &["item"], "brewing `reagent`", file)?;
+    let reagent_val = reagent_obj
+        .get("item")
+        .ok_or_else(|| invalid(file, "missing `reagent.item` field"))?;
+    let reagent = parse_ingredient(reagent_val, tags, file)?;
+
+    let output_obj = obj
+        .get("output")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "missing or non-object `output` field"))?;
+    reject_unknown_keys(output_obj, &["id", "components"], "brewing `output`", file)?;
+    let output_id = parse_non_tag_id(output_obj, "id", "output.id", file)?;
+    let output_comp_obj = output_obj
+        .get("components")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(file, "missing or non-object `output.components`"))?;
+    reject_unknown_keys(
+        output_comp_obj,
+        &["minecraft:potion_contents"],
+        "brewing `output.components`",
+        file,
+    )?;
+    let output_pc_obj = output_comp_obj
+        .get("minecraft:potion_contents")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(
+                file,
+                "missing or non-object `output.components[\"minecraft:potion_contents\"]`",
+            )
+        })?;
+    reject_unknown_keys(
+        output_pc_obj,
+        &["potion"],
+        "brewing `output.components[\"minecraft:potion_contents\"]`",
+        file,
+    )?;
+    let output_potion = parse_non_tag_id(
+        output_pc_obj,
+        "potion",
+        "output.components[\"minecraft:potion_contents\"].potion",
+        file,
+    )?
+    .to_owned();
+
+    let output = build_result_stack(output_id, 1, items, file)?;
+    Ok(BrewingRecipe {
+        id: id.to_owned(),
+        input_item,
+        input_potions,
+        reagent,
+        output,
+        output_potion,
+    })
 }
 
 #[cfg(test)]
@@ -1357,6 +1698,237 @@ mod tests {
                 "stonecutting recipe {}",
                 recipe.id()
             );
+        }
+        for recipe in data.brewing() {
+            let expected = items
+                .max_stack_size(recipe.output().item())
+                .expect("brewing result item in ItemDefaults");
+            assert_eq!(
+                recipe.output().max_stack(),
+                u16::from(expected),
+                "brewing recipe {}",
+                recipe.id()
+            );
+        }
+    }
+
+    #[test]
+    fn loads_brewing_recipes_supports_lists_and_tags_and_finds_by_triple() {
+        let root = scratch_root("brewing-parse-lookup");
+        write(
+            &root.join("data/testns/tags/item/reagents.json"),
+            r#"{"values": ["testns:herb_a", "testns:herb_b"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/brewing/single.json"),
+            r#"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "testns:bottle",
+                    "potion_contents": {"potions": "testns:base"}
+                },
+                "reagent": {"item": "testns:catalyst"},
+                "output": {
+                    "id": "testns:splash_bottle",
+                    "components": {
+                        "minecraft:potion_contents": {"potion": "testns:charged"}
+                    }
+                }
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/brewing/multi.json"),
+            r##"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "minecraft:potion",
+                    "potion_contents": {"potions": ["testns:tonic", "testns:elixir"]}
+                },
+                "reagent": {"item": "#testns:reagents"},
+                "output": {
+                    "id": "minecraft:splash_potion",
+                    "components": {
+                        "minecraft:potion_contents": {"potion": "testns:upgraded"}
+                    }
+                }
+            }"##,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load brewing recipes");
+        assert_eq!(data.brewing().len(), 2);
+        assert!(data.skipped().is_empty());
+
+        let single = data
+            .find_brewing("testns:bottle", "testns:base", "testns:catalyst")
+            .expect("single recipe match");
+        assert_eq!(single.id(), "testns:brewing/single");
+        assert_eq!(single.output_item(), "testns:splash_bottle");
+        assert_eq!(single.output_potion(), "testns:charged");
+
+        // `minecraft:` prefixes are optional for lookup.
+        let multi = data
+            .find_brewing("potion", "testns:elixir", "testns:herb_b")
+            .expect("multi recipe match");
+        assert_eq!(multi.id(), "testns:brewing/multi");
+        assert_eq!(multi.output_item(), "minecraft:splash_potion");
+        assert_eq!(multi.output_potion(), "testns:upgraded");
+
+        assert!(
+            data.find_brewing("minecraft:splash_potion", "testns:elixir", "testns:herb_b")
+                .is_none()
+        );
+        assert!(
+            data.find_brewing("minecraft:potion", "testns:other", "testns:herb_b")
+                .is_none()
+        );
+        assert!(
+            data.find_brewing("minecraft:potion", "testns:elixir", "testns:other")
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn duplicate_brewing_triple_errors_naming_both_recipe_ids() {
+        let root = scratch_root("brewing-dup");
+        write(
+            &root.join("data/testns/recipe/brewing/first.json"),
+            r#"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "testns:bottle",
+                    "potion_contents": {"potions": "testns:base"}
+                },
+                "reagent": {"item": "testns:catalyst"},
+                "output": {
+                    "id": "testns:bottle",
+                    "components": {"minecraft:potion_contents": {"potion": "testns:out_a"}}
+                }
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/brewing/second.json"),
+            r#"{
+                "type": "minecraft:brewing",
+                "input": {
+                    "item": "testns:bottle",
+                    "potion_contents": {"potions": ["testns:other", "testns:base"]}
+                },
+                "reagent": {"item": "testns:catalyst"},
+                "output": {
+                    "id": "testns:bottle",
+                    "components": {"minecraft:potion_contents": {"potion": "testns:out_b"}}
+                }
+            }"#,
+        );
+
+        let err = RecipeData::load(&root, &ItemTags::default())
+            .expect_err("duplicate brewing triple must fail")
+            .to_string();
+        assert!(err.contains("testns:brewing/first"), "{err}");
+        assert!(err.contains("testns:brewing/second"), "{err}");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn unknown_brewing_shape_errors_naming_file() {
+        let cases = [
+            (
+                "extra_top_key.json",
+                r#"{
+                    "type": "minecraft:brewing",
+                    "extra": 1,
+                    "input": {"item": "testns:b", "potion_contents": {"potions": "testns:p"}},
+                    "reagent": {"item": "testns:r"},
+                    "output": {"id": "testns:b", "components": {"minecraft:potion_contents": {"potion": "testns:o"}}}
+                }"#,
+            ),
+            (
+                "bad_reagent_shape.json",
+                r#"{
+                    "type": "minecraft:brewing",
+                    "input": {"item": "testns:b", "potion_contents": {"potions": "testns:p"}},
+                    "reagent": {"tag": "testns:r"},
+                    "output": {"id": "testns:b", "components": {"minecraft:potion_contents": {"potion": "testns:o"}}}
+                }"#,
+            ),
+            (
+                "missing_output_potion.json",
+                r#"{
+                    "type": "minecraft:brewing",
+                    "input": {"item": "testns:b", "potion_contents": {"potions": "testns:p"}},
+                    "reagent": {"item": "testns:r"},
+                    "output": {"id": "testns:b", "components": {"minecraft:potion_contents": {}}}
+                }"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write(&root.join("data/testns/recipe/brewing").join(name), body);
+            let err = RecipeData::load(&root, &ItemTags::default())
+                .expect_err("unknown brewing shape must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_brewing_recipes_load_and_lookup`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_brewing_recipes_load_and_lookup() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        assert_eq!(data.brewing().len(), 279);
+        assert!(
+            !data
+                .skipped()
+                .iter()
+                .any(|(id, reason)| id.starts_with("minecraft:brewing/")
+                    || *reason == SkipReason::UnsupportedType("minecraft:brewing".to_owned())),
+            "no brewing recipes may be skipped"
+        );
+
+        let strength = data
+            .find_brewing(
+                "minecraft:potion",
+                "minecraft:awkward",
+                "minecraft:blaze_powder",
+            )
+            .expect("potion + awkward + blaze_powder recipe");
+        assert_eq!(strength.output_item(), "minecraft:potion");
+        assert_eq!(strength.output_potion(), "minecraft:strength");
+
+        let gunpowder_path =
+            root.join("data/minecraft/recipe/brewing/potion_awkward_gunpowder.json");
+        if gunpowder_path.exists() {
+            let doc = read_json(&gunpowder_path).expect("read potion_awkward_gunpowder.json");
+            let expected_item = doc["output"]["id"].as_str().expect("output id");
+            let expected_potion =
+                doc["output"]["components"]["minecraft:potion_contents"]["potion"]
+                    .as_str()
+                    .expect("output potion");
+            let splash = data
+                .find_brewing(
+                    "minecraft:potion",
+                    "minecraft:awkward",
+                    "minecraft:gunpowder",
+                )
+                .expect("potion + awkward + gunpowder recipe");
+            assert_eq!(splash.output_item(), expected_item);
+            assert_eq!(splash.output_potion(), expected_potion);
+            assert_eq!(splash.output_item(), "minecraft:splash_potion");
+            assert_eq!(splash.output_potion(), "minecraft:awkward");
         }
     }
 }
