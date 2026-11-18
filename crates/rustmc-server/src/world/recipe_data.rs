@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::item::{ItemDefaults, ItemStack, items_equal, normalize_item_id};
+use crate::item::{ArmorTrim, ItemDefaults, ItemStack, items_equal, normalize_item_id};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
@@ -308,19 +308,17 @@ pub enum SmithingResult {
         /// Transformed output stack.
         result: ItemStack,
     },
-    /// Result of a `minecraft:smithing_trim` recipe.
+    /// Result stack of a `minecraft:smithing_trim` recipe with its `trim`
+    /// data component (`pattern` + `material`) applied to the base item stack.
     ///
-    /// [`ItemStack`] has no component data, so the base item stack is returned
-    /// alongside the trim `pattern` identifier and `material` item identifier.
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/trim` revision 3685746):
+    /// "`minecraft:trim`: Contains the trim applied to this armor piece."
     Trim {
         /// Matched recipe identifier.
         recipe_id: String,
-        /// Base item stack (without component data).
-        base: ItemStack,
-        /// Trim pattern identifier (for example `"minecraft:coast"`).
-        pattern: String,
-        /// Canonical trim material item identifier (for example `"minecraft:gold_ingot"`).
-        material: String,
+        /// Base item stack with its `minecraft:trim` component set.
+        result: ItemStack,
     },
 }
 
@@ -773,11 +771,14 @@ impl RecipeData {
             let Some(material) = find_matching_ingredient_item(&recipe.addition, addition) else {
                 continue;
             };
+            let Ok(trim) = ArmorTrim::try_new(recipe.pattern.as_str(), material) else {
+                continue;
+            };
+            let mut result = base_stack.clone();
+            result.components_mut().set_trim(Some(trim));
             return Some(SmithingResult::Trim {
                 recipe_id: recipe.id.clone(),
-                base: base_stack.clone(),
-                pattern: recipe.pattern.clone(),
-                material: material.to_owned(),
+                result,
             });
         }
         None
@@ -2378,14 +2379,16 @@ mod tests {
         let trim = data
             .find_smithing("testns:wave_template", "iron_chestplate", "testns:ruby")
             .expect("trim match");
+        let SmithingResult::Trim { recipe_id, result } = trim else {
+            panic!("expected Trim result");
+        };
+        assert_eq!(recipe_id, "testns:wave_trim");
+        assert_eq!(result.item(), "minecraft:iron_chestplate");
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.max_stack(), 64);
         assert_eq!(
-            trim,
-            SmithingResult::Trim {
-                recipe_id: "testns:wave_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 64).unwrap(),
-                pattern: "testns:wave".to_owned(),
-                material: "testns:ruby".to_owned(),
-            }
+            result.components().trim(),
+            Some(&ArmorTrim::try_new("testns:wave", "testns:ruby").unwrap())
         );
 
         // Wrong template/base/addition -> None.
@@ -2412,14 +2415,16 @@ mod tests {
                 "testns:sapphire",
             )
             .expect("trim with items");
+        let SmithingResult::Trim { recipe_id, result } = with_items_trim else {
+            panic!("expected Trim result");
+        };
+        assert_eq!(recipe_id, "testns:wave_trim");
+        assert_eq!(result.item(), "minecraft:iron_chestplate");
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.max_stack(), 1);
         assert_eq!(
-            with_items_trim,
-            SmithingResult::Trim {
-                recipe_id: "testns:wave_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
-                pattern: "testns:wave".to_owned(),
-                material: "testns:sapphire".to_owned(),
-            }
+            result.components().trim(),
+            Some(&ArmorTrim::try_new("testns:wave", "testns:sapphire").unwrap())
         );
         let with_items_upgrade = data_with_items
             .find_smithing(
@@ -2531,14 +2536,19 @@ mod tests {
                 "minecraft:gold_ingot",
             )
             .expect("coast armor trim with iron chestplate and gold ingot");
+        let SmithingResult::Trim { recipe_id, result } = coast_trim else {
+            panic!("expected Trim result");
+        };
         assert_eq!(
-            coast_trim,
-            SmithingResult::Trim {
-                recipe_id: "minecraft:coast_armor_trim_smithing_template_smithing_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
-                pattern: "minecraft:coast".to_owned(),
-                material: "minecraft:gold_ingot".to_owned(),
-            }
+            recipe_id,
+            "minecraft:coast_armor_trim_smithing_template_smithing_trim"
+        );
+        assert_eq!(result.item(), "minecraft:iron_chestplate");
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.max_stack(), 1);
+        assert_eq!(
+            result.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:gold_ingot").unwrap())
         );
 
         // Wrong template returns None.
@@ -2566,5 +2576,73 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn smithing_trim_result_carries_trim_component_and_prevents_mismatched_stacking() {
+        let root = scratch_root("smithing-trim-comp");
+        write(
+            &root.join("data/testns/tags/item/armors.json"),
+            r#"{"values": ["minecraft:iron_chestplate"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/item/trim_mats.json"),
+            r#"{"values": ["minecraft:gold_ingot", "minecraft:diamond"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/coast_trim.json"),
+            r##"{
+                "type": "minecraft:smithing_trim",
+                "template": "minecraft:coast_armor_trim_smithing_template",
+                "base": "#testns:armors",
+                "addition": "#testns:trim_mats",
+                "pattern": "minecraft:coast"
+            }"##,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+
+        let SmithingResult::Trim {
+            result: gold_trimmed,
+            ..
+        } = data
+            .find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:gold_ingot",
+            )
+            .expect("gold trim")
+        else {
+            panic!("expected Trim result");
+        };
+        let SmithingResult::Trim {
+            result: diamond_trimmed,
+            ..
+        } = data
+            .find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:diamond",
+            )
+            .expect("diamond trim")
+        else {
+            panic!("expected Trim result");
+        };
+        let untrimmed = ItemStack::try_new("minecraft:iron_chestplate", 1, 64).unwrap();
+
+        assert_eq!(
+            gold_trimmed.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:gold_ingot").unwrap())
+        );
+        assert_eq!(
+            diamond_trimmed.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:diamond").unwrap())
+        );
+        assert!(!gold_trimmed.can_stack_with(&untrimmed));
+        assert!(!gold_trimmed.can_stack_with(&diamond_trimmed));
+        assert!(gold_trimmed.can_stack_with(&gold_trimmed.clone()));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
