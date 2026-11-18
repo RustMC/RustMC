@@ -32,10 +32,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::item::normalize_item_id;
+use crate::item::{
+    ItemDefaults, ItemDefaultsError, ItemStack, MAX_STACK_LIMIT, default_max_stack, items_equal,
+    normalize_item_id,
+};
+use crate::vanilla::feature::{BlockTags, ItemTags};
+use crate::vanilla::random::RandomSource;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 
 /// Errors encountered while loading or parsing block loot tables.
@@ -43,6 +49,8 @@ use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk
 pub enum LootError {
     /// Reading or parsing a JSON file failed.
     Worldgen(WorldgenError),
+    /// Reading or parsing default item component reports failed.
+    ItemDefaults(ItemDefaultsError),
     /// A loot table referenced a named predicate file that does not exist.
     MissingPredicate {
         table_file: PathBuf,
@@ -57,6 +65,7 @@ impl fmt::Display for LootError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Worldgen(error) => write!(f, "{error}"),
+            Self::ItemDefaults(error) => write!(f, "{error}"),
             Self::MissingPredicate {
                 table_file,
                 predicate,
@@ -79,6 +88,12 @@ impl std::error::Error for LootError {}
 impl From<WorldgenError> for LootError {
     fn from(error: WorldgenError) -> Self {
         Self::Worldgen(error)
+    }
+}
+
+impl From<ItemDefaultsError> for LootError {
+    fn from(error: ItemDefaultsError) -> Self {
+        Self::ItemDefaults(error)
     }
 }
 
@@ -266,8 +281,89 @@ pub struct LootPool {
     pub modifiers: Vec<LootModifier>,
 }
 
+impl LootEntry {
+    fn conditions(&self) -> &[LootCondition] {
+        match self {
+            Self::Item { conditions, .. }
+            | Self::Alternatives { conditions, .. }
+            | Self::Dynamic { conditions, .. } => conditions,
+        }
+    }
+}
+
+/// Tool context supplied to [`LootTable::roll`] when breaking a block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolContext {
+    /// Item identifier of the breaking tool (for example `"minecraft:diamond_pickaxe"`).
+    pub item: String,
+    /// Active enchantment levels on the tool keyed by enchantment id.
+    pub enchantments: BTreeMap<String, u8>,
+}
+
+/// Execution context for evaluating a block [`LootTable`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LootContext {
+    /// Broken block state as `(block_id, properties)`.
+    pub block_state: (String, BTreeMap<String, String>),
+    /// Breaking tool, or `None` when broken bare-handed or without a tool.
+    pub tool: Option<ToolContext>,
+    /// Explosion radius when destroyed by an explosion, or `None` otherwise.
+    pub explosion_radius: Option<f32>,
+}
+
+impl LootContext {
+    /// Builds a bare-handed, non-explosion context for `block_id` with empty properties.
+    #[must_use]
+    pub fn for_block(block_id: impl Into<String>) -> Self {
+        Self {
+            block_state: (block_id.into(), BTreeMap::new()),
+            tool: None,
+            explosion_radius: None,
+        }
+    }
+}
+
+/// Typed note emitted by [`LootTable::roll_with_notes`] when component data or
+/// dynamic entries could not be materialized without block-entity state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LootNote {
+    /// `minecraft:copy_components` kept the item without copying block-entity/tool components.
+    CopyComponentsNotApplied {
+        item: String,
+        source: String,
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    /// `minecraft:copy_state` kept the item without copying block-state properties.
+    CopyStateNotApplied {
+        item: String,
+        block: String,
+        properties: Vec<String>,
+    },
+    /// `minecraft:dynamic` matched and yielded no stacks because dynamic block-entity loot is unmodeled.
+    DynamicNotApplied { name: String },
+    /// An unsupported modifier kept the item stack unchanged.
+    UnsupportedModifier { item: String, what: String },
+}
+
+/// Full outcome of rolling a [`LootTable`], containing dropped stacks and typed notes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LootRoll {
+    /// Dropped item stacks in roll order.
+    pub items: Vec<ItemStack>,
+    /// Typed notes for unapplied component modifiers, dynamic entries, or unsupported modifiers.
+    pub notes: Vec<LootNote>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LootRegistries {
+    item_tags: Arc<ItemTags>,
+    block_tags: Arc<BlockTags>,
+    item_defaults: Option<Arc<ItemDefaults>>,
+}
+
 /// Parsed block loot table loaded from `data/<ns>/loot_table/blocks/**/*.json`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct LootTable {
     /// Optional loot context type string (for example `"minecraft:block"`).
     pub table_type: Option<String>,
@@ -277,9 +373,52 @@ pub struct LootTable {
     pub pools: Vec<LootPool>,
     /// Optional table-level modifiers applied to all drops from this table.
     pub modifiers: Vec<LootModifier>,
+    registries: LootRegistries,
+}
+
+impl PartialEq for LootTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_type == other.table_type
+            && self.random_sequence == other.random_sequence
+            && self.pools == other.pools
+            && self.modifiers == other.modifiers
+    }
 }
 
 impl LootTable {
+    /// Constructs a standalone [`LootTable`] with empty tag and item-default registries.
+    #[must_use]
+    pub fn new(
+        table_type: Option<String>,
+        random_sequence: Option<String>,
+        pools: Vec<LootPool>,
+        modifiers: Vec<LootModifier>,
+    ) -> Self {
+        Self {
+            table_type,
+            random_sequence,
+            pools,
+            modifiers,
+            registries: LootRegistries::default(),
+        }
+    }
+
+    /// Attaches tag and item-default registries used during [`Self::roll`].
+    #[must_use]
+    pub fn with_registries(
+        mut self,
+        item_tags: Arc<ItemTags>,
+        block_tags: Arc<BlockTags>,
+        item_defaults: Option<Arc<ItemDefaults>>,
+    ) -> Self {
+        self.registries = LootRegistries {
+            item_tags,
+            block_tags,
+            item_defaults,
+        };
+        self
+    }
+
     /// Returns the `what` labels of every [`LootCondition::Unsupported`] and
     /// [`LootModifier::Unsupported`] node anywhere in this table.
     #[must_use]
@@ -301,21 +440,166 @@ impl LootTable {
         }
         out
     }
+
+    /// Evaluates this block loot table under `ctx` using `random` and returns dropped stacks.
+    ///
+    /// Uses real maximum stack sizes from [`ItemDefaults`] when loaded from the data root's
+    /// `reports/minecraft/components/item/*.json`, falling back to [`default_max_stack`]
+    /// otherwise.
+    ///
+    /// Semantics follow `minecraft.wiki` and the task's binding reviewer decisions:
+    /// - **Pool & entry expansion** (`Loot table` rev 3893957):
+    ///   - `"Each roll of a pool is independent."`
+    ///   - `"composite entries first expand their children, and then singleton entries that do not meet their conditions are removed from the pool, then entries are rolled afterward."`
+    ///   - `alternatives`: `"Extracts only the first successful (conditions are met) entry. Conditions are checked in order."`
+    ///   - `dynamic`: `"Drops block-specific loot."` Kept unmaterialized and recorded in [`LootNote::DynamicNotApplied`] via [`Self::roll_with_notes`].
+    ///   - Table `modifier`: `"Applies an item modifier, onto all item stacks dropped by this table."`
+    /// - **Conditions** (`Predicate` rev 3888899 & `Data component predicate` rev 3826514):
+    ///   - `survives_explosion`: `"Returns success with 1 ÷ explosion radius probability. Requires explosion radius provided by loot context, and always success if not provided."`
+    ///   - `table_bonus`: `"Passes with probability picked from a list, indexed by enchantment power. Requires tool provided by loot context. If not provided, the enchantment level is regarded as 0."`
+    ///     Reviewer decision: levels beyond the list use `chances[min(level, len - 1)]`, backed by `Fortune` (rev 3864999), where `"Fortune IV+"` for `"Flint"` from `"Gravel"` shares `"100%"` with Fortune III.
+    ///   - `random_chance`: `"Generates a random number between 0.0 and 1.0, and checks if it is less than a specified value."`
+    ///   - `match_tool`: `"Checks tool used to mine the block. Requires tool provided by loot context, and always fails if not provided."` (`minecraft:enchantments`: `"Array of conditions. The sub-predicate succeeds when all the conditions succeed."`)
+    ///   - `entity_properties`: reviewer decision — with no entity in [`LootContext`], evaluates to `false`.
+    ///   - `Unsupported` (including `minecraft:location_check`): evaluates to `false`.
+    /// - **Modifiers** (`Item modifier` rev 3896146, `Fortune` rev 3864999, `Explosion` rev 3903416):
+    ///   - `apply_bonus` (`ore_drops`): `"Count *= (max(1; randomInt(0(inclusive) .. (Level + 2)(exclusive))))"` — reviewer decision: `count *= max(1, random_int(0 ..= level + 1))`.
+    ///   - `apply_bonus` (`uniform_bonus_count`): `"uniform distribution (from 0 to level * bonusMultiplier)"` — reviewer decision: `count += random_int(0 ..= level * bonusMultiplier)`.
+    ///   - `apply_bonus` (`binomial_with_bonus_count`): `Item modifier` rev 3896146 writes `"for 1 bonus item plus bonus determined by binomial distribution with n=level + extra, p=probability"`, whereas `Fortune` rev 3864999 shows `"the binomial distribution in the default case is created by rolling three times (n=3) with a drop probability of 57% (p=4/7), then an additional seed is added"` (`"Average drops"` = `"2.71 (2 5/7)"` = `1 + 3 * 4/7`). Reviewer decision: `count += Binomial(n = level + extra, p = probability)` with **no extra +1**, and missing enchantment = level 0.
+    ///   - `explosion_decay`: `Explosion` rev 3903416 states `"Other explosions have a 1/power chance of dropping items."` and `Predicate` rev 3888899 states `"1 ÷ explosion radius probability"`, contradicting `Item modifier` rev 3896146 (`"Each item in the item stack has a chance of 1/explosion radius to be lost."`). Reviewer decision: each item in the stack is **kept** with probability `1 / explosion_radius`, and no explosion radius in context means no decay.
+    ///   - `limit_count`: `"Limits the count between a minimum and maximum value."` Reviewer decision: clamps to bounds; counts `<= 0` after all modifiers produce no stack.
+    ///   - `copy_components` / `copy_state`: keep the item without inventing component data and record a typed [`LootNote`].
+    /// - **Number providers** (`Number provider` rev 3869456):
+    ///   - `uniform`: `"The values are inclusive, meaning the provided number can be either min or max, except if the provided number is a float, in which case it must be strictly less than max. If max <= min, the provided number is min."` Reviewer decision: integer `min`/`max` draws an integer uniformly from `min ..= max` inclusive.
+    ///   - `binomial`: `"A random number following a binomial distribution."` (`n` = `"The amount of trials"`, `p` = `"The probability of success on an individual trial"`).
+    pub fn roll(&self, ctx: &LootContext, random: &mut RandomSource) -> Vec<ItemStack> {
+        self.roll_with_notes(ctx, random).items
+    }
+
+    /// Evaluates this block loot table under `ctx` and returns both dropped stacks and
+    /// typed [`LootNote`] records for unapplied component/dynamic entries.
+    pub fn roll_with_notes(&self, ctx: &LootContext, random: &mut RandomSource) -> LootRoll {
+        self.roll_with(
+            ctx,
+            random,
+            &self.registries.item_tags,
+            &self.registries.block_tags,
+            self.registries.item_defaults.as_deref(),
+        )
+    }
+
+    /// Evaluates this block loot table using explicit `item_tags`, `block_tags`, and `item_defaults`.
+    pub fn roll_with(
+        &self,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+        item_tags: &ItemTags,
+        block_tags: &BlockTags,
+        item_defaults: Option<&ItemDefaults>,
+    ) -> LootRoll {
+        let eval_ctx = EvalCtx {
+            loot: ctx,
+            item_tags,
+            block_tags,
+        };
+        let mut outcome = LootRoll::default();
+
+        for pool in &self.pools {
+            if !eval_conditions(&pool.conditions, &eval_ctx, random) {
+                continue;
+            }
+            let rolls = sample_count_provider(&pool.rolls, random);
+            if rolls <= 0 {
+                continue;
+            }
+
+            for _ in 0..rolls {
+                let mut candidates = Vec::new();
+                for entry in &pool.entries {
+                    expand_entry(entry, &eval_ctx, random, &mut candidates);
+                }
+                if candidates.is_empty() {
+                    continue;
+                }
+                let selected = if candidates.len() == 1 {
+                    candidates.swap_remove(0)
+                } else {
+                    let idx = random.next_int_bounded(candidates.len() as u32) as usize;
+                    candidates.swap_remove(idx)
+                };
+
+                match selected.kind {
+                    SelectedEntryKind::Dynamic(name) => {
+                        outcome.notes.push(LootNote::DynamicNotApplied {
+                            name: name.to_owned(),
+                        });
+                    }
+                    SelectedEntryKind::Item(item_name) => {
+                        let mut count = 1_i32;
+                        let all_modifiers = selected
+                            .modifiers
+                            .into_iter()
+                            .chain(pool.modifiers.iter())
+                            .chain(self.modifiers.iter());
+                        for modifier in all_modifiers {
+                            if eval_conditions(modifier.conditions(), &eval_ctx, random) {
+                                apply_modifier(
+                                    modifier,
+                                    item_name,
+                                    &mut count,
+                                    &eval_ctx,
+                                    random,
+                                    &mut outcome.notes,
+                                );
+                            }
+                        }
+                        if count > 0 {
+                            push_item_stacks(item_name, count, item_defaults, &mut outcome.items);
+                        }
+                    }
+                }
+            }
+        }
+
+        outcome
+    }
 }
 
 /// Loaded collection of block loot tables keyed by `<ns>:blocks/<path>`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct LootTables {
     tables: BTreeMap<String, LootTable>,
+    registries: LootRegistries,
+}
+
+impl PartialEq for LootTables {
+    fn eq(&self, other: &Self) -> bool {
+        self.tables == other.tables
+    }
 }
 
 impl LootTables {
-    /// Loads every `data/<ns>/loot_table/blocks/**/*.json` file under `root`
-    /// and resolves string condition references through `data/<ns>/predicate/**`.
+    /// Loads every `data/<ns>/loot_table/blocks/**/*.json` file under `root`,
+    /// resolves string condition references through `data/<ns>/predicate/**`,
+    /// and loads `ItemTags`, `BlockTags`, and optional `ItemDefaults` (when
+    /// `reports/minecraft/components/item` is present).
     pub fn load_blocks(root: &Path) -> Result<Self, LootError> {
         let data_dir = root.join("data");
         let Some(namespaces) = read_dir_optional(&data_dir)? else {
             return Ok(Self::default());
+        };
+
+        let item_tags = Arc::new(ItemTags::load(root)?);
+        let block_tags = Arc::new(BlockTags::load(root)?);
+        let item_defaults = match ItemDefaults::load(root) {
+            Ok(defaults) => Some(Arc::new(defaults)),
+            Err(ItemDefaultsError::MissingReports(_)) => None,
+            Err(error) => return Err(LootError::ItemDefaults(error)),
+        };
+        let registries = LootRegistries {
+            item_tags,
+            block_tags,
+            item_defaults,
         };
 
         let mut ns_dirs = Vec::new();
@@ -355,12 +639,13 @@ impl LootTables {
             for file in walk_json(&blocks_dir)? {
                 let id = format!("{ns}:blocks/{}", relative_stem(&file, &blocks_dir));
                 let value = read_json(&file)?;
-                let table = parse_loot_table(&value, &file, &mut resolver)?;
+                let mut table = parse_loot_table(&value, &file, &mut resolver)?;
+                table.registries = registries.clone();
                 tables.insert(id, table);
             }
         }
 
-        Ok(Self { tables })
+        Ok(Self { tables, registries })
     }
 
     /// Looks up the loot table for `block_id`.
@@ -371,6 +656,35 @@ impl LootTables {
     pub fn get(&self, block_id: &str) -> Option<&LootTable> {
         let key = normalize_block_table_id(block_id);
         self.tables.get(&key)
+    }
+
+    /// Rolls the loot table for `block_id` if present, returning stacks and typed notes.
+    pub fn roll(
+        &self,
+        block_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get(block_id)
+            .map(|table| table.roll_with_notes(ctx, random))
+    }
+
+    /// Returns the loaded item tag registry used during condition matching.
+    #[must_use]
+    pub fn item_tags(&self) -> &ItemTags {
+        &self.registries.item_tags
+    }
+
+    /// Returns the loaded block tag registry used during condition matching.
+    #[must_use]
+    pub fn block_tags(&self) -> &BlockTags {
+        &self.registries.block_tags
+    }
+
+    /// Returns the loaded vanilla item defaults, when present under `reports/`.
+    #[must_use]
+    pub fn item_defaults(&self) -> Option<&ItemDefaults> {
+        self.registries.item_defaults.as_deref()
     }
 
     /// Returns the number of loaded block loot tables.
@@ -657,12 +971,12 @@ fn parse_loot_table(
 
     let modifiers = parse_optional_modifiers(obj.get("modifier"), file, resolver)?;
 
-    Ok(LootTable {
+    Ok(LootTable::new(
         table_type,
         random_sequence,
         pools,
         modifiers,
-    })
+    ))
 }
 
 fn parse_pool(
@@ -1463,6 +1777,384 @@ fn collect_unsupported_entry<'a>(entry: &'a LootEntry, out: &mut Vec<&'a str>) {
     }
 }
 
+struct EvalCtx<'a> {
+    loot: &'a LootContext,
+    item_tags: &'a ItemTags,
+    block_tags: &'a BlockTags,
+}
+
+enum SelectedEntryKind<'a> {
+    Item(&'a str),
+    Dynamic(&'a str),
+}
+
+struct SelectedEntry<'a> {
+    kind: SelectedEntryKind<'a>,
+    modifiers: Vec<&'a LootModifier>,
+}
+
+fn expand_entry<'a>(
+    entry: &'a LootEntry,
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+    out: &mut Vec<SelectedEntry<'a>>,
+) -> bool {
+    if !eval_conditions(entry.conditions(), ctx, random) {
+        return false;
+    }
+    match entry {
+        LootEntry::Item {
+            name, modifiers, ..
+        } => {
+            out.push(SelectedEntry {
+                kind: SelectedEntryKind::Item(name.as_str()),
+                modifiers: modifiers.iter().collect(),
+            });
+            true
+        }
+        LootEntry::Dynamic {
+            name, modifiers, ..
+        } => {
+            out.push(SelectedEntry {
+                kind: SelectedEntryKind::Dynamic(name.as_str()),
+                modifiers: modifiers.iter().collect(),
+            });
+            true
+        }
+        LootEntry::Alternatives {
+            children,
+            modifiers,
+            ..
+        } => {
+            let start = out.len();
+            for child in children {
+                if expand_entry(child, ctx, random, out) {
+                    for selected in &mut out[start..] {
+                        selected.modifiers.extend(modifiers.iter());
+                    }
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn eval_conditions(
+    conditions: &[LootCondition],
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+) -> bool {
+    conditions
+        .iter()
+        .all(|condition| eval_condition(condition, ctx, random))
+}
+
+fn eval_condition(condition: &LootCondition, ctx: &EvalCtx<'_>, random: &mut RandomSource) -> bool {
+    match condition {
+        LootCondition::SurvivesExplosion => ctx
+            .loot
+            .explosion_radius
+            .is_none_or(|radius| survives_explosion_radius(radius, random)),
+        LootCondition::MatchBlock { blocks, state } => match_block(blocks, state, ctx),
+        LootCondition::TableBonus {
+            enchantment,
+            chances,
+        } => {
+            let Some(&last_chance) = chances.last() else {
+                return false;
+            };
+            let level = usize::from(tool_enchantment_level(ctx.loot.tool.as_ref(), enchantment));
+            let chance = chances.get(level).copied().unwrap_or(last_chance);
+            sample_probability(chance, random)
+        }
+        LootCondition::AllOf { terms } => eval_conditions(terms, ctx, random),
+        LootCondition::AnyOf { terms } => {
+            terms.iter().any(|term| eval_condition(term, ctx, random))
+        }
+        LootCondition::Inverted { term } => !eval_condition(term, ctx, random),
+        LootCondition::RandomChance { chance } => sample_probability(*chance, random),
+        LootCondition::MatchTool { predicate } => match_tool(predicate, ctx),
+        // Reviewer decision: with no entity in LootContext, entity_properties is false.
+        LootCondition::EntityProperties { .. } | LootCondition::Unsupported { .. } => false,
+    }
+}
+
+fn survives_explosion_radius(radius: f32, random: &mut RandomSource) -> bool {
+    if !radius.is_finite() || radius <= 0.0 {
+        return false;
+    }
+    let survival_chance = 1.0 / f64::from(radius);
+    sample_probability(survival_chance, random)
+}
+
+fn sample_probability(chance: f64, random: &mut RandomSource) -> bool {
+    f64::from(random.next_float()) < chance
+}
+
+fn match_block(blocks: &[String], state: &BTreeMap<String, String>, ctx: &EvalCtx<'_>) -> bool {
+    let (block_id, properties) = &ctx.loot.block_state;
+    if !blocks.is_empty() {
+        if block_id.is_empty() {
+            return false;
+        }
+        let id_matches = blocks.iter().any(|spec| {
+            if let Some(tag_id) = spec.strip_prefix('#') {
+                let tag = ensure_namespaced(tag_id);
+                ctx.block_tags
+                    .members(&tag)
+                    .is_some_and(|members| members.iter().any(|m| items_equal(m, block_id)))
+            } else {
+                items_equal(spec, block_id)
+            }
+        });
+        if !id_matches {
+            return false;
+        }
+    }
+    state
+        .iter()
+        .all(|(prop, expected)| properties.get(prop) == Some(expected))
+}
+
+fn match_tool(predicate: &ToolPredicate, ctx: &EvalCtx<'_>) -> bool {
+    let Some(tool) = ctx.loot.tool.as_ref() else {
+        return false;
+    };
+    if !predicate.items.is_empty() {
+        if tool.item.is_empty() {
+            return false;
+        }
+        let item_matches = predicate.items.iter().any(|spec| {
+            if let Some(tag_id) = spec.strip_prefix('#') {
+                let tag = ensure_namespaced(tag_id);
+                ctx.item_tags
+                    .members(&tag)
+                    .is_some_and(|members| members.iter().any(|m| items_equal(m, &tool.item)))
+            } else {
+                items_equal(spec, &tool.item)
+            }
+        });
+        if !item_matches {
+            return false;
+        }
+    }
+    predicate
+        .enchantments
+        .iter()
+        .all(|ench_pred| match_enchantment_predicate(ench_pred, tool))
+}
+
+fn match_enchantment_predicate(pred: &EnchantmentPredicate, tool: &ToolContext) -> bool {
+    let matches_level = |lvl: u8| -> bool {
+        lvl > 0
+            && pred.min_level.is_none_or(|min| u32::from(lvl) >= min)
+            && pred.max_level.is_none_or(|max| u32::from(lvl) <= max)
+    };
+    if pred.enchantments.is_empty() {
+        tool.enchantments.values().copied().any(matches_level)
+    } else {
+        pred.enchantments.iter().any(|target| {
+            tool.enchantments
+                .iter()
+                .any(|(id, &lvl)| items_equal(id, target) && matches_level(lvl))
+        })
+    }
+}
+
+fn tool_enchantment_level(tool: Option<&ToolContext>, enchantment: &str) -> u8 {
+    let Some(tool) = tool else {
+        return 0;
+    };
+    tool.enchantments
+        .iter()
+        .filter(|(id, _)| items_equal(id, enchantment))
+        .map(|(_, &lvl)| lvl)
+        .max()
+        .unwrap_or(0)
+}
+
+fn apply_modifier(
+    modifier: &LootModifier,
+    item_name: &str,
+    count: &mut i32,
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+    notes: &mut Vec<LootNote>,
+) {
+    match modifier {
+        LootModifier::SetCount { count: np, add, .. } => {
+            let delta = sample_count_provider(np, random);
+            if *add {
+                *count = count.saturating_add(delta);
+            } else {
+                *count = delta;
+            }
+        }
+        LootModifier::ExplosionDecay { .. } => {
+            if let Some(radius) = ctx.loot.explosion_radius
+                && *count > 0
+            {
+                let mut kept = 0_i32;
+                for _ in 0..*count {
+                    if survives_explosion_radius(radius, random) {
+                        kept += 1;
+                    }
+                }
+                *count = kept;
+            }
+        }
+        LootModifier::ApplyBonus {
+            enchantment,
+            formula,
+            ..
+        } => {
+            apply_bonus(enchantment, formula, count, ctx.loot.tool.as_ref(), random);
+        }
+        LootModifier::LimitCount { min, max, .. } => {
+            if let Some(lo) = min {
+                *count = (*count).max(*lo);
+            }
+            if let Some(hi) = max {
+                *count = (*count).min(*hi);
+            }
+        }
+        LootModifier::CopyComponents {
+            source,
+            include,
+            exclude,
+            ..
+        } => {
+            notes.push(LootNote::CopyComponentsNotApplied {
+                item: ensure_namespaced(item_name),
+                source: source.clone(),
+                include: include.clone(),
+                exclude: exclude.clone(),
+            });
+        }
+        LootModifier::CopyState {
+            block, properties, ..
+        } => {
+            notes.push(LootNote::CopyStateNotApplied {
+                item: ensure_namespaced(item_name),
+                block: block.clone(),
+                properties: properties.clone(),
+            });
+        }
+        LootModifier::Unsupported { what } => {
+            notes.push(LootNote::UnsupportedModifier {
+                item: ensure_namespaced(item_name),
+                what: what.clone(),
+            });
+        }
+    }
+}
+
+fn apply_bonus(
+    enchantment: &str,
+    formula: &BonusFormula,
+    count: &mut i32,
+    tool: Option<&ToolContext>,
+    random: &mut RandomSource,
+) {
+    let level = tool_enchantment_level(tool, enchantment);
+    match formula {
+        BonusFormula::OreDrops => {
+            if level > 0 {
+                let bound = u32::from(level) + 2;
+                let multiplier = (random.next_int_bounded(bound) as i32).max(1);
+                *count = count.saturating_mul(multiplier);
+            }
+        }
+        BonusFormula::UniformBonusCount { bonus_multiplier } => {
+            let max_bonus = (f64::from(level) * bonus_multiplier).floor();
+            if max_bonus >= 1.0 {
+                let bound = if max_bonus >= f64::from(u32::MAX) {
+                    u32::MAX
+                } else {
+                    (max_bonus as u32).saturating_add(1)
+                };
+                let bonus = random.next_int_bounded(bound) as i32;
+                *count = count.saturating_add(bonus);
+            }
+        }
+        BonusFormula::BinomialWithBonusCount { extra, probability } => {
+            let trials = u32::from(level).saturating_add(*extra);
+            let bonus = sample_binomial(trials, *probability, random);
+            *count = count.saturating_add(bonus);
+        }
+    }
+}
+
+fn round_f64_to_i32(value: f64) -> i32 {
+    (value + 0.5)
+        .floor()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn sample_count_provider(provider: &NumberProvider, random: &mut RandomSource) -> i32 {
+    match provider {
+        NumberProvider::Constant(value) => round_f64_to_i32(*value),
+        NumberProvider::Uniform { min, max } => {
+            if *max <= *min {
+                return round_f64_to_i32(*min);
+            }
+            if min.fract() == 0.0
+                && max.fract() == 0.0
+                && *min >= f64::from(i32::MIN)
+                && *max <= f64::from(i32::MAX)
+            {
+                let min_i = *min as i32;
+                let max_i = *max as i32;
+                let span = i64::from(max_i) - i64::from(min_i) + 1;
+                if let Ok(bound) = u32::try_from(span) {
+                    let offset = i64::from(random.next_int_bounded(bound));
+                    return (i64::from(min_i) + offset) as i32;
+                }
+            }
+            let sample = *min + f64::from(random.next_float()) * (*max - *min);
+            round_f64_to_i32(sample)
+        }
+        NumberProvider::Binomial { n, p } => sample_binomial(*n, *p, random),
+    }
+}
+
+fn sample_binomial(n: u32, p: f64, random: &mut RandomSource) -> i32 {
+    let mut successes = 0_i32;
+    for _ in 0..n {
+        if sample_probability(p, random) {
+            successes = successes.saturating_add(1);
+        }
+    }
+    successes
+}
+
+fn resolve_max_stack(item_name: &str, item_defaults: Option<&ItemDefaults>) -> u16 {
+    item_defaults
+        .and_then(|defaults| defaults.max_stack_size(item_name))
+        .map(u16::from)
+        .unwrap_or_else(|| default_max_stack(item_name))
+        .clamp(1, MAX_STACK_LIMIT)
+}
+
+fn push_item_stacks(
+    raw_name: &str,
+    count: i32,
+    item_defaults: Option<&ItemDefaults>,
+    out: &mut Vec<ItemStack>,
+) {
+    let item_name = ensure_namespaced(raw_name);
+    let max_stack = resolve_max_stack(&item_name, item_defaults);
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(i32::from(max_stack)) as u16;
+        if let Ok(stack) = ItemStack::try_new(item_name.as_str(), chunk, max_stack) {
+            out.push(stack);
+        }
+        remaining -= i32::from(chunk);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1903,6 +2595,768 @@ mod tests {
             "error should report cycle: {err}"
         );
         fs::remove_dir_all(&cycle_root).expect("cleanup");
+    }
+
+    fn load_single_table(label: &str, table_name: &str, body: &str) -> LootTable {
+        let root = scratch_root(label);
+        write(
+            &root.join(format!("data/testns/loot_table/blocks/{table_name}.json")),
+            body,
+        );
+        let tables = LootTables::load_blocks(&root).expect("load synthetic table");
+        let table = tables
+            .get(&format!("testns:{table_name}"))
+            .expect("table present")
+            .clone();
+        fs::remove_dir_all(&root).expect("cleanup");
+        table
+    }
+
+    #[test]
+    fn alternatives_pick_first_passing_child() {
+        let table = load_single_table(
+            "alt_first",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [
+                            {
+                                "type": "minecraft:alternatives",
+                                "children": [
+                                    {
+                                        "type": "minecraft:item",
+                                        "name": "testns:silk_widget",
+                                        "condition": {
+                                            "type": "minecraft:match_tool",
+                                            "predicate": {
+                                                "predicates": {
+                                                    "minecraft:enchantments": [
+                                                        {"enchantments": "testns:delicate", "levels": {"min": 1}}
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "type": "minecraft:item",
+                                        "name": "testns:tool_widget",
+                                        "condition": {
+                                            "type": "minecraft:match_tool",
+                                            "predicate": {"items": "testns:hammer"}
+                                        }
+                                    },
+                                    {
+                                        "type": "minecraft:item",
+                                        "name": "testns:fallback_widget"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        let mut rng = RandomSource::from_world_seed(42);
+        let mut hammer_delicate = BTreeMap::new();
+        hammer_delicate.insert("testns:delicate".to_owned(), 1);
+        let ctx_first = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "testns:hammer".to_owned(),
+                enchantments: hammer_delicate,
+            }),
+            explosion_radius: None,
+        };
+        let drops_first = table.roll(&ctx_first, &mut rng);
+        assert_eq!(drops_first.len(), 1);
+        assert_eq!(drops_first[0].item(), "testns:silk_widget");
+        assert_eq!(drops_first[0].count(), 1);
+
+        let ctx_second = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "testns:hammer".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+        };
+        let drops_second = table.roll(&ctx_second, &mut rng);
+        assert_eq!(drops_second.len(), 1);
+        assert_eq!(drops_second[0].item(), "testns:tool_widget");
+
+        let ctx_third = LootContext::for_block("testns:widget");
+        let drops_third = table.roll(&ctx_third, &mut rng);
+        assert_eq!(drops_third.len(), 1);
+        assert_eq!(drops_third[0].item(), "testns:fallback_widget");
+    }
+
+    #[test]
+    fn survives_explosion_with_and_without_explosion() {
+        let table = load_single_table(
+            "survives_exp",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "testns:widget",
+                                "condition": {"type": "minecraft:survives_explosion"}
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        let no_explosion = LootContext::for_block("testns:widget");
+        for seed in 0..50_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = table.roll(&no_explosion, &mut rng);
+            assert_eq!(drops.len(), 1, "without explosion must always drop");
+            assert_eq!(drops[0].item(), "testns:widget");
+        }
+
+        let exploded = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: None,
+            explosion_radius: Some(4.0),
+        };
+        let mut survived = 0_u32;
+        for seed in 0..10_000_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = table.roll(&exploded, &mut rng);
+            assert!(drops.len() <= 1);
+            survived += drops.len() as u32;
+        }
+        assert!(
+            (2300..=2700).contains(&survived),
+            "expected ~2500 survivors at radius 4, got {survived}"
+        );
+    }
+
+    #[test]
+    fn table_bonus_indexes_by_level_and_clamps_above_list() {
+        let table = load_single_table(
+            "table_bonus",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "testns:bonus_drop",
+                                "condition": {
+                                    "type": "minecraft:table_bonus",
+                                    "enchantment": "testns:luck",
+                                    "chances": [0.0, 0.5, 1.0]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        let ctx_level = |level: Option<u8>| LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: level.map(|lvl| {
+                let mut enchantments = BTreeMap::new();
+                enchantments.insert("testns:luck".to_owned(), lvl);
+                ToolContext {
+                    item: "testns:pick".to_owned(),
+                    enchantments,
+                }
+            }),
+            explosion_radius: None,
+        };
+
+        // Missing tool -> level 0 -> chance 0.0 -> never drops.
+        for seed in 0..200_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            assert!(table.roll(&ctx_level(None), &mut rng).is_empty());
+        }
+
+        // Level 1 -> chance 0.5 -> roughly half of 2000 trials.
+        let mut level1_hits = 0_u32;
+        for seed in 0..2000_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            level1_hits += table.roll(&ctx_level(Some(1)), &mut rng).len() as u32;
+        }
+        assert!(
+            (900..=1100).contains(&level1_hits),
+            "expected ~1000 hits at level 1, got {level1_hits}"
+        );
+
+        // Level 2 -> chance 1.0 -> always drops.
+        for seed in 0..200_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            assert_eq!(table.roll(&ctx_level(Some(2)), &mut rng).len(), 1);
+        }
+
+        // Level 5 (above chances len 3) -> uses last entry (1.0) -> always drops.
+        for seed in 0..200_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            assert_eq!(table.roll(&ctx_level(Some(5)), &mut rng).len(), 1);
+        }
+    }
+
+    #[test]
+    fn apply_bonus_formulas_pin_exact_counts_for_fixed_seeds() {
+        let ore_table = load_single_table(
+            "bonus_ore",
+            "ore",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "testns:gem",
+                        "modifier": [
+                            {"type": "minecraft:set_count", "count": 2},
+                            {
+                                "type": "minecraft:apply_bonus",
+                                "enchantment": "testns:luck",
+                                "formula": "minecraft:ore_drops"
+                            }
+                        ]
+                    }]
+                }]
+            }"#,
+        );
+        let uniform_table = load_single_table(
+            "bonus_uniform",
+            "bush",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "testns:berry",
+                        "modifier": {
+                            "type": "minecraft:apply_bonus",
+                            "enchantment": "testns:luck",
+                            "formula": "minecraft:uniform_bonus_count",
+                            "parameters": {"bonusMultiplier": 2}
+                        }
+                    }]
+                }]
+            }"#,
+        );
+        let binomial_table = load_single_table(
+            "bonus_binomial",
+            "crop",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "testns:seed",
+                        "modifier": {
+                            "type": "minecraft:apply_bonus",
+                            "enchantment": "testns:luck",
+                            "formula": "minecraft:binomial_with_bonus_count",
+                            "parameters": {"extra": 3, "probability": 0.5}
+                        }
+                    }]
+                }]
+            }"#,
+        );
+
+        let mut enchs = BTreeMap::new();
+        enchs.insert("testns:luck".to_owned(), 3);
+        let ctx_luck3 = LootContext {
+            block_state: ("testns:block".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "testns:tool".to_owned(),
+                enchantments: enchs,
+            }),
+            explosion_radius: None,
+        };
+        let ctx_bare = LootContext::for_block("testns:block");
+
+        // Compute exact expected results from independent RandomSource clones with the same formula.
+        let ore_counts: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                ore_table.roll(&ctx_luck3, &mut rng)[0].count()
+            })
+            .collect();
+        let expected_ore: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                let mult = (rng.next_int_bounded(5) as u16).max(1);
+                2 * mult
+            })
+            .collect();
+        assert_eq!(ore_counts, expected_ore);
+        assert_eq!(ore_counts, vec![8, 4, 4, 8, 4, 6, 2, 6]);
+        // Missing enchantment -> level 0 -> multiplier 1 -> base count 2.
+        assert_eq!(
+            ore_table.roll(&ctx_bare, &mut RandomSource::from_world_seed(1))[0].count(),
+            2
+        );
+
+        let uniform_counts: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                uniform_table.roll(&ctx_luck3, &mut rng)[0].count()
+            })
+            .collect();
+        let expected_uniform: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                1 + rng.next_int_bounded(7) as u16
+            })
+            .collect();
+        assert_eq!(uniform_counts, expected_uniform);
+        assert_eq!(uniform_counts, vec![7, 3, 4, 7, 4, 5, 1, 5]);
+        // Missing enchantment -> level 0 -> bonus 0 -> base count 1.
+        assert_eq!(
+            uniform_table.roll(&ctx_bare, &mut RandomSource::from_world_seed(1))[0].count(),
+            1
+        );
+
+        let binomial_counts: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                binomial_table.roll(&ctx_luck3, &mut rng)[0].count()
+            })
+            .collect();
+        let expected_binomial: Vec<u16> = (0..8_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                let mut successes = 0_u16;
+                for _ in 0..6 {
+                    if f64::from(rng.next_float()) < 0.5 {
+                        successes += 1;
+                    }
+                }
+                1 + successes
+            })
+            .collect();
+        assert_eq!(binomial_counts, expected_binomial);
+        assert_eq!(binomial_counts, vec![5, 5, 4, 4, 3, 4, 3, 2]);
+
+        // Verify no extra +1 on binomial_with_bonus_count: with level 0, extra 3, p = 0.5,
+        // mean over 4000 seeds must be ~ 1 + 3 * 0.5 = 2.5 (never ~3.5).
+        let total: u32 = (0..4000_u64)
+            .map(|seed| {
+                let mut rng = RandomSource::from_world_seed(seed);
+                u32::from(binomial_table.roll(&ctx_bare, &mut rng)[0].count())
+            })
+            .sum();
+        let mean = f64::from(total) / 4000.0;
+        assert!(
+            (2.4..=2.6).contains(&mean),
+            "expected mean ~2.5, got {mean}"
+        );
+    }
+
+    #[test]
+    fn limit_count_clamps_and_zero_or_negative_drops_nothing() {
+        let clamped_table = load_single_table(
+            "limit_clamp",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {
+                            "type": "minecraft:item",
+                            "name": "testns:low",
+                            "modifier": [
+                                {"type": "minecraft:set_count", "count": -3},
+                                {"type": "minecraft:limit_count", "limit": {"min": 2, "max": 5}}
+                            ]
+                        }
+                    ]
+                }]
+            }"#,
+        );
+        let high_table = load_single_table(
+            "limit_high",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {
+                            "type": "minecraft:item",
+                            "name": "testns:high",
+                            "modifier": [
+                                {"type": "minecraft:set_count", "count": 9},
+                                {"type": "minecraft:limit_count", "limit": {"min": 2, "max": 5}}
+                            ]
+                        }
+                    ]
+                }]
+            }"#,
+        );
+        let zero_table = load_single_table(
+            "limit_zero",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {
+                            "type": "minecraft:item",
+                            "name": "testns:zero",
+                            "modifier": [
+                                {"type": "minecraft:set_count", "count": -2},
+                                {"type": "minecraft:limit_count", "limit": {"min": 0}}
+                            ]
+                        }
+                    ]
+                }]
+            }"#,
+        );
+
+        let ctx = LootContext::for_block("testns:widget");
+        let mut rng = RandomSource::from_world_seed(7);
+
+        let low = clamped_table.roll(&ctx, &mut rng);
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0].count(), 2);
+
+        let high = high_table.roll(&ctx, &mut rng);
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].count(), 5);
+
+        let zero = zero_table.roll(&ctx, &mut rng);
+        assert!(zero.is_empty(), "count <= 0 must drop nothing");
+    }
+
+    #[test]
+    fn explosion_decay_radius_four_keeps_around_quarter() {
+        let table = load_single_table(
+            "exp_decay",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "testns:widget",
+                        "modifier": {"type": "minecraft:explosion_decay"}
+                    }]
+                }]
+            }"#,
+        );
+
+        // No explosion radius -> no decay.
+        let bare = LootContext::for_block("testns:widget");
+        assert_eq!(
+            table.roll(&bare, &mut RandomSource::from_world_seed(1))[0].count(),
+            1
+        );
+
+        let exploded = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: None,
+            explosion_radius: Some(4.0),
+        };
+        let mut kept = 0_u32;
+        for seed in 0..10_000_u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let drops = table.roll(&exploded, &mut rng);
+            assert!(drops.len() <= 1);
+            kept += drops.len() as u32;
+        }
+        assert!(
+            (2300..=2700).contains(&kept),
+            "expected 2300..=2700 kept items at radius 4, got {kept}"
+        );
+    }
+
+    #[test]
+    fn conditions_tags_modifiers_notes_and_item_defaults() {
+        let root = scratch_root("full_eval");
+        write(
+            &root.join("data/testns/tags/item/cutters.json"),
+            r#"{"values": ["testns:shears_x", "testns:shears_y"]}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/synthetic_widget.json"),
+            r#"{"components": {"minecraft:max_stack_size": 16}}"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/blocks/gadget.json"),
+            r##"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 2,
+                        "condition": {
+                            "type": "minecraft:all_of",
+                            "terms": [
+                                {
+                                    "type": "minecraft:match_block",
+                                    "blocks": "testns:gadget",
+                                    "state": {"active": "true"}
+                                },
+                                {
+                                    "type": "minecraft:inverted",
+                                    "term": {
+                                        "type": "minecraft:entity_properties",
+                                        "entity": "this",
+                                        "predicate": {}
+                                    }
+                                }
+                            ]
+                        },
+                        "entries": [{
+                            "type": "minecraft:alternatives",
+                            "children": [
+                                {
+                                    "type": "minecraft:dynamic",
+                                    "name": "testns:bits",
+                                    "condition": {
+                                        "type": "minecraft:match_block",
+                                        "blocks": "testns:gadget",
+                                        "state": {"cracked": "true"}
+                                    }
+                                },
+                                {
+                                    "type": "minecraft:item",
+                                    "name": "minecraft:synthetic_widget",
+                                    "condition": {
+                                        "type": "minecraft:match_tool",
+                                        "predicate": {"items": "#testns:cutters"}
+                                    },
+                                    "modifier": [
+                                        {"type": "minecraft:set_count", "count": 10},
+                                        {
+                                            "type": "minecraft:copy_components",
+                                            "source": "block_entity",
+                                            "include": ["testns:custom"]
+                                        },
+                                        {
+                                            "type": "minecraft:copy_state",
+                                            "block": "testns:gadget",
+                                            "properties": ["active"]
+                                        }
+                                    ]
+                                },
+                                {
+                                    "type": "minecraft:item",
+                                    "name": "testns:crumb",
+                                    "modifier": [
+                                        {"type": "minecraft:set_count", "count": {"type": "minecraft:uniform", "min": -2, "max": 2}},
+                                        {
+                                            "type": "minecraft:set_count",
+                                            "add": true,
+                                            "condition": {
+                                                "type": "minecraft:match_block",
+                                                "blocks": "testns:gadget",
+                                                "state": {"bonus": "true"}
+                                            },
+                                            "count": 3
+                                        }
+                                    ]
+                                }
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "condition": {"type": "testns:unsupported_cond"},
+                        "entries": [{"type": "minecraft:item", "name": "testns:never"}]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_blocks(&root).expect("load full eval");
+        assert!(tables.item_defaults().is_some());
+        let gadget = tables.get("testns:gadget").expect("gadget");
+
+        // Cracked state hits dynamic entry twice (rolls = 2): no items invented, two notes emitted.
+        let mut props_cracked = BTreeMap::new();
+        props_cracked.insert("active".to_owned(), "true".to_owned());
+        props_cracked.insert("cracked".to_owned(), "true".to_owned());
+        let ctx_cracked = LootContext {
+            block_state: ("testns:gadget".to_owned(), props_cracked),
+            tool: None,
+            explosion_radius: None,
+        };
+        let mut rng = RandomSource::from_world_seed(99);
+        let cracked_roll = gadget.roll_with_notes(&ctx_cracked, &mut rng);
+        assert!(cracked_roll.items.is_empty());
+        assert_eq!(
+            cracked_roll.notes,
+            vec![
+                LootNote::DynamicNotApplied {
+                    name: "testns:bits".to_owned()
+                },
+                LootNote::DynamicNotApplied {
+                    name: "testns:bits".to_owned()
+                },
+            ]
+        );
+
+        // Tag-matched tool drops minecraft:synthetic_widget with ItemDefaults max_stack = 16 and component notes.
+        let mut props_active = BTreeMap::new();
+        props_active.insert("active".to_owned(), "true".to_owned());
+        let ctx_cutter = LootContext {
+            block_state: ("testns:gadget".to_owned(), props_active),
+            tool: Some(ToolContext {
+                item: "testns:shears_x".to_owned(),
+                enchantments: BTreeMap::new(),
+            }),
+            explosion_radius: None,
+        };
+        let cutter_roll = tables
+            .roll("testns:gadget", &ctx_cutter, &mut rng)
+            .expect("table exists");
+        assert_eq!(cutter_roll.items.len(), 2);
+        assert_eq!(cutter_roll.items[0].item(), "minecraft:synthetic_widget");
+        assert_eq!(cutter_roll.items[0].count(), 10);
+        assert_eq!(cutter_roll.items[0].max_stack(), 16);
+        assert_eq!(cutter_roll.notes.len(), 4);
+        assert!(matches!(
+            &cutter_roll.notes[0],
+            LootNote::CopyComponentsNotApplied { item, source, .. }
+                if item == "minecraft:synthetic_widget" && source == "block_entity"
+        ));
+        assert!(matches!(
+            &cutter_roll.notes[1],
+            LootNote::CopyStateNotApplied { item, block, properties }
+                if item == "minecraft:synthetic_widget"
+                    && block == "testns:gadget"
+                    && properties == &vec!["active".to_owned()]
+        ));
+
+        // Inactive block state fails match_block -> empty drops; unsupported pool condition also fails.
+        let ctx_inactive = LootContext::for_block("testns:gadget");
+        assert!(gadget.roll(&ctx_inactive, &mut rng).is_empty());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn binomial_provider_random_chance_any_of_and_stack_splitting() {
+        let table = load_single_table(
+            "split_and_chance",
+            "widget",
+            r#"{
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "condition": {
+                            "type": "minecraft:any_of",
+                            "terms": [
+                                {"type": "testns:missing_cond"},
+                                {
+                                    "type": "minecraft:match_tool",
+                                    "predicate": {
+                                        "predicates": {
+                                            "minecraft:enchantments": [
+                                                {"enchantments": "testns:delicate", "levels": {"min": 1, "max": 2}}
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "minecraft:snowball",
+                                "modifier": {"type": "minecraft:set_count", "count": 20}
+                            }
+                        ]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [
+                            {
+                                "type": "minecraft:item",
+                                "name": "testns:seed",
+                                "condition": {"type": "minecraft:random_chance", "chance": 0.25},
+                                "modifier": {
+                                    "type": "minecraft:set_count",
+                                    "count": {"type": "minecraft:binomial", "n": 4, "p": 0.5}
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        // No ItemDefaults present -> minecraft:snowball falls back to default_max_stack (16),
+        // splitting 20 items into 16 + 4.
+        let mut enchs = BTreeMap::new();
+        enchs.insert("testns:delicate".to_owned(), 2);
+        let ctx_delicate = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "testns:wand".to_owned(),
+                enchantments: enchs,
+            }),
+            explosion_radius: None,
+        };
+        let mut rng = RandomSource::from_world_seed(123);
+        let drops = table.roll(&ctx_delicate, &mut rng);
+        assert!(drops.len() >= 2);
+        assert_eq!(drops[0].item(), "minecraft:snowball");
+        assert_eq!(drops[0].count(), 16);
+        assert_eq!(drops[0].max_stack(), 16);
+        assert_eq!(drops[1].item(), "minecraft:snowball");
+        assert_eq!(drops[1].count(), 4);
+        assert_eq!(drops[1].max_stack(), 16);
+
+        // Enchantment level 0 is treated as absent -> fails min: 1.
+        let mut zero_enchs = BTreeMap::new();
+        zero_enchs.insert("testns:delicate".to_owned(), 0);
+        let ctx_zero = LootContext {
+            block_state: ("testns:widget".to_owned(), BTreeMap::new()),
+            tool: Some(ToolContext {
+                item: "testns:wand".to_owned(),
+                enchantments: zero_enchs,
+            }),
+            explosion_radius: None,
+        };
+        let mut seed_hits = 0_u32;
+        let mut seed_total = 0_u32;
+        let mut r = RandomSource::from_world_seed(777);
+        for _ in 0..4000_u32 {
+            let res = table.roll(&ctx_zero, &mut r);
+            assert!(res.iter().all(|s| s.item() == "testns:seed"));
+            if let Some(s) = res.first() {
+                seed_hits += 1;
+                seed_total += u32::from(s.count());
+                assert!(s.count() <= 4);
+            }
+        }
+        // 0.25 pass rate * (1 - 0.5^4) non-zero binomial rate = 0.234375 -> ~938 out of 4000.
+        assert!((830..=1050).contains(&seed_hits), "seed_hits={seed_hits}");
+        let conditional_mean = f64::from(seed_total) / f64::from(seed_hits);
+        // Conditional mean of Binomial(4, 0.5) given > 0 is 2.0 / (1 - 0.0625) = 2.133...
+        assert!(
+            (1.95..=2.30).contains(&conditional_mean),
+            "conditional_mean={conditional_mean}"
+        );
     }
 
     /// Run with:
