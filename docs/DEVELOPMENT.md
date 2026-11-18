@@ -184,3 +184,45 @@ A single connection is bounded by one pending chunk batch, a 1 MiB inbound
 budget during play, and a 10-minute lifetime. The bound listener does not
 announce a persistent playable world. See [compatibility](COMPATIBILITY.md)
 and [ADR-0013](decisions/ADR-0013.md).
+
+## Vanilla 26.3 rule data root
+
+The recipe, fuel, brewing, smithing, anvil, enchantment, item default
+component, tool rule, and block loot loaders read Java 26.3 data and reports at
+runtime from an operator-provisioned directory. These files are library logic
+and are not wired into live play yet.
+
+To provision a local data root from your own official Java 26.3 `server.jar`
+(requires Java 25 and `unzip`), extract `data/minecraft/**` from the versioned
+server jar inside the bundler jar and generate reports with
+`java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --reports`
+into `<root>/reports`:
+
+```sh
+server_jar="/path/to/server.jar"
+data_root="/path/to/vanilla-data"
+tmp_dir="$(mktemp -d)"
+mkdir -p "$data_root"
+
+# 1. Extract data/minecraft/** from the versioned server jar inside the bundler jar.
+unzip -p "$server_jar" META-INF/versions/26.3/server-26.3.jar > "$tmp_dir/server-26.3.jar"
+unzip -q "$tmp_dir/server-26.3.jar" 'data/minecraft/*' -d "$data_root"
+
+# 2. Generate Mojang reports and move them into <root>/reports.
+(cd "$tmp_dir" && java -DbundlerMainClass=net.minecraft.data.Main -jar "$server_jar" --reports)
+mv "$tmp_dir/generated/reports" "$data_root/reports"
+rm -rf "$tmp_dir"
+
+# 3. Verify the provisioned data root and print its summary JSON.
+cargo run -p rustmc-tools --bin check_vanilla_data --locked -- "$data_root"
+```
+
+You can also set `RUSTMC_VANILLA_DATA="$data_root"` instead of passing the path
+as an argument to `check_vanilla_data`, or run the opt-in data-root tests:
+
+```sh
+RUSTMC_VANILLA_DATA="$data_root" cargo test -p rustmc-server --lib -- --ignored pack_vanilla_rules_pin_26_3_summary
+```
+
+Keep the provisioned directory outside the repository: official game data and
+generated reports **must not be committed or redistributed**.

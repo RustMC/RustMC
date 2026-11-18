@@ -1399,3 +1399,22 @@ still only a selected slice of 26.3 vegetation.
 ## Bedrock chunk packets
 
 `LevelChunkPacket` header field order and widths follow `LevelChunkPacketPayload.json` in Mojang's [1.26.51 schema](https://github.com/Mojang/bedrock-protocol-docs/releases/tag/v1.26.51) (commit `8667debe0adad27de6c692c88942c489a1193206`). That schema leaves the chunk data opaque, so the sub-chunk, block palette, and biome storage layouts have no primary source. They, and the presence rules for the blob-ID array and `Client Request SubChunk Limit`, stay unverified until a real 1.26.51 client loads a RustMC chunk.
+
+## Vanilla 26.3 rule bundle and data provenance (19 November 2026)
+
+Item, block, and enchantment tags, item default component reports, recipes (crafting, cooking, stonecutting, brewing, and smithing), block loot tables and predicates, and enchantment definitions are read at runtime from an operator-provisioned Java 26.3 data root via `VanillaRules::load` (verified with `check_vanilla_data`). No vanilla data files or generated reports are committed to the repository.
+
+Behavior not encoded directly in the JSON data follows the `minecraft.wiki` revisions cited in the code:
+
+- `Smelting` (revisions `3829803` and `3896034`, plus `Template:Smelting_table` revision `3859871`) in [`furnace.rs`](../crates/rustmc-server/src/world/furnace.rs)
+- `Anvil mechanics` (revision `3804134`) in [`anvil.rs`](../crates/rustmc-server/src/world/anvil.rs)
+- `Enchantment definition` (revision `3843772`) in [`enchantment.rs`](../crates/rustmc-server/src/world/enchantment.rs) and [`anvil.rs`](../crates/rustmc-server/src/world/anvil.rs)
+- `Loot table` (revision `3893957`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Predicate` (revision `3888899`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Item modifier` (revision `3896146`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Number provider` (revision `3869456`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Fortune` (revision `3864999`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Explosion` (revision `3903416`) in [`loot.rs`](../crates/rustmc-server/src/world/loot.rs)
+- `Data component format` (revision `3903955`, subpages `Data component format/tool` revision `2910648`, `Data component format/food` revision `3432839`, and `Data component format/consumable` revision `3852491`) in [`item.rs`](../crates/rustmc-server/src/item.rs)
+
+Where `minecraft.wiki` pages disagree (such as `Item modifier` vs. `Fortune` on `binomial_with_bonus_count`, and `Explosion` and `Predicate` vs. `Item modifier` on `explosion_decay`), the chosen rule and the conflicting sentence are recorded in the module's doc comments. No data files are committed, and no new Cargo dependencies were added (runtime JSON parsing uses the already-locked, already-reviewed `serde_json` dependency).
