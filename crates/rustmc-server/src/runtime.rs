@@ -123,11 +123,22 @@ struct Connection {
     last_activity: Instant,
     created: Instant,
     pending_chunk_since: Option<Instant>,
+    write_overflow: bool,
     /// Start of the current play-phase read window and bytes read within it.
     rate_window: Instant,
     rate_window_bytes: usize,
     /// When the session entered play; the play lifetime counts from here.
     play_started: Option<Instant>,
+}
+
+/// Queue a frame for one recipient unless that would pass the write bound.
+/// A recipient too slow to accept it is closed rather than silently missing chat.
+fn queue_broadcast(pending: &mut Vec<u8>, write_overflow: &mut bool, frame: &[u8]) {
+    if pending.len().saturating_add(frame.len()) > MAX_PENDING_BYTES {
+        *write_overflow = true;
+    } else {
+        pending.extend_from_slice(frame);
+    }
 }
 
 impl Connection {
@@ -508,6 +519,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                         last_activity: Instant::now(),
                         created: Instant::now(),
                         pending_chunk_since: None,
+                        write_overflow: false,
                         rate_window: Instant::now(),
                         rate_window_bytes: 0,
                         play_started: None,
@@ -545,7 +557,9 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
             let playing = connection.discovery.state() == discovery_java::State::Play;
             let (read_len, byte_limit) = connection.read_allowance(config, playing);
             let mut buffer = [0u8; READ_CHUNK];
-            let reason = if connection.lifetime_expired(config, playing) {
+            let reason = if connection.write_overflow {
+                Some("write_limit")
+            } else if connection.lifetime_expired(config, playing) {
                 Some("lifetime_timeout")
             } else if read_len == 0 && !playing {
                 Some("read_limit")
@@ -684,6 +698,15 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                 discovery_java::State::Refused => Some("login_refused"),
                 _ => None,
             });
+            // Chat is relayed even if its sender closed in this same pass.
+            let broadcasts = connection.discovery.take_broadcasts();
+            for (other_index, other) in connections.iter_mut().enumerate() {
+                if other_index != index && other.discovery.state() == discovery_java::State::Play {
+                    for frame in &broadcasts {
+                        queue_broadcast(&mut other.pending, &mut other.write_overflow, frame);
+                    }
+                }
+            }
             if let Some(reason) = reason {
                 let connection = connections.swap_remove(index);
                 let _ = connection.stream.shutdown(Shutdown::Both);
@@ -708,6 +731,18 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_queue_marks_a_recipient_that_would_pass_the_write_bound() {
+        let mut pending = vec![0; MAX_PENDING_BYTES - 2];
+        let mut overflow = false;
+        queue_broadcast(&mut pending, &mut overflow, &[1, 2]);
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+        assert!(!overflow);
+        queue_broadcast(&mut pending, &mut overflow, &[3]);
+        assert_eq!(pending.len(), MAX_PENDING_BYTES);
+        assert!(overflow);
+    }
 
     #[test]
     fn prebind_shutdown_never_opens_socket() {
@@ -753,6 +788,7 @@ mod tests {
             last_activity: Instant::now(),
             created: Instant::now(),
             pending_chunk_since: None,
+            write_overflow: false,
             rate_window: Instant::now(),
             rate_window_bytes: 0,
             play_started: None,
