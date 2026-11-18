@@ -895,6 +895,20 @@ impl<'a> NbtReader<'a> {
     }
 }
 
+/// Decodes one anonymous root network NBT tag (without a root name), returning the tag
+/// and the number of bytes consumed from `data`.
+pub fn read_anonymous_network_nbt(data: &[u8]) -> Result<(NbtTag, usize), BlockEntityError> {
+    let mut reader = NbtReader::new(data);
+    let root_type = reader.read_u8()?;
+    if root_type == 0 {
+        return Err(BlockEntityError::Malformed(
+            "unexpected TAG_End as root network NBT tag",
+        ));
+    }
+    let tag = reader.read_payload(root_type, 0)?;
+    Ok((tag, reader.pos))
+}
+
 /// Decodes network NBT from bytes, accepting both anonymous and named root compounds.
 pub fn read_network_nbt(data: &[u8]) -> Result<NbtTag, BlockEntityError> {
     let mut reader = NbtReader::new(data);

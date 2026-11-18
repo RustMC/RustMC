@@ -8,3 +8,4 @@ pub mod entity_spawn;
 pub mod ids;
 pub mod movement;
 pub mod player_info;
+pub mod slot;
