@@ -17,7 +17,7 @@ use crate::protocol::{
     ids::{DynamicRegistryIds, ProtocolIds},
     slot,
 };
-use crate::world::inventory::PlayerInventory;
+use crate::world::inventory::{PlayerInventory, WINDOW_CREATIVE_DROP_SLOT, WINDOW_PLAYER_SLOTS};
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
@@ -857,20 +857,33 @@ impl Session {
                             // ignored.
                             if let Some(protocol_ids) = &self.protocol_ids {
                                 let (window_slot, rest) = read_i16_be(body)?;
-                                let slot_index = PlayerInventory::window_slot_to_index(window_slot)
-                                    .ok_or(Error::Malformed)?;
-                                let (stack, consumed) = slot::decode_slot(
+                                if window_slot != WINDOW_CREATIVE_DROP_SLOT
+                                    && !WINDOW_PLAYER_SLOTS.contains(&window_slot)
+                                {
+                                    return Err(Error::Malformed);
+                                }
+                                let decoded = match slot::decode_slot(
                                     rest,
                                     protocol_ids,
                                     &self.dynamic_registry_ids,
-                                )
-                                .map_err(|_| Error::Malformed)?;
-                                if consumed != rest.len() {
-                                    return Err(Error::Malformed);
+                                ) {
+                                    Ok((stack, consumed)) if consumed == rest.len() => Some(stack),
+                                    // Creative tabs offer items with components RustMC does
+                                    // not model yet; that is valid client input, so the slot
+                                    // is no longer tracked rather than ending the session.
+                                    Err(slot::SlotError::UnsupportedComponent(_)) => None,
+                                    _ => return Err(Error::Malformed),
+                                };
+                                // Only main inventory and hotbar slots are modelled; drops
+                                // (-1), crafting, armor and offhand slots are accepted and
+                                // not stored.
+                                if let Some(slot_index) =
+                                    PlayerInventory::window_slot_to_index(window_slot)
+                                {
+                                    self.inventory
+                                        .set_slot(slot_index, decoded.flatten())
+                                        .map_err(|_| Error::Malformed)?;
                                 }
-                                self.inventory
-                                    .set_slot(slot_index, stack)
-                                    .map_err(|_| Error::Malformed)?;
                             } else if body.is_empty() {
                                 return Err(Error::Malformed);
                             }
@@ -2539,14 +2552,65 @@ mod tests {
     }
 
     #[test]
+    fn creative_slot_accepts_drop_crafting_armor_and_offhand_slots_without_storing() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+        // -1 drops the item; 0..=8 are crafting output/input and armor; 45 is the offhand.
+        for slot in [-1, 0, 1, 4, 5, 8, 45] {
+            let packet = creative_slot_frame(slot, &Some(stone.clone()), &ids, &dynamic_ids);
+            assert!(
+                s.receive(&packet, 4096).is_ok(),
+                "window slot {slot} is valid creative input"
+            );
+        }
+        assert_eq!(s.state(), State::Play);
+        assert_eq!(s.inventory().total_item_count(), 0);
+    }
+
+    #[test]
+    fn creative_slot_with_unmodelled_component_keeps_the_session_and_untracks_the_slot() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+        s.receive(
+            &creative_slot_frame(36, &Some(stone), &ids, &dynamic_ids),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(s.inventory().total_item_count(), 1);
+
+        // Component type 99 is not modelled (for example fireworks or banner patterns).
+        let mut body = 36i16.to_be_bytes().to_vec();
+        put_varint(1, &mut body); // count
+        put_varint(1, &mut body); // minecraft:stone
+        put_varint(1, &mut body); // one component to add
+        put_varint(0, &mut body); // none to remove
+        put_varint(99, &mut body); // unmodelled component type
+        body.push(0);
+        assert!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &body),
+                4096
+            )
+            .is_ok()
+        );
+        assert_eq!(s.state(), State::Play);
+        assert!(s.inventory().get_window_slot(36).is_none());
+    }
+
+    #[test]
     fn creative_slot_rejects_out_of_range_slot_and_unknown_item_id() {
         use crate::item::{DEFAULT_MAX_STACK, ItemStack};
 
         let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
         let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
 
-        // Slots outside the player inventory window's main/hotbar storage (`9..=44`) are rejected.
-        for bad_slot in [i16::MIN, -999, -1, 0, 1, 4, 5, 8, 45, 46, 100, i16::MAX] {
+        // Only numbers outside the player inventory window (`0..=45`) and the creative
+        // drop slot (`-1`) are rejected.
+        for bad_slot in [i16::MIN, -999, -2, 46, 100, i16::MAX] {
             let packet = creative_slot_frame(bad_slot, &Some(stone.clone()), &ids, &dynamic_ids);
             assert_eq!(
                 s.receive(&packet, 4096),

@@ -41,6 +41,16 @@ pub const WINDOW_MAIN_SLOTS: std::ops::RangeInclusive<i16> = 9..=35;
 /// (`Java Edition protocol/Inventory`, revision 3201379, `== Player Inventory ==`: `36–44`).
 pub const WINDOW_HOTBAR_SLOTS: std::ops::RangeInclusive<i16> = 36..=44;
 
+/// Every slot number of the Java Edition player inventory window: crafting output
+/// `0`, 2×2 crafting input `1–4`, armor `5–8`, main `9–35`, hotbar `36–44`, offhand
+/// `45` (`Java Edition protocol/Inventory`, revision 3201379, `== Player Inventory ==`).
+pub const WINDOW_PLAYER_SLOTS: std::ops::RangeInclusive<i16> = 0..=45;
+
+/// Slot number a creative client sends when it drops an item outside the window
+/// (`Java Edition protocol/Packets`, revision 3868170, `Set Creative Mode Slot`:
+/// "Dropping an item (by clicking outside the window) effectively sets slot -1").
+pub const WINDOW_CREATIVE_DROP_SLOT: i16 = -1;
+
 /// Errors returned by inventory transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryError {
