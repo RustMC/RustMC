@@ -41,8 +41,9 @@
 //!   | Name | Type           | Description
 //!   | Name | Text Component |
 //!   ```
-//!   Encoded as an anonymous network NBT `TAG_Compound` `{"text": "<custom_name>"}`
-//!   via [`crate::world::block_entity::write_network_nbt`].
+//!   A plain-text name is encoded as a `TAG_String` text component ("As a String Tag:
+//!   For components only containing text (no styling, no events etc.)") via
+//!   [`crate::java_wire::put_nbt_text`]; decoding also accepts a `{"text": …}` compound.
 //! - `minecraft:enchantments` (see also `Data component format/enchantments`, revision `3849825`):
 //!   ```text
 //!   | Name                  | Type                        | Description
@@ -94,9 +95,7 @@ use crate::item::{
 };
 use crate::java_wire::{self, MAX_NBT_STRING_BYTES, WireError, put_varint};
 use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
-use crate::world::block_entity::{
-    BlockEntityError, NbtTag, encode_modified_utf8, read_anonymous_network_nbt, write_network_nbt,
-};
+use crate::world::block_entity::{BlockEntityError, NbtTag, read_anonymous_network_nbt};
 use crate::world::enchantment::MAX_ENCHANTMENT_LEVEL;
 
 /// RustMC policy bound on component additions or removals in a single network `Slot`.
@@ -333,15 +332,9 @@ fn require_component_id(ids: &ProtocolIds, name: &'static str) -> Result<u32, Sl
 }
 
 fn encode_custom_name(name: &str, out: &mut Vec<u8>) -> Result<(), SlotError> {
-    let encoded = encode_modified_utf8(name);
-    if encoded.len() > MAX_CUSTOM_NAME_BYTES {
-        return Err(SlotError::InvalidCustomName(
-            "custom_name exceeds maximum NBT string byte length",
-        ));
-    }
-    let tag = NbtTag::Compound(vec![("text".to_owned(), NbtTag::String(name.to_owned()))]);
-    write_network_nbt(&tag, out);
-    Ok(())
+    java_wire::put_nbt_text(name, out).map_err(|_| {
+        SlotError::InvalidCustomName("custom_name exceeds maximum NBT string byte length")
+    })
 }
 
 fn decode_custom_name(input: &[u8]) -> Result<(String, usize), SlotError> {
@@ -1011,11 +1004,8 @@ mod tests {
                 0x01, // add_count = 1
                 0x00, // remove_count = 0
                 0x06, // component_type = 6 (minecraft:custom_name)
-                0x0a, // anonymous root TAG_Compound
-                0x08, // TAG_String entry
-                0x00, 0x04, b't', b'e', b'x', b't', // key "text"
-                0x00, 0x02, b'H', b'i', // value "Hi"
-                0x00, // TAG_End
+                0x08, // TAG_String text component
+                0x00, 0x02, b'H', b'i', // "Hi"
             ]
         );
 
