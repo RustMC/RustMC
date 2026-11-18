@@ -12,7 +12,7 @@
 //! articles; item durabilities follow the minecraft.wiki `Durability` article.
 //! Enchantment combination costs are not modelled.
 
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError, items_equal, normalize_item_id};
 use crate::vanilla::random::RandomSource;
 use std::fmt;
 
@@ -90,18 +90,6 @@ impl AnvilState {
             None
         }
     }
-}
-
-/// Strips optional `minecraft:` namespace prefix for canonical item comparison.
-#[inline]
-pub fn normalize_item_id(item: &str) -> &str {
-    item.strip_prefix("minecraft:").unwrap_or(item)
-}
-
-/// Returns true if two item identifiers are canonically identical.
-#[inline]
-pub fn items_equal(a: &str, b: &str) -> bool {
-    normalize_item_id(a) == normalize_item_id(b)
 }
 
 /// Returns the standard vanilla max durability for a known tool, weapon, or armor piece.

@@ -10,7 +10,8 @@
 
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::{CookingKind, RecipeData};
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+pub use crate::item::default_max_stack;
+use crate::item::{ItemStack, ItemStackError, normalize_item_id};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
@@ -47,28 +48,6 @@ pub const INPUT_SLOT: usize = 0;
 pub const FUEL_SLOT: usize = 1;
 pub const OUTPUT_SLOT: usize = 2;
 pub const TOTAL_SLOTS: usize = 3;
-
-/// Strips optional `minecraft:` namespace prefix for canonical item matching.
-#[inline]
-pub fn normalize_item_id(item: &str) -> &str {
-    item.strip_prefix("minecraft:").unwrap_or(item)
-}
-
-/// Checks if two item identifiers match canonically regardless of `minecraft:` prefix.
-#[inline]
-pub fn items_equal(a: &str, b: &str) -> bool {
-    normalize_item_id(a) == normalize_item_id(b)
-}
-
-/// Returns the standard default maximum stack size for common items.
-#[must_use]
-pub fn default_max_stack(item: &str) -> u16 {
-    match normalize_item_id(item) {
-        "lava_bucket" | "water_bucket" | "milk_bucket" => 1,
-        "bucket" | "snowball" | "ender_pearl" | "egg" => 16,
-        _ => DEFAULT_MAX_STACK,
-    }
-}
 
 /// Registered fuel entry with burn duration in ticks and optional residual item.
 #[derive(Debug, Clone, PartialEq, Eq)]

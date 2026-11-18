@@ -8,6 +8,32 @@ pub const DEFAULT_MAX_STACK: u16 = 64;
 /// Upper bound of the item max_stack_size component since Java 1.20.5.
 pub const MAX_STACK_LIMIT: u16 = 99;
 
+/// Strips an optional `minecraft:` namespace prefix for canonical item comparison.
+#[inline]
+#[must_use]
+pub fn normalize_item_id(item: &str) -> &str {
+    item.strip_prefix("minecraft:").unwrap_or(item)
+}
+
+/// Returns true if two item identifiers match canonically regardless of `minecraft:` prefix.
+#[inline]
+#[must_use]
+pub fn items_equal(a: &str, b: &str) -> bool {
+    normalize_item_id(a) == normalize_item_id(b)
+}
+
+/// Returns the standard default maximum stack size for common items.
+#[inline]
+#[must_use]
+pub fn default_max_stack(item: &str) -> u16 {
+    match normalize_item_id(item) {
+        "lava_bucket" | "water_bucket" | "milk_bucket" | "potion" | "splash_potion"
+        | "lingering_potion" => 1,
+        "bucket" | "snowball" | "ender_pearl" | "egg" => 16,
+        _ => DEFAULT_MAX_STACK,
+    }
+}
+
 /// Rejection reasons when constructing an [`ItemStack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemStackError {
@@ -302,5 +328,31 @@ mod tests {
         assert_eq!(taken_more.count(), 10);
         assert_eq!(taken_more.max_stack(), 16);
         assert_eq!(rest_more, None);
+    }
+
+    #[test]
+    fn item_id_helpers_normalize_compare_and_default_max_stack() {
+        assert_eq!(normalize_item_id("minecraft:stone"), "stone");
+        assert_eq!(normalize_item_id("stone"), "stone");
+        assert_eq!(normalize_item_id("custom:widget"), "custom:widget");
+
+        assert!(items_equal("minecraft:oak_planks", "oak_planks"));
+        assert!(items_equal("oak_planks", "oak_planks"));
+        assert!(!items_equal("custom:oak_planks", "oak_planks"));
+
+        for single in [
+            "minecraft:lava_bucket",
+            "water_bucket",
+            "minecraft:milk_bucket",
+            "minecraft:potion",
+            "splash_potion",
+            "minecraft:lingering_potion",
+        ] {
+            assert_eq!(default_max_stack(single), 1, "{single}");
+        }
+        for sixteen in ["bucket", "minecraft:snowball", "ender_pearl", "egg"] {
+            assert_eq!(default_max_stack(sixteen), 16, "{sixteen}");
+        }
+        assert_eq!(default_max_stack("minecraft:stone"), DEFAULT_MAX_STACK);
     }
 }

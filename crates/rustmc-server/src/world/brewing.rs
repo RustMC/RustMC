@@ -12,7 +12,9 @@
 //! `registries.json`.
 
 use super::container_data::SetContainerDataPacket;
-use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::item::{
+    DEFAULT_MAX_STACK, ItemStack, ItemStackError, default_max_stack, items_equal, normalize_item_id,
+};
 use std::fmt;
 
 /// Potion bottle slot 0 (left slot).
@@ -95,13 +97,6 @@ const VANILLA_POTION_TYPES: [&str; 46] = [
     "minecraft:wind_charged",
 ];
 
-/// Strips optional `minecraft:` namespace prefix for canonical item or potion matching.
-#[inline]
-#[must_use]
-pub fn normalize_item_id(item: &str) -> &str {
-    item.strip_prefix("minecraft:").unwrap_or(item)
-}
-
 /// Returns whether `item` is one of the three Java 26.3 potion container items.
 #[inline]
 #[must_use]
@@ -120,22 +115,6 @@ pub fn canonical_potion_type(potion_type: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|entry| normalize_item_id(entry) == bare)
-}
-
-/// Checks if two item identifiers match canonically in the `minecraft` namespace.
-#[must_use]
-pub fn items_equal(a: &str, b: &str) -> bool {
-    normalize_item_id(a) == normalize_item_id(b)
-}
-
-/// Returns the standard default maximum stack size for brewing items.
-#[must_use]
-pub fn default_max_stack(item: &str) -> u16 {
-    if is_potion_container_item(item) {
-        POTION_MAX_STACK
-    } else {
-        DEFAULT_MAX_STACK
-    }
 }
 
 /// Potion effect kind.
