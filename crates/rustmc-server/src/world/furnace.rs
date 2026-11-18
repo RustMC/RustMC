@@ -11,6 +11,7 @@
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::{CookingKind, RecipeData};
 use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -84,16 +85,82 @@ pub struct FuelEntry {
 /// - Sticks: 100 ticks (0.5 smelts).
 /// - Lava bucket: 20000 ticks (100 smelts), leaves empty bucket (`minecraft:bucket`).
 /// - Non-fuel items: 0 ticks (rejected).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FuelRegistry {
     custom: BTreeMap<String, FuelEntry>,
+    fallback: bool,
+}
+
+impl Default for FuelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FuelRegistry {
-    /// Creates an empty registry relying on default vanilla fuel specifications.
+    /// Offline fallback registry used when no operator-provisioned data root is loaded.
+    ///
+    /// Creates an empty registry relying on [`fuel_burn_time`] and [`fuel_remainder`].
     pub fn new() -> Self {
         Self {
             custom: BTreeMap::new(),
+            fallback: true,
+        }
+    }
+
+    /// Builds a fuel registry from operator-provisioned [`ItemTags`].
+    ///
+    /// Registers coal, charcoal, lava bucket (with `minecraft:bucket` remainder),
+    /// and stick with their built-in burn-time constants; every member of
+    /// `minecraft:logs_that_burn`, `minecraft:planks`, and (when present)
+    /// `minecraft:bamboo_blocks` not in `minecraft:non_flammable_wood` at
+    /// `WOOD_BURN_TIME`; and every member of `minecraft:wooden_slabs` not in
+    /// `minecraft:non_flammable_wood` at `WOODEN_SLAB_BURN_TIME`. Does not
+    /// fall back to [`fuel_burn_time`].
+    #[must_use]
+    pub fn from_item_tags(tags: &ItemTags) -> Self {
+        let mut registry = Self {
+            custom: BTreeMap::new(),
+            fallback: false,
+        };
+        let bucket =
+            ItemStack::try_new("minecraft:bucket", 1, default_max_stack("minecraft:bucket"))
+                .expect("built-in bucket item id is valid");
+        registry.insert_entry("minecraft:coal", COAL_BURN_TIME, None);
+        registry.insert_entry("minecraft:charcoal", COAL_BURN_TIME, None);
+        registry.insert_entry("minecraft:lava_bucket", LAVA_BUCKET_BURN_TIME, Some(bucket));
+        registry.insert_entry("minecraft:stick", STICK_BURN_TIME, None);
+
+        for tag in [
+            "minecraft:logs_that_burn",
+            "minecraft:planks",
+            "minecraft:bamboo_blocks",
+        ] {
+            registry.register_flammable_tag(tags, tag, WOOD_BURN_TIME);
+        }
+        registry.register_flammable_tag(tags, "minecraft:wooden_slabs", WOODEN_SLAB_BURN_TIME);
+        registry
+    }
+
+    fn insert_entry(&mut self, item_id: &str, burn_time: u16, remainder: Option<ItemStack>) {
+        let key = normalize_item_id(item_id).to_string();
+        self.custom.insert(
+            key,
+            FuelEntry {
+                burn_time,
+                remainder,
+            },
+        );
+    }
+
+    fn register_flammable_tag(&mut self, tags: &ItemTags, tag: &str, burn_time: u16) {
+        let Some(members) = tags.members(tag) else {
+            return;
+        };
+        for item in members {
+            if !tags.contains("minecraft:non_flammable_wood", item) {
+                self.insert_entry(item, burn_time, None);
+            }
         }
     }
 
@@ -111,14 +178,7 @@ impl FuelRegistry {
             })
             .transpose()?;
         let item_id = item_id.into();
-        let key = normalize_item_id(&item_id).to_string();
-        self.custom.insert(
-            key,
-            FuelEntry {
-                burn_time,
-                remainder,
-            },
-        );
+        self.insert_entry(&item_id, burn_time, remainder);
         Ok(())
     }
 
@@ -129,7 +189,11 @@ impl FuelRegistry {
         if let Some(entry) = self.custom.get(normalized) {
             return entry.burn_time;
         }
-        fuel_burn_time(normalized)
+        if self.fallback {
+            fuel_burn_time(normalized)
+        } else {
+            0
+        }
     }
 
     /// Returns the remainder item left behind when consuming fuel, if any.
@@ -139,10 +203,14 @@ impl FuelRegistry {
         if let Some(entry) = self.custom.get(normalized) {
             return entry.remainder.clone();
         }
-        fuel_remainder(normalized).map(|rem| {
-            ItemStack::try_new(rem, 1, default_max_stack(rem))
-                .expect("built-in fuel remainders use valid item ids")
-        })
+        if self.fallback {
+            fuel_remainder(normalized).map(|rem| {
+                ItemStack::try_new(rem, 1, default_max_stack(rem))
+                    .expect("built-in fuel remainders use valid item ids")
+            })
+        } else {
+            None
+        }
     }
 
     /// Whether an item is recognized as valid fuel.
@@ -152,6 +220,8 @@ impl FuelRegistry {
     }
 }
 
+/// Offline fallback burn-time lookup used when no operator-provisioned data root is loaded.
+///
 /// Returns the standard vanilla fuel burn duration in ticks for a given item identifier.
 ///
 /// Only real Java 26.3 item IDs from `registries.json` and the server's
@@ -1462,6 +1532,163 @@ mod tests {
         assert!(
             (3_200..=3_800).contains(&extra_count),
             "expected extra point count in 3200..=3800, got {extra_count}"
+        );
+    }
+
+    #[test]
+    fn test_fuel_registry_from_item_tags_respects_tags_and_non_flammable_exclusions() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Empty tags register only the four scalar built-in fuels without falling back to `fuel_burn_time`.
+        let empty_reg = FuelRegistry::from_item_tags(&ItemTags::default());
+        assert_eq!(empty_reg.burn_time("minecraft:coal"), COAL_BURN_TIME);
+        assert_eq!(empty_reg.burn_time("minecraft:charcoal"), COAL_BURN_TIME);
+        assert_eq!(
+            empty_reg.burn_time("minecraft:lava_bucket"),
+            LAVA_BUCKET_BURN_TIME
+        );
+        assert_eq!(
+            empty_reg.remainder("minecraft:lava_bucket"),
+            Some(stack("minecraft:bucket", 1))
+        );
+        assert_eq!(empty_reg.burn_time("minecraft:stick"), STICK_BURN_TIME);
+        assert_eq!(empty_reg.burn_time("minecraft:oak_planks"), 0);
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-fuel-tags-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, text).expect("write");
+        };
+
+        write(
+            "data/minecraft/tags/item/logs_that_burn.json",
+            r#"{"values": ["testns:cedar_log", "testns:nether_log"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/planks.json",
+            r#"{"values": ["testns:cedar_planks", "testns:nether_planks"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/wooden_slabs.json",
+            r#"{"values": ["testns:cedar_slab", "testns:nether_slab"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/bamboo_blocks.json",
+            r#"{"values": ["testns:bamboo_log"]}"#,
+        );
+        write(
+            "data/minecraft/tags/item/non_flammable_wood.json",
+            r#"{"values": ["testns:nether_log", "testns:nether_planks", "testns:nether_slab"]}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let reg = FuelRegistry::from_item_tags(&tags);
+        assert_eq!(reg.burn_time("testns:cedar_log"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:cedar_planks"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:bamboo_log"), WOOD_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:cedar_slab"), WOODEN_SLAB_BURN_TIME);
+        assert_eq!(reg.burn_time("testns:nether_log"), 0);
+        assert_eq!(reg.burn_time("testns:nether_planks"), 0);
+        assert_eq!(reg.burn_time("testns:nether_slab"), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_fuel_registry_matches_fallback_and_reports_diffs --nocapture`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_fuel_registry_matches_fallback_and_reports_diffs() {
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let data = RecipeData::load(&root, &tags).expect("load vanilla recipes");
+        let tag_reg = FuelRegistry::from_item_tags(&tags);
+
+        assert!(
+            tags.members("minecraft:bamboo_blocks").is_some(),
+            "26.3 data includes minecraft:bamboo_blocks"
+        );
+
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for item in [
+            "minecraft:coal",
+            "minecraft:charcoal",
+            "minecraft:lava_bucket",
+            "minecraft:stick",
+            "minecraft:bamboo_mosaic_slab",
+        ] {
+            candidates.insert(item.to_owned());
+        }
+        for tag in [
+            "minecraft:logs_that_burn",
+            "minecraft:planks",
+            "minecraft:wooden_slabs",
+            "minecraft:bamboo_blocks",
+            "minecraft:non_flammable_wood",
+        ] {
+            if let Some(members) = tags.members(tag) {
+                candidates.extend(members.iter().cloned());
+            }
+        }
+        for kind in CookingKind::ALL {
+            for recipe in data.cooking(kind) {
+                candidates.extend(recipe.ingredient().allowed_items().iter().cloned());
+                candidates.insert(recipe.result().item().to_owned());
+            }
+        }
+        for recipe in data.crafting() {
+            candidates.insert(recipe.output().item().to_owned());
+        }
+
+        let mut tag_only = Vec::new();
+        let mut fallback_only = Vec::new();
+        for item in &candidates {
+            let tag_burn = tag_reg.burn_time(item);
+            let fallback_burn = fuel_burn_time(item);
+            if tag_burn > 0 && fallback_burn == 0 {
+                tag_only.push((item.as_str(), tag_burn));
+            } else if fallback_burn > 0 && tag_burn == 0 {
+                fallback_only.push((item.as_str(), fallback_burn));
+            } else {
+                assert_eq!(
+                    tag_burn, fallback_burn,
+                    "burn time mismatch for {item}: tag={tag_burn}, fallback={fallback_burn}"
+                );
+            }
+        }
+
+        eprintln!("tag registry fuels not in fallback ({}):", tag_only.len());
+        for (item, burn) in &tag_only {
+            eprintln!("  + {item}: {burn} ticks");
+        }
+        eprintln!(
+            "fallback fuels not in tag registry ({}):",
+            fallback_only.len()
+        );
+        for (item, burn) in &fallback_only {
+            eprintln!("  - {item}: {burn} ticks");
+        }
+
+        // `minecraft:bamboo_mosaic_slab` is listed in `fuel_burn_time` (150 ticks)
+        // but is absent from `#minecraft:wooden_slabs` in the 26.3 tag data.
+        assert_eq!(
+            fallback_only,
+            vec![("minecraft:bamboo_mosaic_slab", WOODEN_SLAB_BURN_TIME)]
+        );
+        assert_eq!(
+            tag_reg.remainder("minecraft:lava_bucket"),
+            FuelRegistry::new().remainder("minecraft:lava_bucket")
         );
     }
 }
