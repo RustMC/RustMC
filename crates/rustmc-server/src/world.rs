@@ -61,9 +61,14 @@ pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
+pub mod brewing;
 pub mod container_data;
 pub mod furnace;
 
+pub use brewing::{
+    BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
+    BrewingStandProperty, Potion,
+};
 pub use container_data::{
     SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
 };
