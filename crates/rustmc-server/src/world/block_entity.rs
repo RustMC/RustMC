@@ -15,7 +15,7 @@
 use rustc_hash::FxHashMap;
 use std::fmt;
 
-use crate::java_wire::{frame, put_string, put_varint};
+use crate::java_wire::{self, WireError, frame, put_string, put_varint};
 
 /// Maximum byte length for a single sign text line (384 bytes UTF-8).
 pub const MAX_LINE_BYTES: usize = 384;
@@ -667,131 +667,13 @@ impl NbtTag {
 ///   each surrogate occupying 3 bytes, producing a total of 6 bytes.
 pub fn encode_modified_utf8(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    for c in s.chars() {
-        let cp = c as u32;
-        if cp == 0 {
-            out.push(0xc0);
-            out.push(0x80);
-        } else if cp <= 0x7f {
-            out.push(cp as u8);
-        } else if cp <= 0x7ff {
-            out.push((0xc0 | ((cp >> 6) & 0x1f)) as u8);
-            out.push((0x80 | (cp & 0x3f)) as u8);
-        } else if cp <= 0xffff {
-            out.push((0xe0 | ((cp >> 12) & 0x0f)) as u8);
-            out.push((0x80 | ((cp >> 6) & 0x3f)) as u8);
-            out.push((0x80 | (cp & 0x3f)) as u8);
-        } else {
-            // Supplementary character: encode as surrogate pair in two 3-byte chunks
-            let u_prime = cp - 0x10000;
-            let w1 = 0xd800 + ((u_prime >> 10) & 0x3ff);
-            let w2 = 0xdc00 + (u_prime & 0x3ff);
-
-            out.push((0xe0 | ((w1 >> 12) & 0x0f)) as u8);
-            out.push((0x80 | ((w1 >> 6) & 0x3f)) as u8);
-            out.push((0x80 | (w1 & 0x3f)) as u8);
-
-            out.push((0xe0 | ((w2 >> 12) & 0x0f)) as u8);
-            out.push((0x80 | ((w2 >> 6) & 0x3f)) as u8);
-            out.push((0x80 | (w2 & 0x3f)) as u8);
-        }
-    }
+    java_wire::encode_modified_utf8(s, &mut out);
     out
 }
 
 /// Decodes Java Modified UTF-8 bytes into a standard Rust UTF-8 String.
 pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, BlockEntityError> {
-    let mut s = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b <= 0x7f && b != 0 {
-            s.push(b as char);
-            i += 1;
-        } else if b & 0xe0 == 0xc0 {
-            if i + 1 >= bytes.len() {
-                return Err(BlockEntityError::Malformed(
-                    "truncated modified UTF-8 sequence",
-                ));
-            }
-            let b2 = bytes[i + 1];
-            if b2 & 0xc0 != 0x80 {
-                return Err(BlockEntityError::Malformed(
-                    "invalid continuation in modified UTF-8",
-                ));
-            }
-            if b == 0xc0 && b2 == 0x80 {
-                s.push('\0');
-            } else {
-                let cp = (((b & 0x1f) as u32) << 6) | ((b2 & 0x3f) as u32);
-                let c = char::from_u32(cp).ok_or(BlockEntityError::Malformed(
-                    "invalid codepoint in modified UTF-8",
-                ))?;
-                s.push(c);
-            }
-            i += 2;
-        } else if b & 0xf0 == 0xe0 {
-            if i + 2 >= bytes.len() {
-                return Err(BlockEntityError::Malformed(
-                    "truncated modified UTF-8 sequence",
-                ));
-            }
-            let b2 = bytes[i + 1];
-            let b3 = bytes[i + 2];
-            if b2 & 0xc0 != 0x80 || b3 & 0xc0 != 0x80 {
-                return Err(BlockEntityError::Malformed(
-                    "invalid continuation in modified UTF-8",
-                ));
-            }
-            let cp =
-                (((b & 0x0f) as u32) << 12) | (((b2 & 0x3f) as u32) << 6) | ((b3 & 0x3f) as u32);
-            i += 3;
-            if (0xd800..=0xdbff).contains(&cp) {
-                // High surrogate: must be immediately followed by low surrogate (3-byte sequence)
-                if i + 2 >= bytes.len() {
-                    return Err(BlockEntityError::Malformed(
-                        "unpaired high surrogate in modified UTF-8",
-                    ));
-                }
-                let lb1 = bytes[i];
-                let lb2 = bytes[i + 1];
-                let lb3 = bytes[i + 2];
-                if lb1 & 0xf0 != 0xe0 || lb2 & 0xc0 != 0x80 || lb3 & 0xc0 != 0x80 {
-                    return Err(BlockEntityError::Malformed(
-                        "invalid low surrogate in modified UTF-8",
-                    ));
-                }
-                let low_cp = (((lb1 & 0x0f) as u32) << 12)
-                    | (((lb2 & 0x3f) as u32) << 6)
-                    | ((lb3 & 0x3f) as u32);
-                if !(0xdc00..=0xdfff).contains(&low_cp) {
-                    return Err(BlockEntityError::Malformed(
-                        "invalid low surrogate range in modified UTF-8",
-                    ));
-                }
-                i += 3;
-                let full_cp = 0x10000 + (((cp - 0xd800) << 10) | (low_cp - 0xdc00));
-                let c = char::from_u32(full_cp).ok_or(BlockEntityError::Malformed(
-                    "invalid supplementary codepoint in modified UTF-8",
-                ))?;
-                s.push(c);
-            } else if (0xdc00..=0xdfff).contains(&cp) {
-                return Err(BlockEntityError::Malformed(
-                    "unpaired low surrogate in modified UTF-8",
-                ));
-            } else {
-                let c = char::from_u32(cp).ok_or(BlockEntityError::Malformed(
-                    "invalid codepoint in modified UTF-8",
-                ))?;
-                s.push(c);
-            }
-        } else {
-            return Err(BlockEntityError::Malformed(
-                "invalid leading byte in modified UTF-8",
-            ));
-        }
-    }
-    Ok(s)
+    java_wire::decode_modified_utf8(bytes).map_err(map_wire_error)
 }
 
 fn write_nbt_payload(tag: &NbtTag, out: &mut Vec<u8>) {
@@ -919,9 +801,13 @@ impl<'a> NbtReader<'a> {
     }
 
     fn read_string(&mut self) -> Result<String, BlockEntityError> {
-        let len = self.read_u16()? as usize;
-        let bytes = self.read_bytes(len)?;
-        decode_modified_utf8(bytes)
+        let rest = self
+            .data
+            .get(self.pos..)
+            .ok_or(BlockEntityError::UnexpectedEof)?;
+        let (text, consumed) = java_wire::read_nbt_string(rest).map_err(map_wire_error)?;
+        self.pos += consumed;
+        Ok(text)
     }
 
     fn read_payload(&mut self, tag_type: u8, depth: usize) -> Result<NbtTag, BlockEntityError> {
@@ -1070,21 +956,20 @@ pub fn read_named_network_nbt(data: &[u8]) -> Result<(String, NbtTag), BlockEnti
     Ok((root_name, NbtTag::Compound(entries)))
 }
 
-fn read_varint_slice(input: &[u8]) -> Result<(u32, usize), BlockEntityError> {
-    let mut value = 0u32;
-    for (i, &byte) in input.iter().take(5).enumerate() {
-        if i == 4 && byte & 0xf0 != 0 {
-            return Err(BlockEntityError::Malformed("VarInt overflow"));
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if byte & 0x80 == 0 {
-            if i > 0 && byte == 0 {
-                return Err(BlockEntityError::Malformed("non-canonical VarInt"));
-            }
-            return Ok((value, i + 1));
-        }
+fn map_wire_error(err: WireError) -> BlockEntityError {
+    match err {
+        WireError::Truncated => BlockEntityError::UnexpectedEof,
+        WireError::VarIntTooLong => BlockEntityError::Malformed("VarInt overflow"),
+        WireError::NonCanonicalVarInt => BlockEntityError::Malformed("non-canonical VarInt"),
+        WireError::TooLong { length, .. } => BlockEntityError::LineTooLong(length),
+        WireError::InvalidText => BlockEntityError::Malformed("invalid text encoding"),
     }
-    Err(BlockEntityError::UnexpectedEof)
+}
+
+fn read_varint(input: &[u8]) -> Result<(u32, usize), BlockEntityError> {
+    java_wire::read_varint(input)
+        .map_err(map_wire_error)?
+        .ok_or(BlockEntityError::UnexpectedEof)
 }
 
 /// Java 26.3 Clientbound `BlockEntityDataPacket` (`0x06`).
@@ -1135,7 +1020,7 @@ impl BlockEntityDataPacket {
         input = &input[8..];
         let pos = BlockPos::unpack(pos_raw);
 
-        let (type_id, varint_len) = read_varint_slice(input)?;
+        let (type_id, varint_len) = read_varint(input)?;
         input = &input[varint_len..];
 
         let nbt = read_network_nbt(input)?;
@@ -1149,12 +1034,12 @@ impl BlockEntityDataPacket {
 
     /// Decodes from a framed packet (skipping frame length and packet ID `0x06`).
     pub fn decode_framed(input: &[u8]) -> Result<Self, BlockEntityError> {
-        let (frame_len, len_bytes) = read_varint_slice(input)?;
+        let (frame_len, len_bytes) = read_varint(input)?;
         let frame_payload = &input[len_bytes..];
         if frame_payload.len() != frame_len as usize {
             return Err(BlockEntityError::Malformed("frame length mismatch"));
         }
-        let (packet_id, id_bytes) = read_varint_slice(frame_payload)?;
+        let (packet_id, id_bytes) = read_varint(frame_payload)?;
         if packet_id != PACKET_ID_BLOCK_ENTITY_DATA {
             return Err(BlockEntityError::MismatchedType {
                 expected: PACKET_ID_BLOCK_ENTITY_DATA,
@@ -1242,19 +1127,10 @@ impl UpdateSignPacket {
 
         let mut lines = [String::new(), String::new(), String::new(), String::new()];
         for line in &mut lines {
-            let (str_len, prefix) = read_varint_slice(input)?;
-            input = &input[prefix..];
-            let len = str_len as usize;
-            if len > MAX_LINE_BYTES {
-                return Err(BlockEntityError::LineTooLong(len));
-            }
-            if input.len() < len {
-                return Err(BlockEntityError::UnexpectedEof);
-            }
-            let text = std::str::from_utf8(&input[..len])
-                .map_err(|_| BlockEntityError::Malformed("invalid UTF-8 in sign line"))?;
+            let (text, rest) =
+                java_wire::read_string(input, MAX_LINE_BYTES).map_err(map_wire_error)?;
             *line = text.to_string();
-            input = &input[len..];
+            input = rest;
         }
 
         if !input.is_empty() {
@@ -1272,12 +1148,12 @@ impl UpdateSignPacket {
 
     /// Decodes from a framed packet (skipping frame length and packet ID `0x3E`).
     pub fn decode_framed(input: &[u8]) -> Result<Self, BlockEntityError> {
-        let (frame_len, len_bytes) = read_varint_slice(input)?;
+        let (frame_len, len_bytes) = read_varint(input)?;
         let frame_payload = &input[len_bytes..];
         if frame_payload.len() != frame_len as usize {
             return Err(BlockEntityError::Malformed("frame length mismatch"));
         }
-        let (packet_id, id_bytes) = read_varint_slice(frame_payload)?;
+        let (packet_id, id_bytes) = read_varint(frame_payload)?;
         if packet_id != PACKET_ID_UPDATE_SIGN {
             return Err(BlockEntityError::MismatchedType {
                 expected: PACKET_ID_UPDATE_SIGN,
@@ -1779,5 +1655,37 @@ mod tests {
             read_named_network_nbt(&named_bytes).expect("read_named_network_nbt");
         assert_eq!(root_name, "root");
         assert_eq!(decoded_named, tag);
+    }
+
+    #[test]
+    fn test_modified_utf8_rejects_overlong_encodings() {
+        assert_eq!(decode_modified_utf8(&[0xC0, 0x80]), Ok("\0".to_string()));
+        for overlong in [
+            &[0xC1, 0x81][..],
+            &[0xC0, 0xAF][..],
+            &[0xE0, 0x80, 0x80][..],
+            &[0xE0, 0x81, 0x81][..],
+            &[0xE0, 0x9F, 0xBF][..],
+        ] {
+            assert!(
+                matches!(
+                    decode_modified_utf8(overlong),
+                    Err(BlockEntityError::Malformed(_))
+                ),
+                "expected overlong modified UTF-8 {overlong:02X?} to be rejected"
+            );
+        }
+
+        let overlong_nbt = [
+            10, // TAG_Compound
+            8,  // TAG_String
+            0, 1, b'k', // key "k"
+            0, 2, 0xC1, 0x81, // overlong 'A'
+            0,    // TAG_End
+        ];
+        assert!(matches!(
+            read_network_nbt(&overlong_nbt),
+            Err(BlockEntityError::Malformed(_))
+        ));
     }
 }
