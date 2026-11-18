@@ -1,6 +1,5 @@
-//! A counted stack of one item kind, with invariants checked at construction.
-//! Per-item components (durability, names, enchantments) are deliberately not
-//! modelled yet.
+//! A counted stack of one item kind, with invariants checked at construction
+//! and typed per-item data components.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,6 +9,14 @@ use serde_json::Value;
 
 use crate::vanilla::feature::{BlockTags, ItemTags};
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
+use crate::world::enchantment::MAX_ENCHANTMENT_LEVEL;
+
+/// Minimum valid enchantment level in Java Edition (`1`;
+/// minecraft.wiki `Enchantment` revision 3902233: "The minimum level of any
+/// enchantment is I"; `Enchantment definition` revision 3843772: "Value
+/// between 1 and 255 (inclusive)"; `Item modifier` revision 3896146:
+/// "Decreasing an enchantment power below 1 remove the enchantment").
+pub const MIN_ENCHANTMENT_LEVEL: u8 = 1;
 
 /// Default stack limit for standard items.
 pub const DEFAULT_MAX_STACK: u16 = 64;
@@ -81,6 +88,38 @@ pub fn default_max_stack(item: &str) -> u16 {
     }
 }
 
+/// Rejection reasons when constructing or validating [`ItemComponents`] or [`ArmorTrim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemComponentsError {
+    /// Enchantment identifier is not a valid namespaced resource location.
+    InvalidEnchantmentId,
+    /// Enchantment level is outside `MIN_ENCHANTMENT_LEVEL..=MAX_ENCHANTMENT_LEVEL` (`1..=255`).
+    InvalidEnchantmentLevel(u8),
+    /// Potion identifier is not a valid namespaced resource location.
+    InvalidPotionId,
+    /// Armor trim pattern identifier is not a valid namespaced resource location.
+    InvalidTrimPattern,
+    /// Armor trim material identifier is not a valid namespaced resource location.
+    InvalidTrimMaterial,
+}
+
+impl fmt::Display for ItemComponentsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEnchantmentId => f.write_str("invalid namespaced enchantment id"),
+            Self::InvalidEnchantmentLevel(level) => write!(
+                f,
+                "enchantment level {level} must be in {MIN_ENCHANTMENT_LEVEL}..={MAX_ENCHANTMENT_LEVEL}"
+            ),
+            Self::InvalidPotionId => f.write_str("invalid namespaced potion id"),
+            Self::InvalidTrimPattern => f.write_str("invalid namespaced trim pattern id"),
+            Self::InvalidTrimMaterial => f.write_str("invalid namespaced trim material id"),
+        }
+    }
+}
+
+impl std::error::Error for ItemComponentsError {}
+
 /// Rejection reasons when constructing an [`ItemStack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemStackError {
@@ -90,6 +129,8 @@ pub enum ItemStackError {
     InvalidMaxStack(u16),
     /// Stack count is zero or exceeds the stack's maximum size.
     InvalidCount(u16),
+    /// Data component values failed validation.
+    InvalidComponents(ItemComponentsError),
 }
 
 impl std::fmt::Display for ItemStackError {
@@ -100,18 +141,399 @@ impl std::fmt::Display for ItemStackError {
                 write!(f, "max stack size {max} must be in 1..={MAX_STACK_LIMIT}")
             }
             Self::InvalidCount(count) => write!(f, "invalid item stack count {count}"),
+            Self::InvalidComponents(err) => write!(f, "{err}"),
         }
     }
 }
 
 impl std::error::Error for ItemStackError {}
 
-/// Non-empty, capacity-bounded stack of a single item kind.
+impl From<ItemComponentsError> for ItemStackError {
+    fn from(err: ItemComponentsError) -> Self {
+        Self::InvalidComponents(err)
+    }
+}
+
+/// Armor trim pattern and material stored in an item's `minecraft:trim` component.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/trim` revision 3685746):
+/// "`minecraft:trim`: Contains the trim applied to this armor piece."
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArmorTrim {
+    pattern: String,
+    material: String,
+}
+
+impl ArmorTrim {
+    /// Constructs a validated [`ArmorTrim`], ensuring `pattern` and `material`
+    /// are non-empty namespaced resource locations.
+    pub fn try_new(
+        pattern: impl Into<String>,
+        material: impl Into<String>,
+    ) -> Result<Self, ItemComponentsError> {
+        let pattern = pattern.into();
+        let material = material.into();
+        let trim = Self { pattern, material };
+        trim.validate()?;
+        Ok(trim)
+    }
+
+    /// Returns the namespaced trim pattern identifier (for example `"minecraft:coast"`).
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Returns the namespaced trim material identifier.
+    #[must_use]
+    pub fn material(&self) -> &str {
+        &self.material
+    }
+
+    fn validate(&self) -> Result<(), ItemComponentsError> {
+        if !valid_item_id(&self.pattern) {
+            return Err(ItemComponentsError::InvalidTrimPattern);
+        }
+        if !valid_item_id(&self.material) {
+            return Err(ItemComponentsError::InvalidTrimMaterial);
+        }
+        Ok(())
+    }
+}
+
+fn validate_enchantment_entry(id: &str, level: u8) -> Result<(), ItemComponentsError> {
+    if !valid_item_id(id) {
+        return Err(ItemComponentsError::InvalidEnchantmentId);
+    }
+    if !(MIN_ENCHANTMENT_LEVEL..=MAX_ENCHANTMENT_LEVEL).contains(&level) {
+        return Err(ItemComponentsError::InvalidEnchantmentLevel(level));
+    }
+    Ok(())
+}
+
+fn validate_enchantment_map(map: &BTreeMap<String, u8>) -> Result<(), ItemComponentsError> {
+    for (id, &level) in map {
+        validate_enchantment_entry(id, level)?;
+    }
+    Ok(())
+}
+
+fn insert_enchantment(
+    map: &mut BTreeMap<String, u8>,
+    id: String,
+    level: u8,
+) -> Result<(), ItemComponentsError> {
+    validate_enchantment_entry(&id, level)?;
+    map.insert(id, level);
+    Ok(())
+}
+
+fn replace_enchantments(
+    target: &mut BTreeMap<String, u8>,
+    enchantments: BTreeMap<String, u8>,
+) -> Result<(), ItemComponentsError> {
+    validate_enchantment_map(&enchantments)?;
+    *target = enchantments;
+    Ok(())
+}
+
+/// Typed per-item data components modeled by RustMC.
+///
+/// Sources (minecraft.wiki `Data component format` revision 3903955 and subpages):
+/// - `Data component format/damage` (revision 3536877):
+///   "`minecraft:damage`: The number of uses consumed (not remaining) of the item's
+///   durability. Must be a non-negative integer, defaults to 0."
+/// - `Data component format/custom name` (revision 3863465):
+///   "`minecraft:custom_name`: The player-assigned name of this item, block, or entity,
+///   typically assigned with an anvil or a name tag."
+/// - `Data component format/enchantments` (revision 3849825):
+///   "`minecraft:enchantments`: Contains a map of each of this item's enchantments to
+///   its enchantment level."
+/// - `Data component format/stored enchantments` (revision 3849830):
+///   "`minecraft:stored_enchantments`: Contains a map of inactive enchantments and
+///   their levels."
+/// - `Data component format/repair cost` (revision 2710067):
+///   "`minecraft:repair_cost`: The number of experience levels to add to the base
+///   level cost when repairing, combining, or renaming this item with an anvil. Must
+///   be a non-negative integer, defaults to 0."
+/// - `Data component format/potion contents` (revision 3676971) and
+///   `Entity format/potion contents` (revision 3620348):
+///   "`potion`: The ID of a potion type. Optional."
+/// - `Data component format/trim` (revision 3685746):
+///   "`minecraft:trim`: Contains the trim applied to this armor piece."
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ItemComponents {
+    damage: Option<u32>,
+    custom_name: Option<String>,
+    enchantments: BTreeMap<String, u8>,
+    stored_enchantments: BTreeMap<String, u8>,
+    repair_cost: Option<u32>,
+    potion: Option<String>,
+    trim: Option<ArmorTrim>,
+}
+
+static EMPTY_COMPONENTS: ItemComponents = ItemComponents::new();
+
+impl ItemComponents {
+    /// Creates an empty component set (all optional components unset).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            damage: None,
+            custom_name: None,
+            enchantments: BTreeMap::new(),
+            stored_enchantments: BTreeMap::new(),
+            repair_cost: None,
+            potion: None,
+            trim: None,
+        }
+    }
+
+    /// Returns `true` when no non-default data components are set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.damage.is_none()
+            && self.custom_name.is_none()
+            && self.enchantments.is_empty()
+            && self.stored_enchantments.is_empty()
+            && self.repair_cost.is_none()
+            && self.potion.is_none()
+            && self.trim.is_none()
+    }
+
+    /// Returns the `minecraft:damage` component (uses consumed), if set.
+    #[must_use]
+    pub fn damage(&self) -> Option<u32> {
+        self.damage
+    }
+
+    /// Returns the `minecraft:custom_name` component, if set.
+    #[must_use]
+    pub fn custom_name(&self) -> Option<&str> {
+        self.custom_name.as_deref()
+    }
+
+    /// Returns the active `minecraft:enchantments` map.
+    #[must_use]
+    pub fn enchantments(&self) -> &BTreeMap<String, u8> {
+        &self.enchantments
+    }
+
+    /// Returns the inactive `minecraft:stored_enchantments` map (used on enchanted books).
+    #[must_use]
+    pub fn stored_enchantments(&self) -> &BTreeMap<String, u8> {
+        &self.stored_enchantments
+    }
+
+    /// Returns the `minecraft:repair_cost` prior-work penalty, if set.
+    #[must_use]
+    pub fn repair_cost(&self) -> Option<u32> {
+        self.repair_cost
+    }
+
+    /// Returns the base potion ID from `minecraft:potion_contents`, if set.
+    #[must_use]
+    pub fn potion(&self) -> Option<&str> {
+        self.potion.as_deref()
+    }
+
+    /// Returns the `minecraft:trim` armor trim component, if set.
+    #[must_use]
+    pub fn trim(&self) -> Option<&ArmorTrim> {
+        self.trim.as_ref()
+    }
+
+    /// Sets `minecraft:damage` (uses consumed) on this component set.
+    #[must_use]
+    pub fn with_damage(mut self, damage: u32) -> Self {
+        self.damage = Some(damage);
+        self
+    }
+
+    /// Sets `minecraft:custom_name` on this component set.
+    #[must_use]
+    pub fn with_custom_name(mut self, custom_name: impl Into<String>) -> Self {
+        self.custom_name = Some(custom_name.into());
+        self
+    }
+
+    /// Inserts or updates a validated active enchantment in `minecraft:enchantments`.
+    pub fn with_enchantment(
+        mut self,
+        id: impl Into<String>,
+        level: u8,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_enchantment(id, level)?;
+        Ok(self)
+    }
+
+    /// Replaces `minecraft:enchantments` after validating every ID and level (`1..=255`).
+    pub fn with_enchantments(
+        mut self,
+        enchantments: BTreeMap<String, u8>,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_enchantments(enchantments)?;
+        Ok(self)
+    }
+
+    /// Inserts or updates a validated stored enchantment in `minecraft:stored_enchantments`.
+    pub fn with_stored_enchantment(
+        mut self,
+        id: impl Into<String>,
+        level: u8,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_stored_enchantment(id, level)?;
+        Ok(self)
+    }
+
+    /// Replaces `minecraft:stored_enchantments` after validating every ID and level (`1..=255`).
+    pub fn with_stored_enchantments(
+        mut self,
+        stored_enchantments: BTreeMap<String, u8>,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_stored_enchantments(stored_enchantments)?;
+        Ok(self)
+    }
+
+    /// Sets `minecraft:repair_cost` on this component set.
+    #[must_use]
+    pub fn with_repair_cost(mut self, repair_cost: u32) -> Self {
+        self.repair_cost = Some(repair_cost);
+        self
+    }
+
+    /// Sets the `minecraft:potion_contents` base potion ID after validating its resource location.
+    pub fn with_potion(mut self, potion: impl Into<String>) -> Result<Self, ItemComponentsError> {
+        self.set_potion(Some(potion.into()))?;
+        Ok(self)
+    }
+
+    /// Sets `minecraft:trim` on this component set.
+    #[must_use]
+    pub fn with_trim(mut self, trim: ArmorTrim) -> Self {
+        self.trim = Some(trim);
+        self
+    }
+
+    /// Sets or clears `minecraft:damage`.
+    pub fn set_damage(&mut self, damage: Option<u32>) {
+        self.damage = damage;
+    }
+
+    /// Sets or clears `minecraft:custom_name`.
+    pub fn set_custom_name(&mut self, custom_name: Option<String>) {
+        self.custom_name = custom_name;
+    }
+
+    /// Inserts or updates a validated enchantment in `minecraft:enchantments`.
+    pub fn set_enchantment(
+        &mut self,
+        id: impl Into<String>,
+        level: u8,
+    ) -> Result<(), ItemComponentsError> {
+        insert_enchantment(&mut self.enchantments, id.into(), level)
+    }
+
+    /// Removes an enchantment from `minecraft:enchantments` if present.
+    pub fn remove_enchantment(&mut self, id: &str) -> Option<u8> {
+        self.enchantments.remove(id)
+    }
+
+    /// Replaces `minecraft:enchantments` after validating every entry.
+    pub fn set_enchantments(
+        &mut self,
+        enchantments: BTreeMap<String, u8>,
+    ) -> Result<(), ItemComponentsError> {
+        replace_enchantments(&mut self.enchantments, enchantments)
+    }
+
+    /// Inserts or updates a validated enchantment in `minecraft:stored_enchantments`.
+    pub fn set_stored_enchantment(
+        &mut self,
+        id: impl Into<String>,
+        level: u8,
+    ) -> Result<(), ItemComponentsError> {
+        insert_enchantment(&mut self.stored_enchantments, id.into(), level)
+    }
+
+    /// Removes an enchantment from `minecraft:stored_enchantments` if present.
+    pub fn remove_stored_enchantment(&mut self, id: &str) -> Option<u8> {
+        self.stored_enchantments.remove(id)
+    }
+
+    /// Replaces `minecraft:stored_enchantments` after validating every entry.
+    pub fn set_stored_enchantments(
+        &mut self,
+        stored_enchantments: BTreeMap<String, u8>,
+    ) -> Result<(), ItemComponentsError> {
+        replace_enchantments(&mut self.stored_enchantments, stored_enchantments)
+    }
+
+    /// Sets or clears `minecraft:repair_cost`.
+    pub fn set_repair_cost(&mut self, repair_cost: Option<u32>) {
+        self.repair_cost = repair_cost;
+    }
+
+    /// Sets or clears the `minecraft:potion_contents` base potion ID, validating resource location syntax.
+    pub fn set_potion(&mut self, potion: Option<String>) -> Result<(), ItemComponentsError> {
+        if let Some(ref id) = potion
+            && !valid_item_id(id)
+        {
+            return Err(ItemComponentsError::InvalidPotionId);
+        }
+        self.potion = potion;
+        Ok(())
+    }
+
+    /// Sets or clears `minecraft:trim`.
+    pub fn set_trim(&mut self, trim: Option<ArmorTrim>) {
+        self.trim = trim;
+    }
+
+    /// Validates all component fields against Java Edition rules.
+    pub fn validate(&self) -> Result<(), ItemComponentsError> {
+        validate_enchantment_map(&self.enchantments)?;
+        validate_enchantment_map(&self.stored_enchantments)?;
+        if let Some(ref id) = self.potion
+            && !valid_item_id(id)
+        {
+            return Err(ItemComponentsError::InvalidPotionId);
+        }
+        if let Some(ref trim) = self.trim {
+            trim.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Non-empty, capacity-bounded stack of a single item kind with typed data components.
+#[derive(Debug, Clone)]
 pub struct ItemStack {
     item: String,
     count: u16,
     max_stack: u16,
+    components: Option<Box<ItemComponents>>,
+}
+
+impl PartialEq for ItemStack {
+    fn eq(&self, other: &Self) -> bool {
+        self.item == other.item
+            && self.count == other.count
+            && self.max_stack == other.max_stack
+            && self.components() == other.components()
+    }
+}
+
+impl Eq for ItemStack {}
+
+impl std::hash::Hash for ItemStack {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.item.hash(state);
+        self.count.hash(state);
+        self.max_stack.hash(state);
+        self.components().hash(state);
+    }
 }
 
 // Java Edition resource-location character rules.
@@ -127,7 +549,8 @@ pub(crate) fn valid_item_id(id: &str) -> bool {
 }
 
 impl ItemStack {
-    /// Constructs a validated stack, checking the item id, max stack size, and count in order.
+    /// Constructs a validated stack with empty components, checking the item id,
+    /// max stack size, and count in order.
     pub fn try_new(
         item: impl Into<String>,
         count: u16,
@@ -147,6 +570,7 @@ impl ItemStack {
             item,
             count,
             max_stack,
+            components: None,
         })
     }
 
@@ -165,9 +589,41 @@ impl ItemStack {
         self.max_stack
     }
 
-    /// Reports whether `other` shares the same item identifier and maximum stack size.
+    /// Returns the stack's typed data components.
+    #[must_use]
+    pub fn components(&self) -> &ItemComponents {
+        self.components.as_deref().unwrap_or(&EMPTY_COMPONENTS)
+    }
+
+    /// Returns a mutable reference to the stack's validated data components.
+    pub fn components_mut(&mut self) -> &mut ItemComponents {
+        self.components.get_or_insert_with(Default::default)
+    }
+
+    /// Replaces the stack's data components after validating them.
+    pub fn with_components(mut self, components: ItemComponents) -> Result<Self, ItemStackError> {
+        components.validate()?;
+        self.components = if components.is_empty() {
+            None
+        } else {
+            Some(Box::new(components))
+        };
+        Ok(self)
+    }
+
+    /// Reports whether `other` shares the same item identifier, maximum stack size,
+    /// and exact data components.
+    ///
+    /// Source: minecraft.wiki `Java Edition 1.21.9` (revision 3880956) /
+    /// `Java Edition 25w34a` (revision 3601201):
+    /// "Items stack based on exact contents, so even if a dynamic component is
+    /// eventually resolved to the same profile as a static one, they won't stack together."
+    /// Also minecraft.wiki `Anvil` (revision 3902804):
+    /// "Named items do not stack with unnamed or differently-named items of the same type."
     pub fn can_stack_with(&self, other: &Self) -> bool {
-        self.item == other.item && self.max_stack == other.max_stack
+        self.item == other.item
+            && self.max_stack == other.max_stack
+            && self.components() == other.components()
     }
 
     /// Adds as many items as fit under `max_stack` and returns the overflow.
@@ -178,7 +634,8 @@ impl ItemStack {
         amount - accepted
     }
 
-    /// Splits up to `amount` items off into a new stack and returns any remaining stack.
+    /// Splits up to `amount` items off into a new stack and returns any remaining stack,
+    /// preserving data components on both halves.
     pub fn split(self, amount: u16) -> Result<(Self, Option<Self>), Self> {
         if amount == 0 {
             return Err(self);
@@ -192,11 +649,13 @@ impl ItemStack {
             item: self.item.clone(),
             count: take,
             max_stack: self.max_stack,
+            components: self.components.clone(),
         };
         let rest = Self {
             item: self.item,
             count: remaining,
             max_stack: self.max_stack,
+            components: self.components,
         };
         Ok((taken, Some(rest)))
     }
@@ -352,6 +811,7 @@ struct ItemDefaultEntry {
     tool: Option<ToolComponent>,
     food: Option<FoodValues>,
     consumable: Option<ConsumableValues>,
+    trim_material: Option<String>,
 }
 
 /// Default per-item components read from `reports/minecraft/components/item/*.json`.
@@ -430,6 +890,17 @@ impl ItemDefaults {
         self.entries
             .get(normalize_item_id(item))
             .and_then(|entry| entry.enchantability)
+    }
+
+    /// Returns the armor trim material `item` provides in a smithing table, from its
+    /// `minecraft:provides_trim_material` component (for example `minecraft:gold_ingot`
+    /// provides `minecraft:gold`), or `None` if it provides none. Accepts identifiers
+    /// with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn trim_material(&self, item: &str) -> Option<&str> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.trim_material.as_deref())
     }
 
     /// Returns the mining speed multiplier for `item` breaking `block` from its
@@ -624,6 +1095,22 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
         Some(value) => Some(parse_consumable(value, file)?),
     };
 
+    let trim_material = match components.get("minecraft:provides_trim_material") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|id| valid_item_id(id))
+                .ok_or_else(|| {
+                    item_report_invalid(
+                        file,
+                        "`components[\"minecraft:provides_trim_material\"]` must be a namespaced id string",
+                    )
+                })?
+                .to_owned(),
+        ),
+    };
+
     Ok((
         item_stem.to_owned(),
         ItemDefaultEntry {
@@ -634,6 +1121,7 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
             tool,
             food,
             consumable,
+            trim_material,
         },
     ))
 }
@@ -1166,6 +1654,169 @@ mod tests {
         assert_eq!(taken_more.count(), 10);
         assert_eq!(taken_more.max_stack(), 16);
         assert_eq!(rest_more, None);
+    }
+
+    #[test]
+    fn empty_components_equal_and_default_on_new_stacks() {
+        let a = ItemComponents::new();
+        let b = ItemComponents::default();
+        assert_eq!(a, b);
+        assert!(a.is_empty());
+        assert_eq!(a.damage(), None);
+        assert_eq!(a.custom_name(), None);
+        assert!(a.enchantments().is_empty());
+        assert!(a.stored_enchantments().is_empty());
+        assert_eq!(a.repair_cost(), None);
+        assert_eq!(a.potion(), None);
+        assert_eq!(a.trim(), None);
+
+        let stack = ItemStack::try_new("minecraft:stone", 1, 64).unwrap();
+        assert_eq!(stack.components(), &a);
+        assert!(stack.components().is_empty());
+    }
+
+    #[test]
+    fn components_builders_validate_wiki_rules_and_reject_invalid_values() {
+        assert_eq!(
+            ItemComponents::new().with_enchantment("minecraft:sharpness", 0),
+            Err(ItemComponentsError::InvalidEnchantmentLevel(0))
+        );
+        assert_eq!(
+            ItemComponents::new().with_stored_enchantment("minecraft:mending", 0),
+            Err(ItemComponentsError::InvalidEnchantmentLevel(0))
+        );
+        let bad_map = BTreeMap::from([("minecraft:sharpness".to_owned(), 0u8)]);
+        assert_eq!(
+            ItemComponents::new().with_enchantments(bad_map.clone()),
+            Err(ItemComponentsError::InvalidEnchantmentLevel(0))
+        );
+        assert_eq!(
+            ItemComponents::new().with_stored_enchantments(bad_map),
+            Err(ItemComponentsError::InvalidEnchantmentLevel(0))
+        );
+
+        for invalid_id in ["", "sharpness", ":sharpness", "minecraft:", "Bad:id"] {
+            assert_eq!(
+                ItemComponents::new().with_enchantment(invalid_id, 1),
+                Err(ItemComponentsError::InvalidEnchantmentId)
+            );
+            assert_eq!(
+                ItemComponents::new().with_stored_enchantment(invalid_id, 1),
+                Err(ItemComponentsError::InvalidEnchantmentId)
+            );
+            assert_eq!(
+                ItemComponents::new().with_potion(invalid_id),
+                Err(ItemComponentsError::InvalidPotionId)
+            );
+            assert_eq!(
+                ArmorTrim::try_new(invalid_id, "minecraft:gold_ingot"),
+                Err(ItemComponentsError::InvalidTrimPattern)
+            );
+            assert_eq!(
+                ArmorTrim::try_new("minecraft:coast", invalid_id),
+                Err(ItemComponentsError::InvalidTrimMaterial)
+            );
+        }
+
+        let trim = ArmorTrim::try_new("minecraft:coast", "minecraft:gold_ingot").unwrap();
+        assert_eq!(trim.pattern(), "minecraft:coast");
+        assert_eq!(trim.material(), "minecraft:gold_ingot");
+
+        let built = ItemComponents::new()
+            .with_damage(12)
+            .with_custom_name("Blade")
+            .with_enchantment("minecraft:sharpness", 255)
+            .unwrap()
+            .with_stored_enchantment("minecraft:unbreaking", 1)
+            .unwrap()
+            .with_repair_cost(3)
+            .with_potion("minecraft:healing")
+            .unwrap()
+            .with_trim(trim.clone());
+
+        assert!(!built.is_empty());
+        assert_eq!(built.damage(), Some(12));
+        assert_eq!(built.custom_name(), Some("Blade"));
+        assert_eq!(built.enchantments().get("minecraft:sharpness"), Some(&255));
+        assert_eq!(
+            built.stored_enchantments().get("minecraft:unbreaking"),
+            Some(&1)
+        );
+        assert_eq!(built.repair_cost(), Some(3));
+        assert_eq!(built.potion(), Some("minecraft:healing"));
+        assert_eq!(built.trim(), Some(&trim));
+
+        for err in [
+            ItemComponentsError::InvalidEnchantmentId,
+            ItemComponentsError::InvalidEnchantmentLevel(0),
+            ItemComponentsError::InvalidPotionId,
+            ItemComponentsError::InvalidTrimPattern,
+            ItemComponentsError::InvalidTrimMaterial,
+        ] {
+            let text = err.to_string();
+            assert!(!text.is_empty());
+            assert_eq!(text, text.to_lowercase());
+            let wrapped = ItemStackError::from(err);
+            assert_eq!(wrapped, ItemStackError::InvalidComponents(err));
+            assert_eq!(wrapped.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn stacks_with_different_components_do_not_stack_and_split_and_add_keep_components() {
+        let unnamed = ItemStack::try_new("minecraft:diamond", 4, 64).unwrap();
+        let named_a1 = ItemStack::try_new("minecraft:diamond", 4, 64)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Alpha"))
+            .unwrap();
+        let mut named_a2 = ItemStack::try_new("minecraft:diamond", 10, 64)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Alpha"))
+            .unwrap();
+        let named_b = ItemStack::try_new("minecraft:diamond", 4, 64)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Beta"))
+            .unwrap();
+
+        assert!(!unnamed.can_stack_with(&named_a1));
+        assert!(!named_a1.can_stack_with(&named_b));
+        assert!(named_a1.can_stack_with(&named_a2));
+
+        let other_enchant = ItemStack::try_new("minecraft:diamond", 4, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_custom_name("Alpha")
+                    .with_enchantment("minecraft:unbreaking", 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!named_a1.can_stack_with(&other_enchant));
+
+        assert_eq!(named_a2.add(5), 0);
+        assert_eq!(named_a2.count(), 15);
+        assert_eq!(named_a2.components().custom_name(), Some("Alpha"));
+
+        let rich = ItemStack::try_new("minecraft:stick", 8, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(3)
+                    .with_custom_name("Wand")
+                    .with_enchantment("minecraft:knockback", 2)
+                    .unwrap()
+                    .with_repair_cost(1)
+                    .with_trim(ArmorTrim::try_new("minecraft:coast", "minecraft:diamond").unwrap()),
+            )
+            .unwrap();
+        let expected_components = rich.components().clone();
+        let (taken, rest) = rich.split(3).unwrap();
+        assert_eq!(taken.count(), 3);
+        assert_eq!(taken.components(), &expected_components);
+        let rest = rest.expect("remainder should exist");
+        assert_eq!(rest.count(), 5);
+        assert_eq!(rest.components(), &expected_components);
+        assert!(taken.can_stack_with(&rest));
     }
 
     #[test]

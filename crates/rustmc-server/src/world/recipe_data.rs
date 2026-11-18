@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::item::{ItemDefaults, ItemStack, items_equal, normalize_item_id};
+use crate::item::{ArmorTrim, ItemDefaults, ItemStack, items_equal, normalize_item_id};
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
@@ -163,7 +163,6 @@ pub struct BrewingRecipe {
     input_potions: Vec<String>,
     reagent: Ingredient,
     output: ItemStack,
-    output_potion: String,
 }
 
 impl BrewingRecipe {
@@ -191,7 +190,7 @@ impl BrewingRecipe {
         &self.reagent
     }
 
-    /// Output container item stack produced per brew.
+    /// Output container item stack produced per brew (with its `potion` component set).
     #[must_use]
     pub fn output(&self) -> &ItemStack {
         &self.output
@@ -206,7 +205,7 @@ impl BrewingRecipe {
     /// Output `minecraft:potion` registry identifier.
     #[must_use]
     pub fn output_potion(&self) -> &str {
-        &self.output_potion
+        self.output.components().potion().unwrap_or("")
     }
 }
 
@@ -265,6 +264,8 @@ pub struct SmithingTrimRecipe {
     addition: Ingredient,
     pattern: String,
     base_stacks: BTreeMap<String, ItemStack>,
+    /// Addition item (without `minecraft:`) to the trim material id it provides.
+    materials: BTreeMap<String, String>,
 }
 
 impl SmithingTrimRecipe {
@@ -309,19 +310,17 @@ pub enum SmithingResult {
         /// Transformed output stack.
         result: ItemStack,
     },
-    /// Result of a `minecraft:smithing_trim` recipe.
+    /// Result stack of a `minecraft:smithing_trim` recipe with its `trim`
+    /// data component (`pattern` + `material`) applied to the base item stack.
     ///
-    /// [`ItemStack`] has no component data, so the base item stack is returned
-    /// alongside the trim `pattern` identifier and `material` item identifier.
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/trim` revision 3685746):
+    /// "`minecraft:trim`: Contains the trim applied to this armor piece."
     Trim {
         /// Matched recipe identifier.
         recipe_id: String,
-        /// Base item stack (without component data).
-        base: ItemStack,
-        /// Trim pattern identifier (for example `"minecraft:coast"`).
-        pattern: String,
-        /// Canonical trim material item identifier (for example `"minecraft:gold_ingot"`).
-        material: String,
+        /// Base item stack with its `minecraft:trim` component set.
+        result: ItemStack,
     },
 }
 
@@ -746,6 +745,12 @@ impl RecipeData {
 
     /// Finds a loaded smithing transform or trim recipe matching `(template, base, addition)`,
     /// ignoring optional `minecraft:` prefixes.
+    ///
+    /// A trim result's `trim` component holds the trim material the addition item
+    /// provides (minecraft.wiki `Data component format/trim` revision 3685746:
+    /// "`material`: The ID of the trim material to apply"), read from the item report.
+    /// Trim recipes loaded without item defaults ([`RecipeData::load`]) therefore never
+    /// match; load them with [`RecipeData::load_with_items`].
     #[must_use]
     pub fn find_smithing(
         &self,
@@ -771,14 +776,17 @@ impl RecipeData {
             let Some(base_stack) = recipe.base_stacks.get(normalize_item_id(base)) else {
                 continue;
             };
-            let Some(material) = find_matching_ingredient_item(&recipe.addition, addition) else {
+            let Some(material) = recipe.materials.get(normalize_item_id(addition)) else {
                 continue;
             };
+            let Ok(trim) = ArmorTrim::try_new(recipe.pattern.as_str(), material.as_str()) else {
+                continue;
+            };
+            let mut result = base_stack.clone();
+            result.components_mut().set_trim(Some(trim));
             return Some(SmithingResult::Trim {
                 recipe_id: recipe.id.clone(),
-                base: base_stack.clone(),
-                pattern: recipe.pattern.clone(),
-                material: material.to_owned(),
+                result,
             });
         }
         None
@@ -1295,14 +1303,17 @@ fn parse_brewing_recipe(
     )?
     .to_owned();
 
-    let output = build_result_stack(output_id, 1, items, file)?;
+    let mut output = build_result_stack(output_id, 1, items, file)?;
+    output
+        .components_mut()
+        .set_potion(Some(output_potion))
+        .map_err(|error| invalid(file, format!("invalid output potion component: {error}")))?;
     Ok(BrewingRecipe {
         id: id.to_owned(),
         input_item,
         input_potions,
         reagent,
         output,
-        output_potion,
     })
 }
 
@@ -1414,6 +1425,25 @@ fn parse_smithing_trim_recipe(
         base_stacks.insert(normalize_item_id(allowed).to_owned(), stack);
     }
 
+    // The trim component stores the trim material id, which each addition item
+    // declares in its `minecraft:provides_trim_material` component (item report),
+    // not the item id. Without item defaults the materials are unknown, so the
+    // recipe loads but cannot produce a result.
+    let mut materials = BTreeMap::new();
+    if let Some(items) = items {
+        for allowed in addition.allowed_items() {
+            let material = items.trim_material(allowed).ok_or_else(|| {
+                invalid(
+                    file,
+                    format!(
+                        "trim addition `{allowed}` provides no trim material in the item report"
+                    ),
+                )
+            })?;
+            materials.insert(normalize_item_id(allowed).to_owned(), material.to_owned());
+        }
+    }
+
     Ok(SmithingTrimRecipe {
         id: id.to_owned(),
         template,
@@ -1421,6 +1451,7 @@ fn parse_smithing_trim_recipe(
         addition,
         pattern,
         base_stacks,
+        materials,
     })
 }
 
@@ -2271,7 +2302,15 @@ mod tests {
         );
         write(
             &root.join("data/testns/tags/item/trim_mats.json"),
-            r#"{"values": ["testns:ruby", "testns:sapphire"]}"#,
+            r#"{"values": ["minecraft:ruby_gem", "minecraft:sapphire_gem"]}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/ruby_gem.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:provides_trim_material": "testns:ruby"}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/sapphire_gem.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:provides_trim_material": "testns:sapphire"}}"#,
         );
         write(
             &root.join("reports/minecraft/components/item/bronze_plate.json"),
@@ -2372,31 +2411,9 @@ mod tests {
             None
         );
 
-        // Trim match (with prefix-insensitive lookup on minecraft: item).
-        let trim = data
-            .find_smithing("testns:wave_template", "iron_chestplate", "testns:ruby")
-            .expect("trim match");
+        // Without item defaults the trim materials are unknown, so trims never match.
         assert_eq!(
-            trim,
-            SmithingResult::Trim {
-                recipe_id: "testns:wave_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 64).unwrap(),
-                pattern: "testns:wave".to_owned(),
-                material: "testns:ruby".to_owned(),
-            }
-        );
-
-        // Wrong template/base/addition -> None.
-        assert_eq!(
-            data.find_smithing("testns:wrong", "iron_chestplate", "testns:ruby"),
-            None
-        );
-        assert_eq!(
-            data.find_smithing("testns:wave_template", "testns:not_armor", "testns:ruby"),
-            None
-        );
-        assert_eq!(
-            data.find_smithing("testns:wave_template", "iron_chestplate", "testns:stone"),
+            data.find_smithing("testns:wave_template", "iron_chestplate", "ruby_gem"),
             None
         );
 
@@ -2407,17 +2424,46 @@ mod tests {
             .find_smithing(
                 "testns:wave_template",
                 "minecraft:iron_chestplate",
-                "testns:sapphire",
+                "sapphire_gem",
             )
             .expect("trim with items");
+        let SmithingResult::Trim { recipe_id, result } = with_items_trim else {
+            panic!("expected Trim result");
+        };
+        assert_eq!(recipe_id, "testns:wave_trim");
+        assert_eq!(result.item(), "minecraft:iron_chestplate");
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.max_stack(), 1);
         assert_eq!(
-            with_items_trim,
-            SmithingResult::Trim {
-                recipe_id: "testns:wave_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
-                pattern: "testns:wave".to_owned(),
-                material: "testns:sapphire".to_owned(),
-            }
+            result.components().trim(),
+            Some(&ArmorTrim::try_new("testns:wave", "testns:sapphire").unwrap())
+        );
+        assert_eq!(
+            data_with_items
+                .find_smithing("testns:wave_template", "iron_chestplate", "ruby_gem")
+                .and_then(|found| match found {
+                    SmithingResult::Trim { result, .. } => result.components().trim().cloned(),
+                    SmithingResult::Transform { .. } => None,
+                }),
+            Some(ArmorTrim::try_new("testns:wave", "testns:ruby").unwrap())
+        );
+
+        // Wrong template/base/addition -> None.
+        assert_eq!(
+            data_with_items.find_smithing("testns:wrong", "iron_chestplate", "ruby_gem"),
+            None
+        );
+        assert_eq!(
+            data_with_items.find_smithing("testns:wave_template", "testns:not_armor", "ruby_gem"),
+            None
+        );
+        assert_eq!(
+            data_with_items.find_smithing(
+                "testns:wave_template",
+                "iron_chestplate",
+                "testns:stone"
+            ),
+            None
         );
         let with_items_upgrade = data_with_items
             .find_smithing(
@@ -2529,14 +2575,19 @@ mod tests {
                 "minecraft:gold_ingot",
             )
             .expect("coast armor trim with iron chestplate and gold ingot");
+        let SmithingResult::Trim { recipe_id, result } = coast_trim else {
+            panic!("expected Trim result");
+        };
         assert_eq!(
-            coast_trim,
-            SmithingResult::Trim {
-                recipe_id: "minecraft:coast_armor_trim_smithing_template_smithing_trim".to_owned(),
-                base: ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap(),
-                pattern: "minecraft:coast".to_owned(),
-                material: "minecraft:gold_ingot".to_owned(),
-            }
+            recipe_id,
+            "minecraft:coast_armor_trim_smithing_template_smithing_trim"
+        );
+        assert_eq!(result.item(), "minecraft:iron_chestplate");
+        assert_eq!(result.count(), 1);
+        assert_eq!(result.max_stack(), 1);
+        assert_eq!(
+            result.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:gold").unwrap())
         );
 
         // Wrong template returns None.
@@ -2564,5 +2615,117 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn smithing_trim_result_carries_trim_component_and_prevents_mismatched_stacking() {
+        let root = scratch_root("smithing-trim-comp");
+        write(
+            &root.join("data/testns/tags/item/armors.json"),
+            r#"{"values": ["minecraft:iron_chestplate"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/item/trim_mats.json"),
+            r#"{"values": ["minecraft:gold_ingot", "minecraft:diamond"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/coast_trim.json"),
+            r##"{
+                "type": "minecraft:smithing_trim",
+                "template": "minecraft:coast_armor_trim_smithing_template",
+                "base": "#testns:armors",
+                "addition": "#testns:trim_mats",
+                "pattern": "minecraft:coast"
+            }"##,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/iron_chestplate.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/gold_ingot.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:provides_trim_material": "minecraft:gold"}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/diamond.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:provides_trim_material": "minecraft:diamond"}}"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let items = ItemDefaults::load(&root).expect("load item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        let SmithingResult::Trim {
+            result: gold_trimmed,
+            ..
+        } = data
+            .find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:gold_ingot",
+            )
+            .expect("gold trim")
+        else {
+            panic!("expected Trim result");
+        };
+        let SmithingResult::Trim {
+            result: diamond_trimmed,
+            ..
+        } = data
+            .find_smithing(
+                "minecraft:coast_armor_trim_smithing_template",
+                "minecraft:iron_chestplate",
+                "minecraft:diamond",
+            )
+            .expect("diamond trim")
+        else {
+            panic!("expected Trim result");
+        };
+        let untrimmed = ItemStack::try_new("minecraft:iron_chestplate", 1, 1).unwrap();
+
+        assert_eq!(
+            gold_trimmed.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:gold").unwrap())
+        );
+        assert_eq!(
+            diamond_trimmed.components().trim(),
+            Some(&ArmorTrim::try_new("minecraft:coast", "minecraft:diamond").unwrap())
+        );
+        assert!(!gold_trimmed.can_stack_with(&untrimmed));
+        assert!(!gold_trimmed.can_stack_with(&diamond_trimmed));
+        assert!(gold_trimmed.can_stack_with(&gold_trimmed.clone()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn smithing_trim_addition_without_trim_material_is_a_load_error() {
+        let root = scratch_root("smithing-trim-no-material");
+        write(
+            &root.join("data/testns/recipe/coast_trim.json"),
+            r#"{
+                "type": "minecraft:smithing_trim",
+                "template": "minecraft:coast_armor_trim_smithing_template",
+                "base": "minecraft:iron_chestplate",
+                "addition": "minecraft:stick",
+                "pattern": "minecraft:coast"
+            }"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/iron_chestplate.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/stick.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+        let tags = ItemTags::load(&root).expect("load tags");
+        let items = ItemDefaults::load(&root).expect("load item defaults");
+        let error = RecipeData::load_with_items(&root, &tags, &items)
+            .expect_err("addition without a trim material must fail")
+            .to_string();
+        assert!(error.contains("coast_trim.json"), "{error}");
+        assert!(error.contains("minecraft:stick"), "{error}");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

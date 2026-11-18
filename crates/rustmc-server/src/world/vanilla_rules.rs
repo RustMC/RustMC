@@ -256,7 +256,7 @@ mod tests {
         );
         root.write(
             "reports/minecraft/components/item/widget.json",
-            r#"{"components": {"minecraft:max_stack_size": 16}}"#,
+            r#"{"components": {"minecraft:max_stack_size": 16, "minecraft:provides_trim_material": "testns:widget_material"}}"#,
         );
         root.write(
             "data/testns/recipe/widget_craft.json",

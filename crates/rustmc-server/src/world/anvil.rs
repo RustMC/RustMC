@@ -308,18 +308,64 @@ fn validate_anvil_item_invariants(
     Ok(())
 }
 
-/// An anvil slot item wrapping the shared [`ItemStack`] for item ID and count,
-/// with durability, prior work penalty (`repair_cost`), custom name, stored
-/// enchantments, and enchanted-book flag kept private behind invariant-enforcing
-/// constructors and accessors.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AnvilItem {
-    stack: ItemStack,
+fn max_durability_override_for(item: &str, max_durability: u32) -> Option<u32> {
+    (max_durability != default_max_durability(item).unwrap_or(0)).then_some(max_durability)
+}
+
+fn damage_for_durability(durability: u32, max_durability: u32) -> Option<u32> {
+    let damage = max_durability.saturating_sub(durability);
+    (damage > 0).then_some(damage)
+}
+
+fn set_item_enchantments(
+    stack: &mut ItemStack,
+    is_enchanted_book: bool,
+    enchantments: BTreeMap<String, u8>,
+) -> Result<(), AnvilItemError> {
+    let res = if is_enchanted_book {
+        stack.components_mut().set_stored_enchantments(enchantments)
+    } else {
+        stack.components_mut().set_enchantments(enchantments)
+    };
+    res.map_err(|err| AnvilItemError::InvalidStack(ItemStackError::InvalidComponents(err)))
+}
+
+fn apply_anvil_components(
+    mut stack: ItemStack,
     durability: u32,
     max_durability: u32,
     repair_cost: u32,
     custom_name: Option<String>,
     enchantments: BTreeMap<String, u8>,
+    is_enchanted_book: bool,
+) -> Result<ItemStack, AnvilItemError> {
+    {
+        let components = stack.components_mut();
+        components.set_damage(damage_for_durability(durability, max_durability));
+        components.set_repair_cost((repair_cost > 0).then_some(repair_cost));
+        components.set_custom_name(custom_name);
+    }
+    set_item_enchantments(&mut stack, is_enchanted_book, enchantments)?;
+    Ok(stack)
+}
+
+/// An anvil slot item wrapping the shared [`ItemStack`], storing damage,
+/// prior work penalty (`repair_cost`), custom name, active `enchantments`,
+/// and enchanted-book `stored_enchantments` in the stack's [`crate::item::ItemComponents`].
+///
+/// Sources (minecraft.wiki `Data component format` revision 3903955):
+/// - `Data component format/damage` (revision 3536877):
+///   "`minecraft:damage`: The number of uses consumed (not remaining) of the item's
+///   durability. Must be a non-negative integer, defaults to 0."
+/// - `Data component format/max damage` (revision 3389861):
+///   "`minecraft:max_damage`: The maximum amount of damage that this item can take."
+/// - `Data component format/stored enchantments` (revision 3849830):
+///   "`minecraft:stored_enchantments`: Contains a map of inactive enchantments and
+///   their levels."
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnvilItem {
+    stack: ItemStack,
+    max_durability_override: Option<u32>,
     is_enchanted_book: bool,
 }
 
@@ -367,13 +413,19 @@ impl AnvilItem {
             max_durability,
             custom_name.as_deref(),
         )?;
-        Ok(Self {
+        let max_durability_override = max_durability_override_for(stack.item(), max_durability);
+        let stack = apply_anvil_components(
             stack,
             durability,
             max_durability,
             repair_cost,
             custom_name,
             enchantments,
+            is_enchanted_book,
+        )?;
+        Ok(Self {
+            stack,
+            max_durability_override,
             is_enchanted_book,
         })
     }
@@ -385,15 +437,11 @@ impl AnvilItem {
     /// [`AnvilRules::item_from_stack`] when item report data is loaded.
     #[must_use]
     pub fn from_stack(stack: ItemStack) -> Self {
-        let max_durability = default_max_durability(stack.item()).unwrap_or(0);
-        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID)
+            || !stack.components().stored_enchantments().is_empty();
         Self {
             stack,
-            durability: max_durability,
-            max_durability,
-            repair_cost: 0,
-            custom_name: None,
-            enchantments: BTreeMap::new(),
+            max_durability_override: None,
             is_enchanted_book,
         }
     }
@@ -414,11 +462,7 @@ impl AnvilItem {
         let stack = ItemStack::try_new(item, count, max_stack)?;
         Ok(Self {
             stack,
-            durability: max_durability,
-            max_durability,
-            repair_cost: 0,
-            custom_name: None,
-            enchantments: BTreeMap::new(),
+            max_durability_override: None,
             is_enchanted_book,
         })
     }
@@ -441,34 +485,40 @@ impl AnvilItem {
         self.stack.count()
     }
 
-    /// Returns current remaining durability.
+    /// Returns current remaining durability (`max_durability - damage`).
     #[must_use]
     pub fn durability(&self) -> u32 {
-        self.durability
+        self.max_durability()
+            .saturating_sub(self.stack.components().damage().unwrap_or(0))
     }
 
     /// Returns maximum durability (`0` for non-damageable items).
     #[must_use]
     pub fn max_durability(&self) -> u32 {
-        self.max_durability
+        self.max_durability_override
+            .unwrap_or_else(|| default_max_durability(self.stack.item()).unwrap_or(0))
     }
 
     /// Returns prior work penalty (`repair_cost`).
     #[must_use]
     pub fn repair_cost(&self) -> u32 {
-        self.repair_cost
+        self.stack.components().repair_cost().unwrap_or(0)
     }
 
     /// Returns the custom display name, if set.
     #[must_use]
     pub fn custom_name(&self) -> Option<&str> {
-        self.custom_name.as_deref()
+        self.stack.components().custom_name()
     }
 
     /// Returns the enchantments on this item (or stored on an enchanted book).
     #[must_use]
     pub fn enchantments(&self) -> &BTreeMap<String, u8> {
-        &self.enchantments
+        if self.is_enchanted_book {
+            self.stack.components().stored_enchantments()
+        } else {
+            self.stack.components().enchantments()
+        }
     }
 
     /// Returns `true` if this item is treated as an enchanted book (`minecraft:enchanted_book`)
@@ -481,14 +531,30 @@ impl AnvilItem {
     /// Replaces the item's enchantment map.
     #[must_use]
     pub fn with_enchantments(mut self, enchantments: BTreeMap<String, u8>) -> Self {
-        self.enchantments = enchantments;
+        let filtered: BTreeMap<String, u8> = enchantments
+            .into_iter()
+            .filter(|(_, level)| *level > 0)
+            .collect();
+        let _ = set_item_enchantments(&mut self.stack, self.is_enchanted_book, filtered);
         self
     }
 
     /// Inserts or updates a single enchantment level on this item.
     #[must_use]
     pub fn with_enchantment(mut self, id: impl Into<String>, level: u8) -> Self {
-        self.enchantments.insert(id.into(), level);
+        let id = id.into();
+        let components = self.stack.components_mut();
+        if level == 0 {
+            if self.is_enchanted_book {
+                components.remove_stored_enchantment(&id);
+            } else {
+                components.remove_enchantment(&id);
+            }
+        } else if self.is_enchanted_book {
+            let _ = components.set_stored_enchantment(id, level);
+        } else {
+            let _ = components.set_enchantment(id, level);
+        }
         self
     }
 
@@ -502,67 +568,78 @@ impl AnvilItem {
     /// Updates remaining durability, enforcing `durability <= max_durability`
     /// and `max_durability > 0`.
     pub fn with_durability(mut self, durability: u32) -> Result<Self, AnvilItemError> {
-        if self.max_durability == 0 {
+        let max_durability = self.max_durability();
+        if max_durability == 0 {
             return Err(AnvilItemError::ZeroMaxDurability);
         }
-        if durability > self.max_durability {
+        if durability > max_durability {
             return Err(AnvilItemError::DurabilityExceedsMax {
                 durability,
-                max_durability: self.max_durability,
+                max_durability,
             });
         }
-        self.durability = durability;
+        self.stack
+            .components_mut()
+            .set_damage(damage_for_durability(durability, max_durability));
         Ok(self)
     }
 
     /// Updates maximum durability, enforcing invariants for damageable items and current durability.
     pub fn with_max_durability(mut self, max_durability: u32) -> Result<Self, AnvilItemError> {
+        let cur_durability = self.durability();
         validate_anvil_item_invariants(
             default_max_durability(self.stack.item()).is_some(),
-            self.durability,
+            cur_durability,
             max_durability,
-            self.custom_name.as_deref(),
+            self.custom_name(),
         )?;
-        self.max_durability = max_durability;
+        self.max_durability_override =
+            max_durability_override_for(self.stack.item(), max_durability);
+        self.stack
+            .components_mut()
+            .set_damage(damage_for_durability(cur_durability, max_durability));
         Ok(self)
     }
 
     /// Sets the prior work penalty (`repair_cost`).
     #[must_use]
     pub fn with_repair_cost(mut self, repair_cost: u32) -> Self {
-        self.repair_cost = repair_cost;
+        self.stack
+            .components_mut()
+            .set_repair_cost((repair_cost > 0).then_some(repair_cost));
         self
     }
 
     /// Updates the custom display name, enforcing [`MAX_NAME_LENGTH`].
     pub fn with_custom_name(mut self, name: impl Into<String>) -> Result<Self, AnvilItemError> {
         let name = name.into();
+        let max_durability = self.max_durability();
         validate_anvil_item_invariants(
             default_max_durability(self.stack.item()).is_some(),
-            self.durability,
-            self.max_durability,
+            self.durability(),
+            max_durability,
             Some(&name),
         )?;
-        self.custom_name = Some(name);
+        self.stack.components_mut().set_custom_name(Some(name));
         Ok(self)
     }
 
     /// Returns damage taken (missing durability).
     #[must_use]
     pub fn damage(&self) -> u32 {
-        self.max_durability.saturating_sub(self.durability)
+        self.max_durability().saturating_sub(self.durability())
     }
 
     /// Returns whether this item is damageable (`max_durability > 0`).
     #[must_use]
     pub fn is_damageable(&self) -> bool {
-        self.max_durability > 0
+        self.max_durability() > 0
     }
 
     /// Returns whether this item has taken damage (`durability < max_durability`).
     #[must_use]
     pub fn is_damaged(&self) -> bool {
-        self.is_damageable() && self.durability < self.max_durability
+        self.is_damageable() && self.durability() < self.max_durability()
     }
 }
 
@@ -835,13 +912,19 @@ impl AnvilRules {
             custom_name.as_deref(),
         )?;
         let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
-        Ok(AnvilItem {
+        let max_durability_override = max_durability_override_for(stack.item(), max_durability);
+        let stack = apply_anvil_components(
             stack,
             durability,
             max_durability,
             repair_cost,
             custom_name,
-            enchantments: BTreeMap::new(),
+            BTreeMap::new(),
+            is_enchanted_book,
+        )?;
+        Ok(AnvilItem {
+            stack,
+            max_durability_override,
             is_enchanted_book,
         })
     }
@@ -851,14 +934,12 @@ impl AnvilRules {
     #[must_use]
     pub fn item_from_stack(&self, stack: ItemStack) -> AnvilItem {
         let max_durability = self.max_durability(stack.item()).unwrap_or(0);
-        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID);
+        let max_durability_override = max_durability_override_for(stack.item(), max_durability);
+        let is_enchanted_book = items_equal(stack.item(), ENCHANTED_BOOK_ID)
+            || !stack.components().stored_enchantments().is_empty();
         AnvilItem {
             stack,
-            durability: max_durability,
-            max_durability,
-            repair_cost: 0,
-            custom_name: None,
-            enchantments: BTreeMap::new(),
+            max_durability_override,
             is_enchanted_book,
         }
     }
@@ -883,14 +964,11 @@ impl AnvilRules {
                 }
             });
         let is_enchanted_book = items_equal(&item, ENCHANTED_BOOK_ID);
+        let max_durability_override = max_durability_override_for(&item, max_durability);
         let stack = ItemStack::try_new(item, count, max_stack)?;
         Ok(AnvilItem {
             stack,
-            durability: max_durability,
-            max_durability,
-            repair_cost: 0,
-            custom_name: None,
-            enchantments: BTreeMap::new(),
+            max_durability_override,
             is_enchanted_book,
         })
     }
@@ -1011,7 +1089,7 @@ fn combine_enchantments(
     registry: &EnchantmentRegistry,
 ) -> EnchantmentCombineOutcome {
     let mut result_enchantments = BTreeMap::new();
-    for (id, &level) in &base.enchantments {
+    for (id, &level) in base.enchantments() {
         if level > 0 {
             result_enchantments.insert(canonical_enchantment_id(registry, id), level);
         }
@@ -1021,7 +1099,7 @@ fn combine_enchantments(
     let mut any_applied = false;
     let mut any_incompatible = false;
 
-    for (raw_id, &sac_level) in &sacrifice.enchantments {
+    for (raw_id, &sac_level) in sacrifice.enchantments() {
         if sac_level == 0 {
             continue;
         }
@@ -1117,7 +1195,8 @@ fn calculate_repair_internal(
 
     // Custom rename validation (max 50 chars, trimmed, blank string reset)
     let mut rename_changed = false;
-    let mut final_custom_name = input.base_item.custom_name.clone();
+    let base_custom_name = input.base_item.custom_name();
+    let mut final_custom_name = base_custom_name.map(str::to_owned);
 
     if let Some(ref raw_name) = input.custom_name {
         let char_count = raw_name.chars().count();
@@ -1130,11 +1209,11 @@ fn calculate_repair_internal(
         let trimmed = raw_name.trim();
         if trimmed.is_empty() {
             // Blank string reset
-            if input.base_item.custom_name.is_some() {
+            if base_custom_name.is_some() {
                 final_custom_name = None;
                 rename_changed = true;
             }
-        } else if input.base_item.custom_name.as_deref() != Some(trimmed) {
+        } else if base_custom_name != Some(trimmed) {
             final_custom_name = Some(trimmed.to_string());
             rename_changed = true;
         }
@@ -1143,8 +1222,8 @@ fn calculate_repair_internal(
     let rename_level_cost = if rename_changed { RENAME_LEVEL_COST } else { 0 };
 
     // Evaluate repair and enchantment combination
-    let mut result_durability = input.base_item.durability;
-    let mut result_enchantments = input.base_item.enchantments.clone();
+    let mut result_durability = input.base_item.durability();
+    let mut result_enchantments = input.base_item.enchantments().clone();
     let mut repair_cost_levels = 0;
     let mut material_cost = 0;
     let mut sacrifice_penalty = 0;
@@ -1174,7 +1253,7 @@ fn calculate_repair_internal(
                 let Some(registry) = source.enchantments() else {
                     return Err(AnvilError::IncompatibleSacrificeItem);
                 };
-                if sacrifice.enchantments.is_empty() {
+                if sacrifice.enchantments().is_empty() {
                     return Err(AnvilError::IncompatibleSacrificeItem);
                 }
 
@@ -1186,15 +1265,15 @@ fn calculate_repair_internal(
                 result_enchantments = outcome.enchantments;
                 repair_cost_levels = outcome.enchant_cost;
                 material_cost = 1;
-                sacrifice_penalty = sacrifice.repair_cost;
+                sacrifice_penalty = sacrifice.repair_cost();
             } else if is_same_item {
                 if !input.base_item.is_damageable() {
                     return Err(AnvilError::NotDamageable);
                 }
 
-                let max_durability = input.base_item.max_durability;
-                let d1 = input.base_item.durability.min(max_durability);
-                let d2 = sacrifice.durability.min(sacrifice.max_durability);
+                let max_durability = input.base_item.max_durability();
+                let d1 = input.base_item.durability().min(max_durability);
+                let d2 = sacrifice.durability().min(sacrifice.max_durability());
                 let bonus = ((f64::from(max_durability)) * DURABILITY_BONUS_FACTOR).floor() as u32;
                 let combined = d1
                     .saturating_add(d2)
@@ -1208,7 +1287,7 @@ fn calculate_repair_internal(
                 }
 
                 let mut any_enchant_change = false;
-                if !sacrifice.enchantments.is_empty() {
+                if !sacrifice.enchantments().is_empty() {
                     let Some(registry) = source.enchantments() else {
                         return Err(AnvilError::IncompatibleSacrificeItem);
                     };
@@ -1223,14 +1302,14 @@ fn calculate_repair_internal(
                 }
 
                 material_cost = 1;
-                sacrifice_penalty = sacrifice.repair_cost;
+                sacrifice_penalty = sacrifice.repair_cost();
             } else if is_mat {
                 if !input.base_item.is_damageable() {
                     return Err(AnvilError::NotDamageable);
                 }
 
-                let max_durability = input.base_item.max_durability;
-                let d1 = input.base_item.durability.min(max_durability);
+                let max_durability = input.base_item.max_durability();
+                let d1 = input.base_item.durability().min(max_durability);
                 let missing = max_durability.saturating_sub(d1);
 
                 if missing == 0 {
@@ -1267,7 +1346,7 @@ fn calculate_repair_internal(
     }
 
     // Prior work penalty calculation
-    let base_penalty = input.base_item.repair_cost;
+    let base_penalty = input.base_item.repair_cost();
     let prior_penalty_cost = base_penalty.saturating_add(sacrifice_penalty);
     let total_level_cost = prior_penalty_cost
         .saturating_add(rename_level_cost)
@@ -1285,11 +1364,16 @@ fn calculate_repair_internal(
         });
     }
 
-    let Ok(result_stack) = ItemStack::try_new(
+    let Ok(base_result_stack) = ItemStack::try_new(
         input.base_item.item(),
         1,
         input.base_item.stack().max_stack(),
     ) else {
+        return Err(AnvilError::NoOperation);
+    };
+    let Ok(result_stack) =
+        base_result_stack.with_components(input.base_item.stack().components().clone())
+    else {
         return Err(AnvilError::NoOperation);
     };
     let result_max_durability = input.base_item.max_durability();
@@ -1303,14 +1387,24 @@ fn calculate_repair_internal(
         AnvilItemError::NameTooLong { len, max } => AnvilError::NameTooLong { len, max },
         _ => AnvilError::NoOperation,
     })?;
+    let is_enchanted_book = input.base_item.is_enchanted_book();
+    let result_stack = apply_anvil_components(
+        result_stack,
+        result_durability,
+        result_max_durability,
+        next_prior_work_penalty,
+        final_custom_name,
+        result_enchantments,
+        is_enchanted_book,
+    )
+    .map_err(|_| AnvilError::NoOperation)?;
     let result_item = AnvilItem {
         stack: result_stack,
-        durability: result_durability,
-        max_durability: result_max_durability,
-        repair_cost: next_prior_work_penalty,
-        custom_name: final_custom_name,
-        enchantments: result_enchantments,
-        is_enchanted_book: input.base_item.is_enchanted_book,
+        max_durability_override: max_durability_override_for(
+            input.base_item.item(),
+            result_max_durability,
+        ),
+        is_enchanted_book,
     };
 
     let degraded_state = roll.and_then(|r| anvil_state.roll_degradation(r));
@@ -2595,5 +2689,67 @@ mod tests {
                 .get("minecraft:soul_speed"),
             Some(&3)
         );
+    }
+
+    #[test]
+    fn anvil_rename_and_enchant_writes_item_stack_components() {
+        let rules = AnvilRules::from_enchantments(&synthetic_enchantment_registry());
+        let damaged_sword = item("minecraft:diamond_sword", 1)
+            .with_durability(1000)
+            .expect("durability")
+            .with_enchantment("minecraft:sharpness", 4)
+            .with_repair_cost(3);
+        let book = item("minecraft:enchanted_book", 1)
+            .with_enchantment("minecraft:sharpness", 4)
+            .with_repair_cost(1);
+        assert_eq!(
+            book.stack()
+                .components()
+                .stored_enchantments()
+                .get("minecraft:sharpness"),
+            Some(&4)
+        );
+        assert!(book.stack().components().enchantments().is_empty());
+
+        let input = AnvilRepairInput::new(damaged_sword, Some(book), Some("Excalibur".to_owned()))
+            .expect("rename + enchant input");
+        let result = rules
+            .calculate_repair(&input, false)
+            .expect("rename + enchant succeeds");
+
+        let stack = result.result_item.stack();
+        let components = stack.components();
+        assert_eq!(components.custom_name(), Some("Excalibur"));
+        assert_eq!(
+            components.enchantments().get("minecraft:sharpness"),
+            Some(&5)
+        );
+        assert!(components.stored_enchantments().is_empty());
+        assert_eq!(components.repair_cost(), Some(7));
+        assert_eq!(components.damage(), Some(1561 - 1000));
+
+        // Merging two enchanted books writes to `stored_enchantments` rather than `enchantments`.
+        let book_a = item("minecraft:enchanted_book", 1).with_enchantment("minecraft:sharpness", 3);
+        let book_b =
+            item("minecraft:enchanted_book", 1).with_enchantment("minecraft:unbreaking", 2);
+        let merged_books = rules
+            .calculate_repair(&AnvilRepairInput::combine(book_a, book_b), false)
+            .expect("book merge succeeds");
+        let book_components = merged_books.result_item.stack().components();
+        assert!(book_components.enchantments().is_empty());
+        assert_eq!(
+            book_components
+                .stored_enchantments()
+                .get("minecraft:sharpness"),
+            Some(&3)
+        );
+        assert_eq!(
+            book_components
+                .stored_enchantments()
+                .get("minecraft:unbreaking"),
+            Some(&2)
+        );
+        assert_eq!(book_components.repair_cost(), Some(1));
+        assert_eq!(book_components.damage(), None);
     }
 }
