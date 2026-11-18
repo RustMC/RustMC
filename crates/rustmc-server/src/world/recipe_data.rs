@@ -580,6 +580,7 @@ impl RecipeData {
         }
 
         data.crafting.sort_by(|a, b| a.id().cmp(&b.id()));
+        data.stonecutting.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_transform.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_trim.sort_by(|a, b| a.id().cmp(b.id()));
         Ok(data)
@@ -698,6 +699,32 @@ impl RecipeData {
     #[must_use]
     pub fn get_stonecutting_by_id(&self, id: &str) -> Option<&StonecuttingRecipe> {
         self.stonecutting.iter().find(|recipe| recipe.id() == id)
+    }
+
+    /// Lists every loaded `minecraft:stonecutting` recipe whose ingredient
+    /// accepts `input_item` (ignoring an optional `minecraft:` prefix),
+    /// returning `(recipe_id, result)` pairs sorted by `recipe_id`.
+    ///
+    /// Sources:
+    /// - minecraft.wiki `Stonecutter` (revision 3892466):
+    ///   - "All of its recipes require just one ingredient and produce one product (in varying quantities)."
+    ///   - "The GUI contains a block selection menu that is empty. The menu is populated with blocks that can be crafted from that particular material, only if a block is inserted into its input."
+    /// - minecraft.wiki `Recipe (Java Edition)` (revision 3873625, `stonecutting`):
+    ///   - "`ingredient`: The ingredient for the recipe. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+    ///   - "`result`: The output item of the recipe."
+    ///
+    /// Neither page states a vanilla ordering for the stonecutter output list;
+    /// sorting by `recipe_id` is RustMC's deterministic order.
+    #[must_use]
+    pub fn stonecutting_results(&self, input_item: &str) -> Vec<(&str, ItemStack)> {
+        let mut results: Vec<(&str, ItemStack)> = self
+            .stonecutting
+            .iter()
+            .filter(|recipe| ingredient_matches_item(&recipe.ingredient, input_item))
+            .map(|recipe| (recipe.id(), recipe.result().clone()))
+            .collect();
+        results.sort_by_key(|(id, _)| *id);
+        results
     }
 
     /// Finds a loaded crafting recipe matching `grid`, returning `(recipe_id, result)`.
@@ -1458,6 +1485,7 @@ fn parse_smithing_trim_recipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item::DEFAULT_MAX_STACK;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2727,5 +2755,143 @@ mod tests {
         assert!(error.contains("coast_trim.json"), "{error}");
         assert!(error.contains("minecraft:stick"), "{error}");
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stonecutting_results_filters_and_sorts_by_recipe_id() {
+        let root = scratch_root("stonecutting-results");
+        write(
+            &root.join("data/testns/tags/item/cuttable_stones.json"),
+            r#"{"values": ["minecraft:stone", "testns:granite"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/z_slab.json"),
+            r##"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "#testns:cuttable_stones",
+                "result": {"id": "testns:cut_slab", "count": 2}
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/a_stairs.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "minecraft:stone",
+                "result": {"id": "testns:cut_stairs"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/m_wall.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": ["testns:other", "minecraft:stone"],
+                "result": {"id": "testns:cut_wall"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/other_only.json"),
+            r#"{
+                "type": "minecraft:stonecutting",
+                "ingredient": "testns:other",
+                "result": {"id": "testns:other_slab", "count": 2}
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+
+        let expected = vec![
+            (
+                "testns:a_stairs",
+                ItemStack::try_new("testns:cut_stairs", 1, DEFAULT_MAX_STACK).unwrap(),
+            ),
+            (
+                "testns:m_wall",
+                ItemStack::try_new("testns:cut_wall", 1, DEFAULT_MAX_STACK).unwrap(),
+            ),
+            (
+                "testns:z_slab",
+                ItemStack::try_new("testns:cut_slab", 2, DEFAULT_MAX_STACK).unwrap(),
+            ),
+        ];
+        assert_eq!(data.stonecutting_results("minecraft:stone"), expected);
+        assert_eq!(data.stonecutting_results("stone"), expected);
+        assert!(data.stonecutting_results("minecraft:dirt").is_empty());
+        assert!(data.stonecutting_results("").is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_stonecutting_results_match_vanilla_recipes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_stonecutting_results_match_vanilla_recipes() {
+        // Number of vanilla Java 26.3 `minecraft:stonecutting` recipe files
+        // under `data/minecraft/recipe` whose ingredient accepts `minecraft:stone`.
+        const VANILLA_STONE_STONECUTTING_COUNT: usize = 11;
+        // Slab output count per block cut in a stonecutter
+        // (minecraft.wiki `Stonecutter` revision 3892466: "Andesite -> Andesite Slab, 2").
+        const STONECUTTER_SLAB_COUNT: u16 = 2;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        let recipe_dir = root.join("data/minecraft/recipe");
+        let mut expected_stone: Vec<(String, ItemStack)> = Vec::new();
+        for entry in walk_json(&recipe_dir).expect("walk vanilla recipes") {
+            let doc = read_json(&entry).expect("read recipe json");
+            if doc.get("type").and_then(Value::as_str) != Some("minecraft:stonecutting") {
+                continue;
+            }
+            let ing = parse_ingredient(&doc["ingredient"], &tags, &entry).expect("ingredient");
+            if !ingredient_matches_item(&ing, "minecraft:stone") {
+                continue;
+            }
+            let id = recipe_id("minecraft", &recipe_dir, &entry);
+            let ParsedOrSkipped::Loaded(stack) =
+                parse_result(doc.as_object().unwrap(), Some(&items), &entry).expect("result")
+            else {
+                continue;
+            };
+            expected_stone.push((id, stack));
+        }
+        expected_stone.sort_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b));
+
+        assert_eq!(expected_stone.len(), VANILLA_STONE_STONECUTTING_COUNT);
+
+        let actual_stone = data.stonecutting_results("minecraft:stone");
+        assert_eq!(actual_stone.len(), VANILLA_STONE_STONECUTTING_COUNT);
+        let expected_refs: Vec<(&str, ItemStack)> = expected_stone
+            .iter()
+            .map(|(id, stack)| (id.as_str(), stack.clone()))
+            .collect();
+        assert_eq!(actual_stone, expected_refs);
+        assert_eq!(data.stonecutting_results("stone"), expected_refs);
+
+        let andesite_results = data.stonecutting_results("minecraft:andesite");
+        let expected_andesite_slab = ItemStack::try_new(
+            "minecraft:andesite_slab",
+            STONECUTTER_SLAB_COUNT,
+            u16::from(
+                items
+                    .max_stack_size("minecraft:andesite_slab")
+                    .expect("andesite_slab max stack"),
+            ),
+        )
+        .expect("andesite_slab stack");
+        assert!(
+            andesite_results.contains(&(
+                "minecraft:andesite_slab_from_andesite_stonecutting",
+                expected_andesite_slab
+            )),
+            "andesite stonecutting results must include andesite_slab x2: {andesite_results:?}"
+        );
+
+        assert!(data.stonecutting_results("minecraft:dirt").is_empty());
     }
 }
