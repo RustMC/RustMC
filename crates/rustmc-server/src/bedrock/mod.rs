@@ -2,6 +2,7 @@
 
 pub mod packet;
 pub mod session;
+pub mod wire;
 
 pub use packet::{
     BEDROCK_GAME_VERSION, BEDROCK_PROTOCOL_VERSION, BedrockIdentity, BedrockPacket, ID_LOGIN,

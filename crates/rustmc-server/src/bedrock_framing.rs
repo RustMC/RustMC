@@ -27,6 +27,7 @@
 
 use std::io::Write;
 
+use crate::bedrock::wire;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 
@@ -137,41 +138,15 @@ impl std::fmt::Display for BedrockFramingError {
 impl std::error::Error for BedrockFramingError {}
 
 /// Encodes a 32-bit unsigned integer into variable-length LEB128 bytes (VarUint32).
-pub fn write_varuint32(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+pub fn write_varuint32(value: u32, out: &mut Vec<u8>) {
+    wire::put_varuint32(value, out);
 }
 
 /// Decodes a 32-bit unsigned integer from variable-length LEB128 bytes (VarUint32).
 ///
 /// Returns the decoded integer and the number of bytes consumed from `slice`.
 pub fn read_varuint32(slice: &[u8]) -> Result<(u32, usize), BedrockFramingError> {
-    let mut value = 0u32;
-    let mut shift = 0;
-    for (i, &byte) in slice.iter().take(5).enumerate() {
-        if i == 4 {
-            if byte & 0xf0 != 0 {
-                return Err(BedrockFramingError::MalformedVarInt);
-            }
-            value |= u32::from(byte & 0x0f) << shift;
-            return Ok((value, 5));
-        }
-        value |= u32::from(byte & 0x7f) << shift;
-        if (byte & 0x80) == 0 {
-            return Ok((value, i + 1));
-        }
-        shift += 7;
-    }
-    Err(BedrockFramingError::MalformedVarInt)
+    wire::read_varuint32(slice).map_err(|_| BedrockFramingError::MalformedVarInt)
 }
 
 /// Alias for [`write_varuint32`].

@@ -21,6 +21,7 @@
 //! request limit, which a real client must confirm. No Bedrock client has
 //! exercised this code.
 
+use crate::bedrock::wire;
 use std::fmt;
 
 /// Packet identifier for Bedrock `LevelChunkPacket` (58 / 0x3A).
@@ -152,60 +153,35 @@ impl std::error::Error for BedrockChunkError {}
 /// Encodes an `i32` using 32-bit ZigZag mapping into a `u32`.
 #[inline]
 pub fn zigzag_encode32(val: i32) -> u32 {
-    ((val << 1) ^ (val >> 31)) as u32
+    wire::zigzag_encode32(val)
 }
 
 /// Decodes a 32-bit ZigZag-mapped `u32` into a signed `i32`.
 #[inline]
 pub fn zigzag_decode32(val: u32) -> i32 {
-    ((val >> 1) as i32) ^ (-((val & 1) as i32))
+    wire::zigzag_decode32(val)
 }
 
 /// Encodes a 32-bit unsigned integer into variable-length LEB128 bytes (VarUint32).
-pub fn write_varuint32(mut value: u32, out: &mut Vec<u8>) {
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+pub fn write_varuint32(value: u32, out: &mut Vec<u8>) {
+    wire::put_varuint32(value, out);
 }
 
 /// Decodes a 32-bit unsigned integer from variable-length LEB128 bytes (VarUint32).
 ///
 /// Returns the decoded integer and the number of bytes consumed.
 pub fn read_varuint32(slice: &[u8]) -> Result<(u32, usize), BedrockChunkError> {
-    let mut value = 0u32;
-    for (i, &byte) in slice.iter().take(5).enumerate() {
-        if i == 4 {
-            if byte & 0xf0 != 0 {
-                return Err(BedrockChunkError::MalformedVarInt);
-            }
-            value |= u32::from(byte & 0x0f) << 28;
-            return Ok((value, 5));
-        }
-        value |= u32::from(byte & 0x7f) << (i * 7);
-        if (byte & 0x80) == 0 {
-            return Ok((value, i + 1));
-        }
-    }
-    Err(BedrockChunkError::MalformedVarInt)
+    wire::read_varuint32(slice).map_err(|_| BedrockChunkError::MalformedVarInt)
 }
 
 /// Encodes a signed 32-bit integer into ZigZag-encoded VarInt32 bytes.
 pub fn write_varint32(value: i32, out: &mut Vec<u8>) {
-    write_varuint32(zigzag_encode32(value), out);
+    wire::put_varint32(value, out);
 }
 
 /// Decodes a signed 32-bit integer from ZigZag-encoded VarInt32 bytes.
 pub fn read_varint32(slice: &[u8]) -> Result<(i32, usize), BedrockChunkError> {
-    let (u, len) = read_varuint32(slice)?;
-    Ok((zigzag_decode32(u), len))
+    wire::read_varint32(slice).map_err(|_| BedrockChunkError::MalformedVarInt)
 }
 
 // --- Coordinate and bit packing helpers ---
