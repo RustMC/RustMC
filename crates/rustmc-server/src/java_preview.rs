@@ -934,14 +934,9 @@ mod tests {
     use crate::world::Terrain;
 
     fn read_varint(input: &[u8]) -> (u32, usize) {
-        let mut value = 0;
-        for (index, byte) in input.iter().take(5).enumerate() {
-            value |= u32::from(byte & 0x7f) << (index * 7);
-            if byte & 0x80 == 0 {
-                return (value, index + 1);
-            }
-        }
-        panic!("invalid test packet VarInt");
+        crate::java_wire::read_varint(input)
+            .expect("valid test packet VarInt")
+            .expect("complete test packet VarInt")
     }
 
     fn packet_ids(mut stream: &[u8]) -> Vec<u32> {
