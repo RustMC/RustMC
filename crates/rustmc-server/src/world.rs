@@ -98,7 +98,7 @@ pub use vanilla_rules::{
 pub mod inventory;
 pub use inventory::{
     HOTBAR_SLOT_COUNT, HOTBAR_SLOTS, InventoryError, MAIN_SLOT_COUNT, MAIN_SLOTS, PlayerInventory,
-    TOTAL_SLOT_COUNT, TOTAL_SLOTS,
+    TOTAL_SLOT_COUNT, TOTAL_SLOTS, WINDOW_HOTBAR_SLOTS, WINDOW_MAIN_SLOTS,
 };
 
 pub const CHUNK_SIDE: usize = 16;

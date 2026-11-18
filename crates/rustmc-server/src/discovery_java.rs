@@ -12,7 +12,12 @@ use crate::java_wire::{
     read_i16_be, read_i64_be, read_string, read_u64_be, read_varint, unpack_block_position,
 };
 use crate::preview_data::RegistryManifest;
-use crate::protocol::chat;
+use crate::protocol::{
+    chat,
+    ids::{DynamicRegistryIds, ProtocolIds},
+    slot,
+};
+use crate::world::inventory::PlayerInventory;
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
@@ -500,6 +505,9 @@ pub struct Session {
     local_preview: bool,
     session_id: [u8; 16],
     registry_manifest: Option<Arc<RegistryManifest>>,
+    protocol_ids: Option<Arc<ProtocolIds>>,
+    dynamic_registry_ids: DynamicRegistryIds,
+    inventory: PlayerInventory,
     pub preview: Option<crate::java_preview::Preview>,
     preview_seed: u64,
     preview_radius: u8,
@@ -518,6 +526,9 @@ impl Default for Session {
             local_preview: false,
             session_id: [0; 16],
             registry_manifest: None,
+            protocol_ids: None,
+            dynamic_registry_ids: DynamicRegistryIds::default(),
+            inventory: PlayerInventory::new(),
             preview: None,
             preview_seed: 0,
             preview_radius: 2,
@@ -551,10 +562,18 @@ impl Session {
         self.vanilla_source = Some(source);
         self
     }
+    pub fn with_protocol_ids(mut self, protocol_ids: Arc<ProtocolIds>) -> Self {
+        self.protocol_ids = Some(protocol_ids);
+        self
+    }
     pub fn state(&self) -> State {
         self.state
     }
+    pub fn inventory(&self) -> &PlayerInventory {
+        &self.inventory
+    }
     pub fn with_registry_manifest(mut self, manifest: Arc<RegistryManifest>) -> Self {
+        self.dynamic_registry_ids = DynamicRegistryIds::from_manifest(&manifest);
         self.registry_manifest = Some(manifest);
         self
     }
@@ -824,8 +843,39 @@ impl Session {
                             let action = decode_use_item_on(body)?;
                             responses.push(acknowledge_block_change(action.sequence));
                         }
-                        sb::SET_CREATIVE_MODE_SLOT
-                        | sb::USE_ITEM
+                        sb::SET_CREATIVE_MODE_SLOT => {
+                            // `Set Creative Mode Slot` (0x39 / 57, `Java Edition protocol/Packets`
+                            // revision 3868170): `Slot` (Short) followed by `Clicked Item` (Slot,
+                            // `Java Edition protocol/Slot data` revision 3763756).
+                            //
+                            // Player inventory window slots (`Java Edition protocol/Inventory`
+                            // revision 3201379, `== Player Inventory ==`): main inventory `9..=35`
+                            // maps to `PlayerInventory` `9..=35` and hotbar `36..=44` maps to
+                            // `PlayerInventory` `0..=8`. Without `ProtocolIds` (when started
+                            // without a vanilla data root containing `reports/registries.json`),
+                            // creative slot packets remain bounded by frame/session limits and
+                            // ignored.
+                            if let Some(protocol_ids) = &self.protocol_ids {
+                                let (window_slot, rest) = read_i16_be(body)?;
+                                let slot_index = PlayerInventory::window_slot_to_index(window_slot)
+                                    .ok_or(Error::Malformed)?;
+                                let (stack, consumed) = slot::decode_slot(
+                                    rest,
+                                    protocol_ids,
+                                    &self.dynamic_registry_ids,
+                                )
+                                .map_err(|_| Error::Malformed)?;
+                                if consumed != rest.len() {
+                                    return Err(Error::Malformed);
+                                }
+                                self.inventory
+                                    .set_slot(slot_index, stack)
+                                    .map_err(|_| Error::Malformed)?;
+                            } else if body.is_empty() {
+                                return Err(Error::Malformed);
+                            }
+                        }
+                        sb::USE_ITEM
                         | sb::PICK_ITEM_FROM_BLOCK
                         | sb::PICK_ITEM_FROM_ENTITY
                         | sb::CONTAINER_CLOSE => {
@@ -863,7 +913,9 @@ impl Session {
                             if !rest.is_empty() || !(0..HOTBAR_SLOTS).contains(&slot) {
                                 return Err(Error::Malformed);
                             }
-                            // Selected hotbar slot is client-local here.
+                            self.inventory
+                                .set_held_slot(slot as u8)
+                                .map_err(|_| Error::Malformed)?;
                         }
                         sb::SPECTATOR_ACTION => {
                             if body != [0] {
@@ -2324,5 +2376,248 @@ mod tests {
                 Err(Error::Malformed)
             );
         }
+    }
+
+    fn test_protocol_ids() -> Arc<ProtocolIds> {
+        const SYNTHETIC_REGISTRIES: &str = r#"{
+            "minecraft:item": {
+                "entries": {
+                    "minecraft:air": { "protocol_id": 0 },
+                    "minecraft:stone": { "protocol_id": 1 },
+                    "minecraft:cobblestone": { "protocol_id": 14 },
+                    "minecraft:diamond_sword": { "protocol_id": 851 }
+                }
+            },
+            "minecraft:data_component_type": {
+                "entries": {
+                    "minecraft:damage": { "protocol_id": 3 },
+                    "minecraft:custom_name": { "protocol_id": 6 },
+                    "minecraft:enchantments": { "protocol_id": 13 }
+                }
+            },
+            "minecraft:potion": {
+                "entries": {
+                    "minecraft:water": { "protocol_id": 0 }
+                }
+            }
+        }"#;
+        Arc::new(
+            ProtocolIds::from_json_str(
+                std::path::Path::new("reports/registries.json"),
+                SYNTHETIC_REGISTRIES,
+            )
+            .expect("synthetic protocol ids"),
+        )
+    }
+
+    fn test_manifest_with_enchantments() -> Arc<RegistryManifest> {
+        let mut manifest = (*test_manifest()).clone();
+        manifest.registries.push((
+            "minecraft:enchantment".into(),
+            vec!["minecraft:sharpness".into(), "minecraft:unbreaking".into()],
+        ));
+        Arc::new(manifest)
+    }
+
+    fn enter_play_session_with_protocol_ids() -> (Session, Arc<ProtocolIds>, DynamicRegistryIds) {
+        let ids = test_protocol_ids();
+        let manifest = test_manifest_with_enchantments();
+        let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
+
+        let mut current = handshake(777);
+        *current.last_mut().unwrap() = 2;
+        let mut s = Session::new(true)
+            .with_registry_manifest(manifest)
+            .with_protocol_ids(Arc::clone(&ids));
+        s.receive(&current, 4096).unwrap();
+        let mut login = vec![4];
+        login.extend_from_slice(b"Test");
+        login.extend_from_slice(&[7; 16]);
+        s.receive(&frame(0, &login), 4096).unwrap();
+        s.receive(&frame(3, &[]), 4096).unwrap();
+        let mut known = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known);
+        }
+        s.receive(&frame(7, &known), 4096).unwrap();
+        s.receive(&frame(3, &[]), 4096).unwrap();
+        assert_eq!(s.state(), State::Play);
+        (s, ids, dynamic_ids)
+    }
+
+    fn creative_slot_frame(
+        window_slot: i16,
+        stack: &Option<crate::item::ItemStack>,
+        ids: &ProtocolIds,
+        dynamic_ids: &DynamicRegistryIds,
+    ) -> Vec<u8> {
+        let mut body = window_slot.to_be_bytes().to_vec();
+        slot::encode_slot(stack, ids, dynamic_ids, &mut body).expect("encode creative slot");
+        frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &body)
+    }
+
+    #[test]
+    fn creative_slot_stores_and_clears_stacks_and_tracks_carried_item() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemComponents, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        assert_eq!(s.inventory().held_slot(), 0);
+        assert!(s.inventory().held_item().is_none());
+
+        // Window slot 36 is hotbar slot 0 (`Java Edition protocol/Inventory` rev 3201379).
+        let stone = ItemStack::try_new("minecraft:stone", 64, DEFAULT_MAX_STACK).unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(36, &Some(stone.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(0), Some(&stone));
+        assert_eq!(s.inventory().get_window_slot(36), Some(&stone));
+        assert_eq!(s.inventory().held_item(), Some(&stone));
+
+        // Window slot 44 is hotbar slot 8; store an enchanted named sword with damage.
+        let sword = ItemStack::try_new("minecraft:diamond_sword", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_damage(12)
+                    .with_custom_name("Excalibur")
+                    .with_enchantment("minecraft:sharpness", 5)
+                    .unwrap(),
+            )
+            .unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(44, &Some(sword.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(8), Some(&sword));
+        assert_eq!(s.inventory().get_window_slot(44), Some(&sword));
+
+        // Window slot 9 is the first main inventory slot (`9..=35`).
+        let cobble = ItemStack::try_new("minecraft:cobblestone", 32, DEFAULT_MAX_STACK).unwrap();
+        let replies = s
+            .receive(
+                &creative_slot_frame(9, &Some(cobble.clone()), &ids, &dynamic_ids),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().get_slot(9), Some(&cobble));
+        assert_eq!(s.inventory().get_window_slot(9), Some(&cobble));
+
+        // `SET_CARRIED_ITEM` selects hotbar slot 8 (window slot 44).
+        let replies = s
+            .receive(
+                &frame(play::serverbound::SET_CARRIED_ITEM, &8i16.to_be_bytes()),
+                4096,
+            )
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(s.inventory().held_slot(), 8);
+        assert_eq!(s.inventory().held_item(), Some(&sword));
+
+        // Clearing hotbar slot 0 (window slot 36) and hotbar slot 8 (window slot 44) removes them.
+        assert!(
+            s.receive(&creative_slot_frame(36, &None, &ids, &dynamic_ids), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.inventory().get_slot(0).is_none());
+        assert!(
+            s.receive(&creative_slot_frame(44, &None, &ids, &dynamic_ids), 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.inventory().get_slot(8).is_none());
+        assert!(s.inventory().held_item().is_none());
+        assert_eq!(s.inventory().get_slot(9), Some(&cobble));
+    }
+
+    #[test]
+    fn creative_slot_rejects_out_of_range_slot_and_unknown_item_id() {
+        use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+
+        let (mut s, ids, dynamic_ids) = enter_play_session_with_protocol_ids();
+        let stone = ItemStack::try_new("minecraft:stone", 1, DEFAULT_MAX_STACK).unwrap();
+
+        // Slots outside the player inventory window's main/hotbar storage (`9..=44`) are rejected.
+        for bad_slot in [i16::MIN, -999, -1, 0, 1, 4, 5, 8, 45, 46, 100, i16::MAX] {
+            let packet = creative_slot_frame(bad_slot, &Some(stone.clone()), &ids, &dynamic_ids);
+            assert_eq!(
+                s.receive(&packet, 4096),
+                Err(Error::Malformed),
+                "window slot {bad_slot} should be rejected"
+            );
+        }
+        assert_eq!(s.inventory().total_item_count(), 0);
+
+        // Unknown item protocol ID (999) in a valid window slot (36) is rejected as Malformed.
+        let mut unknown_item = 36i16.to_be_bytes().to_vec();
+        put_varint(1, &mut unknown_item); // count = 1
+        put_varint(999, &mut unknown_item); // unknown item id
+        put_varint(0, &mut unknown_item); // 0 components to add
+        put_varint(0, &mut unknown_item); // 0 components to remove
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &unknown_item),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(s.inventory().total_item_count(), 0);
+
+        // Truncated creative slot body and trailing bytes after the slot are rejected.
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &[0x00]),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            s.receive(
+                &frame(
+                    play::serverbound::SET_CREATIVE_MODE_SLOT,
+                    &36i16.to_be_bytes()
+                ),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+        let mut trailing = 36i16.to_be_bytes().to_vec();
+        trailing.push(0); // Empty slot
+        trailing.push(0); // Trailing byte
+        assert_eq!(
+            s.receive(
+                &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &trailing),
+                4096
+            ),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn creative_slot_without_protocol_ids_stays_bounded_and_ignored() {
+        let mut s = enter_play_session();
+        assert_eq!(
+            s.receive(&frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &[]), 4096),
+            Err(Error::Malformed)
+        );
+        for payload in [&[0u8][..], &[0, 36, 1, 99, 0, 0][..], &[0xff; 32][..]] {
+            assert!(
+                s.receive(
+                    &frame(play::serverbound::SET_CREATIVE_MODE_SLOT, payload),
+                    4096
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        assert_eq!(s.inventory().total_item_count(), 0);
     }
 }
