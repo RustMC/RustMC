@@ -98,6 +98,13 @@ fn load_registry(
     load_registry_from_roots(&[root], registry)
 }
 
+pub(crate) fn load_tag_entries(
+    root: &Path,
+    registry: &str,
+) -> Result<HashMap<String, Vec<String>>, WorldgenError> {
+    load_registry(root, registry)
+}
+
 /// Loads `data/<namespace>/tags/<registry>/**/*.json` across ordered pack
 /// roots, applying `"replace": true` before resolving nested `#tag` references.
 fn load_registry_from_roots(
