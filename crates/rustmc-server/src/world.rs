@@ -77,6 +77,7 @@ pub mod enchantment;
 pub mod furnace;
 pub mod loot;
 pub mod recipe_data;
+pub mod vanilla_rules;
 
 pub use brewing::{
     BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
@@ -90,6 +91,9 @@ pub use furnace::{
 };
 pub use recipe_data::{
     CookingKind, CookingRecipe, RecipeData, RecipeDataError, SkipReason, StonecuttingRecipe,
+};
+pub use vanilla_rules::{
+    CookingSummary, RecipeSummary, TagSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,
 };
 pub mod inventory;
 pub use inventory::{
