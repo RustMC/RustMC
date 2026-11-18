@@ -811,6 +811,7 @@ struct ItemDefaultEntry {
     tool: Option<ToolComponent>,
     food: Option<FoodValues>,
     consumable: Option<ConsumableValues>,
+    trim_material: Option<String>,
 }
 
 /// Default per-item components read from `reports/minecraft/components/item/*.json`.
@@ -889,6 +890,17 @@ impl ItemDefaults {
         self.entries
             .get(normalize_item_id(item))
             .and_then(|entry| entry.enchantability)
+    }
+
+    /// Returns the armor trim material `item` provides in a smithing table, from its
+    /// `minecraft:provides_trim_material` component (for example `minecraft:gold_ingot`
+    /// provides `minecraft:gold`), or `None` if it provides none. Accepts identifiers
+    /// with or without the `minecraft:` prefix.
+    #[must_use]
+    pub fn trim_material(&self, item: &str) -> Option<&str> {
+        self.entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.trim_material.as_deref())
     }
 
     /// Returns the mining speed multiplier for `item` breaking `block` from its
@@ -1083,6 +1095,22 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
         Some(value) => Some(parse_consumable(value, file)?),
     };
 
+    let trim_material = match components.get("minecraft:provides_trim_material") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|id| valid_item_id(id))
+                .ok_or_else(|| {
+                    item_report_invalid(
+                        file,
+                        "`components[\"minecraft:provides_trim_material\"]` must be a namespaced id string",
+                    )
+                })?
+                .to_owned(),
+        ),
+    };
+
     Ok((
         item_stem.to_owned(),
         ItemDefaultEntry {
@@ -1093,6 +1121,7 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
             tool,
             food,
             consumable,
+            trim_material,
         },
     ))
 }
