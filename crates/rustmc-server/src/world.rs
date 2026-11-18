@@ -61,6 +61,15 @@ pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
+pub mod container_data;
+pub mod furnace;
+
+pub use container_data::{
+    SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
+};
+pub use furnace::{
+    FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
+};
 pub mod inventory;
 pub use inventory::{
     HOTBAR_SLOT_COUNT, HOTBAR_SLOTS, InventoryError, MAIN_SLOT_COUNT, MAIN_SLOTS, PlayerInventory,
