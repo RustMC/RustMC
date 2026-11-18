@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::item::ItemStack;
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
-use crate::world::crafting::{Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
+use crate::world::crafting::{CraftingGrid, Ingredient, Recipe, ShapedRecipe, ShapelessRecipe};
 use crate::world::furnace::default_max_stack;
 
 /// Cooking recipe category matching the four vanilla furnace-family block types.
@@ -400,6 +400,23 @@ impl RecipeData {
     #[must_use]
     pub fn get_stonecutting_by_id(&self, id: &str) -> Option<&StonecuttingRecipe> {
         self.stonecutting.iter().find(|recipe| recipe.id() == id)
+    }
+
+    /// Finds a loaded crafting recipe matching `grid`, returning `(recipe_id, result)`.
+    ///
+    /// Uses `world::crafting` matching (shaped recipes match at any offset and
+    /// horizontally mirrored; shapeless recipes match in any order). If more
+    /// than one recipe matches, returns the one with the lexicographically
+    /// smallest recipe id. This is RustMC's deterministic tie-break, not a
+    /// claim about vanilla Java Edition.
+    #[must_use]
+    pub fn find_crafting(&self, grid: &CraftingGrid) -> Option<(&str, ItemStack)> {
+        self.crafting
+            .iter()
+            .filter(|recipe| recipe.matches(grid))
+            .filter_map(|recipe| recipe.id().map(|id| (id, recipe)))
+            .min_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b))
+            .map(|(id, recipe)| (id, recipe.output().clone()))
     }
 }
 
@@ -1050,5 +1067,147 @@ mod tests {
         assert_eq!(raw_iron.result().count(), 1);
         assert!((raw_iron.experience() - 0.7).abs() < 1e-6);
         assert_eq!(raw_iron.cooking_time(), 200);
+    }
+
+    #[test]
+    fn find_crafting_matches_shaped_mirrored_shapeless_and_smallest_id_tie_break() {
+        let root = scratch_root("find-crafting-tiebreak");
+        write(
+            &root.join("data/testns/recipe/b_shaped.json"),
+            r###"{
+                "type": "minecraft:crafting_shaped",
+                "pattern": ["# ", "##"],
+                "key": {"#": "testns:stone"},
+                "result": {"id": "testns:second_result", "count": 2}
+            }"###,
+        );
+        write(
+            &root.join("data/testns/recipe/a_shapeless.json"),
+            r#"{
+                "type": "minecraft:crafting_shapeless",
+                "ingredients": ["testns:stone", "testns:stone", "testns:stone"],
+                "result": {"id": "testns:first_result", "count": 1}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/c_only_shaped.json"),
+            r#"{
+                "type": "minecraft:crafting_shaped",
+                "pattern": ["A", "B"],
+                "key": {"A": "testns:top", "B": "testns:bottom"},
+                "result": {"id": "testns:pair_out", "count": 4}
+            }"#,
+        );
+
+        let data = RecipeData::load(&root, &ItemTags::default()).expect("load recipes");
+        let stack = |id: &str| ItemStack::try_new(id, 1, 64).expect("stack");
+
+        // Both `testns:a_shapeless` and `testns:b_shaped` match 3 `testns:stone` in an L-shape.
+        let mut tie_grid = CraftingGrid::table_3x3();
+        tie_grid.set_slot(2, 1, stack("testns:stone")).unwrap();
+        tie_grid.set_slot(1, 2, stack("testns:stone")).unwrap();
+        tie_grid.set_slot(2, 2, stack("testns:stone")).unwrap();
+        let (matched_id, matched_out) = data.find_crafting(&tie_grid).expect("tie break match");
+        assert_eq!(matched_id, "testns:a_shapeless");
+        assert_eq!(matched_out.item(), "testns:first_result");
+        assert_eq!(matched_out.count(), 1);
+
+        // Offset placement in bottom-right of 3x3 grid matches shaped recipe.
+        let mut pair_grid = CraftingGrid::table_3x3();
+        pair_grid.set_slot(2, 1, stack("testns:top")).unwrap();
+        pair_grid.set_slot(2, 2, stack("testns:bottom")).unwrap();
+        let (pair_id, pair_out) = data.find_crafting(&pair_grid).expect("offset shaped match");
+        assert_eq!(pair_id, "testns:c_only_shaped");
+        assert_eq!(pair_out.item(), "testns:pair_out");
+        assert_eq!(pair_out.count(), 4);
+
+        // Unmatched grid returns None.
+        let mut none_grid = CraftingGrid::table_3x3();
+        none_grid.set_slot(0, 0, stack("testns:top")).unwrap();
+        assert_eq!(data.find_crafting(&none_grid), None);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_crafting_lookup_matches_vanilla_recipes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_crafting_lookup_matches_vanilla_recipes() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let data = RecipeData::load(&root, &tags).expect("load vanilla recipes");
+
+        let read_expected = |rel: &str| -> (String, u16) {
+            let doc = read_json(&root.join(rel)).expect("read recipe json");
+            let id = doc["result"]["id"].as_str().expect("result id").to_owned();
+            let count = doc["result"]
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u16;
+            (id, count)
+        };
+
+        let (torch_item, torch_count) = read_expected("data/minecraft/recipe/torch.json");
+        let (planks_item, planks_count) = read_expected("data/minecraft/recipe/oak_planks.json");
+        let (stairs_item, stairs_count) = read_expected("data/minecraft/recipe/stone_stairs.json");
+        let stack = |id: &str| ItemStack::try_new(id, 1, 64).expect("stack");
+
+        // 1. Coal above stick in the bottom-right corner of 3x3 table grid.
+        let mut coal_torch = CraftingGrid::table_3x3();
+        coal_torch.set_slot(2, 1, stack("minecraft:coal")).unwrap();
+        coal_torch.set_slot(2, 2, stack("minecraft:stick")).unwrap();
+        let (id, out) = data.find_crafting(&coal_torch).expect("coal torch");
+        assert_eq!(id, "minecraft:torch");
+        assert_eq!(out.item(), torch_item);
+        assert_eq!(out.count(), torch_count);
+        assert_eq!(out.count(), 4);
+
+        // 2. Charcoal above stick in 3x3 table grid.
+        let mut charcoal_torch = CraftingGrid::table_3x3();
+        charcoal_torch
+            .set_slot(0, 0, stack("minecraft:charcoal"))
+            .unwrap();
+        charcoal_torch
+            .set_slot(0, 1, stack("minecraft:stick"))
+            .unwrap();
+        let (id, out) = data.find_crafting(&charcoal_torch).expect("charcoal torch");
+        assert_eq!(id, "minecraft:torch");
+        assert_eq!(out.item(), torch_item);
+        assert_eq!(out.count(), torch_count);
+
+        // 3. One stripped_oak_wood in 2x2 inventory grid -> oak_planks.
+        let mut inv_planks = CraftingGrid::inventory_2x2();
+        inv_planks
+            .set_slot(1, 0, stack("minecraft:stripped_oak_wood"))
+            .unwrap();
+        let (id, out) = data.find_crafting(&inv_planks).expect("oak planks");
+        assert_eq!(id, "minecraft:oak_planks");
+        assert_eq!(out.item(), planks_item);
+        assert_eq!(out.count(), planks_count);
+        assert_eq!(out.count(), 4);
+
+        // 4. Stone in mirrored stair shape ("  #", " ##", "###") -> stone_stairs.
+        let mut stairs = CraftingGrid::table_3x3();
+        stairs.set_slot(2, 0, stack("minecraft:stone")).unwrap();
+        stairs.set_slot(1, 1, stack("minecraft:stone")).unwrap();
+        stairs.set_slot(2, 1, stack("minecraft:stone")).unwrap();
+        stairs.set_slot(0, 2, stack("minecraft:stone")).unwrap();
+        stairs.set_slot(1, 2, stack("minecraft:stone")).unwrap();
+        stairs.set_slot(2, 2, stack("minecraft:stone")).unwrap();
+        let (id, out) = data.find_crafting(&stairs).expect("mirrored stone stairs");
+        assert_eq!(id, "minecraft:stone_stairs");
+        assert_eq!(out.item(), stairs_item);
+        assert_eq!(out.count(), stairs_count);
+        assert_eq!(out.count(), 4);
+
+        // 5. A single stick -> no result.
+        let mut single_stick = CraftingGrid::table_3x3();
+        single_stick
+            .set_slot(1, 1, stack("minecraft:stick"))
+            .unwrap();
+        assert_eq!(data.find_crafting(&single_stick), None);
     }
 }
