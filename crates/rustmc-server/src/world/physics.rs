@@ -270,6 +270,12 @@ impl<T: WorldCollisionView + ?Sized> WorldCollisionView for &T {
     }
 }
 
+impl WorldCollisionView for () {
+    fn get_colliding_boxes(&self, _aabb: &Aabb) -> Vec<Aabb> {
+        Vec::new()
+    }
+}
+
 /// Helper to extract voxel collision boxes for integer coordinates where `is_solid` returns true.
 pub fn get_voxel_colliding_boxes<F>(aabb: &Aabb, is_solid: F) -> Vec<Aabb>
 where
