@@ -11,6 +11,7 @@
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::{CookingKind, RecipeData};
 use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
+use crate::vanilla::random::RandomSource;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -542,13 +543,20 @@ impl FurnaceBlockEntity {
 
     /// Withdraws accumulated experience points.
     ///
-    /// Returns integer experience points to drop/give player and the total accumulated
-    /// float experience, then resets `stored_experience` to 0.0.
-    pub fn withdraw_experience(&mut self) -> (u32, f32) {
+    /// Awards `floor(total)` points plus one extra point when
+    /// `random.next_float() < fraction` (minecraft.wiki `Smelting` rev 3896034;
+    /// `Experience` rev 3891320). Returns `(points, total)` and resets
+    /// `stored_experience` to `0.0`.
+    pub fn withdraw_experience(&mut self, random: &mut RandomSource) -> (u32, f32) {
         let total = self.stored_experience;
-        let points = total.floor() as u32;
         self.stored_experience = 0.0;
-        (points, total)
+        if !total.is_finite() || total <= 0.0 {
+            return (0, total);
+        }
+        let floor = total.floor();
+        let fraction = total - floor;
+        let extra = u32::from(fraction > 0.0 && random.next_float() < fraction);
+        ((floor as u32).saturating_add(extra), total)
     }
 
     /// Executes one authoritative tick of furnace smelting using default fuel and recipe registries.
@@ -957,14 +965,15 @@ mod tests {
         // Total experience: 1.4 + 1.0 = 2.4
         assert!((furnace.stored_experience - 2.4).abs() < 1e-4);
 
-        // Withdraw experience
-        let (points, total_float) = furnace.withdraw_experience();
-        assert_eq!(points, 2);
+        // Withdraw experience with a seeded random source whose first draw is < 0.4 -> floor(2.4) + 1 = 3.
+        let mut rng = RandomSource::from_world_seed(0);
+        let (points, total_float) = furnace.withdraw_experience(&mut rng);
+        assert_eq!(points, 3);
         assert!((total_float - 2.4).abs() < 1e-4);
         assert_eq!(furnace.stored_experience, 0.0);
 
         // Second withdrawal yields 0
-        let (p2, f2) = furnace.withdraw_experience();
+        let (p2, f2) = furnace.withdraw_experience(&mut rng);
         assert_eq!(p2, 0);
         assert_eq!(f2, 0.0);
     }
@@ -1402,5 +1411,57 @@ mod tests {
 
         let blasting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Blasting);
         assert!(blasting.find_recipe("minecraft:beef").is_none());
+    }
+
+    #[test]
+    fn test_withdraw_experience_fractional_chance() {
+        // Seed 0's first next_float() is < 0.7, so 0.7 awards 1 point;
+        // find a concrete seed whose first next_float() >= 0.7 for the 0-point branch too.
+        let low_seed = 0_u64;
+        let high_seed = (1_u64..1000)
+            .find(|&s| RandomSource::from_world_seed(s).next_float() >= 0.7)
+            .expect("seed with next_float >= 0.7");
+
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.stored_experience = 0.7;
+        let (pts_awarded, tot_awarded) =
+            furnace.withdraw_experience(&mut RandomSource::from_world_seed(low_seed));
+        assert_eq!(pts_awarded, 1);
+        assert!((tot_awarded - 0.7).abs() < 1e-6);
+        assert_eq!(furnace.stored_experience(), 0.0);
+
+        furnace.stored_experience = 0.7;
+        let (pts_skipped, tot_skipped) =
+            furnace.withdraw_experience(&mut RandomSource::from_world_seed(high_seed));
+        assert_eq!(pts_skipped, 0);
+        assert!((tot_skipped - 0.7).abs() < 1e-6);
+
+        // Exact integer totals never award an extra point.
+        let mut rng = RandomSource::from_world_seed(42);
+        for _ in 0..100 {
+            furnace.stored_experience = 2.0;
+            let (pts, tot) = furnace.withdraw_experience(&mut rng);
+            assert_eq!(pts, 2);
+            assert_eq!(tot, 2.0);
+
+            furnace.stored_experience = 0.0;
+            let (pts_zero, tot_zero) = furnace.withdraw_experience(&mut rng);
+            assert_eq!(pts_zero, 0);
+            assert_eq!(tot_zero, 0.0);
+        }
+
+        // Over 10,000 seeded withdrawals of 0.35, the extra point occurs ~3,500 times.
+        let mut stat_rng = RandomSource::from_world_seed(2026);
+        let mut extra_count = 0_u32;
+        for _ in 0..10_000 {
+            furnace.stored_experience = 0.35;
+            let (pts, _) = furnace.withdraw_experience(&mut stat_rng);
+            assert!(pts <= 1);
+            extra_count += pts;
+        }
+        assert!(
+            (3_200..=3_800).contains(&extra_count),
+            "expected extra point count in 3200..=3800, got {extra_count}"
+        );
     }
 }
