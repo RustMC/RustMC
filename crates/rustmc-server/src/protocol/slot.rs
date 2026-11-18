@@ -43,7 +43,7 @@
 //!   ```
 //!   A plain-text name is encoded as a `TAG_String` text component ("As a String Tag:
 //!   For components only containing text (no styling, no events etc.)") via
-//!   [`crate::java_wire::put_nbt_text`]; decoding also accepts a `{"text": …}` compound.
+//!   `java_wire::put_nbt_text`; decoding also accepts a `{"text": …}` compound.
 //! - `minecraft:enchantments` (see also `Data component format/enchantments`, revision `3849825`):
 //!   ```text
 //!   | Name                  | Type                        | Description
