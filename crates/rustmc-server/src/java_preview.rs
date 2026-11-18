@@ -242,7 +242,7 @@ const MAX_BATCH_BYTES: usize = 768 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Default block state of each preview block in the official 26.3 block
 /// report, in `Block` discriminant order (checked by a unit test).
-const BLOCK_STATES: [(Block, u32); 24] = [
+pub(crate) const BLOCK_STATES: [(Block, u32); 25] = [
     (Block::Air, 0),                // minecraft:air
     (Block::Bedrock, 88),           // minecraft:bedrock
     (Block::Stone, 1),              // minecraft:stone
@@ -267,10 +267,16 @@ const BLOCK_STATES: [(Block, u32); 24] = [
     (Block::Carpet, 14743),         // minecraft:white_carpet
     (Block::TallGrassLower, 14771), // minecraft:tall_grass[half=lower]
     (Block::TallGrassUpper, 14770), // minecraft:tall_grass[half=upper]
+    (Block::Obsidian, 4925),        // minecraft:obsidian
 ];
 
 fn block_state(index: u16) -> u32 {
     BLOCK_STATES[usize::from(index)].1
+}
+
+/// Returns the Java 26.3 protocol-777 default block state ID for a preview [`Block`].
+pub(crate) fn block_default_state_id(block: Block) -> u32 {
+    BLOCK_STATES[block as usize].1
 }
 const MIN_Y: i32 = -64;
 const SECTION_COUNT: usize = 24;
@@ -1473,5 +1479,10 @@ mod tests {
         ] {
             assert_eq!(block_state(block as u16), state, "{block:?}");
         }
+    }
+
+    #[test]
+    fn obsidian_block_state_id_matches_26_3_default() {
+        assert_eq!(block_state(Block::Obsidian as u16), 4925);
     }
 }

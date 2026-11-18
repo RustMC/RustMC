@@ -966,3 +966,33 @@ fn give_item_saturates_instead_of_overflowing() {
     player.give_item("stone", 6_400);
     assert_eq!(player.item_count("minecraft:stone"), u32::MAX);
 }
+
+#[test]
+fn read_only_preview_rejects_world_mutating_commands() {
+    let mut dispatcher = CommandDispatcher::read_only_preview(42);
+    let sender = CommandSender::player("Alice", (0.0, 64.0, 0.0), 2);
+    for command in [
+        "tp 1 2 3",
+        "teleport 1 2 3",
+        "gamemode creative",
+        "time set day",
+        "time add 100",
+        "give Alice diamond 1",
+        "kill Alice",
+    ] {
+        let result = dispatcher.execute(&sender, command);
+        assert!(
+            result.is_error() && result.message().contains("read-only"),
+            "expected read-only refusal for `{command}`, got {result:?}"
+        );
+    }
+    assert!(dispatcher.players.is_empty());
+    assert_eq!(dispatcher.time(), 0);
+
+    let help = dispatcher.execute(&sender, "help");
+    assert!(help.is_success() && help.message().contains("/help"));
+    let seed = dispatcher.execute(&sender, "seed");
+    assert_eq!(seed, CommandResult::Success("Seed: [42]".to_string()));
+    let query = dispatcher.execute(&sender, "time query daytime");
+    assert_eq!(query, CommandResult::Success("The time is 0".to_string()));
+}

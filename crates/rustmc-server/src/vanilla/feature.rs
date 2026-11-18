@@ -18,7 +18,7 @@
 //! `docs/PROVENANCE.md` session 13 for the rules and their derivation.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -241,6 +241,13 @@ pub enum StateProvider {
         fallback: Box<StateProvider>,
         rules: Vec<RuleBasedEntry>,
     },
+    /// `minecraft:randomized_int` — samples `source` and overrides `property`
+    /// with an integer drawn from `values`.
+    RandomizedInt {
+        source: Box<StateProvider>,
+        property: String,
+        values: RangeProvider,
+    },
     /// A provider shape without a runtime here. Named so the gap report can
     /// tell an unmodeled state apart from a feature that placed nothing.
     Unsupported { kind: String },
@@ -265,6 +272,11 @@ impl StateProvider {
                         .iter()
                         .all(|rule| rule.if_true.is_modelable() && rule.then.is_modelable())
             }
+            Self::RandomizedInt {
+                source,
+                property,
+                values,
+            } => !property.is_empty() && source.is_modelable() && values.is_modelable(),
             Self::Unsupported { .. } => false,
         }
     }
@@ -282,6 +294,7 @@ impl StateProvider {
                 .flat_map(|rule| rule.then.states())
                 .chain(fallback.states())
                 .collect(),
+            Self::RandomizedInt { source, .. } => source.states(),
             Self::Unsupported { .. } => Vec::new(),
         }
     }
@@ -297,9 +310,9 @@ impl StateProvider {
         pos: DecorationPos,
         tags: &BlockTags,
         random: &mut DecorationRandom,
-    ) -> Option<&str> {
+    ) -> Option<Cow<'_, str>> {
         match self {
-            Self::Constant { state } => Some(state.as_str()),
+            Self::Constant { state } => Some(Cow::Borrowed(state.as_str())),
             Self::Weighted { entries } => {
                 let total: i32 = entries.iter().map(|entry| entry.weight).sum();
                 if total <= 0 {
@@ -308,7 +321,7 @@ impl StateProvider {
                 let mut pick = random.next_int_bounded(total);
                 for entry in entries {
                     if pick < entry.weight {
-                        return Some(entry.state.as_str());
+                        return Some(Cow::Borrowed(entry.state.as_str()));
                     }
                     pick -= entry.weight;
                 }
@@ -319,6 +332,15 @@ impl StateProvider {
                 .find(|rule| rule.if_true.test(target, pos, tags))
                 .map_or(fallback.as_ref(), |rule| &rule.then)
                 .sample(target, pos, tags, random),
+            Self::RandomizedInt {
+                source,
+                property,
+                values,
+            } => {
+                let base = source.sample(target, pos, tags, random)?;
+                let value = values.sample(target.min_y(), target.height(), random);
+                Some(Cow::Owned(set_state_property(&base, property, value)))
+            }
             // `is_modelable` gates this out before the feature runs.
             Self::Unsupported { .. } => None,
         }
@@ -557,6 +579,11 @@ pub enum ConfiguredFeature {
         requires_block_below: bool,
         valid_blocks: Vec<String>,
     },
+    /// `minecraft:simple_random_selector` — picks one placed feature from
+    /// `features` uniformly at random and runs it at the candidate position.
+    SimpleRandomSelector {
+        features: Vec<Rc<PlacedFeature>>,
+    },
     Unsupported {
         kind: String,
     },
@@ -586,6 +613,9 @@ impl ConfiguredFeature {
                     && radius.is_modelable()
             }
             Self::Spring { .. } => true,
+            Self::SimpleRandomSelector { features } => {
+                !features.is_empty() && features.iter().all(|feature| feature.is_modelable())
+            }
             Self::Unsupported { .. } => false,
         }
     }
@@ -597,6 +627,11 @@ impl ConfiguredFeature {
             Self::RandomPatch {
                 xz_spread, feature, ..
             } => xz_spread.saturating_add(feature.feature.patch_reach()),
+            Self::SimpleRandomSelector { features } => features
+                .iter()
+                .map(|feature| feature.feature.patch_reach())
+                .max()
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -840,6 +875,13 @@ impl PlacedFeature {
                     ))
                 })?
             }
+            ConfiguredFeature::SimpleRandomSelector { features } => {
+                let mut max_child = 1u32;
+                for child in features {
+                    max_child = max_child.max(child.validate_attempt_budget(depth + 1)?);
+                }
+                max_child
+            }
             _ => 1,
         };
 
@@ -1031,13 +1073,18 @@ impl FeatureData {
         biome_docs.sort_by(|left, right| left.0.cmp(&right.0));
         for (id, document) in configured_docs {
             let feature = parse_configured_feature(&document)?;
-            record_unmodeled_configured(&mut data.unimplemented_features, &feature);
             data.configured.insert(id, Rc::new(feature));
         }
         for (id, document) in placed_docs {
             let feature = parse_placed_feature(&id, &document, &data.configured)?;
-            record_unmodeled_modifiers(&mut data.unimplemented_features, &feature);
             data.placed.insert(id, Rc::new(feature));
+        }
+        resolve_selector_references(&mut data.configured, &data.placed);
+        for feature in data.configured.values() {
+            record_unmodeled_configured(&mut data.unimplemented_features, feature);
+        }
+        for feature in data.placed.values() {
+            record_unmodeled_modifiers(&mut data.unimplemented_features, feature);
         }
         let placed_ids: Vec<String> = data.placed.keys().cloned().collect();
         let configured_ids: Vec<String> = data.configured.keys().cloned().collect();
@@ -1364,6 +1411,55 @@ fn depth_first_visit(
     }
 }
 
+/// Inserts or overrides one integer property on a rendered block state string,
+/// keeping property keys in sorted order to match [`state_from_object`].
+fn set_state_property(state: &str, property: &str, value: i32) -> String {
+    let value_str = value.to_string();
+    let (id, rest) = state
+        .split_once('[')
+        .map_or((state, None), |(base, tail)| (base, Some(tail)));
+    let mut properties: BTreeMap<&str, String> = BTreeMap::new();
+    if let Some(tail) = rest {
+        let props_str = tail.strip_suffix(']').unwrap_or(tail);
+        for pair in props_str.split(',') {
+            let pair = pair.trim();
+            if let Some((k, v)) = pair.split_once('=') {
+                properties.insert(k.trim(), v.trim().to_string());
+            }
+        }
+    }
+    properties.insert(property, value_str);
+    let rendered: Vec<String> = properties
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    format!("{id}[{}]", rendered.join(","))
+}
+
+/// Resolves named child feature references inside `minecraft:simple_random_selector`
+/// against loaded placed and configured features.
+fn resolve_selector_references(
+    configured: &mut HashMap<String, Rc<ConfiguredFeature>>,
+    placed: &HashMap<String, Rc<PlacedFeature>>,
+) {
+    let configured_snapshot = configured.clone();
+    for feature in configured.values_mut() {
+        if let ConfiguredFeature::SimpleRandomSelector { features } = Rc::make_mut(feature) {
+            for child in features.iter_mut() {
+                if let ConfiguredFeature::Unsupported { kind } = child.feature.as_ref() {
+                    if child.id == *kind
+                        && let Some(resolved_placed) = placed.get(&child.id)
+                    {
+                        *child = Rc::clone(resolved_placed);
+                    } else if let Some(resolved_configured) = configured_snapshot.get(kind) {
+                        Rc::make_mut(child).feature = Rc::clone(resolved_configured);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One block state the pack names directly: a bare id, or the
 /// `{"id": ..., "properties": {...}}` object the 26.3 documents write. The
 /// properties are rendered in the `id[k=v,...]` form the save palettes use,
@@ -1484,6 +1580,30 @@ fn parse_state_provider(value: Option<&Value>) -> StateProvider {
                             rules,
                         },
                         _ => unsupported("minecraft:rule_based"),
+                    }
+                }
+                Some("minecraft:randomized_int") => {
+                    let Some(property) = object
+                        .get("property")
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.is_empty())
+                    else {
+                        return unsupported("minecraft:randomized_int");
+                    };
+                    let source = match object.get("source") {
+                        Some(src) => Box::new(parse_state_provider(Some(src))),
+                        None => Box::new(unsupported("minecraft:missing_state")),
+                    };
+                    let values = object
+                        .get("values")
+                        .and_then(|v| RangeProvider::from_value(v, false))
+                        .unwrap_or_else(|| RangeProvider::Unsupported {
+                            kind: "minecraft:missing_values".to_string(),
+                        });
+                    StateProvider::RandomizedInt {
+                        source,
+                        property: property.to_string(),
+                        values,
                     }
                 }
                 Some(other) => unsupported(other),
@@ -1771,6 +1891,7 @@ pub(crate) fn parse_configured_feature(
         }),
         "minecraft:disk" => parse_disk(body),
         "minecraft:spring_feature" => parse_spring(body),
+        "minecraft:simple_random_selector" => parse_simple_random_selector(body),
         _ => Ok(ConfiguredFeature::Unsupported { kind }),
     }
 }
@@ -1908,6 +2029,21 @@ fn parse_random_patch(kind: &str, body: &Value) -> Result<ConfiguredFeature, Wor
     })
 }
 
+/// Parses a `minecraft:simple_random_selector` configuration.
+fn parse_simple_random_selector(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let entries = body
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            WorldgenError::Invalid("simple_random_selector feature without features".to_string())
+        })?;
+    let mut features = Vec::with_capacity(entries.len());
+    for entry in entries {
+        features.push(Rc::new(parse_inline_placed_feature(entry)?));
+    }
+    Ok(ConfiguredFeature::SimpleRandomSelector { features })
+}
+
 /// Counts unmodeled configured features and their inner components for the startup gap report.
 fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &ConfiguredFeature) {
     match feature {
@@ -1944,6 +2080,17 @@ fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &Co
         ConfiguredFeature::SimpleBlock { to_place } => {
             record_unmodeled_provider(counts, to_place);
             record_unplaceable_states(counts, to_place);
+        }
+        ConfiguredFeature::SimpleRandomSelector { features } => {
+            if features.is_empty() {
+                *counts
+                    .entry("minecraft:simple_random_selector:empty".to_string())
+                    .or_insert(0) += 1;
+            }
+            for child in features {
+                record_unmodeled_modifiers(counts, child);
+                record_unmodeled_configured(counts, &child.feature);
+            }
         }
     }
 }
@@ -2071,6 +2218,12 @@ fn record_unmodeled_provider(counts: &mut HashMap<String, usize>, provider: &Sta
             }
             record_unmodeled_provider(counts, fallback);
         }
+        StateProvider::RandomizedInt { source, values, .. } => {
+            record_unmodeled_provider(counts, source);
+            if let RangeProvider::Unsupported { kind } = values {
+                *counts.entry(format!("range:{kind}")).or_insert(0) += 1;
+            }
+        }
         StateProvider::Constant { .. } | StateProvider::Weighted { .. } => {}
     }
 }
@@ -2178,7 +2331,7 @@ fn place_disk(
                 let Some(state) = state_provider.sample(target, candidate_pos, tags, random) else {
                     continue;
                 };
-                target.set_block(px, py, pz, state);
+                target.set_block(px, py, pz, state.as_ref());
                 placed += 1;
             }
         }
@@ -2906,7 +3059,7 @@ fn place_simple_block(
     if !target.writable(pos.x, pos.y, pos.z) || !target.is_air(pos.x, pos.y, pos.z) {
         return 0;
     }
-    plant_support::place_plant(target, tags, state, pos)
+    plant_support::place_plant(target, tags, state.as_ref(), pos)
 }
 
 impl FeatureData {
@@ -3064,6 +3217,14 @@ impl FeatureData {
                     valid_blocks,
                     pos,
                 ),
+                ConfiguredFeature::SimpleRandomSelector { features } => {
+                    if features.is_empty() {
+                        0
+                    } else {
+                        let chosen = random.next_int_bounded(features.len() as i32) as usize;
+                        self.run_chain(target, &features[chosen], 0, pos, random)
+                    }
+                }
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
@@ -6167,5 +6328,151 @@ mod tests {
         assert_eq!(gaps.get("placement:minecraft:environment_scan"), Some(&1));
         assert_eq!(gaps.get("predicate:minecraft:minecraft:solid"), None);
         assert_eq!(gaps.get("predicate:minecraft:solid"), Some(&1));
+    }
+
+    #[test]
+    fn randomized_int_samples_property_uniformly_and_reports_gaps_without_air_fallback() {
+        let doc = json!({
+            "type": "minecraft:randomized_int",
+            "property": "pickles",
+            "source": {
+                "id": "minecraft:sea_pickle",
+                "properties": {
+                    "pickles": "1",
+                    "waterlogged": "true"
+                }
+            },
+            "values": {
+                "type": "minecraft:uniform",
+                "min_inclusive": 1,
+                "max_inclusive": 4
+            }
+        });
+        let provider = parse_state_provider(Some(&doc));
+        assert!(provider.is_modelable());
+        assert!(matches!(provider, StateProvider::RandomizedInt { .. }));
+
+        let target = TestTarget::new();
+        let tags = BlockTags::default();
+        let pos = DecorationPos { x: 0, y: 64, z: 0 };
+        let mut random = DecorationRandom::new(987654321);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..10_000 {
+            let sampled = provider
+                .sample(&target, pos, &tags, &mut random)
+                .expect("modelable randomized_int provider must yield a state")
+                .into_owned();
+            *counts.entry(sampled).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 4);
+        for i in 1..=4 {
+            let expected = format!("minecraft:sea_pickle[pickles={i},waterlogged=true]");
+            let count = counts.get(&expected).copied().unwrap_or_default();
+            assert!(
+                (2100..=2900).contains(&count),
+                "count for {expected} was {count}, expected roughly 2500"
+            );
+        }
+
+        // Un-namespaced identifiers are not aliased and report as unsupported gaps.
+        let bare_type = json!({
+            "type": "randomized_int",
+            "property": "pickles",
+            "source": { "id": "minecraft:sea_pickle" },
+            "values": { "type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 4 }
+        });
+        assert!(!parse_state_provider(Some(&bare_type)).is_modelable());
+
+        // Missing source or state is recorded as an unsupported gap, never defaulted to air.
+        let missing_source = json!({
+            "type": "minecraft:randomized_int",
+            "property": "pickles",
+            "source": {},
+            "values": { "type": "minecraft:uniform", "min_inclusive": 1, "max_inclusive": 4 }
+        });
+        let parsed_missing = parse_state_provider(Some(&missing_source));
+        assert!(!parsed_missing.is_modelable());
+        let mut gap_counts = HashMap::new();
+        record_unmodeled_provider(&mut gap_counts, &parsed_missing);
+        assert_eq!(gap_counts.get("provider:minecraft:missing_state"), Some(&1));
+        assert!(!parsed_missing.states().contains(&"minecraft:air"));
+    }
+
+    #[test]
+    fn simple_random_selector_picks_uniformly_and_enforces_exact_type_and_gaps() {
+        let granite = wrapper(
+            "testns:child_granite",
+            &stone_replacement("minecraft:granite", 16, 0.0),
+            vec![
+                PlacementModifier::Count {
+                    count: RangeProvider::Constant(1),
+                },
+                PlacementModifier::HeightRange {
+                    height: RangeProvider::Constant(64),
+                },
+            ],
+        );
+        let diorite = wrapper(
+            "testns:child_diorite",
+            &stone_replacement("minecraft:diorite", 16, 0.0),
+            vec![
+                PlacementModifier::Count {
+                    count: RangeProvider::Constant(1),
+                },
+                PlacementModifier::HeightRange {
+                    height: RangeProvider::Constant(64),
+                },
+            ],
+        );
+        let selector = Rc::new(ConfiguredFeature::SimpleRandomSelector {
+            features: vec![Rc::clone(&granite), Rc::clone(&diorite)],
+        });
+        assert!(selector.is_supported());
+        let placed_selector = wrapper("testns:selector_placed", &selector, vec![]);
+        assert!(placed_selector.is_modelable());
+        let data = registry(vec![placed_selector]);
+
+        let mut granite_chosen = 0usize;
+        let mut diorite_chosen = 0usize;
+        for seed in 0..100i64 {
+            let mut target = TestTarget::new().write_anywhere();
+            let written = data.decorate_step(&mut target, 0, 0, 0, seed, &region());
+            assert!(written > 0);
+            let g = target.blocks("minecraft:granite");
+            let d = target.blocks("minecraft:diorite");
+            assert!((g > 0 && d == 0) || (d > 0 && g == 0));
+            if g > 0 {
+                granite_chosen += 1;
+            } else {
+                diorite_chosen += 1;
+            }
+        }
+        assert!(granite_chosen > 30 && diorite_chosen > 30);
+
+        // Un-namespaced selector identifier stays Unsupported.
+        let unnamespaced = json!({
+            "type": "simple_random_selector",
+            "features": []
+        });
+        assert!(matches!(
+            parse_configured_feature(&unnamespaced).unwrap(),
+            ConfiguredFeature::Unsupported { ref kind } if kind == "simple_random_selector"
+        ));
+
+        // Real configured feature with unsupported inner feature reports the inner gap.
+        let with_gap = parse_configured_feature(&json!({
+            "type": "minecraft:simple_random_selector",
+            "features": [
+                {
+                    "feature": { "type": "minecraft:coral_tree" },
+                    "placement": []
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(!with_gap.is_supported());
+        let mut gaps = HashMap::new();
+        record_unmodeled_configured(&mut gaps, &with_gap);
+        assert_eq!(gaps.get("minecraft:coral_tree"), Some(&1));
     }
 }

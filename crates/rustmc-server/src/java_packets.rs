@@ -65,6 +65,11 @@ pub mod configuration {
 pub mod play {
     pub mod serverbound {
         pub const ACCEPT_TELEPORTATION: u32 = 0;
+        pub const CHAT_ACK: u32 = 6;
+        pub const CHAT_COMMAND: u32 = 7;
+        pub const CHAT_COMMAND_SIGNED: u32 = 8;
+        pub const CHAT: u32 = 9;
+        pub const CHAT_SESSION_UPDATE: u32 = 10;
         pub const CHUNK_BATCH_RECEIVED: u32 = 11;
         pub const CLIENT_TICK_END: u32 = 13;
         pub const CLIENT_INFORMATION: u32 = 14;
@@ -91,8 +96,11 @@ pub mod play {
     }
     pub mod clientbound {
         pub const BLOCK_CHANGED_ACK: u32 = 4;
+        pub const BLOCK_UPDATE: u32 = 8;
         pub const CHUNK_BATCH_FINISHED: u32 = 11;
         pub const CHUNK_BATCH_START: u32 = 12;
+        pub const CONTAINER_SET_DATA: u32 = 19;
+        pub const CONTAINER_SET_SLOT: u32 = 20;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;
         pub const GAME_EVENT: u32 = 39;
         pub const KEEP_ALIVE: u32 = 45;
@@ -102,5 +110,7 @@ pub mod play {
         pub const PLAYER_POSITION: u32 = 73;
         pub const SET_CHUNK_CACHE_CENTER: u32 = 96;
         pub const SET_TIME: u32 = 115;
+        pub const SYSTEM_CHAT: u32 = 124;
+        pub const TAKE_ITEM_ENTITY: u32 = 127;
     }
 }

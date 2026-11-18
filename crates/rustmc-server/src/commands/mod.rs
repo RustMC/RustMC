@@ -659,6 +659,7 @@ pub struct CommandDispatcher {
     pub players: HashMap<String, PlayerTarget>,
     rng: RandomSource,
     commands: HashMap<String, CommandRegistration>,
+    read_only: bool,
 }
 
 impl Default for CommandDispatcher {
@@ -682,8 +683,20 @@ impl CommandDispatcher {
             players: HashMap::new(),
             rng: RandomSource::from_world_seed(seed as u64),
             commands: HashMap::new(),
+            read_only: false,
         };
         dispatcher.register_standard_commands();
+        dispatcher
+    }
+
+    /// Create a dispatcher for a read-only preview session.
+    ///
+    /// Registers `/help` alongside standard commands, while [`Self::execute`] refuses
+    /// commands that would mutate world or player state.
+    pub fn read_only_preview(seed: i64) -> Self {
+        let mut dispatcher = Self::with_seed(seed);
+        dispatcher.read_only = true;
+        dispatcher.register("help", 0, handle_help);
         dispatcher
     }
 
@@ -863,6 +876,13 @@ impl CommandDispatcher {
         }
 
         let cmd_name = tokens[0].to_ascii_lowercase();
+        let arg_strs: Vec<&str> = tokens[1..].iter().map(String::as_str).collect();
+        if self.read_only && is_world_mutating_command(&cmd_name, &arg_strs) {
+            return CommandResult::error(
+                "This preview session is read-only, so the command was not applied",
+            );
+        }
+
         let registration = match self.commands.get(&cmd_name).cloned() {
             Some(reg) => reg,
             None => return CommandResult::error(format!("Unknown command '{cmd_name}'")),
@@ -877,13 +897,14 @@ impl CommandDispatcher {
         }
 
         // Auto-register or sync sender if it is an in-world player
-        if let CommandSender::Player {
-            name,
-            pos,
-            yaw,
-            pitch,
-            ..
-        } = sender
+        if !self.read_only
+            && let CommandSender::Player {
+                name,
+                pos,
+                yaw,
+                pitch,
+                ..
+            } = sender
         {
             if let Some(player) = self.players.get_mut(name) {
                 player.pos = *pos;
@@ -897,7 +918,6 @@ impl CommandDispatcher {
             }
         }
 
-        let arg_strs: Vec<&str> = tokens[1..].iter().map(String::as_str).collect();
         match (registration.handler)(self, sender, &arg_strs) {
             Ok(msg) => CommandResult::Success(msg),
             Err(err) => CommandResult::Error(err.to_string()),
@@ -1501,5 +1521,48 @@ fn handle_give(
             "Gave {count} [{item}] to {} players",
             targets.len()
         ))
+    }
+}
+
+fn is_world_mutating_command(cmd_name: &str, args: &[&str]) -> bool {
+    match cmd_name {
+        "tp" | "teleport" | "gamemode" | "give" | "kill" => true,
+        "time" => args
+            .first()
+            .is_some_and(|sub| sub.eq_ignore_ascii_case("set") || sub.eq_ignore_ascii_case("add")),
+        _ => false,
+    }
+}
+
+fn handle_help(
+    dispatcher: &mut CommandDispatcher,
+    _sender: &CommandSender,
+    args: &[&str],
+) -> Result<String, CommandError> {
+    if args.is_empty() {
+        let mut names: Vec<&str> = dispatcher
+            .commands
+            .values()
+            .map(|reg| reg.name.as_str())
+            .collect();
+        names.sort_unstable();
+        let list = names
+            .into_iter()
+            .map(|name| format!("/{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("Available commands: {list}"))
+    } else {
+        let topic = args[0]
+            .strip_prefix('/')
+            .unwrap_or(args[0])
+            .to_ascii_lowercase();
+        if dispatcher.commands.contains_key(&topic) {
+            Ok(format!("/{topic}"))
+        } else {
+            Err(CommandError::InvalidArgument(format!(
+                "Help topic '/{topic}' not found"
+            )))
+        }
     }
 }
