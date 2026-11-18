@@ -73,6 +73,7 @@ pub use events::{
 pub mod anvil;
 pub mod brewing;
 pub mod container_data;
+pub mod enchanting;
 pub mod enchantment;
 pub mod furnace;
 pub mod loot;
