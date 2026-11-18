@@ -8,8 +8,8 @@ mod tests_keepalive;
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
 use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
 use crate::java_wire::{
-    WireError, frame, pack_block_position, put_string, put_varint, read_string, read_varint,
-    unpack_block_position,
+    WireError, frame, pack_block_position, put_string, put_varint, read_f32_be, read_f64_be,
+    read_i16_be, read_i64_be, read_string, read_u64_be, read_varint, unpack_block_position,
 };
 use crate::preview_data::RegistryManifest;
 use crate::protocol::chat;
@@ -264,17 +264,12 @@ pub fn decode_player_action(body: &[u8]) -> Result<PlayerAction, Error> {
         return Err(Error::Malformed);
     };
     let status = PlayerActionStatus::try_from(status_val)?;
-    let mut rest = &body[prefix..];
 
-    if rest.len() < 8 {
-        return Err(Error::Malformed);
-    }
-    let packed_pos = i64::from_be_bytes(rest[..8].try_into().unwrap());
+    let (packed_pos, mut rest) = read_i64_be(&body[prefix..])?;
     let (x, y, z) = unpack_block_pos(packed_pos);
     if !is_valid_block_pos(x, y, z) {
         return Err(Error::Malformed);
     }
-    rest = &rest[8..];
 
     if rest.is_empty() {
         return Err(Error::Malformed);
@@ -339,17 +334,12 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     if hand > 1 {
         return Err(Error::Malformed);
     }
-    let mut rest = &body[prefix..];
 
-    if rest.len() < 8 {
-        return Err(Error::Malformed);
-    }
-    let packed_pos = i64::from_be_bytes(rest[..8].try_into().unwrap());
+    let (packed_pos, rest) = read_i64_be(&body[prefix..])?;
     let (x, y, z) = unpack_block_pos(packed_pos);
     if !is_valid_block_pos(x, y, z) {
         return Err(Error::Malformed);
     }
-    rest = &rest[8..];
 
     let Some((face, face_len)) = read_varint(rest)? else {
         return Err(Error::Malformed);
@@ -357,14 +347,11 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     if face > 5 {
         return Err(Error::Malformed);
     }
-    rest = &rest[face_len..];
+    let rest = &rest[face_len..];
 
-    if rest.len() < 12 {
-        return Err(Error::Malformed);
-    }
-    let cursor_x = f32::from_be_bytes(rest[0..4].try_into().unwrap());
-    let cursor_y = f32::from_be_bytes(rest[4..8].try_into().unwrap());
-    let cursor_z = f32::from_be_bytes(rest[8..12].try_into().unwrap());
+    let (cursor_x, rest) = read_f32_be(rest)?;
+    let (cursor_y, rest) = read_f32_be(rest)?;
+    let (cursor_z, mut rest) = read_f32_be(rest)?;
     if !cursor_x.is_finite()
         || !cursor_y.is_finite()
         || !cursor_z.is_finite()
@@ -374,7 +361,6 @@ pub fn decode_use_item_on(body: &[u8]) -> Result<UseItemOn, Error> {
     {
         return Err(Error::Malformed);
     }
-    rest = &rest[12..];
 
     if rest.is_empty() {
         return Err(Error::Malformed);
@@ -734,27 +720,31 @@ impl Session {
                     let preview = self.preview.as_mut().ok_or(Error::WrongState)?;
                     match id {
                         sb::ACCEPT_TELEPORTATION => {
-                            if body.len() != 33 || body[0] != 1 {
+                            let Some((&1, rest)) = body.split_first() else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[1..9].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[9..17].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[17..25].try_into().unwrap());
-                            let yaw = f32::from_be_bytes(body[25..29].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[29..33].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
+                            };
+                            let (x, rest) = read_f64_be(rest)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let (yaw, rest) = read_f32_be(rest)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            if !rest.is_empty()
+                                || !is_valid_coord(x, y, z)
+                                || !is_valid_rotation(yaw, pitch)
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.teleport_acknowledged = true;
                         }
                         sb::CHUNK_BATCH_RECEIVED => {
-                            if body.len() != 4 {
-                                return Err(Error::Malformed);
-                            }
-                            let rate = f32::from_be_bytes(body.try_into().unwrap());
+                            let (rate, rest) = read_f32_be(body)?;
                             // Clients report any positive desired rate; large values
                             // are valid on fast machines and only cap the batch size.
-                            if !preview.awaiting_batch || !rate.is_finite() || rate <= 0.0 {
+                            if !rest.is_empty()
+                                || !preview.awaiting_batch
+                                || !rate.is_finite()
+                                || rate <= 0.0
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.awaiting_batch = false;
@@ -766,48 +756,48 @@ impl Session {
                         }
                         sb::CLIENT_INFORMATION | sb::CUSTOM_PAYLOAD => {} // Bounded information/custom payloads have no effect.
                         sb::KEEP_ALIVE => {
-                            if body.len() != 8 {
-                                return Err(Error::Malformed);
-                            }
-                            let id = u64::from_be_bytes(body.try_into().unwrap());
-                            if preview.pending_keepalive != Some(id) {
+                            let (id, rest) = read_u64_be(body)?;
+                            if !rest.is_empty() || preview.pending_keepalive != Some(id) {
                                 return Err(Error::Malformed);
                             }
                             preview.pending_keepalive = None;
                         }
                         sb::MOVE_PLAYER_POS => {
-                            if body.len() != 25 || (body[24] & !MOVEMENT_FLAGS) != 0 {
+                            let (x, rest) = read_f64_be(body)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0 || !is_valid_coord(x, y, z) {
                                 return Err(Error::Malformed);
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         sb::MOVE_PLAYER_POS_ROT => {
-                            if body.len() != 33 || (body[32] & !MOVEMENT_FLAGS) != 0 {
+                            let (x, rest) = read_f64_be(body)?;
+                            let (y, rest) = read_f64_be(rest)?;
+                            let (z, rest) = read_f64_be(rest)?;
+                            let (yaw, rest) = read_f32_be(rest)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let x = f64::from_be_bytes(body[0..8].try_into().unwrap());
-                            let y = f64::from_be_bytes(body[8..16].try_into().unwrap());
-                            let z = f64::from_be_bytes(body[16..24].try_into().unwrap());
-                            let yaw = f32::from_be_bytes(body[24..28].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[28..32].try_into().unwrap());
-                            if !is_valid_coord(x, y, z) || !is_valid_rotation(yaw, pitch) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0
+                                || !is_valid_coord(x, y, z)
+                                || !is_valid_rotation(yaw, pitch)
+                            {
                                 return Err(Error::Malformed);
                             }
                             preview.move_to(x, y, z).map_err(|_| Error::Malformed)?;
                         }
                         sb::MOVE_PLAYER_ROT => {
-                            if body.len() != 9 || (body[8] & !MOVEMENT_FLAGS) != 0 {
+                            let (yaw, rest) = read_f32_be(body)?;
+                            let (pitch, rest) = read_f32_be(rest)?;
+                            let &[flags] = rest else {
                                 return Err(Error::Malformed);
-                            }
-                            let yaw = f32::from_be_bytes(body[0..4].try_into().unwrap());
-                            let pitch = f32::from_be_bytes(body[4..8].try_into().unwrap());
-                            if !is_valid_rotation(yaw, pitch) {
+                            };
+                            if (flags & !MOVEMENT_FLAGS) != 0 || !is_valid_rotation(yaw, pitch) {
                                 return Err(Error::Malformed);
                             }
                         }
@@ -869,11 +859,8 @@ impl Session {
                             // Punch has no world effect in the preview.
                         }
                         sb::SET_CARRIED_ITEM => {
-                            if body.len() != 2 {
-                                return Err(Error::Malformed);
-                            }
-                            let slot = i16::from_be_bytes(body.try_into().unwrap());
-                            if !(0..HOTBAR_SLOTS).contains(&slot) {
+                            let (slot, rest) = read_i16_be(body)?;
+                            if !rest.is_empty() || !(0..HOTBAR_SLOTS).contains(&slot) {
                                 return Err(Error::Malformed);
                             }
                             // Selected hotbar slot is client-local here.
@@ -2191,5 +2178,151 @@ mod tests {
             s.receive(&frame(USE_ITEM_ON_ID, &bad_cursor_use), 4096),
             Err(Error::Malformed)
         );
+    }
+
+    #[test]
+    fn truncated_player_action_is_malformed() {
+        let valid = encode_player_action(&PlayerAction {
+            status: PlayerActionStatus::StartedDigging,
+            pos: (10, 64, -20),
+            face: 1,
+            sequence: 7,
+        });
+        for len in 0..valid.len() {
+            assert_eq!(decode_player_action(&valid[..len]), Err(Error::Malformed));
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::PLAYER_ACTION, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_use_item_on_is_malformed() {
+        let valid = encode_use_item_on(&UseItemOn {
+            hand: 0,
+            pos: (10, 64, -20),
+            face: 1,
+            cursor_x: 0.5,
+            cursor_y: 0.5,
+            cursor_z: 0.5,
+            inside_block: false,
+            world_border_hit: false,
+            sequence: 7,
+        });
+        for len in 0..valid.len() {
+            assert_eq!(decode_use_item_on(&valid[..len]), Err(Error::Malformed));
+            assert_eq!(
+                enter_play_session()
+                    .receive(&frame(play::serverbound::USE_ITEM_ON, &valid[..len]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_accept_teleportation_is_malformed() {
+        let valid = teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0);
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::ACCEPT_TELEPORTATION, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_chunk_batch_received_is_malformed() {
+        let valid = 20.0f32.to_be_bytes();
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().awaiting_batch = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::CHUNK_BATCH_RECEIVED, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_keep_alive_is_malformed() {
+        let valid = 12345u64.to_be_bytes();
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().pending_keepalive = Some(12345);
+            assert_eq!(
+                s.receive(&frame(play::serverbound::KEEP_ALIVE, &valid[..len]), 4096),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_pos_is_malformed() {
+        let valid = player_position(0.0, 64.0, 0.0, 1);
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().teleport_acknowledged = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::MOVE_PLAYER_POS, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_pos_rot_is_malformed() {
+        let valid = player_pos_rot(0.0, 64.0, 0.0, 0.0, 0.0, 1);
+        for len in 0..valid.len() {
+            let mut s = enter_play_session();
+            s.preview.as_mut().unwrap().teleport_acknowledged = true;
+            assert_eq!(
+                s.receive(
+                    &frame(play::serverbound::MOVE_PLAYER_POS_ROT, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_move_player_rot_is_malformed() {
+        let valid = player_rotation(0.0, 0.0, 1);
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::MOVE_PLAYER_ROT, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_set_carried_item_is_malformed() {
+        let valid = 4i16.to_be_bytes();
+        for len in 0..valid.len() {
+            assert_eq!(
+                enter_play_session().receive(
+                    &frame(play::serverbound::SET_CARRIED_ITEM, &valid[..len]),
+                    4096
+                ),
+                Err(Error::Malformed)
+            );
+        }
     }
 }
