@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::vanilla::feature::ItemTags;
+use crate::vanilla::feature::{BlockTags, ItemTags};
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
 
 /// Default stack limit for standard items.
@@ -16,6 +16,14 @@ pub const DEFAULT_MAX_STACK: u16 = 64;
 
 /// Upper bound of the item max_stack_size component since Java 1.20.5.
 pub const MAX_STACK_LIMIT: u16 = 99;
+
+/// Default mining speed multiplier when an item has no `minecraft:tool` component,
+/// omits `default_mining_speed`, or matches no rule overriding `speed`.
+///
+/// Source: minecraft.wiki `Data component format` (revision 3903955,
+/// `Data component format/tool` revision 2910648):
+/// "`default_mining_speed`: The default mining speed of this tool, used if no rules override it. Defaults to 1.0."
+pub const DEFAULT_TOOL_MINING_SPEED: f32 = 1.0;
 
 /// Strips an optional `minecraft:` namespace prefix for canonical item comparison.
 #[inline]
@@ -200,22 +208,50 @@ impl From<WorldgenError> for ItemDefaultsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RepairableItems {
+enum IdSet {
     Id(String),
     Tag(String),
     List(Vec<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl IdSet {
+    fn matches_block(&self, block: &str, tags: &BlockTags) -> bool {
+        match self {
+            Self::Id(spec) => items_equal(spec, block),
+            Self::Tag(raw_tag) => {
+                let tag_id = raw_tag.strip_prefix('#').unwrap_or(raw_tag);
+                tags.members(tag_id)
+                    .is_some_and(|members| members.iter().any(|m| items_equal(m, block)))
+            }
+            Self::List(list) => list.iter().any(|spec| items_equal(spec, block)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolRule {
+    blocks: IdSet,
+    speed: Option<f32>,
+    correct_for_drops: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ToolComponent {
+    default_mining_speed: f32,
+    rules: Vec<ToolRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ItemDefaultEntry {
     max_stack_size: u8,
     max_damage: Option<u32>,
-    repairable: Option<RepairableItems>,
+    repairable: Option<IdSet>,
     enchantability: Option<u32>,
+    tool: Option<ToolComponent>,
 }
 
 /// Default per-item components read from `reports/minecraft/components/item/*.json`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ItemDefaults {
     entries: BTreeMap<String, ItemDefaultEntry>,
 }
@@ -270,12 +306,12 @@ impl ItemDefaults {
     pub fn repair_materials(&self, item: &str, tags: &ItemTags) -> Option<Vec<String>> {
         let entry = self.entries.get(normalize_item_id(item))?;
         match entry.repairable.as_ref()? {
-            RepairableItems::Id(id) => Some(vec![id.clone()]),
-            RepairableItems::Tag(raw_tag) => {
+            IdSet::Id(id) => Some(vec![id.clone()]),
+            IdSet::Tag(raw_tag) => {
                 let tag_id = raw_tag.strip_prefix('#').unwrap_or(raw_tag);
                 tags.members(tag_id).map(|members| members.to_vec())
             }
-            RepairableItems::List(list) => Some(list.clone()),
+            IdSet::List(list) => Some(list.clone()),
         }
     }
 
@@ -290,6 +326,58 @@ impl ItemDefaults {
         self.entries
             .get(normalize_item_id(item))
             .and_then(|entry| entry.enchantability)
+    }
+
+    /// Returns the mining speed multiplier for `item` breaking `block` from its
+    /// `minecraft:tool` component, or [`DEFAULT_TOOL_MINING_SPEED`] (`1.0`) if `item`
+    /// is unknown, has no `minecraft:tool` component, or has no matching rule
+    /// overriding `speed` (falling back to `default_mining_speed` when `minecraft:tool`
+    /// is present). Accepts item and block identifiers with or without the `minecraft:`
+    /// prefix.
+    ///
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/tool` revision 2910648):
+    /// - `rules`: "If a field is overridden by multiple matched rules, the one that comes first in the list is chosen."
+    /// - `speed`: "If the blocks match, overrides the default mining speed. Optional."
+    /// - `default_mining_speed`: "The default mining speed of this tool, used if no rules override it. Defaults to 1.0."
+    #[must_use]
+    pub fn tool_speed(&self, item: &str, block: &str, tags: &BlockTags) -> f32 {
+        let Some(tool) = self
+            .entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.tool.as_ref())
+        else {
+            return DEFAULT_TOOL_MINING_SPEED;
+        };
+        tool.rules
+            .iter()
+            .filter(|rule| rule.blocks.matches_block(block, tags))
+            .find_map(|rule| rule.speed)
+            .unwrap_or(tool.default_mining_speed)
+    }
+
+    /// Returns whether `item` is considered correct to mine `block` at full efficiency
+    /// and drop tool-gated items according to its `minecraft:tool` component, or `None`
+    /// if `item` is unknown or lacks `minecraft:tool`.
+    /// Accepts item and block identifiers with or without the `minecraft:` prefix.
+    ///
+    /// Source: minecraft.wiki `Data component format` (revision 3903955,
+    /// `Data component format/tool` revision 2910648):
+    /// - `rules`: "If a field is overridden by multiple matched rules, the one that comes first in the list is chosen."
+    /// - `correct_for_drops`: "If the blocks match, overrides whether or not this tool is considered correct to mine at its most efficient speed, and to drop items if the block's loot table requires it. If not set by any rules, defaults to `false`. Optional."
+    #[must_use]
+    pub fn is_correct_for_drops(&self, item: &str, block: &str, tags: &BlockTags) -> Option<bool> {
+        let tool = self
+            .entries
+            .get(normalize_item_id(item))
+            .and_then(|entry| entry.tool.as_ref())?;
+        let matched = tool
+            .rules
+            .iter()
+            .filter(|rule| rule.blocks.matches_block(block, tags))
+            .find_map(|rule| rule.correct_for_drops)
+            .unwrap_or(false);
+        Some(matched)
     }
 
     /// Returns the number of items loaded from the report.
@@ -381,6 +469,11 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
         Some(value) => Some(parse_enchantable(value, file)?),
     };
 
+    let tool = match components.get("minecraft:tool") {
+        None => None,
+        Some(value) => Some(parse_tool(value, file)?),
+    };
+
     Ok((
         item_stem.to_owned(),
         ItemDefaultEntry {
@@ -388,11 +481,72 @@ fn parse_item_report(file: &Path) -> Result<(String, ItemDefaultEntry), ItemDefa
             max_damage,
             repairable,
             enchantability,
+            tool,
         },
     ))
 }
 
-fn parse_repairable(value: &Value, file: &Path) -> Result<RepairableItems, ItemDefaultsError> {
+fn parse_id_set(value: &Value, file: &Path, context: &str) -> Result<IdSet, ItemDefaultsError> {
+    match value {
+        Value::String(raw) => {
+            if let Some(tag) = raw.strip_prefix('#') {
+                if !valid_item_id(tag) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid tag `{raw}` in {context}"),
+                    ));
+                }
+                Ok(IdSet::Tag(raw.clone()))
+            } else {
+                if !valid_item_id(raw) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid id `{raw}` in {context}"),
+                    ));
+                }
+                Ok(IdSet::Id(raw.clone()))
+            }
+        }
+        Value::Array(arr) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for elem in arr {
+                let raw = elem.as_str().ok_or_else(|| {
+                    item_report_invalid(file, format!("{context} list entries must be strings"))
+                })?;
+                if !valid_item_id(raw) {
+                    return Err(item_report_invalid(
+                        file,
+                        format!("invalid id `{raw}` in {context} list"),
+                    ));
+                }
+                if !list.iter().any(|existing| existing == raw) {
+                    list.push(raw.to_owned());
+                }
+            }
+            Ok(IdSet::List(list))
+        }
+        _ => Err(item_report_invalid(
+            file,
+            format!("{context} must be an id string, #tag string, or list"),
+        )),
+    }
+}
+
+fn parse_finite_f32(value: &Value, file: &Path, context: &str) -> Result<f32, ItemDefaultsError> {
+    let raw = value
+        .as_f64()
+        .ok_or_else(|| item_report_invalid(file, format!("{context} must be a number")))?;
+    let parsed = raw as f32;
+    if !parsed.is_finite() {
+        return Err(item_report_invalid(
+            file,
+            format!("{context} must be a finite 32-bit float"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_repairable(value: &Value, file: &Path) -> Result<IdSet, ItemDefaultsError> {
     let obj = value.as_object().ok_or_else(|| {
         item_report_invalid(
             file,
@@ -405,52 +559,11 @@ fn parse_repairable(value: &Value, file: &Path) -> Result<RepairableItems, ItemD
             "missing `items` field in `components[\"minecraft:repairable\"]`",
         )
     })?;
-    match items_val {
-        Value::String(raw) => {
-            if let Some(tag) = raw.strip_prefix('#') {
-                if !valid_item_id(tag) {
-                    return Err(item_report_invalid(
-                        file,
-                        format!("invalid repairable item tag `{raw}`"),
-                    ));
-                }
-                Ok(RepairableItems::Tag(raw.clone()))
-            } else {
-                if !valid_item_id(raw) {
-                    return Err(item_report_invalid(
-                        file,
-                        format!("invalid repairable item id `{raw}`"),
-                    ));
-                }
-                Ok(RepairableItems::Id(raw.clone()))
-            }
-        }
-        Value::Array(arr) => {
-            let mut list = Vec::with_capacity(arr.len());
-            for elem in arr {
-                let raw = elem.as_str().ok_or_else(|| {
-                    item_report_invalid(
-                        file,
-                        "`components[\"minecraft:repairable\"].items` list entries must be strings",
-                    )
-                })?;
-                if !valid_item_id(raw) {
-                    return Err(item_report_invalid(
-                        file,
-                        format!("invalid repairable item id `{raw}` in list"),
-                    ));
-                }
-                if !list.iter().any(|existing| existing == raw) {
-                    list.push(raw.to_owned());
-                }
-            }
-            Ok(RepairableItems::List(list))
-        }
-        _ => Err(item_report_invalid(
-            file,
-            "`components[\"minecraft:repairable\"].items` must be an id string, #tag string, or list",
-        )),
-    }
+    parse_id_set(
+        items_val,
+        file,
+        "`components[\"minecraft:repairable\"].items`",
+    )
 }
 
 fn parse_enchantable(value: &Value, file: &Path) -> Result<u32, ItemDefaultsError> {
@@ -470,6 +583,122 @@ fn parse_enchantable(value: &Value, file: &Path) -> Result<u32, ItemDefaultsErro
                 "`components[\"minecraft:enchantable\"].value` must be a positive 32-bit integer",
             )
         })
+}
+
+fn parse_tool_rule(value: &Value, file: &Path) -> Result<ToolRule, ItemDefaultsError> {
+    let obj = value.as_object().ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "`components[\"minecraft:tool\"].rules[]` entries must be JSON objects",
+        )
+    })?;
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "blocks" | "speed" | "correct_for_drops") {
+            return Err(item_report_invalid(
+                file,
+                format!("unknown key `{key}` in `components[\"minecraft:tool\"].rules[]`"),
+            ));
+        }
+    }
+    let blocks_val = obj.get("blocks").ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "missing `blocks` field in `components[\"minecraft:tool\"].rules[]`",
+        )
+    })?;
+    let blocks = parse_id_set(
+        blocks_val,
+        file,
+        "`components[\"minecraft:tool\"].rules[].blocks`",
+    )?;
+    let speed = match obj.get("speed") {
+        None => None,
+        Some(val) => Some(parse_finite_f32(
+            val,
+            file,
+            "`components[\"minecraft:tool\"].rules[].speed`",
+        )?),
+    };
+    let correct_for_drops = match obj.get("correct_for_drops") {
+        None => None,
+        Some(val) => {
+            let b = val.as_bool().ok_or_else(|| {
+                item_report_invalid(
+                    file,
+                    "`components[\"minecraft:tool\"].rules[].correct_for_drops` must be a boolean",
+                )
+            })?;
+            Some(b)
+        }
+    };
+    Ok(ToolRule {
+        blocks,
+        speed,
+        correct_for_drops,
+    })
+}
+
+fn parse_tool(value: &Value, file: &Path) -> Result<ToolComponent, ItemDefaultsError> {
+    let obj = value.as_object().ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "`components[\"minecraft:tool\"]` must be a JSON object",
+        )
+    })?;
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "rules"
+                | "default_mining_speed"
+                | "damage_per_block"
+                | "can_destroy_blocks_in_creative"
+        ) {
+            return Err(item_report_invalid(
+                file,
+                format!("unknown key `{key}` in `components[\"minecraft:tool\"]`"),
+            ));
+        }
+    }
+    let default_mining_speed = match obj.get("default_mining_speed") {
+        None => DEFAULT_TOOL_MINING_SPEED,
+        Some(val) => parse_finite_f32(
+            val,
+            file,
+            "`components[\"minecraft:tool\"].default_mining_speed`",
+        )?,
+    };
+    if let Some(val) = obj.get("damage_per_block") {
+        val.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                item_report_invalid(
+                    file,
+                    "`components[\"minecraft:tool\"].damage_per_block` must be a non-negative 32-bit integer",
+                )
+            })?;
+    }
+    if let Some(val) = obj.get("can_destroy_blocks_in_creative")
+        && !val.is_boolean()
+    {
+        return Err(item_report_invalid(
+            file,
+            "`components[\"minecraft:tool\"].can_destroy_blocks_in_creative` must be a boolean",
+        ));
+    }
+    let raw_rules = obj.get("rules").and_then(Value::as_array).ok_or_else(|| {
+        item_report_invalid(
+            file,
+            "missing or non-array `rules` field in `components[\"minecraft:tool\"]`",
+        )
+    })?;
+    let mut rules = Vec::with_capacity(raw_rules.len());
+    for raw_rule in raw_rules {
+        rules.push(parse_tool_rule(raw_rule, file)?);
+    }
+    Ok(ToolComponent {
+        default_mining_speed,
+        rules,
+    })
 }
 
 #[cfg(test)]
@@ -954,5 +1183,346 @@ mod tests {
         assert_eq!(defaults.max_damage("minecraft:book"), None);
         assert_eq!(defaults.repair_materials("minecraft:book", &tags), None);
         assert_eq!(defaults.enchantability("minecraft:book"), Some(1));
+    }
+
+    #[test]
+    fn item_defaults_evaluates_tool_rules_order_and_defaults() {
+        let root = scratch_root("tool-rules");
+        write_file(
+            &root.join("data/testns/tags/block/mineable.json"),
+            r#"{"values": ["testns:stone", "testns:hard_ore"]}"#,
+        );
+        write_file(
+            &root.join("data/testns/tags/block/denied.json"),
+            r#"{"values": ["testns:hard_ore", "testns:bedrock"]}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/multi_tool.json"),
+            r##"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:tool": {
+                    "default_mining_speed": 1.5,
+                    "damage_per_block": 2,
+                    "can_destroy_blocks_in_creative": false,
+                    "rules": [
+                        {"blocks": "#testns:denied", "correct_for_drops": false},
+                        {"blocks": "#testns:mineable", "speed": 7.5, "correct_for_drops": true},
+                        {"blocks": ["testns:alpha", "testns:beta"], "speed": 12.0, "correct_for_drops": true},
+                        {"blocks": "testns:alpha", "speed": 99.0, "correct_for_drops": false}
+                    ]
+                }
+            }}"##,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/speed_only.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:tool": {
+                    "rules": [
+                        {"blocks": "minecraft:cobweb", "speed": 15.0}
+                    ]
+                }
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/empty_tool.json"),
+            r#"{"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:tool": {"damage_per_block": 0, "rules": []}
+            }}"#,
+        );
+        write_file(
+            &root.join("reports/minecraft/components/item/plain.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+
+        let block_tags = BlockTags::load(&root).expect("load synthetic block tags");
+        let defaults = ItemDefaults::load(&root).expect("load synthetic item defaults");
+
+        // Denied tag overrides correct_for_drops first, while speed falls through to mineable rule.
+        assert_eq!(
+            defaults.tool_speed("minecraft:multi_tool", "testns:hard_ore", &block_tags),
+            7.5
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("multi_tool", "testns:hard_ore", &block_tags),
+            Some(false)
+        );
+
+        // Mineable only.
+        assert_eq!(
+            defaults.tool_speed("multi_tool", "testns:stone", &block_tags),
+            7.5
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("minecraft:multi_tool", "testns:stone", &block_tags),
+            Some(true)
+        );
+
+        // First matching rule wins over later rule for the same block.
+        assert_eq!(
+            defaults.tool_speed("multi_tool", "testns:alpha", &block_tags),
+            12.0
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("multi_tool", "testns:alpha", &block_tags),
+            Some(true)
+        );
+        assert_eq!(
+            defaults.tool_speed("multi_tool", "testns:beta", &block_tags),
+            12.0
+        );
+
+        // Denied-only block falls back to default_mining_speed.
+        assert_eq!(
+            defaults.tool_speed("multi_tool", "testns:bedrock", &block_tags),
+            1.5
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("multi_tool", "testns:bedrock", &block_tags),
+            Some(false)
+        );
+
+        // Unmatched block with minecraft:tool gets default_mining_speed and Some(false).
+        assert_eq!(
+            defaults.tool_speed("multi_tool", "testns:unlisted", &block_tags),
+            1.5
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("multi_tool", "testns:unlisted", &block_tags),
+            Some(false)
+        );
+
+        // Speed-only rule supports prefix-insensitive minecraft: blocks and defaults correct_for_drops to false.
+        assert_eq!(
+            defaults.tool_speed("speed_only", "cobweb", &block_tags),
+            15.0
+        );
+        assert_eq!(
+            defaults.tool_speed("speed_only", "minecraft:cobweb", &block_tags),
+            15.0
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("speed_only", "cobweb", &block_tags),
+            Some(false)
+        );
+        assert_eq!(
+            defaults.tool_speed("speed_only", "testns:unlisted", &block_tags),
+            DEFAULT_TOOL_MINING_SPEED
+        );
+
+        // Empty rules list still has minecraft:tool defaults.
+        assert_eq!(
+            defaults.tool_speed("empty_tool", "testns:stone", &block_tags),
+            DEFAULT_TOOL_MINING_SPEED
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("empty_tool", "testns:stone", &block_tags),
+            Some(false)
+        );
+
+        // Items without minecraft:tool or unknown items get 1.0 and None.
+        assert_eq!(
+            defaults.tool_speed("plain", "testns:stone", &block_tags),
+            DEFAULT_TOOL_MINING_SPEED
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("plain", "testns:stone", &block_tags),
+            None
+        );
+        assert_eq!(
+            defaults.tool_speed("missing", "testns:stone", &block_tags),
+            DEFAULT_TOOL_MINING_SPEED
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("missing", "testns:stone", &block_tags),
+            None
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn item_defaults_rejects_malformed_tool_component_naming_file() {
+        let cases = [
+            (
+                "bad_tool_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": "bad"}}"#,
+            ),
+            (
+                "missing_tool_rules.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {}}}"#,
+            ),
+            (
+                "bad_tool_rules_type.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": "bad"}}}"#,
+            ),
+            (
+                "bad_tool_rule_entry.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": ["bad"]}}}"#,
+            ),
+            (
+                "missing_rule_blocks.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"speed": 2.0}]}}}"#,
+            ),
+            (
+                "bad_rule_blocks_id.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "bad"}]}}}"#,
+            ),
+            (
+                "bad_rule_blocks_tag.json",
+                r##"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "#bad"}]}}}"##,
+            ),
+            (
+                "bad_rule_speed.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "testns:a", "speed": "fast"}]}}}"#,
+            ),
+            (
+                "overflow_rule_speed.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "testns:a", "speed": 1e39}]}}}"#,
+            ),
+            (
+                "bad_rule_correct.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "testns:a", "correct_for_drops": 1}]}}}"#,
+            ),
+            (
+                "bad_default_speed.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"default_mining_speed": "1.0", "rules": []}}}"#,
+            ),
+            (
+                "negative_damage_per_block.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"damage_per_block": -1, "rules": []}}}"#,
+            ),
+            (
+                "bad_creative_destroy.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"can_destroy_blocks_in_creative": 0, "rules": []}}}"#,
+            ),
+            (
+                "unknown_tool_key.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"extra": true, "rules": []}}}"#,
+            ),
+            (
+                "unknown_rule_key.json",
+                r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:tool": {"rules": [{"blocks": "testns:a", "extra": 1}]}}}"#,
+            ),
+        ];
+
+        for (name, body) in cases {
+            let root = scratch_root(name);
+            write_file(
+                &root.join("reports/minecraft/components/item").join(name),
+                body,
+            );
+            let err = ItemDefaults::load(&root)
+                .expect_err("malformed tool component must fail")
+                .to_string();
+            assert!(err.contains(name), "error must name {name}: {err}");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    fn read_tool_rule_speed(root: &Path, item: &str, rule_index: usize) -> f32 {
+        let report_path = root
+            .join("reports/minecraft/components/item")
+            .join(format!("{item}.json"));
+        let doc = read_json(&report_path).expect("read item report");
+        doc["components"]["minecraft:tool"]["rules"][rule_index]["speed"]
+            .as_f64()
+            .expect("rule speed in report") as f32
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_item_defaults_evaluate_tool_rules`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_item_defaults_evaluate_tool_rules() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let block_tags = BlockTags::load(&root).expect("load vanilla block tags");
+        let defaults = ItemDefaults::load(&root).expect("load vanilla item defaults");
+
+        let tool_count = defaults
+            .entries
+            .values()
+            .filter(|entry| entry.tool.is_some())
+            .count();
+        assert_eq!(tool_count, 38);
+
+        let diamond_pickaxe_speed = read_tool_rule_speed(&root, "diamond_pickaxe", 1);
+        let iron_pickaxe_speed = read_tool_rule_speed(&root, "iron_pickaxe", 1);
+        let wooden_shovel_speed = read_tool_rule_speed(&root, "wooden_shovel", 1);
+        let shears_cobweb_speed = read_tool_rule_speed(&root, "shears", 0);
+
+        assert_eq!(
+            defaults.tool_speed("minecraft:diamond_pickaxe", "minecraft:stone", &block_tags),
+            diamond_pickaxe_speed
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops(
+                "minecraft:diamond_pickaxe",
+                "minecraft:stone",
+                &block_tags
+            ),
+            Some(true)
+        );
+
+        assert_eq!(
+            defaults.tool_speed(
+                "minecraft:diamond_pickaxe",
+                "minecraft:obsidian",
+                &block_tags
+            ),
+            diamond_pickaxe_speed
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops(
+                "minecraft:diamond_pickaxe",
+                "minecraft:obsidian",
+                &block_tags
+            ),
+            Some(true)
+        );
+
+        assert_eq!(
+            defaults.tool_speed("minecraft:iron_pickaxe", "minecraft:obsidian", &block_tags),
+            iron_pickaxe_speed
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops(
+                "minecraft:iron_pickaxe",
+                "minecraft:obsidian",
+                &block_tags
+            ),
+            Some(false)
+        );
+
+        assert_eq!(
+            defaults.tool_speed("minecraft:wooden_shovel", "minecraft:dirt", &block_tags),
+            wooden_shovel_speed
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("minecraft:wooden_shovel", "minecraft:dirt", &block_tags),
+            Some(true)
+        );
+
+        assert_eq!(shears_cobweb_speed, 15.0);
+        assert_eq!(
+            defaults.tool_speed("minecraft:shears", "minecraft:cobweb", &block_tags),
+            shears_cobweb_speed
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("minecraft:shears", "minecraft:cobweb", &block_tags),
+            Some(true)
+        );
+
+        assert_eq!(
+            defaults.tool_speed("minecraft:stick", "minecraft:stone", &block_tags),
+            1.0
+        );
+        assert_eq!(
+            defaults.is_correct_for_drops("minecraft:stick", "minecraft:stone", &block_tags),
+            None
+        );
     }
 }
