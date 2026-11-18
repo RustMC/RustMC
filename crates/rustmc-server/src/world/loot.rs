@@ -7272,4 +7272,331 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
+
+    fn count_item_drops(stacks: &[ItemStack], item_id: &str) -> u32 {
+        stacks
+            .iter()
+            .filter(|stack| stack.item() == item_id)
+            .map(|stack| u32::from(stack.count()))
+            .sum()
+    }
+
+    /// Pin vanilla `minecraft:cow` drops against `entities/cow.json` and `minecraft.wiki` `Cow`
+    /// (revision `3903124`):
+    /// - Raw Beef (`not_burn`) / Steak (`burn`, `minecraft:cooked_beef`): `quantity=1-3|lootingquantity=0-1`
+    ///   (base mean 2.0, Looting III mean 3.5).
+    /// - Leather: `quantity=0-2|lootingquantity=0-1` (base mean 1.0, Looting III mean 2.5, max `2 + 3 = 5`).
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_cow_drops_looting_and_fire`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_cow_drops_looting_and_fire() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_entities(&root).expect("load vanilla entity loot tables");
+        let cow = tables.get_entity("minecraft:cow").expect("cow loot table");
+
+        // Read expected ranges directly from `entities/cow.json`.
+        let raw_json: Value = read_json(&root.join("data/minecraft/loot_table/entities/cow.json"))
+            .expect("read cow.json");
+        let pools = raw_json["pools"].as_array().expect("cow pools");
+        let leather_entry = &pools[0]["entries"][0];
+        assert_eq!(leather_entry["name"].as_str(), Some("minecraft:leather"));
+        let leather_mods = leather_entry["modifier"].as_array().expect("leather mods");
+        let leather_min = leather_mods[0]["count"]["min"].as_i64().expect("min") as u32;
+        let leather_max = leather_mods[0]["count"]["max"].as_i64().expect("max") as u32;
+        let leather_looting_max = leather_mods[1]["count"]["max"]
+            .as_f64()
+            .expect("looting max")
+            .round() as u32;
+
+        let beef_entry = &pools[1]["entries"][0];
+        assert_eq!(beef_entry["name"].as_str(), Some("minecraft:beef"));
+        let beef_mods = beef_entry["modifier"].as_array().expect("beef mods");
+        let beef_min = beef_mods[0]["count"]["min"].as_i64().expect("beef min") as u32;
+        let beef_max = beef_mods[0]["count"]["max"].as_i64().expect("beef max") as u32;
+        let beef_looting_max = beef_mods[2]["count"]["max"]
+            .as_f64()
+            .expect("beef looting max")
+            .round() as u32;
+
+        // Without looting, leather stays in [leather_min, leather_max] and beef is raw [beef_min, beef_max].
+        let normal_ctx = LootContext::for_entity("minecraft:cow");
+        let mut bare_leather_sum = 0_u64;
+        let mut bare_leather_min = u32::MAX;
+        let mut bare_leather_max = 0_u32;
+        let mut bare_beef_sum = 0_u64;
+        let trials = 6_000_u64;
+        for seed in 0..trials {
+            let drops = cow.roll(&normal_ctx, &mut RandomSource::from_world_seed(seed));
+            let leather = count_item_drops(&drops, "minecraft:leather");
+            let beef = count_item_drops(&drops, "minecraft:beef");
+            let steak = count_item_drops(&drops, "minecraft:cooked_beef");
+            assert_eq!(steak, 0, "cold kill must not drop cooked_beef");
+            assert!(
+                (leather_min..=leather_max).contains(&leather),
+                "bare leather {leather} outside {leather_min}..={leather_max}"
+            );
+            assert!(
+                (beef_min..=beef_max).contains(&beef),
+                "bare beef {beef} outside {beef_min}..={beef_max}"
+            );
+            bare_leather_min = bare_leather_min.min(leather);
+            bare_leather_max = bare_leather_max.max(leather);
+            bare_leather_sum += u64::from(leather);
+            bare_beef_sum += u64::from(beef);
+        }
+        assert_eq!(bare_leather_min, leather_min);
+        assert_eq!(bare_leather_max, leather_max);
+        let bare_leather_avg = bare_leather_sum as f64 / trials as f64;
+        let expected_bare_leather_avg = f64::from(leather_min + leather_max) / 2.0;
+        assert!(
+            (bare_leather_avg - expected_bare_leather_avg).abs() <= 0.05,
+            "bare leather mean {bare_leather_avg} vs {expected_bare_leather_avg}"
+        );
+        let bare_beef_avg = bare_beef_sum as f64 / trials as f64;
+        let expected_bare_beef_avg = f64::from(beef_min + beef_max) / 2.0;
+        assert!(
+            (bare_beef_avg - expected_bare_beef_avg).abs() <= 0.05,
+            "bare beef mean {bare_beef_avg} vs {expected_bare_beef_avg}"
+        );
+
+        // With Looting III, max leather equals leather_max + 3 * leather_looting_max.
+        let mut looting3 = BTreeMap::new();
+        looting3.insert("minecraft:looting".to_owned(), 3);
+        let loot3_ctx = LootContext::for_entity("minecraft:cow")
+            .with_killed_by_player(true)
+            .with_attacker_weapon(ToolContext {
+                item: "minecraft:diamond_sword".to_owned(),
+                enchantments: looting3,
+            });
+        let expected_loot3_leather_max = leather_max + 3 * leather_looting_max;
+        let expected_loot3_beef_max = beef_max + 3 * beef_looting_max;
+        let mut loot3_leather_sum = 0_u64;
+        let mut loot3_leather_max = 0_u32;
+        let mut loot3_beef_sum = 0_u64;
+        let mut loot3_beef_max = 0_u32;
+        for seed in 0..trials {
+            let drops = cow.roll(&loot3_ctx, &mut RandomSource::from_world_seed(seed));
+            let leather = count_item_drops(&drops, "minecraft:leather");
+            let beef = count_item_drops(&drops, "minecraft:beef");
+            assert!(leather <= expected_loot3_leather_max);
+            assert!(beef >= beef_min && beef <= expected_loot3_beef_max);
+            loot3_leather_max = loot3_leather_max.max(leather);
+            loot3_beef_max = loot3_beef_max.max(beef);
+            loot3_leather_sum += u64::from(leather);
+            loot3_beef_sum += u64::from(beef);
+        }
+        assert_eq!(loot3_leather_max, expected_loot3_leather_max);
+        assert_eq!(loot3_beef_max, expected_loot3_beef_max);
+        let loot3_leather_avg = loot3_leather_sum as f64 / trials as f64;
+        assert!(
+            (loot3_leather_avg - 2.5).abs() <= 0.06,
+            "Looting III leather mean {loot3_leather_avg} vs 2.5"
+        );
+        let loot3_beef_avg = loot3_beef_sum as f64 / trials as f64;
+        assert!(
+            (loot3_beef_avg - 3.5).abs() <= 0.06,
+            "Looting III beef mean {loot3_beef_avg} vs 3.5"
+        );
+
+        // When cow is on fire, beef smelts to `minecraft:cooked_beef`.
+        let fire_ctx = LootContext::default()
+            .with_entity(EntityContext::new("minecraft:cow").with_on_fire(true));
+        for seed in 0..200_u64 {
+            let drops = cow.roll(&fire_ctx, &mut RandomSource::from_world_seed(seed));
+            assert_eq!(
+                count_item_drops(&drops, "minecraft:beef"),
+                0,
+                "burning cow must not drop raw beef"
+            );
+            let cooked = count_item_drops(&drops, "minecraft:cooked_beef");
+            assert!((beef_min..=beef_max).contains(&cooked));
+        }
+
+        // Also confirm melee direct_attacker holding Fire Aspect (#minecraft:smelts_loot) smelts beef.
+        let mut fire_aspect = BTreeMap::new();
+        fire_aspect.insert("minecraft:fire_aspect".to_owned(), 2);
+        let fire_aspect_ctx = LootContext::for_entity("minecraft:cow")
+            .with_killed_by_player(true)
+            .with_direct_attacker(EntityContext::new("minecraft:player").with_mainhand(
+                ToolContext {
+                    item: "minecraft:diamond_sword".to_owned(),
+                    enchantments: fire_aspect,
+                },
+            ));
+        let fa_drops = cow.roll(&fire_aspect_ctx, &mut RandomSource::from_world_seed(42));
+        assert_eq!(count_item_drops(&fa_drops, "minecraft:beef"), 0);
+        assert!(count_item_drops(&fa_drops, "minecraft:cooked_beef") >= beef_min);
+    }
+
+    /// Pin vanilla `minecraft:zombie` rare drops (`minecraft:iron_ingot`, `minecraft:carrot`,
+    /// `minecraft:potato`, or `minecraft:baked_potato` when on fire) against `entities/zombie.json`
+    /// and `minecraft.wiki` `Zombie` (revision `3902006`):
+    /// `player_or_pet` (`killed_by_player`), `dropchance=0.025|lootingchance=0.01|multiplychance=1/3`
+    /// (`0.025` base, `0.055` with Looting III).
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_zombie_rare_drop_player_kill_and_rate`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_zombie_rare_drop_player_kill_and_rate() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_entities(&root).expect("load vanilla entity loot tables");
+        let zombie = tables
+            .get_entity("minecraft:zombie")
+            .expect("zombie loot table");
+
+        // Extract rare-drop probabilities and item set directly from `entities/zombie.json`.
+        let raw_json: Value =
+            read_json(&root.join("data/minecraft/loot_table/entities/zombie.json"))
+                .expect("read zombie.json");
+        let rare_pool = &raw_json["pools"][2];
+        let chance_cond = &rare_pool["condition"]["terms"][1];
+        assert_eq!(
+            chance_cond["type"].as_str(),
+            Some("minecraft:random_chance_with_enchanted_bonus")
+        );
+        let unenchanted_rate = chance_cond["unenchanted_chance"]
+            .as_f64()
+            .expect("unenchanted_chance");
+        let enchant_base = chance_cond["enchanted_chance"]["base"]
+            .as_f64()
+            .expect("base");
+        let enchant_per_level = chance_cond["enchanted_chance"]["per_level_above_first"]
+            .as_f64()
+            .expect("per_level_above_first");
+        let expected_loot3_rate = enchant_base + enchant_per_level * 2.0;
+
+        let is_rare_drop = |item: &str| -> bool {
+            matches!(
+                item,
+                "minecraft:iron_ingot"
+                    | "minecraft:carrot"
+                    | "minecraft:potato"
+                    | "minecraft:baked_potato"
+            )
+        };
+
+        // Never drops when not killed by a player (even with Looting III attached).
+        let mut looting3 = BTreeMap::new();
+        looting3.insert("minecraft:looting".to_owned(), 3);
+        let non_player = LootContext::for_entity("minecraft:zombie")
+            .with_killed_by_player(false)
+            .with_attacker_weapon(ToolContext {
+                item: "minecraft:diamond_sword".to_owned(),
+                enchantments: looting3.clone(),
+            });
+        let seeds = 20_000_u64;
+        for seed in 0..seeds {
+            let drops = zombie.roll(&non_player, &mut RandomSource::from_world_seed(seed));
+            assert!(
+                drops.iter().all(|s| !is_rare_drop(s.item())),
+                "non-player zombie kill must never yield rare drop on seed {seed}: {drops:?}"
+            );
+        }
+
+        // Player kill without looting matches unenchanted_chance (0.025 +/- 0.01 over 20,000 seeds).
+        let player_ctx = LootContext::for_entity("minecraft:zombie").with_killed_by_player(true);
+        let mut rare_hits = 0_u32;
+        for seed in 0..seeds {
+            let drops = zombie.roll(&player_ctx, &mut RandomSource::from_world_seed(seed));
+            if drops.iter().any(|s| is_rare_drop(s.item())) {
+                rare_hits += 1;
+            }
+        }
+        let observed_rate = f64::from(rare_hits) / seeds as f64;
+        assert!(
+            (observed_rate - unenchanted_rate).abs() <= 0.01,
+            "expected zombie rare drop rate {unenchanted_rate} +/- 0.01, got {observed_rate}"
+        );
+
+        // Player kill with Looting III matches 0.055 +/- 0.01 over 20,000 seeds,
+        // and burning zombies smelt potato rare drops to `minecraft:baked_potato`.
+        let loot3_burning = LootContext::default()
+            .with_entity(EntityContext::new("minecraft:zombie").with_on_fire(true))
+            .with_killed_by_player(true)
+            .with_attacker_weapon(ToolContext {
+                item: "minecraft:diamond_sword".to_owned(),
+                enchantments: looting3,
+            });
+        let mut loot3_hits = 0_u32;
+        let mut baked_potato_hits = 0_u32;
+        for seed in 0..seeds {
+            let drops = zombie.roll(&loot3_burning, &mut RandomSource::from_world_seed(seed));
+            assert_eq!(
+                count_item_drops(&drops, "minecraft:potato"),
+                0,
+                "burning zombie must drop baked_potato instead of raw potato"
+            );
+            if drops.iter().any(|s| s.item() == "minecraft:baked_potato") {
+                baked_potato_hits += 1;
+            }
+            if drops.iter().any(|s| is_rare_drop(s.item())) {
+                loot3_hits += 1;
+            }
+        }
+        let observed_loot3 = f64::from(loot3_hits) / seeds as f64;
+        assert!(
+            (observed_loot3 - expected_loot3_rate).abs() <= 0.01,
+            "expected zombie Looting III rare drop rate {expected_loot3_rate} +/- 0.01, got {observed_loot3}"
+        );
+        assert!(
+            baked_potato_hits > 0,
+            "expected at least one smelted baked_potato rare drop"
+        );
+    }
+
+    /// Roll every vanilla entity loot table once with an empty context and fixed seed
+    /// without error or panic, and report how many return nothing.
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_all_entity_tables_roll_without_panic_in_empty_context`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_all_entity_tables_roll_without_panic_in_empty_context() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_entities(&root).expect("load vanilla entity loot tables");
+        // 93 top-level entity files + 16 `sheep/<color>.json` sub-tables = 109 files.
+        assert_eq!(tables.len(), 109);
+        let item_defaults = tables
+            .item_defaults()
+            .expect("vanilla data root includes ItemDefaults reports");
+
+        let empty_ctx = LootContext::default();
+        let mut rng = RandomSource::from_world_seed(202_603);
+        let mut returned_nothing = 0_usize;
+        let mut top_level_total = 0_usize;
+        let mut top_level_nothing = 0_usize;
+        for (id, table) in tables.iter() {
+            let outcome = table.roll_with_notes(&empty_ctx, &mut rng);
+            for stack in &outcome.items {
+                let expected_max = u16::from(
+                    item_defaults
+                        .max_stack_size(stack.item())
+                        .expect("every vanilla entity drop exists in ItemDefaults"),
+                );
+                assert_eq!(stack.max_stack(), expected_max);
+            }
+            let is_top_level = !id.starts_with("minecraft:entities/sheep/");
+            if is_top_level {
+                top_level_total += 1;
+            }
+            if outcome.items.is_empty() {
+                returned_nothing += 1;
+                if is_top_level {
+                    top_level_nothing += 1;
+                }
+            }
+        }
+        println!(
+            "rolled {} vanilla entity tables in empty context ({} top-level + {} sheep color sub-tables); {} returned nothing ({} of {} top-level)",
+            tables.len(),
+            top_level_total,
+            tables.len() - top_level_total,
+            returned_nothing,
+            top_level_nothing,
+            top_level_total
+        );
+    }
 }
