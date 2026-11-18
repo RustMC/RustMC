@@ -61,6 +61,15 @@ pub use fluid::{
     BlockPos, FluidSimulator, FluidState, FluidType, FluidWorldView, compute_fluid_spread,
 };
 
+pub mod events;
+pub use events::{
+    AcknowledgeBlockChangePacket, BlockBreakEvent, BlockBreakOutcome, BlockPlaceEvent,
+    BlockPlaceOutcome, BlockPlaceRequest, BlockUpdatePacket, BreakRollback, Cancellable,
+    ContainerSetSlotPacket, DispatchError, Event, EventBus, EventPriority, InteractAction,
+    InteractionHand, PlaceRollback, PlayerInteractEvent, UnresolvedItemId, apply_block_break,
+    apply_block_place, rollback_break, rollback_break_explicit, rollback_break_with_ack,
+    rollback_place, rollback_place_explicit, rollback_place_with_ack,
+};
 pub mod anvil;
 pub mod brewing;
 pub mod container_data;
