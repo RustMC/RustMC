@@ -242,7 +242,7 @@ const MAX_BATCH_BYTES: usize = 768 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Default block state of each preview block in the official 26.3 block
 /// report, in `Block` discriminant order (checked by a unit test).
-pub(crate) const BLOCK_STATES: [(Block, u32); 24] = [
+pub(crate) const BLOCK_STATES: [(Block, u32); 25] = [
     (Block::Air, 0),                // minecraft:air
     (Block::Bedrock, 88),           // minecraft:bedrock
     (Block::Stone, 1),              // minecraft:stone
@@ -267,6 +267,7 @@ pub(crate) const BLOCK_STATES: [(Block, u32); 24] = [
     (Block::Carpet, 14743),         // minecraft:white_carpet
     (Block::TallGrassLower, 14771), // minecraft:tall_grass[half=lower]
     (Block::TallGrassUpper, 14770), // minecraft:tall_grass[half=upper]
+    (Block::Obsidian, 4925),        // minecraft:obsidian
 ];
 
 fn block_state(index: u16) -> u32 {
@@ -1478,5 +1479,10 @@ mod tests {
         ] {
             assert_eq!(block_state(block as u16), state, "{block:?}");
         }
+    }
+
+    #[test]
+    fn obsidian_block_state_id_matches_26_3_default() {
+        assert_eq!(block_state(Block::Obsidian as u16), 4925);
     }
 }
