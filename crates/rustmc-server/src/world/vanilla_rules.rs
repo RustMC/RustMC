@@ -387,7 +387,7 @@ mod tests {
         );
         root.write(
             "data/testns/recipe/skipped_special.json",
-            r#"{"type": "minecraft:crafting_transmute", "input": "minecraft:widget", "material": "minecraft:widget", "result": {"id": "minecraft:widget"}}"#,
+            r#"{"type": "minecraft:crafting_decorated_pot"}"#,
         );
 
         let rules = VanillaRules::load(root.path()).expect("all recipe kinds load");
@@ -514,7 +514,8 @@ mod tests {
                     smithing_transform: 12,
                     smithing_trim: 18,
                     brewing: 279,
-                    skipped: 81,
+                    // 81 previously skipped minus 33 loaded `minecraft:crafting_transmute` files = 48.
+                    skipped: 48,
                 },
                 loot_tables: 1201,
                 enchantments: 43,

@@ -91,6 +91,7 @@ pub use furnace::{
 };
 pub use recipe_data::{
     CookingKind, CookingRecipe, RecipeData, RecipeDataError, SkipReason, StonecuttingRecipe,
+    TransmuteRecipe,
 };
 pub use vanilla_rules::{
     CookingSummary, RecipeSummary, TagSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,

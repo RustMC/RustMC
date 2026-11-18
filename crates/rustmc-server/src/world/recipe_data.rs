@@ -324,6 +324,129 @@ pub enum SmithingResult {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransmuteResult {
+    /// `result.id` is specified in the recipe file (for example bundle and shulker box dyeing).
+    Fixed(ItemStack),
+    /// `result.id` is omitted (`"result": {}`, as in `minecraft:map_cloning`), so the
+    /// output stack preserves the matched `input` item's identifier.
+    KeepInput(BTreeMap<String, ItemStack>),
+}
+
+/// A parsed `minecraft:crafting_transmute` recipe.
+///
+/// Sources:
+/// - minecraft.wiki `Recipe (Java Edition)` (revision 3873625, `crafting_transmute`):
+///   - "When matched, output copies the input item stack, changing the item type or, optionally, the original stack components."
+///   - "`input`: Ingredient for item to copy. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+///   - "`material`: Additional ingredient to use. Can be one of an string ID, a string tag with `#`, or an list array containing IDs."
+///   - "`material_count`: Optional. The allowed amount of slots containing the item matched by the `material` ingredient. ... Defaults to `1`."
+///   - "`result`: The output item of the recipe, keeping the components of the `input` ingredient."
+///   - "`count`: Optional. The amount of the item. Defaults to `1`."
+/// - minecraft.wiki `Shulker Box` (revision 3863460):
+///   - "`Any Shulker Box + Matching Dye -> Matching Shulker Box`: When you dye the shulker box, it retains its contents. If it is renamed on an anvil, it also retains its contents."
+/// - minecraft.wiki `Bundle` (revision 3853242):
+///   - "`Any Bundle + Matching Dye` (`shapeless = 1`) -> `Matching Dyed Bundle`".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransmuteRecipe {
+    id: String,
+    input: Ingredient,
+    material: Ingredient,
+    result: TransmuteResult,
+    count: u16,
+    group: Option<String>,
+    category: Option<String>,
+    show_notification: Option<bool>,
+}
+
+impl TransmuteRecipe {
+    /// Namespaced recipe identifier (`<namespace>:<path without .json>`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Resolved `input` ingredient supplying the components copied to the output.
+    #[must_use]
+    pub fn input(&self) -> &Ingredient {
+        &self.input
+    }
+
+    /// Resolved `material` ingredient consumed alongside `input`.
+    #[must_use]
+    pub fn material(&self) -> &Ingredient {
+        &self.material
+    }
+
+    /// Base result item stack when `result.id` is explicitly defined in the recipe JSON.
+    #[must_use]
+    pub fn result(&self) -> Option<&ItemStack> {
+        match &self.result {
+            TransmuteResult::Fixed(stack) => Some(stack),
+            TransmuteResult::KeepInput(_) => None,
+        }
+    }
+
+    /// Output stack count specified by `result.count` (defaulting to `1`).
+    #[must_use]
+    pub fn count(&self) -> u16 {
+        self.count
+    }
+
+    /// Optional recipe-book group name.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// Optional recipe-book category name.
+    #[must_use]
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
+
+    /// Optional `show_notification` flag from the recipe data.
+    #[must_use]
+    pub fn show_notification(&self) -> Option<bool> {
+        self.show_notification
+    }
+
+    /// Returns `true` if `grid` contains one `input` item and one `material` item
+    /// in any two non-empty positions.
+    #[must_use]
+    pub fn matches(&self, grid: &CraftingGrid) -> bool {
+        self.evaluate(grid).is_some()
+    }
+
+    /// Evaluates `grid` against this transmute recipe.
+    ///
+    /// Matches a crafting grid with one `input` item and one `material` item in
+    /// any positions, returning the result stack (`result.id` with count from
+    /// `result.count`, default `1`) with the matched `input` stack's
+    /// [`crate::item::ItemComponents`] copied onto it.
+    #[must_use]
+    pub fn evaluate(&self, grid: &CraftingGrid) -> Option<ItemStack> {
+        let non_empty = grid.non_empty_items();
+        let [first, second] = non_empty.as_slice() else {
+            return None;
+        };
+        let input_stack = if self.input.matches(first) && self.material.matches(second) {
+            *first
+        } else if self.input.matches(second) && self.material.matches(first) {
+            *second
+        } else {
+            return None;
+        };
+        let base = match &self.result {
+            TransmuteResult::Fixed(stack) => stack.clone(),
+            TransmuteResult::KeepInput(by_input) => {
+                by_input.get(normalize_item_id(input_stack.item()))?.clone()
+            }
+        };
+        base.with_components(input_stack.components().clone()).ok()
+    }
+}
+
 /// Reason a recipe file was skipped instead of loaded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SkipReason {
@@ -408,6 +531,7 @@ impl From<WorldgenError> for RecipeDataError {
 pub struct RecipeData {
     cooking: BTreeMap<CookingKind, Vec<CookingRecipe>>,
     crafting: Vec<Recipe>,
+    transmute: Vec<TransmuteRecipe>,
     stonecutting: Vec<StonecuttingRecipe>,
     brewing: Vec<BrewingRecipe>,
     brewing_by_reagent: HashMap<String, Vec<usize>>,
@@ -521,6 +645,11 @@ impl RecipeData {
                             data.crafting.push(Recipe::Shapeless(recipe))
                         }
                     }
+                } else if recipe_type == "minecraft:crafting_transmute" {
+                    match parse_transmute_recipe(&id, obj, tags, items, &entry)? {
+                        ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
+                        ParsedOrSkipped::Loaded(recipe) => data.transmute.push(recipe),
+                    }
                 } else if recipe_type == "minecraft:stonecutting" {
                     match parse_stonecutting_recipe(&id, obj, tags, items, &entry)? {
                         ParsedOrSkipped::Skipped(reason) => data.skipped.push((id, reason)),
@@ -580,6 +709,7 @@ impl RecipeData {
         }
 
         data.crafting.sort_by(|a, b| a.id().cmp(&b.id()));
+        data.transmute.sort_by(|a, b| a.id().cmp(b.id()));
         data.stonecutting.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_transform.sort_by(|a, b| a.id().cmp(b.id()));
         data.smithing_trim.sort_by(|a, b| a.id().cmp(b.id()));
@@ -622,6 +752,18 @@ impl RecipeData {
             Recipe::Shapeless(shapeless) => Some(shapeless),
             Recipe::Shaped(_) => None,
         })
+    }
+
+    /// Loaded `minecraft:crafting_transmute` recipes, sorted by recipe id.
+    #[must_use]
+    pub fn transmute(&self) -> &[TransmuteRecipe] {
+        &self.transmute
+    }
+
+    /// Finds a loaded `minecraft:crafting_transmute` recipe by its namespaced id.
+    #[must_use]
+    pub fn get_transmute_by_id(&self, id: &str) -> Option<&TransmuteRecipe> {
+        self.transmute.iter().find(|recipe| recipe.id() == id)
     }
 
     /// Loaded `minecraft:stonecutting` recipes.
@@ -730,18 +872,26 @@ impl RecipeData {
     /// Finds a loaded crafting recipe matching `grid`, returning `(recipe_id, result)`.
     ///
     /// Uses `world::crafting` matching (shaped recipes match at any offset and
-    /// horizontally mirrored; shapeless recipes match in any order). If more
-    /// than one recipe matches, returns the one with the lexicographically
-    /// smallest recipe id. This is RustMC's deterministic tie-break, not a
-    /// claim about vanilla Java Edition.
+    /// horizontally mirrored; shapeless recipes match in any order; transmute
+    /// recipes match one `input` and one `material` in any positions and copy
+    /// the matched `input` stack's components onto the result). If more than
+    /// one recipe matches, returns the one with the lexicographically smallest
+    /// recipe id. This is RustMC's deterministic tie-break, not a claim about
+    /// vanilla Java Edition.
     #[must_use]
     pub fn find_crafting(&self, grid: &CraftingGrid) -> Option<(&str, ItemStack)> {
-        self.crafting
+        let regular = self
+            .crafting
             .iter()
             .filter(|recipe| recipe.matches(grid))
-            .filter_map(|recipe| recipe.id().map(|id| (id, recipe)))
+            .filter_map(|recipe| recipe.id().map(|id| (id, recipe.output().clone())));
+        let transmute = self
+            .transmute
+            .iter()
+            .filter_map(|recipe| recipe.evaluate(grid).map(|out| (recipe.id(), out)));
+        regular
+            .chain(transmute)
             .min_by(|(id_a, _), (id_b, _)| id_a.cmp(id_b))
-            .map(|(id, recipe)| (id, recipe.output().clone()))
     }
 
     /// Loaded `minecraft:smithing_transform` recipes, sorted by recipe id.
@@ -898,6 +1048,27 @@ fn build_result_stack(
         .map_err(|error| invalid(file, format!("invalid `result` stack: {error}")))
 }
 
+/// Default `result.count` when omitted in a recipe JSON object
+/// (minecraft.wiki `Recipe (Java Edition)` revision 3873625:
+/// "`count`: Optional. The amount of the item. Defaults to `1`.").
+const DEFAULT_RESULT_COUNT: u16 = 1;
+
+fn parse_result_count(
+    result_obj: &serde_json::Map<String, Value>,
+    file: &Path,
+) -> Result<u16, RecipeDataError> {
+    match result_obj.get("count") {
+        None => Ok(DEFAULT_RESULT_COUNT),
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| invalid(file, "`result.count` must be a positive integer"))?;
+            u16::try_from(raw)
+                .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))
+        }
+    }
+}
+
 fn parse_result(
     obj: &serde_json::Map<String, Value>,
     items: Option<&ItemDefaults>,
@@ -916,16 +1087,7 @@ fn parse_result(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(file, "missing or non-string `result.id`"))?;
-    let count = match result_obj.get("count") {
-        None => 1,
-        Some(value) => {
-            let raw = value
-                .as_u64()
-                .ok_or_else(|| invalid(file, "`result.count` must be a positive integer"))?;
-            u16::try_from(raw)
-                .map_err(|_| invalid(file, format!("`result.count` {raw} out of range")))?
-        }
-    };
+    let count = parse_result_count(result_obj, file)?;
     let stack = build_result_stack(id, count, items, file)?;
     Ok(ParsedOrSkipped::Loaded(stack))
 }
@@ -1135,6 +1297,75 @@ fn parse_shapeless_recipe(
         recipe = recipe.with_category(category);
     }
     Ok(ParsedOrSkipped::Loaded(recipe))
+}
+
+fn parse_transmute_recipe(
+    id: &str,
+    obj: &serde_json::Map<String, Value>,
+    tags: &ItemTags,
+    items: Option<&ItemDefaults>,
+    file: &Path,
+) -> Result<ParsedOrSkipped<TransmuteRecipe>, RecipeDataError> {
+    reject_unknown_keys(
+        obj,
+        &[
+            "type",
+            "input",
+            "material",
+            "material_count",
+            "add_material_count_to_result",
+            "result",
+            "group",
+            "category",
+            "show_notification",
+        ],
+        "crafting_transmute recipe",
+        file,
+    )?;
+    let input = parse_required_ingredient(obj, "input", tags, file)?;
+    let material = parse_required_ingredient(obj, "material", tags, file)?;
+    let group = parse_optional_string(obj, "group", file)?;
+    let category = parse_optional_string(obj, "category", file)?;
+    let show_notification = parse_optional_bool(obj, "show_notification", file)?;
+    parse_optional_bool(obj, "add_material_count_to_result", file)?;
+
+    let result_val = obj
+        .get("result")
+        .ok_or_else(|| invalid(file, "missing `result` field"))?;
+    let result_obj = result_val
+        .as_object()
+        .ok_or_else(|| invalid(file, "`result` must be a JSON object"))?;
+    if result_obj.contains_key("components") {
+        return Ok(ParsedOrSkipped::Skipped(SkipReason::ResultHasComponents));
+    }
+    let count = parse_result_count(result_obj, file)?;
+    let result = match result_obj.get("id") {
+        Some(id_val) => {
+            let result_id = id_val
+                .as_str()
+                .ok_or_else(|| invalid(file, "missing or non-string `result.id`"))?;
+            TransmuteResult::Fixed(build_result_stack(result_id, count, items, file)?)
+        }
+        None => {
+            let mut by_input = BTreeMap::new();
+            for allowed in input.allowed_items() {
+                let stack = build_result_stack(allowed, count, items, file)?;
+                by_input.insert(normalize_item_id(allowed).to_owned(), stack);
+            }
+            TransmuteResult::KeepInput(by_input)
+        }
+    };
+
+    Ok(ParsedOrSkipped::Loaded(TransmuteRecipe {
+        id: id.to_owned(),
+        input,
+        material,
+        result,
+        count,
+        group,
+        category,
+        show_notification,
+    }))
 }
 
 fn parse_stonecutting_recipe(
@@ -1656,8 +1887,8 @@ mod tests {
     fn skips_unsupported_types_and_component_results() {
         let root = scratch_root("skipped");
         write(
-            &root.join("data/testns/recipe/transmute.json"),
-            r#"{"type": "minecraft:crafting_transmute"}"#,
+            &root.join("data/testns/recipe/pot.json"),
+            r#"{"type": "minecraft:crafting_decorated_pot"}"#,
         );
         write(
             &root.join("data/testns/recipe/stew.json"),
@@ -1678,11 +1909,11 @@ mod tests {
         assert_eq!(
             data.skipped(),
             &[
-                ("testns:stew".to_owned(), SkipReason::ResultHasComponents),
                 (
-                    "testns:transmute".to_owned(),
-                    SkipReason::UnsupportedType("minecraft:crafting_transmute".to_owned())
+                    "testns:pot".to_owned(),
+                    SkipReason::UnsupportedType("minecraft:crafting_decorated_pot".to_owned())
                 ),
+                ("testns:stew".to_owned(), SkipReason::ResultHasComponents),
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
@@ -2893,5 +3124,205 @@ mod tests {
         );
 
         assert!(data.stonecutting_results("minecraft:dirt").is_empty());
+    }
+
+    #[test]
+    fn transmute_preserves_input_components_rejects_extra_items_and_tie_breaks_by_id() {
+        use crate::item::ItemComponents;
+
+        let root = scratch_root("transmute");
+        write(
+            &root.join("data/testns/tags/item/pouches.json"),
+            r#"{"values": ["testns:pouch", "testns:white_pouch"]}"#,
+        );
+        write(
+            &root.join("data/testns/recipe/dye_blue_pouch.json"),
+            r##"{
+                "type": "minecraft:crafting_transmute",
+                "input": "#testns:pouches",
+                "material": "testns:blue_dye",
+                "result": {"id": "testns:blue_pouch", "count": 2},
+                "group": "pouch_dye",
+                "category": "equipment"
+            }"##,
+        );
+        write(
+            &root.join("data/testns/recipe/a_tie_transmute.json"),
+            r#"{
+                "type": "minecraft:crafting_transmute",
+                "input": "testns:pouch",
+                "material": "testns:gold_dye",
+                "result": {"id": "testns:gold_pouch"}
+            }"#,
+        );
+        write(
+            &root.join("data/testns/recipe/b_tie_shapeless.json"),
+            r#"{
+                "type": "minecraft:crafting_shapeless",
+                "ingredients": ["testns:pouch", "testns:gold_dye"],
+                "result": {"id": "testns:shapeless_pouch"}
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+        assert_eq!(data.transmute().len(), 2);
+        assert!(data.skipped().is_empty());
+
+        let blue_recipe = data
+            .get_transmute_by_id("testns:dye_blue_pouch")
+            .expect("dye_blue_pouch recipe");
+        assert_eq!(blue_recipe.group(), Some("pouch_dye"));
+        assert_eq!(blue_recipe.category(), Some("equipment"));
+        assert_eq!(blue_recipe.count(), 2);
+
+        let input_comps = ItemComponents::new()
+            .with_custom_name("Adventurer Pouch")
+            .with_enchantment("minecraft:unbreaking", 3)
+            .expect("valid enchantment")
+            .with_enchantment("minecraft:mending", 1)
+            .expect("valid enchantment");
+        let named_enchanted_pouch = ItemStack::try_new("testns:white_pouch", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(input_comps.clone())
+            .unwrap();
+        let blue_dye = ItemStack::try_new("testns:blue_dye", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Ignored Dye Name"))
+            .unwrap();
+
+        // Any two positions in the 3x3 grid (material before input or input before material).
+        let mut grid = CraftingGrid::table_3x3();
+        grid.set_slot(2, 0, blue_dye.clone()).unwrap();
+        grid.set_slot(0, 2, named_enchanted_pouch.clone()).unwrap();
+        let (recipe_id, result) = data.find_crafting(&grid).expect("transmute match");
+        assert_eq!(recipe_id, "testns:dye_blue_pouch");
+        assert_eq!(result.item(), "testns:blue_pouch");
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.components(), &input_comps);
+        assert_eq!(result.components().custom_name(), Some("Adventurer Pouch"));
+        assert_eq!(
+            result
+                .components()
+                .enchantments()
+                .get("minecraft:unbreaking"),
+            Some(&3)
+        );
+        assert_eq!(
+            result.components().enchantments().get("minecraft:mending"),
+            Some(&1)
+        );
+
+        // Extra item in the grid -> no match.
+        grid.set_slot(
+            1,
+            1,
+            ItemStack::try_new("testns:blue_dye", 1, DEFAULT_MAX_STACK).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data.find_crafting(&grid), None);
+
+        // Single item in the grid -> no match.
+        let mut single_grid = CraftingGrid::inventory_2x2();
+        single_grid
+            .set_slot(0, 0, named_enchanted_pouch.clone())
+            .unwrap();
+        assert_eq!(data.find_crafting(&single_grid), None);
+
+        // Tie-break between `testns:a_tie_transmute` and `testns:b_tie_shapeless` picks smallest id.
+        let mut tie_grid = CraftingGrid::inventory_2x2();
+        let plain_pouch = ItemStack::try_new("testns:pouch", 1, DEFAULT_MAX_STACK)
+            .unwrap()
+            .with_components(ItemComponents::new().with_custom_name("Gilded"))
+            .unwrap();
+        let gold_dye = ItemStack::try_new("testns:gold_dye", 1, DEFAULT_MAX_STACK).unwrap();
+        tie_grid.set_slot(0, 1, plain_pouch).unwrap();
+        tie_grid.set_slot(1, 0, gold_dye).unwrap();
+        let (tie_id, tie_result) = data.find_crafting(&tie_grid).expect("tie-break match");
+        assert_eq!(tie_id, "testns:a_tie_transmute");
+        assert_eq!(tie_result.item(), "testns:gold_pouch");
+        assert_eq!(tie_result.count(), 1);
+        assert_eq!(tie_result.components().custom_name(), Some("Gilded"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_transmute_recipes_load_and_preserve_components`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_transmute_recipes_load_and_preserve_components() {
+        use crate::item::ItemComponents;
+
+        // 16 bundle dye + 16 shulker box dye + 1 map_cloning = 33 `minecraft:crafting_transmute` files.
+        const VANILLA_TRANSMUTE_RECIPE_COUNT: usize = 33;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load vanilla item tags");
+        let items = ItemDefaults::load(&root).expect("load vanilla item defaults");
+        let data = RecipeData::load_with_items(&root, &tags, &items).expect("load recipes");
+
+        assert_eq!(data.transmute().len(), VANILLA_TRANSMUTE_RECIPE_COUNT);
+        assert!(
+            !data.skipped().iter().any(|(_, reason)| {
+                *reason == SkipReason::UnsupportedType("minecraft:crafting_transmute".to_owned())
+            }),
+            "no crafting_transmute recipes may remain in skipped()"
+        );
+
+        // 1. `minecraft:bundle` + `minecraft:black_dye` -> `minecraft:black_bundle`
+        let mut bundle_grid = CraftingGrid::table_3x3();
+        let bundle = ItemStack::try_new(
+            "minecraft:bundle",
+            1,
+            u16::from(items.max_stack_size("minecraft:bundle").unwrap()),
+        )
+        .unwrap();
+        let black_dye = ItemStack::try_new(
+            "minecraft:black_dye",
+            1,
+            u16::from(items.max_stack_size("minecraft:black_dye").unwrap()),
+        )
+        .unwrap();
+        bundle_grid.set_slot(0, 1, bundle).unwrap();
+        bundle_grid.set_slot(2, 2, black_dye).unwrap();
+        let (bundle_recipe_id, black_bundle) =
+            data.find_crafting(&bundle_grid).expect("dye bundle black");
+        assert_eq!(bundle_recipe_id, "minecraft:black_bundle");
+        assert_eq!(black_bundle.item(), "minecraft:black_bundle");
+        assert_eq!(black_bundle.count(), 1);
+        assert_eq!(black_bundle.max_stack(), 1);
+
+        // 2. Named `minecraft:shulker_box` + `minecraft:red_dye` -> `minecraft:red_shulker_box` keeping name
+        let mut shulker_grid = CraftingGrid::inventory_2x2();
+        let named_shulker = ItemStack::try_new(
+            "minecraft:shulker_box",
+            1,
+            u16::from(items.max_stack_size("minecraft:shulker_box").unwrap()),
+        )
+        .unwrap()
+        .with_components(ItemComponents::new().with_custom_name("Redstone Supplies"))
+        .unwrap();
+        let red_dye = ItemStack::try_new(
+            "minecraft:red_dye",
+            1,
+            u16::from(items.max_stack_size("minecraft:red_dye").unwrap()),
+        )
+        .unwrap();
+        shulker_grid.set_slot(1, 0, red_dye).unwrap();
+        shulker_grid.set_slot(0, 1, named_shulker).unwrap();
+        let (shulker_recipe_id, red_shulker) = data
+            .find_crafting(&shulker_grid)
+            .expect("dye shulker box red");
+        assert_eq!(shulker_recipe_id, "minecraft:red_shulker_box");
+        assert_eq!(red_shulker.item(), "minecraft:red_shulker_box");
+        assert_eq!(red_shulker.count(), 1);
+        assert_eq!(red_shulker.max_stack(), 1);
+        assert_eq!(
+            red_shulker.components().custom_name(),
+            Some("Redstone Supplies")
+        );
     }
 }
