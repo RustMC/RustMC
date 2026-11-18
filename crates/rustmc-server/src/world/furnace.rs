@@ -9,6 +9,7 @@
 //! from minecraft.wiki `Smelting` revision 3829803 and `Furnace` revision 3882524.
 
 use super::container_data::SetContainerDataPacket;
+use super::recipe_data::{CookingKind, RecipeData};
 use crate::item::{DEFAULT_MAX_STACK, ItemStack, ItemStackError};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -245,7 +246,7 @@ pub struct SmeltingRecipe {
 }
 
 impl SmeltingRecipe {
-    /// Creates a new smelting recipe, validating the one-item output stack.
+    /// Creates a new smelting recipe, validating a single-item output stack.
     pub fn new(
         input: impl Into<String>,
         output: impl Into<String>,
@@ -255,12 +256,23 @@ impl SmeltingRecipe {
         let output = output.into();
         let max_stack = default_max_stack(&output);
         let output = ItemStack::try_new(output, 1, max_stack)?;
-        Ok(Self {
+        Ok(Self::with_output(input, output, experience, cooking_time))
+    }
+
+    /// Creates a new smelting recipe with an explicit output stack (keeping counts above 1).
+    #[must_use]
+    pub fn with_output(
+        input: impl Into<String>,
+        output: ItemStack,
+        experience: f32,
+        cooking_time: u16,
+    ) -> Self {
+        Self {
             input: input.into(),
             output,
             experience,
             cooking_time,
-        })
+        }
     }
 
     /// Returns the input item identifier.
@@ -269,7 +281,7 @@ impl SmeltingRecipe {
         &self.input
     }
 
-    /// Returns the one-item output stack produced by this recipe.
+    /// Returns the output stack produced by this recipe.
     #[must_use]
     pub fn output(&self) -> &ItemStack {
         &self.output
@@ -307,6 +319,8 @@ impl SmeltingRecipeRegistry {
         self.register(recipe);
     }
 
+    /// Offline fallback registry used when no operator-provisioned data root is provisioned.
+    ///
     /// Constructs a new recipe registry pre-populated with standard vanilla smelting recipes:
     /// - Raw Iron / Iron Ore -> Iron Ingot (0.7 XP).
     /// - Raw Gold / Gold Ore -> Gold Ingot (1.0 XP).
@@ -376,6 +390,25 @@ impl SmeltingRecipeRegistry {
             registry.register_builtin(input, output, experience, DEFAULT_COOKING_TOTAL_TIME);
         }
 
+        registry
+    }
+
+    /// Builds a cooking recipe registry for `kind` from loaded [`RecipeData`].
+    #[must_use]
+    pub fn from_recipe_data(data: &RecipeData, kind: CookingKind) -> Self {
+        let mut registry = Self {
+            recipes: BTreeMap::new(),
+        };
+        for recipe in data.cooking(kind) {
+            for input in recipe.ingredient().allowed_items() {
+                registry.register(SmeltingRecipe::with_output(
+                    input,
+                    recipe.result().clone(),
+                    recipe.experience(),
+                    recipe.cooking_time(),
+                ));
+            }
+        }
         registry
     }
 
@@ -553,7 +586,10 @@ impl FurnaceBlockEntity {
             self.cooking_total_time = rec.cooking_time();
             let output_ready = match &self.output {
                 None => true,
-                Some(out) => out.can_stack_with(rec.output()) && out.count() < out.max_stack(),
+                Some(out) => {
+                    out.can_stack_with(rec.output())
+                        && out.count().saturating_add(rec.output().count()) <= out.max_stack()
+                }
             };
             output_ready.then_some(rec)
         } else {
@@ -588,10 +624,10 @@ impl FurnaceBlockEntity {
                     // Decrement 1 input from slot 0
                     consume_one(&mut self.input);
 
-                    // Increment output stack by 1 in slot 2
+                    // Increment output stack by recipe result count in slot 2
                     match &mut self.output {
                         Some(out) => {
-                            let overflow = out.add(1);
+                            let overflow = out.add(rec.output().count());
                             debug_assert_eq!(overflow, 0);
                         }
                         None => {
@@ -1222,5 +1258,149 @@ mod tests {
         assert_eq!(output.item(), "minecraft:cooked_beef");
         assert_eq!(output.count(), 2);
         assert!((furnace.stored_experience() - (MEAT_SMELT_XP * 2.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_smelting_registry_from_recipe_data_keeps_count_above_one_and_isolates_kinds() {
+        use crate::vanilla::feature::ItemTags;
+        use std::fs;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rustmc-furnace-recipes-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, text).expect("write");
+        };
+
+        write(
+            "data/testns/tags/item/ores.json",
+            r#"{"values": ["testns:ore_a", "testns:ore_b"]}"#,
+        );
+        write(
+            "data/testns/recipe/double_ingot.json",
+            r##"{
+                "type": "minecraft:smelting",
+                "ingredient": "#testns:ores",
+                "result": {"id": "testns:ingot", "count": 2},
+                "experience": 0.4,
+                "cookingtime": 5
+            }"##,
+        );
+        write(
+            "data/testns/recipe/smoke_only.json",
+            r#"{
+                "type": "minecraft:smoking",
+                "ingredient": "testns:raw_food",
+                "result": {"id": "testns:cooked_food"},
+                "experience": 0.25,
+                "cookingtime": 4
+            }"#,
+        );
+
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipe data");
+        let smelting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smelting);
+        let smoking = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smoking);
+        let blasting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Blasting);
+
+        assert!(smelting.find_recipe("testns:ore_a").is_some());
+        assert!(smelting.find_recipe("testns:ore_b").is_some());
+        assert!(smelting.find_recipe("testns:raw_food").is_none());
+        assert!(smoking.find_recipe("testns:raw_food").is_some());
+        assert!(blasting.find_recipe("testns:ore_a").is_none());
+        assert!(blasting.find_recipe("testns:raw_food").is_none());
+
+        let fuels = FuelRegistry::new();
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.input = Some(stack("testns:ore_a", 2));
+        furnace.fuel = Some(stack("minecraft:coal", 1));
+
+        for _ in 0..5 {
+            furnace.tick_with_registries(&fuels, &smelting);
+        }
+        assert_eq!(furnace.output.as_ref().expect("first cook").count(), 2);
+        assert!((furnace.stored_experience() - 0.4).abs() < 1e-6);
+
+        for _ in 0..5 {
+            furnace.tick_with_registries(&fuels, &smelting);
+        }
+        assert_eq!(furnace.output.as_ref().expect("second cook").count(), 4);
+        assert!((furnace.stored_experience() - 0.8).abs() < 1e-6);
+
+        // Output stack at 63 cannot fit a 2-item recipe result (63 + 2 > 64).
+        furnace.input = Some(stack("testns:ore_b", 1));
+        furnace.output = Some(stack("testns:ingot", 63));
+        furnace.tick_with_registries(&fuels, &smelting);
+        assert_eq!(furnace.cooking_progress, 0);
+        assert_eq!(furnace.output.as_ref().expect("blocked").count(), 63);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_furnace_registries_cook_vanilla_recipes`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_furnace_registries_cook_vanilla_recipes() {
+        use crate::vanilla::feature::ItemTags;
+        use crate::vanilla::worldgen::read_json;
+        use std::path::PathBuf;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = ItemTags::load(&root).expect("load item tags");
+        let data = RecipeData::load(&root, &tags).expect("load recipes");
+        let fuels = FuelRegistry::new();
+
+        let gold_json =
+            read_json(&root.join("data/minecraft/recipe/gold_ingot_from_smelting_raw_gold.json"))
+                .expect("read gold smelting json");
+        let gold_time = gold_json["cookingtime"].as_u64().expect("gold cookingtime") as u16;
+        let gold_xp = gold_json["experience"].as_f64().expect("gold xp") as f32;
+        let gold_out = gold_json["result"]["id"].as_str().expect("gold result id");
+
+        let smelting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smelting);
+        let mut furnace = FurnaceBlockEntity::new();
+        furnace.input = Some(stack("minecraft:raw_gold", 1));
+        furnace.fuel = Some(stack("minecraft:coal", 1));
+        for _ in 0..(gold_time - 1) {
+            furnace.tick_with_registries(&fuels, &smelting);
+            assert!(furnace.output.is_none());
+        }
+        furnace.tick_with_registries(&fuels, &smelting);
+        let out = furnace.output.as_ref().expect("smelted gold");
+        assert_eq!(out.item(), gold_out);
+        assert_eq!(out.count(), 1);
+        assert!((furnace.stored_experience() - gold_xp).abs() < 1e-6);
+
+        let beef_json =
+            read_json(&root.join("data/minecraft/recipe/cooked_beef_from_smoking.json"))
+                .expect("read beef smoking json");
+        let beef_time = beef_json["cookingtime"].as_u64().expect("beef cookingtime") as u16;
+        let beef_xp = beef_json["experience"].as_f64().expect("beef xp") as f32;
+        let beef_out = beef_json["result"]["id"].as_str().expect("beef result id");
+
+        let smoking = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Smoking);
+        let mut smoker = FurnaceBlockEntity::new();
+        smoker.input = Some(stack("minecraft:beef", 1));
+        smoker.fuel = Some(stack("minecraft:coal", 1));
+        for _ in 0..(beef_time - 1) {
+            smoker.tick_with_registries(&fuels, &smoking);
+            assert!(smoker.output.is_none());
+        }
+        smoker.tick_with_registries(&fuels, &smoking);
+        let beef_stack = smoker.output.as_ref().expect("smoked beef");
+        assert_eq!(beef_stack.item(), beef_out);
+        assert_eq!(beef_stack.count(), 1);
+        assert!((smoker.stored_experience() - beef_xp).abs() < 1e-6);
+
+        let blasting = SmeltingRecipeRegistry::from_recipe_data(&data, CookingKind::Blasting);
+        assert!(blasting.find_recipe("minecraft:beef").is_none());
     }
 }
