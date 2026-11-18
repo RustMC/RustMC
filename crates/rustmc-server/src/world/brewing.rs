@@ -14,7 +14,8 @@
 use super::container_data::SetContainerDataPacket;
 use super::recipe_data::RecipeData;
 use crate::item::{
-    DEFAULT_MAX_STACK, ItemStack, ItemStackError, default_max_stack, items_equal, normalize_item_id,
+    DEFAULT_MAX_STACK, ItemStack, ItemStackError, StaticItemId, StaticStackSpec, default_max_stack,
+    items_equal, normalize_item_id,
 };
 use std::fmt;
 
@@ -106,6 +107,43 @@ pub fn is_potion_container_item(item: &str) -> bool {
         normalize_item_id(item),
         "potion" | "splash_potion" | "lingering_potion"
     )
+}
+
+const fn is_vanilla_potion_type(potion_type: &str) -> bool {
+    let bytes = potion_type.as_bytes();
+    let mut i = 0;
+    while i < VANILLA_POTION_TYPES.len() {
+        let candidate = VANILLA_POTION_TYPES[i].as_bytes();
+        if bytes.len() == candidate.len() {
+            let mut j = 0;
+            let mut eq = true;
+            while j < bytes.len() {
+                if bytes[j] != candidate[j] {
+                    eq = false;
+                    break;
+                }
+                j += 1;
+            }
+            if eq {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct StaticPotionType(&'static str);
+
+impl StaticPotionType {
+    const fn new(potion_type: &'static str) -> Self {
+        assert!(
+            is_vanilla_potion_type(potion_type),
+            "built-in potion type must be in VANILLA_POTION_TYPES"
+        );
+        Self(potion_type)
+    }
 }
 
 /// Canonicalizes a potion type from the `minecraft:potion` registry if valid.
@@ -297,53 +335,75 @@ impl Potion {
         }
     }
 
+    const fn static_registry_id(&self) -> StaticItemId {
+        match (self.effect, self.tier, self.duration) {
+            (PotionEffect::Water, _, _) => const { StaticItemId::new("minecraft:water") },
+            (PotionEffect::Awkward, _, _) => const { StaticItemId::new("minecraft:awkward") },
+
+            (PotionEffect::Healing, PotionTier::Normal, _) => {
+                const { StaticItemId::new("minecraft:healing") }
+            }
+            (PotionEffect::Healing, PotionTier::Strong, _) => {
+                const { StaticItemId::new("minecraft:strong_healing") }
+            }
+
+            (PotionEffect::Harming, PotionTier::Normal, _) => {
+                const { StaticItemId::new("minecraft:harming") }
+            }
+            (PotionEffect::Harming, PotionTier::Strong, _) => {
+                const { StaticItemId::new("minecraft:strong_harming") }
+            }
+
+            (PotionEffect::Swiftness, PotionTier::Normal, PotionDuration::Normal) => {
+                const { StaticItemId::new("minecraft:swiftness") }
+            }
+            (PotionEffect::Swiftness, PotionTier::Normal, PotionDuration::Long) => {
+                const { StaticItemId::new("minecraft:long_swiftness") }
+            }
+            (PotionEffect::Swiftness, PotionTier::Strong, _) => {
+                const { StaticItemId::new("minecraft:strong_swiftness") }
+            }
+
+            (PotionEffect::Slowness, PotionTier::Normal, PotionDuration::Normal) => {
+                const { StaticItemId::new("minecraft:slowness") }
+            }
+            (PotionEffect::Slowness, PotionTier::Normal, PotionDuration::Long) => {
+                const { StaticItemId::new("minecraft:long_slowness") }
+            }
+            (PotionEffect::Slowness, PotionTier::Strong, _) => {
+                const { StaticItemId::new("minecraft:strong_slowness") }
+            }
+
+            (PotionEffect::Strength, PotionTier::Normal, PotionDuration::Normal) => {
+                const { StaticItemId::new("minecraft:strength") }
+            }
+            (PotionEffect::Strength, PotionTier::Normal, PotionDuration::Long) => {
+                const { StaticItemId::new("minecraft:long_strength") }
+            }
+            (PotionEffect::Strength, PotionTier::Strong, _) => {
+                const { StaticItemId::new("minecraft:strong_strength") }
+            }
+
+            (PotionEffect::FireResistance, _, PotionDuration::Normal) => {
+                const { StaticItemId::new("minecraft:fire_resistance") }
+            }
+            (PotionEffect::FireResistance, _, PotionDuration::Long) => {
+                const { StaticItemId::new("minecraft:long_fire_resistance") }
+            }
+
+            (PotionEffect::Weakness, _, PotionDuration::Normal) => {
+                const { StaticItemId::new("minecraft:weakness") }
+            }
+            (PotionEffect::Weakness, _, PotionDuration::Long) => {
+                const { StaticItemId::new("minecraft:long_weakness") }
+            }
+        }
+    }
+
     /// Returns the canonical `minecraft:potion` registry identifier.
     #[must_use]
     pub const fn registry_id(&self) -> &'static str {
-        match (self.effect, self.tier, self.duration) {
-            (PotionEffect::Water, _, _) => "minecraft:water",
-            (PotionEffect::Awkward, _, _) => "minecraft:awkward",
-
-            (PotionEffect::Healing, PotionTier::Normal, _) => "minecraft:healing",
-            (PotionEffect::Healing, PotionTier::Strong, _) => "minecraft:strong_healing",
-
-            (PotionEffect::Harming, PotionTier::Normal, _) => "minecraft:harming",
-            (PotionEffect::Harming, PotionTier::Strong, _) => "minecraft:strong_harming",
-
-            (PotionEffect::Swiftness, PotionTier::Normal, PotionDuration::Normal) => {
-                "minecraft:swiftness"
-            }
-            (PotionEffect::Swiftness, PotionTier::Normal, PotionDuration::Long) => {
-                "minecraft:long_swiftness"
-            }
-            (PotionEffect::Swiftness, PotionTier::Strong, _) => "minecraft:strong_swiftness",
-
-            (PotionEffect::Slowness, PotionTier::Normal, PotionDuration::Normal) => {
-                "minecraft:slowness"
-            }
-            (PotionEffect::Slowness, PotionTier::Normal, PotionDuration::Long) => {
-                "minecraft:long_slowness"
-            }
-            (PotionEffect::Slowness, PotionTier::Strong, _) => "minecraft:strong_slowness",
-
-            (PotionEffect::Strength, PotionTier::Normal, PotionDuration::Normal) => {
-                "minecraft:strength"
-            }
-            (PotionEffect::Strength, PotionTier::Normal, PotionDuration::Long) => {
-                "minecraft:long_strength"
-            }
-            (PotionEffect::Strength, PotionTier::Strong, _) => "minecraft:strong_strength",
-
-            (PotionEffect::FireResistance, _, PotionDuration::Normal) => {
-                "minecraft:fire_resistance"
-            }
-            (PotionEffect::FireResistance, _, PotionDuration::Long) => {
-                "minecraft:long_fire_resistance"
-            }
-
-            (PotionEffect::Weakness, _, PotionDuration::Normal) => "minecraft:weakness",
-            (PotionEffect::Weakness, _, PotionDuration::Long) => "minecraft:long_weakness",
-        }
+        self.static_registry_id().as_str()
     }
 }
 
@@ -503,13 +563,13 @@ impl BrewingSlotItem {
     /// Helper constructor for a water bottle (`minecraft:potion` + `minecraft:water`).
     #[must_use]
     pub fn water_bottle() -> Self {
-        Self::potion("minecraft:water").expect("minecraft:water is in the 26.3 potion registry")
+        Self::from_potion(Potion::water())
     }
 
     /// Helper constructor for an awkward potion (`minecraft:potion` + `minecraft:awkward`).
     #[must_use]
     pub fn awkward_potion() -> Self {
-        Self::potion("minecraft:awkward").expect("minecraft:awkward is in the 26.3 potion registry")
+        Self::from_potion(Potion::awkward())
     }
 
     /// Helper constructor for blaze powder fuel (`minecraft:blaze_powder`).
@@ -520,7 +580,11 @@ impl BrewingSlotItem {
     /// Helper constructor from a structured [`Potion`].
     #[must_use]
     pub fn from_potion(potion: Potion) -> Self {
-        Self::potion(potion.registry_id()).expect("Potion variants map to 26.3 potion registry IDs")
+        let stack = ItemStack::from_static(
+            const { StaticStackSpec::new("minecraft:potion", 1, POTION_MAX_STACK) },
+        )
+        .with_static_potion(potion.static_registry_id());
+        Self { stack }
     }
 
     /// Returns the underlying shared [`ItemStack`].
@@ -741,120 +805,122 @@ impl BrewingRecipeRegistry {
             .is_some()
     }
 
-    fn register_builtin(&mut self, ingredient: &str, input_potion: &str, output_potion: &str) {
-        self.register_recipe(ingredient, input_potion, output_potion)
-            .expect("built-in brewing recipes use valid 26.3 item and potion registry IDs");
-    }
-
     /// Populates the supported Java Edition potion recipes from minecraft.wiki `Brewing` rev 3885554.
     fn register_defaults(&mut self) {
-        // Base potion recipes
-        self.register_builtin(
-            "minecraft:nether_wart",
-            "minecraft:water",
-            "minecraft:awkward",
-        );
-        self.register_builtin(
-            "minecraft:glistering_melon_slice",
-            "minecraft:awkward",
-            "minecraft:healing",
-        );
-        self.register_builtin(
-            "minecraft:sugar",
-            "minecraft:awkward",
-            "minecraft:swiftness",
-        );
-        self.register_builtin(
-            "minecraft:blaze_powder",
-            "minecraft:awkward",
-            "minecraft:strength",
-        );
-        self.register_builtin(
-            "minecraft:magma_cream",
-            "minecraft:awkward",
-            "minecraft:fire_resistance",
-        );
+        const BUILTINS: [(StaticItemId, StaticPotionType, StaticPotionType); 20] = [
+            // Base potion recipes
+            (
+                StaticItemId::new("minecraft:nether_wart"),
+                StaticPotionType::new("minecraft:water"),
+                StaticPotionType::new("minecraft:awkward"),
+            ),
+            (
+                StaticItemId::new("minecraft:glistering_melon_slice"),
+                StaticPotionType::new("minecraft:awkward"),
+                StaticPotionType::new("minecraft:healing"),
+            ),
+            (
+                StaticItemId::new("minecraft:sugar"),
+                StaticPotionType::new("minecraft:awkward"),
+                StaticPotionType::new("minecraft:swiftness"),
+            ),
+            (
+                StaticItemId::new("minecraft:blaze_powder"),
+                StaticPotionType::new("minecraft:awkward"),
+                StaticPotionType::new("minecraft:strength"),
+            ),
+            (
+                StaticItemId::new("minecraft:magma_cream"),
+                StaticPotionType::new("minecraft:awkward"),
+                StaticPotionType::new("minecraft:fire_resistance"),
+            ),
+            // Redstone duration modifier (extends duration)
+            (
+                StaticItemId::new("minecraft:redstone"),
+                StaticPotionType::new("minecraft:swiftness"),
+                StaticPotionType::new("minecraft:long_swiftness"),
+            ),
+            (
+                StaticItemId::new("minecraft:redstone"),
+                StaticPotionType::new("minecraft:strength"),
+                StaticPotionType::new("minecraft:long_strength"),
+            ),
+            (
+                StaticItemId::new("minecraft:redstone"),
+                StaticPotionType::new("minecraft:fire_resistance"),
+                StaticPotionType::new("minecraft:long_fire_resistance"),
+            ),
+            (
+                StaticItemId::new("minecraft:redstone"),
+                StaticPotionType::new("minecraft:slowness"),
+                StaticPotionType::new("minecraft:long_slowness"),
+            ),
+            (
+                StaticItemId::new("minecraft:redstone"),
+                StaticPotionType::new("minecraft:weakness"),
+                StaticPotionType::new("minecraft:long_weakness"),
+            ),
+            // Glowstone Dust potency modifier (tier II)
+            (
+                StaticItemId::new("minecraft:glowstone_dust"),
+                StaticPotionType::new("minecraft:healing"),
+                StaticPotionType::new("minecraft:strong_healing"),
+            ),
+            (
+                StaticItemId::new("minecraft:glowstone_dust"),
+                StaticPotionType::new("minecraft:swiftness"),
+                StaticPotionType::new("minecraft:strong_swiftness"),
+            ),
+            (
+                StaticItemId::new("minecraft:glowstone_dust"),
+                StaticPotionType::new("minecraft:strength"),
+                StaticPotionType::new("minecraft:strong_strength"),
+            ),
+            (
+                StaticItemId::new("minecraft:glowstone_dust"),
+                StaticPotionType::new("minecraft:harming"),
+                StaticPotionType::new("minecraft:strong_harming"),
+            ),
+            (
+                StaticItemId::new("minecraft:glowstone_dust"),
+                StaticPotionType::new("minecraft:slowness"),
+                StaticPotionType::new("minecraft:strong_slowness"),
+            ),
+            // Fermented Spider Eye effect inversion (Java Edition only)
+            (
+                StaticItemId::new("minecraft:fermented_spider_eye"),
+                StaticPotionType::new("minecraft:healing"),
+                StaticPotionType::new("minecraft:harming"),
+            ),
+            (
+                StaticItemId::new("minecraft:fermented_spider_eye"),
+                StaticPotionType::new("minecraft:strong_healing"),
+                StaticPotionType::new("minecraft:strong_harming"),
+            ),
+            (
+                StaticItemId::new("minecraft:fermented_spider_eye"),
+                StaticPotionType::new("minecraft:swiftness"),
+                StaticPotionType::new("minecraft:slowness"),
+            ),
+            (
+                StaticItemId::new("minecraft:fermented_spider_eye"),
+                StaticPotionType::new("minecraft:long_swiftness"),
+                StaticPotionType::new("minecraft:long_slowness"),
+            ),
+            (
+                StaticItemId::new("minecraft:fermented_spider_eye"),
+                StaticPotionType::new("minecraft:water"),
+                StaticPotionType::new("minecraft:weakness"),
+            ),
+        ];
 
-        // Redstone duration modifier (extends duration)
-        self.register_builtin(
-            "minecraft:redstone",
-            "minecraft:swiftness",
-            "minecraft:long_swiftness",
-        );
-        self.register_builtin(
-            "minecraft:redstone",
-            "minecraft:strength",
-            "minecraft:long_strength",
-        );
-        self.register_builtin(
-            "minecraft:redstone",
-            "minecraft:fire_resistance",
-            "minecraft:long_fire_resistance",
-        );
-        self.register_builtin(
-            "minecraft:redstone",
-            "minecraft:slowness",
-            "minecraft:long_slowness",
-        );
-        self.register_builtin(
-            "minecraft:redstone",
-            "minecraft:weakness",
-            "minecraft:long_weakness",
-        );
-
-        // Glowstone Dust potency modifier (tier II)
-        self.register_builtin(
-            "minecraft:glowstone_dust",
-            "minecraft:healing",
-            "minecraft:strong_healing",
-        );
-        self.register_builtin(
-            "minecraft:glowstone_dust",
-            "minecraft:swiftness",
-            "minecraft:strong_swiftness",
-        );
-        self.register_builtin(
-            "minecraft:glowstone_dust",
-            "minecraft:strength",
-            "minecraft:strong_strength",
-        );
-        self.register_builtin(
-            "minecraft:glowstone_dust",
-            "minecraft:harming",
-            "minecraft:strong_harming",
-        );
-        self.register_builtin(
-            "minecraft:glowstone_dust",
-            "minecraft:slowness",
-            "minecraft:strong_slowness",
-        );
-
-        // Fermented Spider Eye effect inversion (Java Edition only)
-        self.register_builtin(
-            "minecraft:fermented_spider_eye",
-            "minecraft:healing",
-            "minecraft:harming",
-        );
-        self.register_builtin(
-            "minecraft:fermented_spider_eye",
-            "minecraft:strong_healing",
-            "minecraft:strong_harming",
-        );
-        self.register_builtin(
-            "minecraft:fermented_spider_eye",
-            "minecraft:swiftness",
-            "minecraft:slowness",
-        );
-        self.register_builtin(
-            "minecraft:fermented_spider_eye",
-            "minecraft:long_swiftness",
-            "minecraft:long_slowness",
-        );
-        self.register_builtin(
-            "minecraft:fermented_spider_eye",
-            "minecraft:water",
-            "minecraft:weakness",
-        );
+        for (ingredient, input_potion, output_potion) in BUILTINS {
+            self.register(BrewingRecipe {
+                ingredient: ingredient.as_str().to_owned(),
+                input_potion: input_potion.0.to_owned(),
+                output_potion: output_potion.0.to_owned(),
+            });
+        }
     }
 }
 

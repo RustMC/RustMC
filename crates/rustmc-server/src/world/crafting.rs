@@ -4,7 +4,7 @@
 //! shaped and shapeless recipe matching (with horizontal symmetry mirroring), recipe
 //! registry query, and ingredient consumption with crafting residual preservation.
 
-use crate::item::{DEFAULT_MAX_STACK, ItemStack};
+use crate::item::{DEFAULT_MAX_STACK, ItemStack, StaticStackSpec};
 use std::fmt;
 
 /// Maximum allowable grid dimension (width or height) to prevent unbounded memory allocation.
@@ -12,6 +12,21 @@ pub const MAX_GRID_DIMENSION: usize = 16;
 
 /// Maximum allowable total slots in a recipe grid.
 pub const MAX_GRID_SLOTS: usize = MAX_GRID_DIMENSION * MAX_GRID_DIMENSION;
+
+fn crafting_remainder_spec(item: &str) -> Option<StaticStackSpec> {
+    match item {
+        "minecraft:milk_bucket"
+        | "minecraft:water_bucket"
+        | "minecraft:lava_bucket"
+        | "minecraft:powder_snow_bucket" => {
+            Some(const { StaticStackSpec::new("minecraft:bucket", 1, 16) })
+        }
+        "minecraft:honey_bottle" => {
+            Some(const { StaticStackSpec::new("minecraft:glass_bottle", 1, DEFAULT_MAX_STACK) })
+        }
+        _ => None,
+    }
+}
 
 /// Standard vanilla items and their documented crafting remainders.
 ///
@@ -21,28 +36,7 @@ pub const MAX_GRID_SLOTS: usize = MAX_GRID_DIMENSION * MAX_GRID_DIMENSION;
 /// - `honey_bottle` -> `minecraft:glass_bottle` (minecraft.wiki `Honey_Bottle` / `Sugar`).
 #[must_use]
 pub fn crafting_remainder(item: &str) -> Option<&'static str> {
-    match item {
-        "minecraft:milk_bucket"
-        | "minecraft:water_bucket"
-        | "minecraft:lava_bucket"
-        | "minecraft:powder_snow_bucket" => Some("minecraft:bucket"),
-        "minecraft:honey_bottle" => Some("minecraft:glass_bottle"),
-        _ => None,
-    }
-}
-
-/// Returns the standard Java Edition max stack size for crafting items and remainders.
-fn remainder_max_stack(item: &str) -> u16 {
-    match item {
-        // Unstackable buckets and bowls (minecraft.wiki `Bucket`).
-        "minecraft:milk_bucket"
-        | "minecraft:water_bucket"
-        | "minecraft:lava_bucket"
-        | "minecraft:powder_snow_bucket" => 1,
-        // 16-stackable containers and throwables (minecraft.wiki `Bucket`, `Honey_Bottle`, `Egg`).
-        "minecraft:bucket" | "minecraft:honey_bottle" | "minecraft:egg" => 16,
-        _ => DEFAULT_MAX_STACK,
-    }
+    crafting_remainder_spec(item).map(|spec| spec.id.as_str())
 }
 
 /// Errors that can occur during crafting grid manipulation or recipe definition.
@@ -228,13 +222,21 @@ impl CraftingGrid {
     /// Creates a 2x2 crafting grid for player inventory crafting.
     #[must_use]
     pub fn inventory_2x2() -> Self {
-        Self::new(2, 2).expect("2x2 dimensions are valid")
+        Self {
+            width: 2,
+            height: 2,
+            slots: vec![None; 4],
+        }
     }
 
     /// Creates a 3x3 crafting grid for crafting tables / workbenches.
     #[must_use]
     pub fn table_3x3() -> Self {
-        Self::new(3, 3).expect("3x3 dimensions are valid")
+        Self {
+            width: 3,
+            height: 3,
+            slots: vec![None; 9],
+        }
     }
 
     /// Grid width in columns.
@@ -398,13 +400,15 @@ impl CraftingGrid {
             let Some(stack) = slot.take() else {
                 continue;
             };
-            let (consumed, rest) = stack
-                .split(1)
-                .expect("splitting 1 from a non-empty ItemStack succeeds");
-            let remainder_stack = crafting_remainder(consumed.item()).map(|rem| {
-                ItemStack::try_new(rem, 1, remainder_max_stack(rem))
-                    .expect("documented crafting remainders are valid item IDs")
-            });
+            let (consumed, rest) = match stack.split(1) {
+                Ok(pair) => pair,
+                Err(unchanged) => {
+                    *slot = Some(unchanged);
+                    continue;
+                }
+            };
+            let remainder_stack =
+                crafting_remainder_spec(consumed.item()).map(ItemStack::from_static);
             match rest {
                 None => *slot = remainder_stack,
                 Some(remaining) => {
@@ -985,6 +989,19 @@ impl RecipeRegistry {
 mod tests {
     use super::*;
     use crate::item::ItemStackError;
+
+    fn remainder_max_stack(item: &str) -> u16 {
+        match item {
+            // Unstackable buckets and bowls (minecraft.wiki `Bucket`).
+            "minecraft:milk_bucket"
+            | "minecraft:water_bucket"
+            | "minecraft:lava_bucket"
+            | "minecraft:powder_snow_bucket" => 1,
+            // 16-stackable containers and throwables (minecraft.wiki `Bucket`, `Honey_Bottle`, `Egg`).
+            "minecraft:bucket" | "minecraft:honey_bottle" | "minecraft:egg" => 16,
+            _ => DEFAULT_MAX_STACK,
+        }
+    }
 
     fn stack(item: &str, count: u16) -> ItemStack {
         ItemStack::try_new(item, count, remainder_max_stack(item)).unwrap()
