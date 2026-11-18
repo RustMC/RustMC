@@ -77,7 +77,7 @@ pub struct ItemStack {
 }
 
 // Java Edition resource-location character rules.
-fn valid_item_id(id: &str) -> bool {
+pub(crate) fn valid_item_id(id: &str) -> bool {
     let Some((namespace, path)) = id.split_once(':') else {
         return false;
     };

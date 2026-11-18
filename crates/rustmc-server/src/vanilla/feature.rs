@@ -327,6 +327,49 @@ impl ItemTags {
     }
 }
 
+/// The enchantment tags of the provisioned pack, keyed by namespaced id.
+#[derive(Debug, Default, Clone)]
+pub struct EnchantmentTags {
+    entries: HashMap<String, Vec<String>>,
+}
+
+impl EnchantmentTags {
+    /// Loads `data/<namespace>/tags/enchantment/**/*.json` under the data root.
+    /// A missing directory yields an empty registry.
+    pub fn load(root: &Path) -> Result<Self, WorldgenError> {
+        Ok(Self {
+            entries: load_registry(root, "enchantment")?,
+        })
+    }
+
+    /// Loads `data/<namespace>/tags/enchantment/**/*.json` across ordered pack roots.
+    pub fn load_from_roots(roots: &[&Path]) -> Result<Self, WorldgenError> {
+        Ok(Self {
+            entries: load_registry_from_roots(roots, "enchantment")?,
+        })
+    }
+
+    /// Members of `tag`, or `None` if `tag` is absent from the pack.
+    pub fn members(&self, tag: &str) -> Option<&[String]> {
+        tag_members(&self.entries, tag)
+    }
+
+    /// Whether `enchantment` is a member of `tag`.
+    pub fn contains(&self, tag: &str, enchantment: &str) -> bool {
+        tag_contains(&self.entries, tag, enchantment)
+    }
+
+    /// Number of tags read from the pack.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the pack declared no enchantment tags at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// One entry of a `minecraft:weighted` block-state provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedState {
@@ -4898,6 +4941,64 @@ mod tests {
             4
         );
         assert!(tags.contains("minecraft:oak_logs", "minecraft:stripped_oak_wood"));
+    }
+
+    #[test]
+    fn enchantment_tags_resolve_nested_directories_and_replace() {
+        let base = scratch_root("ench-tags-base");
+        let overlay = scratch_root("ench-tags-overlay");
+
+        write(
+            &base.join("data/testns/tags/enchantment/exclusive_set/weapon.json"),
+            r#"{"values": ["testns:alpha", "testns:beta"]}"#,
+        );
+        write(
+            &base.join("data/testns/tags/enchantment/group.json"),
+            r##"{"values": ["#testns:exclusive_set/weapon", "testns:gamma"]}"##,
+        );
+        write(
+            &overlay.join("data/testns/tags/enchantment/group.json"),
+            r#"{"replace": true, "values": ["testns:delta"]}"#,
+        );
+
+        let base_tags = EnchantmentTags::load(&base).expect("base enchantment tags load");
+        assert!(base_tags.contains("testns:exclusive_set/weapon", "testns:alpha"));
+        assert!(base_tags.contains("testns:group", "testns:beta"));
+        assert!(base_tags.contains("testns:group", "testns:gamma"));
+        assert_eq!(base_tags.members("testns:absent"), None);
+
+        let merged =
+            EnchantmentTags::load_from_roots(&[&base, &overlay]).expect("layered tags load");
+        assert_eq!(
+            merged.members("testns:group"),
+            Some(&["testns:delta".to_string()][..])
+        );
+
+        let empty = scratch_root("ench-tags-empty");
+        let empty_tags =
+            EnchantmentTags::load(&empty).expect("pack without enchantment tags loads");
+        assert!(empty_tags.is_empty());
+
+        fs::remove_dir_all(base).expect("cleanup");
+        fs::remove_dir_all(overlay).expect("cleanup");
+        fs::remove_dir_all(empty).expect("cleanup");
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pack_enchantment_tags_pin_vanilla_counts`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_enchantment_tags_pin_vanilla_counts() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let tags = EnchantmentTags::load(&root).expect("the provisioned enchantment tags load");
+        assert!(tags.contains("minecraft:exclusive_set/damage", "minecraft:sharpness"));
+        assert!(tags.contains("minecraft:exclusive_set/damage", "minecraft:smite"));
+        assert!(tags.contains("minecraft:exclusive_set/bow", "minecraft:infinity"));
+        assert!(tags.contains("minecraft:exclusive_set/bow", "minecraft:mending"));
+        assert!(tags.contains("minecraft:double_trade_price", "minecraft:mending"));
+        assert!(!tags.contains("minecraft:double_trade_price", "minecraft:sharpness"));
     }
 
     /// A hand-built decorating pack: two ores and an unmodeled tree, placed
