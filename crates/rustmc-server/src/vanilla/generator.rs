@@ -476,6 +476,30 @@ impl VanillaGenerator {
         names
     }
 
+    /// The loaded feature registry for this dimension, or `None` when the
+    /// data root carries no worldgen feature documents.
+    pub fn features(&self) -> Option<&FeatureData> {
+        self.features.as_ref()
+    }
+
+    /// Distinct biomes present in the 4x4x4 quart-cell volume of the chunks
+    /// covering the inclusive block rectangle `[min_x..=max_x] x [min_z..=max_z]`,
+    /// sorted ascending and deduplicated.
+    pub fn biomes_in_square(&self, min_x: i32, max_x: i32, min_z: i32, max_z: i32) -> Vec<String> {
+        if min_x > max_x || min_z > max_z {
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        for chunk_z in (min_z >> 4)..=(max_z >> 4) {
+            for chunk_x in (min_x >> 4)..=(max_x >> 4) {
+                names.extend(self.chunk_biomes(chunk_x, chunk_z).iter().cloned());
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// The block id left at the column's highest non-air position by the
     /// dimension's surface rules. Fluid tops report the dimension fluid;
     /// a solid top that matches no rule keeps the filler default block
@@ -2815,5 +2839,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Requires the operator-provisioned 26.3 worldgen data. Lists the biomes
+    /// present in the measured `0..=31` square on seed 2026, prints the
+    /// `vegetal_decoration` step table (each placed feature, whether RustMC
+    /// runs it, and its first and remaining unsupported pieces), and pins the
+    /// set of unsupported pieces.
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_measured_square_vegetation_diagnosis_pins_unsupported_pieces() {
+        use crate::vanilla::feature::VEGETAL_DECORATION_STEP;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let generator =
+            VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("overworld generator");
+
+        let square_biomes = generator.biomes_in_square(0, 31, 0, 31);
+        assert_eq!(
+            square_biomes,
+            vec![
+                "minecraft:deep_dark".to_string(),
+                "minecraft:dripstone_caves".to_string(),
+                "minecraft:forest".to_string(),
+            ]
+        );
+
+        let features = generator.features().expect("overworld feature registry");
+        let rows = features.diagnose_step_for_biomes(VEGETAL_DECORATION_STEP, &square_biomes);
+        assert_eq!(rows.len(), 15);
+
+        println!("square 0..=31 biomes: {square_biomes:?}");
+        println!(
+            "{:<44} | {:<5} | {:<40} | all unsupported pieces",
+            "placed_feature", "runs", "first_unsupported"
+        );
+        let mut first_pieces = BTreeSet::new();
+        let mut all_pieces = BTreeSet::new();
+        for row in &rows {
+            let first = row.first_unsupported.as_deref().unwrap_or("-");
+            if let Some(piece) = &row.first_unsupported {
+                first_pieces.insert(piece.clone());
+            }
+            for piece in &row.unsupported_pieces {
+                all_pieces.insert(piece.clone());
+            }
+            println!(
+                "{:<44} | {:<5} | {:<40} | {}",
+                row.id,
+                row.modelable,
+                first,
+                row.unsupported_pieces.join(", ")
+            );
+        }
+
+        let expected_table: [(&str, bool, Option<&str>); 15] = [
+            (
+                "minecraft:glow_lichen",
+                false,
+                Some("minecraft:multiface_growth"),
+            ),
+            (
+                "minecraft:forest_flowers",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:trees_birch_and_oak_leaf_litter",
+                false,
+                Some("range:minecraft:weighted_list"),
+            ),
+            (
+                "minecraft:patch_tall_grass_2",
+                false,
+                Some("placement:minecraft:noise_threshold_count"),
+            ),
+            (
+                "minecraft:patch_bush",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:trees_plains",
+                false,
+                Some("range:minecraft:weighted_list"),
+            ),
+            (
+                "minecraft:flower_plains",
+                false,
+                Some("placement:minecraft:noise_threshold_count"),
+            ),
+            (
+                "minecraft:patch_grass_plain",
+                false,
+                Some("placement:minecraft:noise_threshold_count"),
+            ),
+            (
+                "minecraft:flower_default",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:patch_grass_forest",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:brown_mushroom_normal",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:red_mushroom_normal",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:patch_pumpkin",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:patch_sugar_cane",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+            (
+                "minecraft:patch_firefly_bush_near_water",
+                false,
+                Some("placement:minecraft:heightmap"),
+            ),
+        ];
+
+        for (row, (expected_id, expected_runs, expected_first)) in
+            rows.iter().zip(expected_table.iter())
+        {
+            assert_eq!(row.id, *expected_id);
+            assert_eq!(row.modelable, *expected_runs, "modelable for {}", row.id);
+            assert_eq!(
+                row.first_unsupported.as_deref(),
+                *expected_first,
+                "first unsupported piece for {}",
+                row.id
+            );
+        }
+
+        assert_eq!(
+            first_pieces,
+            BTreeSet::from([
+                "minecraft:multiface_growth".to_string(),
+                "placement:minecraft:heightmap".to_string(),
+                "placement:minecraft:noise_threshold_count".to_string(),
+                "range:minecraft:weighted_list".to_string(),
+            ])
+        );
+        assert_eq!(
+            all_pieces,
+            BTreeSet::from([
+                "minecraft:block_column".to_string(),
+                "minecraft:multiface_growth".to_string(),
+                "minecraft:random_selector".to_string(),
+                "placement:minecraft:heightmap".to_string(),
+                "placement:minecraft:noise_threshold_count".to_string(),
+                "placement:minecraft:offset".to_string(),
+                "placement:minecraft:surface_water_depth_filter".to_string(),
+                "predicate:minecraft:would_survive".to_string(),
+                "provider:minecraft:block_state_provider_reference".to_string(),
+                "range:minecraft:clamped".to_string(),
+                "range:minecraft:weighted_list".to_string(),
+                "state:minecraft:brown_mushroom".to_string(),
+                "state:minecraft:red_mushroom".to_string(),
+            ])
+        );
     }
 }

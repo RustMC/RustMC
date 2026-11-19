@@ -1091,6 +1091,58 @@ impl PlacedFeature {
                 _ => true,
             })
     }
+
+    /// Every unsupported piece of this placed feature in evaluation order:
+    /// placement modifiers first (in list order), then the configured feature,
+    /// its state providers, predicates, or child features, using the gap
+    /// report's prefixed naming (`placement:`, `range:`, `predicate:`,
+    /// `provider:`, `state:`, `target:`, or the configured feature type).
+    ///
+    /// Source: minecraft.wiki `Placed feature` (revision 3816343):
+    /// "Placed features are applied in order to determine where feature
+    /// placement attempt(s) should occur."
+    pub fn unmodeled_pieces(&self) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut seen = HashSet::new();
+        collect_unmodeled_placed_pieces(self, &mut pieces, &mut seen);
+        pieces
+    }
+
+    /// The first unsupported piece blocking placement of this feature in
+    /// evaluation order, or `None` when [`Self::is_modelable`] holds.
+    pub fn first_unmodeled_piece(&self) -> Option<String> {
+        self.unmodeled_pieces().into_iter().next()
+    }
+
+    /// Diagnostic summary for this placed feature.
+    pub fn diagnose(&self) -> PlacedFeatureDiagnosis {
+        let unsupported_pieces = self.unmodeled_pieces();
+        let first_unsupported = unsupported_pieces.first().cloned();
+        PlacedFeatureDiagnosis {
+            id: self.id.clone(),
+            modelable: self.is_modelable(),
+            first_unsupported,
+            unsupported_pieces,
+        }
+    }
+}
+
+/// Diagnostic summary for one placed feature in a generation step.
+///
+/// Source: minecraft.wiki `Placed feature` (revision 3816343):
+/// "Placed features are applied in order to determine where feature
+/// placement attempt(s) should occur."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFeatureDiagnosis {
+    /// Placed feature identifier.
+    pub id: String,
+    /// Whether RustMC currently models and runs this placed feature.
+    pub modelable: bool,
+    /// The first unsupported piece blocking placement in evaluation order,
+    /// or `None` when `modelable` is `true`.
+    pub first_unsupported: Option<String>,
+    /// Every unsupported piece encountered in evaluation order.
+    pub unsupported_pieces: Vec<String>,
 }
 
 /// The configured/placed feature registries plus the per-biome ordered
@@ -1183,6 +1235,14 @@ const MAX_CYCLE_ATTEMPTS: usize = 8;
 /// the overworld pack shape; the array is positional, so the length is part
 /// of the data contract.
 pub const GENERATION_STEPS: usize = 11;
+
+/// Index of the `VEGETAL_DECORATION` step in a biome's 11-entry `features`
+/// array.
+///
+/// Source: minecraft.wiki `Biome definition (Java Edition)` (revision 3862553):
+/// "VEGETAL_DECORATION: Used for trees, bamboo, cacti, kelp, and other ground
+/// and ocean vegetation in vanilla."
+pub const VEGETAL_DECORATION_STEP: usize = 9;
 
 impl FeatureData {
     /// Loads `worldgen/feature`, `worldgen/placed_feature`, `worldgen/biome`
@@ -1511,6 +1571,23 @@ impl FeatureData {
     /// Ordered placed features for one biome, by generation step index.
     pub fn features_for_biome(&self, biome_id: &str) -> Option<&Vec<Vec<Rc<PlacedFeature>>>> {
         self.biomes.get(biome_id)
+    }
+
+    /// Diagnoses the placed features that `biomes` contribute to `step`, in the
+    /// step schedule's ordinal order (`self.region_ordinals(step, biomes)`).
+    pub fn diagnose_step_for_biomes(
+        &self,
+        step: usize,
+        biomes: &[String],
+    ) -> Vec<PlacedFeatureDiagnosis> {
+        let Some(schedule) = self.step(step) else {
+            return Vec::new();
+        };
+        self.region_ordinals(step, biomes)
+            .into_iter()
+            .filter_map(|ordinal| schedule.get(ordinal))
+            .map(|placed| placed.diagnose())
+            .collect()
     }
 
     /// The step indices that carry at least one feature somewhere in the
@@ -2411,6 +2488,186 @@ fn record_unplaceable_states(counts: &mut HashMap<String, usize>, provider: &Sta
                 .entry(format!("state:{}", base_block_id(state)))
                 .or_insert(0) += 1;
         }
+    }
+}
+
+fn push_unique_piece(pieces: &mut Vec<String>, seen: &mut HashSet<String>, key: String) {
+    if seen.insert(key.clone()) {
+        pieces.push(key);
+    }
+}
+
+/// Collects every unsupported piece of one placed feature in evaluation order:
+/// placement modifiers in list order, then the configured feature and its
+/// nested components.
+fn collect_unmodeled_placed_pieces(
+    placed: &PlacedFeature,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for modifier in &placed.modifiers {
+        match modifier {
+            PlacementModifier::Unsupported { kind } => {
+                push_unique_piece(pieces, seen, format!("placement:{kind}"));
+            }
+            PlacementModifier::Count {
+                count: RangeProvider::Unsupported { kind },
+            }
+            | PlacementModifier::HeightRange {
+                height: RangeProvider::Unsupported { kind },
+            } => {
+                push_unique_piece(pieces, seen, format!("range:{kind}"));
+            }
+            PlacementModifier::BlockPredicateFilter { predicate } => {
+                for kind in unmodeled_predicates(predicate) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+            }
+            PlacementModifier::SurfaceRelativeThresholdFilter { heightmap, .. }
+                if heightmap != "OCEAN_FLOOR_WG" =>
+            {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    format!("placement:minecraft:surface_relative_threshold_filter:{heightmap}"),
+                );
+            }
+            PlacementModifier::EnvironmentScan {
+                target_condition,
+                allowed_search_condition,
+                ..
+            } => {
+                for kind in unmodeled_predicates(target_condition) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+                if let Some(allowed) = allowed_search_condition {
+                    for kind in unmodeled_predicates(allowed) {
+                        push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    collect_unmodeled_configured_pieces(&placed.feature, pieces, seen);
+    if placed.validate_attempt_budget(0).is_err() {
+        push_unique_piece(pieces, seen, "placement:attempt_budget".to_string());
+    }
+}
+
+fn collect_unmodeled_configured_pieces(
+    feature: &ConfiguredFeature,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match feature {
+        ConfiguredFeature::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, kind.clone());
+        }
+        ConfiguredFeature::Ore { targets, .. } => {
+            for target in targets {
+                collect_unmodeled_rule_pieces(&target.predicate, pieces, seen);
+            }
+        }
+        ConfiguredFeature::Disk {
+            state_provider,
+            target_predicate,
+            radius,
+            ..
+        } => {
+            collect_unmodeled_provider_pieces(state_provider, pieces, seen);
+            for kind in unmodeled_predicates(target_predicate) {
+                push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+            }
+            if let RangeProvider::Unsupported { kind } = radius {
+                push_unique_piece(pieces, seen, format!("range:{kind}"));
+            }
+        }
+        ConfiguredFeature::Spring { .. } => {}
+        ConfiguredFeature::RandomPatch { feature: child, .. } => {
+            if feature.patch_reach() > MAX_PATCH_REACH {
+                push_unique_piece(pieces, seen, "minecraft:random_patch:reach".to_string());
+            }
+            collect_unmodeled_placed_pieces(child, pieces, seen);
+        }
+        ConfiguredFeature::SimpleBlock { to_place } => {
+            collect_unmodeled_provider_pieces(to_place, pieces, seen);
+            for state in to_place.states() {
+                if !plant_support::is_placeable(state) {
+                    push_unique_piece(pieces, seen, format!("state:{}", base_block_id(state)));
+                }
+            }
+        }
+        ConfiguredFeature::SimpleRandomSelector { features } => {
+            if features.is_empty() {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    "minecraft:simple_random_selector:empty".to_string(),
+                );
+            }
+            for child in features {
+                collect_unmodeled_placed_pieces(child, pieces, seen);
+            }
+        }
+    }
+}
+
+fn collect_unmodeled_rule_pieces(
+    rule: &RuleTest,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match rule {
+        RuleTest::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, format!("target:{kind}"));
+        }
+        RuleTest::AnyOf(rules) | RuleTest::AllOf(rules) => {
+            for nested in rules {
+                collect_unmodeled_rule_pieces(nested, pieces, seen);
+            }
+        }
+        RuleTest::Not(nested) => collect_unmodeled_rule_pieces(nested, pieces, seen),
+        _ => {}
+    }
+}
+
+fn collect_unmodeled_provider_pieces(
+    provider: &StateProvider,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match provider {
+        StateProvider::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, format!("provider:{kind}"));
+        }
+        StateProvider::RuleBased { fallback, rules } => {
+            for rule in rules {
+                for kind in unmodeled_predicates(&rule.if_true) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+                collect_unmodeled_provider_pieces(&rule.then, pieces, seen);
+            }
+            collect_unmodeled_provider_pieces(fallback, pieces, seen);
+        }
+        StateProvider::RandomizedInt {
+            source,
+            property,
+            values,
+        } => {
+            if property.is_empty() {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    "provider:minecraft:randomized_int".to_string(),
+                );
+            }
+            collect_unmodeled_provider_pieces(source, pieces, seen);
+            if let RangeProvider::Unsupported { kind } = values {
+                push_unique_piece(pieces, seen, format!("range:{kind}"));
+            }
+        }
+        StateProvider::Constant { .. } | StateProvider::Weighted { .. } => {}
     }
 }
 
@@ -6840,5 +7097,96 @@ mod tests {
         let mut gaps = HashMap::new();
         record_unmodeled_configured(&mut gaps, &with_gap);
         assert_eq!(gaps.get("minecraft:coral_tree"), Some(&1));
+    }
+
+    #[test]
+    fn diagnose_reports_first_and_all_unsupported_pieces_in_evaluation_order() {
+        let root = scratch_root("diagnose-step");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/grass.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:short_grass"}}"#,
+        );
+        write(
+            &worldgen.join("feature/cane.json"),
+            r#"{"type": "minecraft:block_column", "direction": "up", "prioritize_tip": false, "layers": []}"#,
+        );
+        write(
+            &worldgen.join("feature/plain_flower.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": "minecraft:flower_plain"}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/ready_grass.json"),
+            r#"{"feature": "testns:grass", "placement": [
+                {"type": "minecraft:count", "count": 2},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/blocked_cane.json"),
+            r#"{"feature": "testns:cane", "placement": [
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:offset", "x": 1, "y": 0, "z": 1},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:would_survive", "state": "minecraft:sugar_cane"}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/blocked_provider.json"),
+            r#"{"feature": "testns:plain_flower", "placement": [
+                {"type": "minecraft:count", "count": {"type": "minecraft:clamped", "min_inclusive": 0, "max_inclusive": 1, "source": 1}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/forest.json"),
+            r#"{"features": [[], [], [], [], [], [], [], [], [], [
+                "testns:ready_grass",
+                "testns:blocked_cane",
+                "testns:blocked_provider"
+            ], []]}"#,
+        );
+
+        let data = FeatureData::load(&root).expect("loads synthetic pack");
+        let report =
+            data.diagnose_step_for_biomes(VEGETAL_DECORATION_STEP, &["testns:forest".to_string()]);
+        assert_eq!(report.len(), 3);
+
+        assert_eq!(
+            report[0],
+            PlacedFeatureDiagnosis {
+                id: "testns:ready_grass".to_string(),
+                modelable: true,
+                first_unsupported: None,
+                unsupported_pieces: Vec::new(),
+            }
+        );
+        assert_eq!(
+            report[1],
+            PlacedFeatureDiagnosis {
+                id: "testns:blocked_cane".to_string(),
+                modelable: false,
+                first_unsupported: Some("placement:minecraft:heightmap".to_string()),
+                unsupported_pieces: vec![
+                    "placement:minecraft:heightmap".to_string(),
+                    "placement:minecraft:offset".to_string(),
+                    "predicate:minecraft:would_survive".to_string(),
+                    "minecraft:block_column".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            report[2],
+            PlacedFeatureDiagnosis {
+                id: "testns:blocked_provider".to_string(),
+                modelable: false,
+                first_unsupported: Some("range:minecraft:clamped".to_string()),
+                unsupported_pieces: vec![
+                    "range:minecraft:clamped".to_string(),
+                    "provider:minecraft:block_state_provider_reference".to_string(),
+                ],
+            }
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
