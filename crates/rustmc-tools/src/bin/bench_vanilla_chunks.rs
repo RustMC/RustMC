@@ -225,13 +225,14 @@ fn run(args: &[String]) -> Result<(), String> {
 /// Entries held by every coordinate-keyed cache after one mode's sweep.
 fn report_occupancy(mode: &str, occupancy: &CacheOccupancy) {
     println!(
-        "occupancy,{mode},masks,{},heights,{},ocean_floor_maps,{},biomes,{},biome_regions,{},chunk_carvers,{}",
+        "occupancy,{mode},masks,{},heights,{},ocean_floor_maps,{},biomes,{},biome_regions,{},chunk_carvers,{},chunk_densities,{}",
         occupancy.masks,
         occupancy.heights,
         occupancy.ocean_floor_maps,
         occupancy.biomes,
         occupancy.biome_regions,
-        occupancy.chunk_carvers
+        occupancy.chunk_carvers,
+        occupancy.chunk_densities
     );
     println!(
         "occupancy,{mode},aquifer_centers,{},aquifer_statuses,{},aquifer_surface_levels,{},aquifer_skip_bounds,{},total,{}",
@@ -278,6 +279,10 @@ fn report_budget(mask_bytes: usize) {
     let statuses = entries(NoiseBasedAquifer::STATUS_CACHE_CAPACITY, 24);
     let surfaces = entries(NoiseBasedAquifer::SURFACE_CACHE_CAPACITY, 12);
     let skips = entries(NoiseBasedAquifer::SKIP_CACHE_CAPACITY, 12);
+    let chunk_densities = entries(
+        VanillaGenerator::CHUNK_DENSITY_CACHE_CAPACITY,
+        16 * 384 * 16 * 4,
+    );
     println!(
         "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},ocean_floor_maps,{},biomes,{},aquifer_centers,{}",
         masks / 1024,
@@ -288,11 +293,21 @@ fn report_budget(mask_bytes: usize) {
         centers / 1024
     );
     println!(
-        "budget_kib,aquifer_statuses,{},aquifer_surfaces,{},aquifer_skips,{},total,{}",
+        "budget_kib,aquifer_statuses,{},aquifer_surfaces,{},aquifer_skips,{},chunk_densities,{},total,{}",
         statuses / 1024,
         surfaces / 1024,
         skips / 1024,
-        (masks + carvers + heights + floors + biomes + centers + statuses + surfaces + skips)
+        chunk_densities / 1024,
+        (masks
+            + carvers
+            + heights
+            + floors
+            + biomes
+            + centers
+            + statuses
+            + surfaces
+            + skips
+            + chunk_densities)
             / 1024
     );
 }

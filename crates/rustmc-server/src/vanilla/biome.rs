@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::vanilla::density::Density;
+use crate::vanilla::density::{Density, DensityVolume};
 
 /// Fixed-point scale of a quantized climate coordinate.
 const QUANTIZATION_FACTOR: f32 = 10000.0;
@@ -468,6 +468,34 @@ impl ClimateSampler {
             quantize_coord(self.depth.sample(x, y, z)),
             quantize_coord(self.ridges.sample(x, y, z)),
         ]
+    }
+
+    /// Fills `out` with quantized climate targets over `volume` in
+    /// `DensityVolume::index` order using `sample_volume` for each of the
+    /// six climate densities.
+    pub fn targets_for_volume(
+        &self,
+        volume: &DensityVolume,
+        scratch: &mut Vec<f32>,
+        out: &mut Vec<[i64; 6]>,
+    ) {
+        let count = volume.slot_count();
+        scratch.resize(count, 0.0);
+        out.resize(count, [0; 6]);
+        let samplers = [
+            &self.temperature,
+            &self.vegetation,
+            &self.continents,
+            &self.erosion,
+            &self.depth,
+            &self.ridges,
+        ];
+        for (dim, density) in samplers.iter().enumerate() {
+            density.sample_volume(volume, scratch);
+            for (target, &raw) in out.iter_mut().zip(scratch.iter()) {
+                target[dim] = quantize_coord(raw);
+            }
+        }
     }
 
     /// Biome identifier for a block position given its placement table.
