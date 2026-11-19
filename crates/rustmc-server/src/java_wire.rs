@@ -174,8 +174,8 @@ pub(crate) fn decode_modified_utf8(bytes: &[u8]) -> Result<String, WireError> {
     String::from_utf16(&units).map_err(|_| WireError::InvalidText)
 }
 
-/// Append a plain network NBT text component (`TAG_String`, `u16` length, modified UTF-8).
-pub(crate) fn put_nbt_text(text: &str, out: &mut Vec<u8>) -> Result<(), WireError> {
+/// Encode `text` as a bare NBT string payload (`u16` length + modified UTF-8, without tag byte).
+pub(crate) fn put_nbt_string_payload(text: &str, out: &mut Vec<u8>) -> Result<(), WireError> {
     let mut encoded = Vec::with_capacity(text.len());
     encode_modified_utf8(text, &mut encoded);
     let Ok(length) = u16::try_from(encoded.len()) else {
@@ -184,9 +184,19 @@ pub(crate) fn put_nbt_text(text: &str, out: &mut Vec<u8>) -> Result<(), WireErro
             max: MAX_NBT_STRING_BYTES,
         });
     };
-    out.push(NBT_TAG_STRING);
     out.extend_from_slice(&length.to_be_bytes());
     out.extend_from_slice(&encoded);
+    Ok(())
+}
+
+/// Append a plain network NBT text component (`TAG_String`, `u16` length, modified UTF-8).
+pub(crate) fn put_nbt_text(text: &str, out: &mut Vec<u8>) -> Result<(), WireError> {
+    let start = out.len();
+    out.push(NBT_TAG_STRING);
+    if let Err(err) = put_nbt_string_payload(text, out) {
+        out.truncate(start);
+        return Err(err);
+    }
     Ok(())
 }
 

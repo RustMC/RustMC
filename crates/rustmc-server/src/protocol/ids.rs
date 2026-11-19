@@ -1,13 +1,13 @@
 //! Protocol numeric ID lookups for Java Edition 26.3 (protocol 777).
 //!
 //! Static built-in registries (`minecraft:item`, `minecraft:data_component_type`,
-//! `minecraft:potion`) are loaded from the official server's
-//! `reports/registries.json`.
+//! `minecraft:potion`, `minecraft:mob_effect`) are loaded from the official
+//! server's `reports/registries.json`.
 //!
 //! Data-driven synchronized registries (`minecraft:enchantment`,
-//! `minecraft:trim_pattern`, `minecraft:trim_material`) derive their 0-based
-//! network IDs from the entry order in [`RegistryManifest`], matching the
-//! configuration phase `Registry Data` packets sent by
+//! `minecraft:trim_pattern`, `minecraft:trim_material`, `minecraft:instrument`)
+//! derive their 0-based network IDs from the entry order in [`RegistryManifest`],
+//! matching the configuration phase `Registry Data` packets sent by
 //! `crate::discovery_java::registry_data` (see `Java Edition protocol/Registries`
 //! revision 3886333: "The ordering of the entries in the Entries array defines
 //! the numeric IDs that they will be assigned to, starting from 0 and counting
@@ -30,10 +30,12 @@ pub const MAX_REGISTRIES_JSON_BYTES: usize = 16 * 1024 * 1024;
 const REGISTRY_ITEM: &str = "minecraft:item";
 const REGISTRY_DATA_COMPONENT_TYPE: &str = "minecraft:data_component_type";
 const REGISTRY_POTION: &str = "minecraft:potion";
+const REGISTRY_MOB_EFFECT: &str = "minecraft:mob_effect";
 
 const REGISTRY_ENCHANTMENT: &str = "minecraft:enchantment";
 const REGISTRY_TRIM_PATTERN: &str = "minecraft:trim_pattern";
 const REGISTRY_TRIM_MATERIAL: &str = "minecraft:trim_material";
+const REGISTRY_INSTRUMENT: &str = "minecraft:instrument";
 
 /// Errors encountered while loading or validating `reports/registries.json`.
 #[derive(Debug)]
@@ -202,17 +204,19 @@ impl RegistryLookup {
 }
 
 /// Static Java Edition protocol IDs loaded from `reports/registries.json` for
-/// items, data component types, and potions.
+/// items, data component types, potions, and mob effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolIds {
     items: RegistryLookup,
     component_types: RegistryLookup,
     potions: RegistryLookup,
+    mob_effects: RegistryLookup,
 }
 
 impl ProtocolIds {
-    /// Loads `reports/registries.json` under `root`, retaining only
-    /// `minecraft:item`, `minecraft:data_component_type`, and `minecraft:potion`.
+    /// Loads `reports/registries.json` under `root`, retaining
+    /// `minecraft:item`, `minecraft:data_component_type`, `minecraft:potion`,
+    /// and `minecraft:mob_effect`.
     pub fn load(root: &Path) -> Result<Self, ProtocolIdsError> {
         let file = root.join("reports").join("registries.json");
         let handle = File::open(&file).map_err(|source| ProtocolIdsError::Io {
@@ -259,11 +263,14 @@ impl ProtocolIds {
             root_obj.get(REGISTRY_DATA_COMPONENT_TYPE),
         )?;
         let potions = RegistryLookup::parse(file, REGISTRY_POTION, root_obj.get(REGISTRY_POTION))?;
+        let mob_effects =
+            RegistryLookup::parse(file, REGISTRY_MOB_EFFECT, root_obj.get(REGISTRY_MOB_EFFECT))?;
 
         Ok(Self {
             items,
             component_types,
             potions,
+            mob_effects,
         })
     }
 
@@ -319,6 +326,24 @@ impl ProtocolIds {
     #[must_use]
     pub fn potion_count(&self) -> usize {
         self.potions.len()
+    }
+
+    /// Returns the `minecraft:mob_effect` protocol ID for `name`.
+    #[must_use]
+    pub fn mob_effect_id(&self, name: &str) -> Option<u32> {
+        self.mob_effects.id(name)
+    }
+
+    /// Returns the namespaced mob effect identifier for `id`.
+    #[must_use]
+    pub fn mob_effect_name(&self, id: u32) -> Option<&str> {
+        self.mob_effects.name(id)
+    }
+
+    /// Number of loaded `minecraft:mob_effect` entries.
+    #[must_use]
+    pub fn mob_effect_count(&self) -> usize {
+        self.mob_effects.len()
     }
 }
 
@@ -386,17 +411,20 @@ pub struct DynamicRegistryIds {
     enchantments: DynamicLookup,
     trim_patterns: DynamicLookup,
     trim_materials: DynamicLookup,
+    instruments: DynamicLookup,
 }
 
 impl DynamicRegistryIds {
     /// Extracts synced network IDs for `minecraft:enchantment`,
-    /// `minecraft:trim_pattern`, and `minecraft:trim_material` from `manifest`.
+    /// `minecraft:trim_pattern`, `minecraft:trim_material`, and
+    /// `minecraft:instrument` from `manifest`.
     #[must_use]
     pub fn from_manifest(manifest: &RegistryManifest) -> Self {
         Self {
             enchantments: DynamicLookup::from_manifest(manifest, REGISTRY_ENCHANTMENT),
             trim_patterns: DynamicLookup::from_manifest(manifest, REGISTRY_TRIM_PATTERN),
             trim_materials: DynamicLookup::from_manifest(manifest, REGISTRY_TRIM_MATERIAL),
+            instruments: DynamicLookup::from_manifest(manifest, REGISTRY_INSTRUMENT),
         }
     }
 
@@ -453,6 +481,24 @@ impl DynamicRegistryIds {
     pub fn trim_material_count(&self) -> usize {
         self.trim_materials.len()
     }
+
+    /// Returns the synced `minecraft:instrument` network ID for `name`.
+    #[must_use]
+    pub fn instrument_id(&self, name: &str) -> Option<u32> {
+        self.instruments.id(name)
+    }
+
+    /// Returns the namespaced `minecraft:instrument` identifier for `id`.
+    #[must_use]
+    pub fn instrument_name(&self, id: u32) -> Option<&str> {
+        self.instruments.name(id)
+    }
+
+    /// Number of synced `minecraft:instrument` entries.
+    #[must_use]
+    pub fn instrument_count(&self) -> usize {
+        self.instruments.len()
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +542,13 @@ mod tests {
                 "minecraft:water": { "protocol_id": 0 },
                 "minecraft:awkward": { "protocol_id": 3 }
             }
+        },
+        "minecraft:mob_effect": {
+            "entries": {
+                "minecraft:speed": { "protocol_id": 0 },
+                "minecraft:night_vision": { "protocol_id": 15 },
+                "minecraft:saturation": { "protocol_id": 22 }
+            }
         }
     }"#;
 
@@ -511,6 +564,7 @@ mod tests {
         assert_eq!(ids.item_count(), 3);
         assert_eq!(ids.component_type_count(), 3);
         assert_eq!(ids.potion_count(), 2);
+        assert_eq!(ids.mob_effect_count(), 3);
 
         assert_eq!(ids.item_id("minecraft:stone"), Some(1));
         assert_eq!(ids.item_id("minecraft:diamond_sword"), Some(851));
@@ -528,6 +582,12 @@ mod tests {
         assert_eq!(ids.potion_id("minecraft:awkward"), Some(3));
         assert_eq!(ids.potion_name(3), Some("minecraft:awkward"));
         assert_eq!(ids.potion_name(99), None);
+
+        assert_eq!(ids.mob_effect_id("minecraft:speed"), Some(0));
+        assert_eq!(ids.mob_effect_id("minecraft:night_vision"), Some(15));
+        assert_eq!(ids.mob_effect_id("minecraft:saturation"), Some(22));
+        assert_eq!(ids.mob_effect_name(15), Some("minecraft:night_vision"));
+        assert_eq!(ids.mob_effect_name(99), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -569,6 +629,19 @@ mod tests {
         ));
         assert!(missing_reg.to_string().contains("reports/registries.json"));
 
+        let missing_mob_effect = ProtocolIds::from_json_str(
+            path,
+            r#"{"minecraft:item":{"entries":{}},"minecraft:data_component_type":{"entries":{}},"minecraft:potion":{"entries":{}}}"#,
+        )
+        .expect_err("missing mob_effect registry");
+        assert!(matches!(
+            missing_mob_effect,
+            ProtocolIdsError::MissingRegistry {
+                registry: "minecraft:mob_effect",
+                ..
+            }
+        ));
+
         let dup_err = ProtocolIds::from_json_str(
             path,
             r#"{
@@ -577,7 +650,8 @@ mod tests {
                     "minecraft:b": { "protocol_id": 1 }
                 }},
                 "minecraft:data_component_type": { "entries": {} },
-                "minecraft:potion": { "entries": {} }
+                "minecraft:potion": { "entries": {} },
+                "minecraft:mob_effect": { "entries": {} }
             }"#,
         )
         .expect_err("duplicate protocol_id must error");
@@ -595,7 +669,8 @@ mod tests {
             r#"{
                 "minecraft:item": { "entries": {} },
                 "minecraft:data_component_type": { "entries": { "minecraft:x": { "protocol_id": -1 } } },
-                "minecraft:potion": { "entries": {} }
+                "minecraft:potion": { "entries": {} },
+                "minecraft:mob_effect": { "entries": {} }
             }"#,
         )
         .expect_err("negative protocol_id must error");
@@ -637,6 +712,13 @@ mod tests {
                         "minecraft:diamond".to_owned(),
                     ],
                 ),
+                (
+                    "minecraft:instrument".to_owned(),
+                    vec![
+                        "minecraft:ponder_goat_horn".to_owned(),
+                        "minecraft:sing_goat_horn".to_owned(),
+                    ],
+                ),
             ],
         };
 
@@ -644,6 +726,7 @@ mod tests {
         assert_eq!(dyn_ids.enchantment_count(), 3);
         assert_eq!(dyn_ids.trim_pattern_count(), 2);
         assert_eq!(dyn_ids.trim_material_count(), 2);
+        assert_eq!(dyn_ids.instrument_count(), 2);
 
         assert_eq!(dyn_ids.enchantment_id("minecraft:sharpness"), Some(0));
         assert_eq!(dyn_ids.enchantment_id("minecraft:unbreaking"), Some(1));
@@ -662,6 +745,12 @@ mod tests {
         assert_eq!(dyn_ids.trim_material_name(0), Some("minecraft:amethyst"));
         assert_eq!(dyn_ids.trim_material_name(2), None);
 
+        assert_eq!(dyn_ids.instrument_id("minecraft:ponder_goat_horn"), Some(0));
+        assert_eq!(dyn_ids.instrument_id("minecraft:sing_goat_horn"), Some(1));
+        assert_eq!(dyn_ids.instrument_name(1), Some("minecraft:sing_goat_horn"));
+        assert_eq!(dyn_ids.instrument_name(2), None);
+        assert_eq!(dyn_ids.instrument_id("minecraft:admire_goat_horn"), None);
+
         let empty = DynamicRegistryIds::from_manifest(&RegistryManifest {
             tags: Vec::new(),
             registries: vec![(
@@ -672,7 +761,9 @@ mod tests {
         assert_eq!(empty.enchantment_count(), 0);
         assert_eq!(empty.trim_pattern_count(), 0);
         assert_eq!(empty.trim_material_count(), 0);
+        assert_eq!(empty.instrument_count(), 0);
         assert_eq!(empty.enchantment_id("minecraft:sharpness"), None);
+        assert_eq!(empty.instrument_id("minecraft:ponder_goat_horn"), None);
     }
 
     /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_registries_pin_26_3_protocol_ids`
@@ -718,25 +809,50 @@ mod tests {
                 .len(),
             46
         );
+        assert_eq!(
+            parsed["minecraft:mob_effect"]["entries"]
+                .as_object()
+                .expect("mob_effect entries")
+                .len(),
+            40
+        );
 
         assert_eq!(ids.item_count(), 1658);
         assert_eq!(ids.component_type_count(), 122);
         assert_eq!(ids.potion_count(), 46);
+        assert_eq!(ids.mob_effect_count(), 40);
 
         let expected_components = [
             ("minecraft:damage", 3),
             ("minecraft:custom_name", 6),
+            ("minecraft:item_name", 9),
             ("minecraft:enchantments", 13),
             ("minecraft:repair_cost", 19),
             ("minecraft:stored_enchantments", 45),
             ("minecraft:potion_contents", 53),
+            ("minecraft:suspicious_stew_effects", 55),
             ("minecraft:trim", 58),
+            ("minecraft:instrument", 63),
+            ("minecraft:ominous_bottle_amplifier", 65),
         ];
         for (name, pinned) in expected_components {
             let from_file = read_expected("minecraft:data_component_type", name);
             assert_eq!(from_file, pinned, "file mismatch for {name}");
             assert_eq!(ids.component_type_id(name), Some(from_file));
             assert_eq!(ids.component_type_name(from_file), Some(name));
+        }
+
+        let expected_mob_effects = [
+            ("minecraft:speed", 0),
+            ("minecraft:night_vision", 15),
+            ("minecraft:poison", 18),
+            ("minecraft:saturation", 22),
+        ];
+        for (name, pinned) in expected_mob_effects {
+            let from_file = read_expected("minecraft:mob_effect", name);
+            assert_eq!(from_file, pinned, "file mismatch for {name}");
+            assert_eq!(ids.mob_effect_id(name), Some(from_file));
+            assert_eq!(ids.mob_effect_name(from_file), Some(name));
         }
 
         let awkward_from_file = read_expected("minecraft:potion", "minecraft:awkward");

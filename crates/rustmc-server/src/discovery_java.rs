@@ -2412,6 +2412,11 @@ mod tests {
                 "entries": {
                     "minecraft:water": { "protocol_id": 0 }
                 }
+            },
+            "minecraft:mob_effect": {
+                "entries": {
+                    "minecraft:speed": { "protocol_id": 0 }
+                }
             }
         }"#;
         Arc::new(
