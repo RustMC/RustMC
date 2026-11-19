@@ -215,3 +215,27 @@ for 4.89 %, `BiomePlacement::find_column` accounts for 4.04 %,
 `small_sort_general` accounts for 3.58 % (`2.29 %` + `1.29 %`),
 `sample_interpolated_block_step` accounts for 2.68 %, and
 `Density::sample_volume` accounts for 2.42 %.
+
+### Shared cross-worker chunk products (19 November 2026)
+
+Throughput method: release build of `bench_vanilla_chunks --mode throughput --workers 16 --radius 8`, seed 2026, `minecraft:overworld`, operator-provisioned 26.3 data root and chunk registry table. Sixteen worker threads—each owning a `VanillaGenerator` and `RegistryTables` compiled before the timer starts—pull chunk positions from one shared queue in `java_preview::ordered_view` order around `(0, 0)` with direction `(0, 0)` over the radius-8 square (`17 × 17 = 289` chunks) and run `chunk_from_generator` plus `encode_chunk` cold with no packet cache. Single-thread `columns` mode (`--repeat 1`) was also measured back to back at `(500, 500)` (`1 × 1`) and `(0, 0)` (`4 × 4`).
+
+| Workload | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| `throughput` (16 workers, radius 8, chunks/s) | 27.52 | 115.44 | 4.20× |
+| `throughput` elapsed time (289 chunks, ms) | 10,503.0 | 2,503.4 | 4.20× |
+| `throughput` per-chunk `p50` (ms) | 569.6 | 126.7 | 4.50× |
+| `throughput` per-chunk `p95` (ms) | 815.0 | 208.2 | 3.91× |
+| `throughput` per-chunk `max` (ms) | 942.6 | 377.1 | 2.50× |
+| `columns` isolated `(500, 500)` (ms/chunk) | 746.10 | 651.94 | 1.14× |
+| `columns` `4 × 4` at `(0, 0)` (ms/chunk) | 170.06 | 100.54 | 1.69× |
+
+On a repeat back-to-back `throughput` pass after the final edit, the updated build measured `111.46 chunks/s` (`2,592.9 ms` total, `p50 = 128.9 ms`, `p95 = 217.4 ms`, `max = 334.5 ms`), and peak RSS across the 16 workers dropped from `595,336 KiB` before to `544,560 KiB` (`537,248 KiB` on the repeat) after.
+
+What changed:
+
+- Added `ShardedBoundedCache` (`32` shards, two-generation FIFO eviction, shard locks released before any computation) and `SharedChunkCaches` (`Arc`-shared across `VanillaWorker::new` workers and `bench_vanilla_chunks --mode throughput`, with a private instance for single-generator tools and tests). Total worst-case shared capacity across all eight caches is bounded at roughly `157 MiB`: `chunk_density` (`192` chunks / `144 MiB` max), `masks` (`256` chunks / `~6 MiB` max), `chunk_biomes` (`512` chunks / `~3.5 MiB` max), `ocean_floor_maps` (`512` chunks / `1 MiB` max), `surface_height_maps` (`512` chunks / `1 MiB` max), `biomes` point cache (`8,192` cells / `~512 KiB` max), `ocean_floor_cols` (`16,384` columns / `~512 KiB` max), and `surface_heights` (`16,384` columns / `~512 KiB` max).
+- Each generator keeps its lock-free thread-local L1 `BoundedCache`s and `Rc`-based density trees while consulting `SharedChunkCaches` on L1 misses before computing.
+- `ChunkBiomes` stores the `4 × (height/4) × 4` `u16` quart palette slots alongside the sorted `region` slice (`Arc<[Arc<str>]>`) so `VanillaGenerator::biome` serves in-range chunk queries in `O(1)`, and `build_decorated_chunk` populates `chunk_biomes` before `base_column_ids_with_heights` and publishes completed `256`-column `surface_height_maps` and `ocean_floor_maps` once the base columns finish.
+
+Evidence and remaining profile: `81/81` chunk packets around spawn (`prepare_preview_cache`, seed `2026`, radius `4`) are byte-identical to the `upstream/main` golden set; the ignored `shared_worker_caches_encode_identically_to_private_generator` test confirms `8` shared-cache workers produce byte-identical packets across a `5 × 5` square (`25` chunks) compared with a private `VanillaGenerator::new`; all `978` non-ignored workspace tests pass (`65` ignored), and all `64` ignored data-root tests pass in release mode (the one remaining ignored test requires the operator's local 26.3 save). Before this change, a CPU profile of the 16-worker throughput run (`218B` cycles) showed `44.78 %` in `chunk_density` (driven by neighbour `ocean_floor_height` -> `surface` lookups at `53.67 %` inclusive), `19.16 %` in `BiomePlacement::search`, `14.23 %` in `BiomePlacement::find_column`, `7.32 %` in `NoiseBasedAquifer::substance`, and `3.62 %` in `VanillaGenerator::carved`. After sharing (`52.5B` cycles), the remaining time is spread across `chunk_density` (`31.16 %`, mainly outer halo chunks and startup races on `ocean_floor_height`), `FeatureData::run_chain` (`20.76 %`), `base_column_ids_with_heights` (`16.38 %`, split across `eval_rule` `9.53 %` and `NoiseBasedAquifer::substance` `7.82 %`), `chunk_biomes` (`8.48 %`), and `chunk_adapter` state lookup and packet encoding (`RegistryTables::state` `6.61 %`, `encode_chunk` `6.12 %`).
