@@ -53,7 +53,7 @@ fn write_synthetic_root(root: &ScratchDir) {
     );
     root.write(
         "reports/minecraft/components/item/widget.json",
-        r#"{"components": {"minecraft:max_stack_size": 16}}"#,
+        r#"{"components": {"minecraft:max_stack_size": 16, "minecraft:max_damage": 50, "minecraft:food": {"nutrition": 2, "saturation": 1.0}, "minecraft:tool": {"rules": []}}}"#,
     );
     root.write(
         "data/testns/recipe/widget_craft.json",
@@ -65,12 +65,34 @@ fn write_synthetic_root(root: &ScratchDir) {
         }"##,
     );
     root.write(
+        "data/testns/recipe/widget_transmute.json",
+        r#"{"type": "minecraft:crafting_transmute", "input": "minecraft:widget", "material": "minecraft:widget", "result": {"id": "minecraft:widget"}}"#,
+    );
+    root.write(
+        "data/testns/recipe/widget_repair.json",
+        r#"{"type": "minecraft:crafting_special_repairitem"}"#,
+    );
+    root.write(
         "data/testns/loot_table/blocks/stone.json",
         r#"{
             "type": "minecraft:block",
             "pools": [{
                 "rolls": 1,
                 "entries": [{"type": "minecraft:item", "name": "minecraft:widget"}]
+            }]
+        }"#,
+    );
+    root.write(
+        "data/testns/loot_table/chests/cache.json",
+        r#"{
+            "type": "minecraft:chest",
+            "pools": [{
+                "rolls": 1,
+                "entries": [{
+                    "type": "minecraft:item",
+                    "name": "minecraft:widget",
+                    "modifier": [{"type": "minecraft:exploration_map"}]
+                }]
             }]
         }"#,
     );
@@ -87,31 +109,91 @@ fn write_synthetic_root(root: &ScratchDir) {
             "exclusive_set": "#testns:combat"
         }"##,
     );
+    root.write(
+        "reports/registries.json",
+        r#"{
+            "minecraft:item": {
+                "entries": {
+                    "minecraft:widget": {"protocol_id": 0}
+                }
+            },
+            "minecraft:data_component_type": {
+                "entries": {
+                    "minecraft:max_stack_size": {"protocol_id": 0},
+                    "minecraft:damage": {"protocol_id": 1}
+                }
+            },
+            "minecraft:potion": {
+                "entries": {
+                    "minecraft:water": {"protocol_id": 0},
+                    "minecraft:awkward": {"protocol_id": 1},
+                    "minecraft:swiftness": {"protocol_id": 2}
+                }
+            },
+            "minecraft:mob_effect": {
+                "entries": {
+                    "minecraft:speed": {"protocol_id": 0},
+                    "minecraft:haste": {"protocol_id": 1},
+                    "minecraft:luck": {"protocol_id": 2},
+                    "minecraft:glowing": {"protocol_id": 3}
+                }
+            }
+        }"#,
+    );
 }
 
 fn assert_expected_json(stdout: &[u8]) {
     let parsed: Value = serde_json::from_slice(stdout).expect("stdout must be valid JSON");
     let obj = parsed.as_object().expect("JSON root must be an object");
-    for key in ["tags", "items", "recipes", "loot_tables", "enchantments"] {
+    for key in [
+        "tags",
+        "items",
+        "item_components",
+        "recipes",
+        "loot_tables",
+        "loot_categories",
+        "unsupported_loot_nodes",
+        "enchantments",
+        "protocol_ids",
+    ] {
         assert!(obj.contains_key(key), "missing top-level key `{key}`");
     }
     assert_eq!(parsed["tags"]["item"], 1);
     assert_eq!(parsed["tags"]["block"], 1);
     assert_eq!(parsed["tags"]["enchantment"], 1);
     assert_eq!(parsed["items"], 1);
+    assert_eq!(parsed["item_components"]["foods"], 1);
+    assert_eq!(parsed["item_components"]["tools"], 1);
+    assert_eq!(parsed["item_components"]["damageable_items"], 1);
     assert_eq!(parsed["recipes"]["cooking"]["smelting"], 0);
     assert_eq!(parsed["recipes"]["cooking"]["blasting"], 0);
     assert_eq!(parsed["recipes"]["cooking"]["smoking"], 0);
     assert_eq!(parsed["recipes"]["cooking"]["campfire_cooking"], 0);
     assert_eq!(parsed["recipes"]["crafting_shaped"], 1);
     assert_eq!(parsed["recipes"]["crafting_shapeless"], 0);
+    assert_eq!(parsed["recipes"]["crafting_transmute"], 1);
+    assert_eq!(parsed["recipes"]["crafting_special_repairitem"], 1);
     assert_eq!(parsed["recipes"]["stonecutting"], 0);
     assert_eq!(parsed["recipes"]["smithing_transform"], 0);
     assert_eq!(parsed["recipes"]["smithing_trim"], 0);
     assert_eq!(parsed["recipes"]["brewing"], 0);
     assert_eq!(parsed["recipes"]["skipped"], 0);
-    assert_eq!(parsed["loot_tables"], 1);
+    assert_eq!(parsed["loot_tables"], 2);
+    assert_eq!(parsed["loot_categories"]["blocks"], 1);
+    assert_eq!(parsed["loot_categories"]["entities"], 0);
+    assert_eq!(parsed["loot_categories"]["chests"], 1);
+    assert_eq!(parsed["loot_categories"]["gameplay"], 0);
+    assert_eq!(parsed["loot_categories"]["archaeology"], 0);
+    assert_eq!(parsed["unsupported_loot_nodes"]["count"], 1);
+    assert_eq!(
+        parsed["unsupported_loot_nodes"]["kinds"],
+        serde_json::json!(["minecraft:exploration_map"])
+    );
     assert_eq!(parsed["enchantments"], 1);
+    assert_eq!(parsed["protocol_ids"]["items"], 1);
+    assert_eq!(parsed["protocol_ids"]["component_types"], 2);
+    assert_eq!(parsed["protocol_ids"]["potions"], 3);
+    assert_eq!(parsed["protocol_ids"]["mob_effects"], 4);
 }
 
 #[test]
@@ -165,6 +247,21 @@ fn missing_root_and_broken_data_exit_1_with_error_chain() {
     assert!(broken_stderr.contains("RecipeData"), "{broken_stderr}");
     assert!(broken_stderr.contains("caused by:"), "{broken_stderr}");
     assert!(broken_stderr.contains("bad.json"), "{broken_stderr}");
+
+    let broken_ids = ScratchDir::new("broken-registries");
+    write_synthetic_root(&broken_ids);
+    broken_ids.write("reports/registries.json", "{not json");
+    let ids_output = Command::new(env!("CARGO_BIN_EXE_check_vanilla_data"))
+        .arg(broken_ids.path())
+        .env_remove("RUSTMC_VANILLA_DATA")
+        .output()
+        .unwrap();
+    assert_eq!(ids_output.status.code(), Some(1));
+    assert!(ids_output.stdout.is_empty());
+    let ids_stderr = String::from_utf8_lossy(&ids_output.stderr);
+    assert!(ids_stderr.contains("ProtocolIds"), "{ids_stderr}");
+    assert!(ids_stderr.contains("caused by:"), "{ids_stderr}");
+    assert!(ids_stderr.contains("registries.json"), "{ids_stderr}");
 }
 
 #[test]

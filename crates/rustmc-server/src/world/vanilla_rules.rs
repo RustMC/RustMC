@@ -1,19 +1,24 @@
 //! Combined loader and summary for all operator-provisioned vanilla 26.3 rule data.
 //!
 //! Loads item, block, and enchantment tags, default item component reports,
-//! recipes (resolved against [`ItemTags`] and [`ItemDefaults`]), block loot tables,
-//! and enchantment definitions in dependency order from one data root.
+//! recipes (resolved against [`ItemTags`] and [`ItemDefaults`]), loot tables across
+//! all supported categories, enchantment definitions, and static protocol IDs in
+//! dependency order from one data root.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
 use crate::item::{ItemDefaults, ItemDefaultsError};
+use crate::protocol::ids::{ProtocolIds, ProtocolIdsError};
 use crate::vanilla::feature::{BlockTags, EnchantmentTags, ItemTags};
 use crate::vanilla::worldgen::WorldgenError;
 use crate::world::enchantment::{EnchantmentError, EnchantmentRegistry};
 use crate::world::loot::{LootError, LootTables};
 use crate::world::recipe_data::{CookingKind, RecipeData, RecipeDataError};
+
+const LOOT_CATEGORIES: [&str; 5] = ["blocks", "entities", "chests", "gameplay", "archaeology"];
 
 /// Error returned when loading any part of the vanilla rule bundle fails.
 #[derive(Debug)]
@@ -28,10 +33,12 @@ pub enum VanillaRulesError {
     ItemDefaults(ItemDefaultsError),
     /// Loading recipe definitions from `data/<ns>/recipe` failed.
     RecipeData(RecipeDataError),
-    /// Loading block loot tables from `data/<ns>/loot_table/blocks` failed.
+    /// Loading loot tables from `data/<ns>/loot_table/<category>` failed.
     LootTables(LootError),
     /// Loading enchantment definitions from `data/<ns>/enchantment` failed.
     EnchantmentRegistry(EnchantmentError),
+    /// Loading static protocol IDs from `reports/registries.json` failed.
+    ProtocolIds(ProtocolIdsError),
 }
 
 impl fmt::Display for VanillaRulesError {
@@ -48,6 +55,7 @@ impl fmt::Display for VanillaRulesError {
             Self::EnchantmentRegistry(source) => {
                 write!(f, "failed to load EnchantmentRegistry: {source}")
             }
+            Self::ProtocolIds(source) => write!(f, "failed to load ProtocolIds: {source}"),
         }
     }
 }
@@ -62,6 +70,7 @@ impl Error for VanillaRulesError {
             Self::RecipeData(source) => Some(source),
             Self::LootTables(source) => Some(source),
             Self::EnchantmentRegistry(source) => Some(source),
+            Self::ProtocolIds(source) => Some(source),
         }
     }
 }
@@ -75,6 +84,17 @@ pub struct TagSummary {
     pub block: usize,
     /// Number of enchantment tags (`data/<ns>/tags/enchantment`).
     pub enchantment: usize,
+}
+
+/// Counts of items with default components exposed by [`ItemDefaults`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ItemComponentSummary {
+    /// Items carrying `minecraft:food`.
+    pub foods: usize,
+    /// Items carrying `minecraft:tool`.
+    pub tools: usize,
+    /// Items carrying `minecraft:max_damage`.
+    pub damageable_items: usize,
 }
 
 /// Counts of loaded cooking recipes per furnace-family kind.
@@ -99,6 +119,10 @@ pub struct RecipeSummary {
     pub crafting_shaped: usize,
     /// Loaded `minecraft:crafting_shapeless` recipes.
     pub crafting_shapeless: usize,
+    /// Loaded `minecraft:crafting_transmute` recipes.
+    pub crafting_transmute: usize,
+    /// Loaded `minecraft:crafting_special_repairitem` recipes.
+    pub crafting_special_repairitem: usize,
     /// Loaded `minecraft:stonecutting` recipes.
     pub stonecutting: usize,
     /// Loaded `minecraft:smithing_transform` recipes.
@@ -111,19 +135,64 @@ pub struct RecipeSummary {
     pub skipped: usize,
 }
 
-/// Summary counts across every dataset in [`VanillaRules`].
+/// Counts of loaded loot tables per category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LootCategorySummary {
+    /// Loaded block loot tables (`data/<ns>/loot_table/blocks`).
+    pub blocks: usize,
+    /// Loaded entity loot tables (`data/<ns>/loot_table/entities`).
+    pub entities: usize,
+    /// Loaded chest loot tables (`data/<ns>/loot_table/chests`).
+    pub chests: usize,
+    /// Loaded gameplay loot tables (`data/<ns>/loot_table/gameplay`).
+    pub gameplay: usize,
+    /// Loaded archaeology loot tables (`data/<ns>/loot_table/archaeology`).
+    pub archaeology: usize,
+}
+
+/// Summary of unsupported loot condition and modifier nodes across loaded loot tables.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnsupportedLootSummary {
+    /// Total number of unsupported condition and modifier nodes.
+    pub count: usize,
+    /// Sorted distinct unsupported node identifiers (`what` labels).
+    pub kinds: Vec<String>,
+}
+
+/// Counts of static Java Edition protocol IDs loaded from `reports/registries.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProtocolIdSummary {
+    /// Loaded `minecraft:item` entries.
+    pub items: usize,
+    /// Loaded `minecraft:data_component_type` entries.
+    pub component_types: usize,
+    /// Loaded `minecraft:potion` entries.
+    pub potions: usize,
+    /// Loaded `minecraft:mob_effect` entries.
+    pub mob_effects: usize,
+}
+
+/// Summary counts across every dataset in [`VanillaRules`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VanillaRulesSummary {
     /// Tag counts per registry.
     pub tags: TagSummary,
     /// Number of default item component entries (`reports/minecraft/components/item`).
     pub items: usize,
+    /// Counts of exposed default item components across loaded items.
+    pub item_components: ItemComponentSummary,
     /// Recipe counts per kind and skipped count.
     pub recipes: RecipeSummary,
-    /// Number of loaded block loot tables.
+    /// Total number of loaded loot tables across all supported categories.
     pub loot_tables: usize,
+    /// Loaded loot tables per category.
+    pub loot_categories: LootCategorySummary,
+    /// Unsupported loot condition and modifier nodes across loaded tables.
+    pub unsupported_loot_nodes: UnsupportedLootSummary,
     /// Number of loaded enchantment definitions.
     pub enchantments: usize,
+    /// Static Java Edition protocol ID counts per registry.
+    pub protocol_ids: ProtocolIdSummary,
 }
 
 /// Bundle of all vanilla 26.3 rule registries loaded from one operator data root.
@@ -139,10 +208,12 @@ pub struct VanillaRules {
     pub item_defaults: ItemDefaults,
     /// Crafting, cooking, stonecutting, smithing, and brewing recipes.
     pub recipes: RecipeData,
-    /// Block loot tables and resolved predicates.
+    /// Loot tables across all supported categories and resolved predicates.
     pub loot_tables: LootTables,
     /// Enchantment definitions.
     pub enchantments: EnchantmentRegistry,
+    /// Static Java Edition protocol IDs from `reports/registries.json`.
+    pub protocol_ids: ProtocolIds,
 }
 
 impl VanillaRules {
@@ -155,9 +226,11 @@ impl VanillaRules {
         let item_defaults = ItemDefaults::load(root).map_err(VanillaRulesError::ItemDefaults)?;
         let recipes = RecipeData::load_with_items(root, &item_tags, &item_defaults)
             .map_err(VanillaRulesError::RecipeData)?;
-        let loot_tables = LootTables::load_blocks(root).map_err(VanillaRulesError::LootTables)?;
         let enchantments = EnchantmentRegistry::load(root, &item_tags, &enchantment_tags)
             .map_err(VanillaRulesError::EnchantmentRegistry)?;
+        let loot_tables = LootTables::load_categories(root, &LOOT_CATEGORIES)
+            .map_err(VanillaRulesError::LootTables)?;
+        let protocol_ids = ProtocolIds::load(root).map_err(VanillaRulesError::ProtocolIds)?;
 
         Ok(Self {
             item_tags,
@@ -167,12 +240,37 @@ impl VanillaRules {
             recipes,
             loot_tables,
             enchantments,
+            protocol_ids,
         })
     }
 
     /// Returns a summary of counts across all loaded rule registries.
     #[must_use]
     pub fn summary(&self) -> VanillaRulesSummary {
+        let mut loot_categories = LootCategorySummary::default();
+        for (id, _) in self.loot_tables.iter() {
+            if let Some(category) = id
+                .split_once(':')
+                .and_then(|(_, rest)| rest.split_once('/'))
+                .map(|(cat, _)| cat)
+            {
+                match category {
+                    "blocks" => loot_categories.blocks += 1,
+                    "entities" => loot_categories.entities += 1,
+                    "chests" => loot_categories.chests += 1,
+                    "gameplay" => loot_categories.gameplay += 1,
+                    "archaeology" => loot_categories.archaeology += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        let unsupported = self.loot_tables.unsupported();
+        let kinds: BTreeSet<String> = unsupported
+            .iter()
+            .map(|(_, what)| (*what).to_owned())
+            .collect();
+
         VanillaRulesSummary {
             tags: TagSummary {
                 item: self.item_tags.len(),
@@ -180,6 +278,11 @@ impl VanillaRules {
                 enchantment: self.enchantment_tags.len(),
             },
             items: self.item_defaults.len(),
+            item_components: ItemComponentSummary {
+                foods: self.item_defaults.food_count(),
+                tools: self.item_defaults.tool_count(),
+                damageable_items: self.item_defaults.damageable_items().count(),
+            },
             recipes: RecipeSummary {
                 cooking: CookingSummary {
                     smelting: self.recipes.cooking(CookingKind::Smelting).len(),
@@ -189,6 +292,8 @@ impl VanillaRules {
                 },
                 crafting_shaped: self.recipes.shaped_recipes().count(),
                 crafting_shapeless: self.recipes.shapeless_recipes().count(),
+                crafting_transmute: self.recipes.transmute().len(),
+                crafting_special_repairitem: self.recipes.repair_item().len(),
                 stonecutting: self.recipes.stonecutting().len(),
                 smithing_transform: self.recipes.smithing_transform().len(),
                 smithing_trim: self.recipes.smithing_trim().len(),
@@ -196,7 +301,18 @@ impl VanillaRules {
                 skipped: self.recipes.skipped().len(),
             },
             loot_tables: self.loot_tables.len(),
+            loot_categories,
+            unsupported_loot_nodes: UnsupportedLootSummary {
+                count: unsupported.len(),
+                kinds: kinds.into_iter().collect(),
+            },
             enchantments: self.enchantments.len(),
+            protocol_ids: ProtocolIdSummary {
+                items: self.protocol_ids.item_count(),
+                component_types: self.protocol_ids.component_type_count(),
+                potions: self.protocol_ids.potion_count(),
+                mob_effects: self.protocol_ids.mob_effect_count(),
+            },
         }
     }
 }
@@ -290,6 +406,31 @@ mod tests {
                 "exclusive_set": "#testns:combat"
             }"##,
         );
+        root.write(
+            "reports/registries.json",
+            r#"{
+                "minecraft:item": {
+                    "entries": {
+                        "minecraft:widget": {"protocol_id": 0}
+                    }
+                },
+                "minecraft:data_component_type": {
+                    "entries": {
+                        "minecraft:max_stack_size": {"protocol_id": 0}
+                    }
+                },
+                "minecraft:potion": {
+                    "entries": {
+                        "minecraft:water": {"protocol_id": 0}
+                    }
+                },
+                "minecraft:mob_effect": {
+                    "entries": {
+                        "minecraft:speed": {"protocol_id": 0}
+                    }
+                }
+            }"#,
+        );
     }
 
     #[test]
@@ -307,6 +448,11 @@ mod tests {
                     enchantment: 1,
                 },
                 items: 1,
+                item_components: ItemComponentSummary {
+                    foods: 0,
+                    tools: 0,
+                    damageable_items: 0,
+                },
                 recipes: RecipeSummary {
                     cooking: CookingSummary {
                         smelting: 0,
@@ -316,6 +462,8 @@ mod tests {
                     },
                     crafting_shaped: 1,
                     crafting_shapeless: 0,
+                    crafting_transmute: 0,
+                    crafting_special_repairitem: 0,
                     stonecutting: 0,
                     smithing_transform: 0,
                     smithing_trim: 0,
@@ -323,7 +471,24 @@ mod tests {
                     skipped: 0,
                 },
                 loot_tables: 1,
+                loot_categories: LootCategorySummary {
+                    blocks: 1,
+                    entities: 0,
+                    chests: 0,
+                    gameplay: 0,
+                    archaeology: 0,
+                },
+                unsupported_loot_nodes: UnsupportedLootSummary {
+                    count: 0,
+                    kinds: Vec::new(),
+                },
                 enchantments: 1,
+                protocol_ids: ProtocolIdSummary {
+                    items: 1,
+                    component_types: 1,
+                    potions: 1,
+                    mob_effects: 1,
+                },
             }
         );
 
@@ -338,6 +503,7 @@ mod tests {
                 .enchantments
                 .can_apply("testns:keen", "minecraft:widget")
         );
+        assert_eq!(rules.protocol_ids.item_id("minecraft:widget"), Some(0));
     }
 
     #[test]
@@ -363,6 +529,14 @@ mod tests {
         root.write(
             "data/testns/recipe/shapeless.json",
             r#"{"type": "minecraft:crafting_shapeless", "ingredients": ["minecraft:widget"], "result": {"id": "minecraft:widget"}}"#,
+        );
+        root.write(
+            "data/testns/recipe/transmute.json",
+            r#"{"type": "minecraft:crafting_transmute", "input": "minecraft:widget", "material": "minecraft:widget", "result": {"id": "minecraft:widget"}}"#,
+        );
+        root.write(
+            "data/testns/recipe/repair.json",
+            r#"{"type": "minecraft:crafting_special_repairitem"}"#,
         );
         root.write(
             "data/testns/recipe/cut.json",
@@ -402,11 +576,136 @@ mod tests {
                 },
                 crafting_shaped: 1,
                 crafting_shapeless: 1,
+                crafting_transmute: 1,
+                crafting_special_repairitem: 1,
                 stonecutting: 1,
                 smithing_transform: 1,
                 smithing_trim: 1,
                 brewing: 1,
                 skipped: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn summary_counts_loot_categories_unsupported_nodes_item_components_and_protocol_ids() {
+        let root = ScratchDir::new("extended-summary");
+        write_minimal_valid_root(&root);
+        root.write(
+            "reports/minecraft/components/item/apple_snack.json",
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 4, "saturation": 2.4}}}"#,
+        );
+        root.write(
+            "reports/minecraft/components/item/pick.json",
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 250, "minecraft:tool": {"rules": []}}}"#,
+        );
+        root.write(
+            "reports/minecraft/components/item/shears_tool.json",
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 120}}"#,
+        );
+        root.write(
+            "data/testns/loot_table/entities/slime.json",
+            r#"{"type": "minecraft:entity", "pools": [{"rolls": 1, "entries": [{"type": "minecraft:item", "name": "minecraft:widget"}]}]}"#,
+        );
+        root.write(
+            "data/testns/loot_table/chests/vault.json",
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:widget",
+                        "modifier": [
+                            {"type": "minecraft:exploration_map"},
+                            {"type": "testns:custom_fn"},
+                            {"type": "minecraft:exploration_map"}
+                        ]
+                    }]
+                }]
+            }"#,
+        );
+        root.write(
+            "data/testns/loot_table/gameplay/fishing.json",
+            r#"{"type": "minecraft:fishing", "pools": [{"rolls": 1, "condition": [{"type": "testns:custom_cond"}], "entries": [{"type": "minecraft:empty"}]}]}"#,
+        );
+        root.write(
+            "data/testns/loot_table/archaeology/ruins.json",
+            r#"{"type": "minecraft:archaeology", "pools": [{"rolls": 1, "entries": [{"type": "minecraft:item", "name": "minecraft:widget"}]}]}"#,
+        );
+        root.write(
+            "reports/registries.json",
+            r#"{
+                "minecraft:item": {
+                    "entries": {
+                        "minecraft:widget": {"protocol_id": 0},
+                        "minecraft:apple_snack": {"protocol_id": 1},
+                        "minecraft:pick": {"protocol_id": 2}
+                    }
+                },
+                "minecraft:data_component_type": {
+                    "entries": {
+                        "minecraft:max_stack_size": {"protocol_id": 0},
+                        "minecraft:food": {"protocol_id": 1}
+                    }
+                },
+                "minecraft:potion": {
+                    "entries": {
+                        "minecraft:water": {"protocol_id": 0},
+                        "minecraft:awkward": {"protocol_id": 1},
+                        "minecraft:swiftness": {"protocol_id": 2},
+                        "minecraft:healing": {"protocol_id": 3}
+                    }
+                },
+                "minecraft:mob_effect": {
+                    "entries": {
+                        "minecraft:speed": {"protocol_id": 0},
+                        "minecraft:haste": {"protocol_id": 1}
+                    }
+                }
+            }"#,
+        );
+
+        let rules = VanillaRules::load(root.path()).expect("extended summary loads");
+        let summary = rules.summary();
+        assert_eq!(summary.items, 4);
+        assert_eq!(
+            summary.item_components,
+            ItemComponentSummary {
+                foods: 1,
+                tools: 1,
+                damageable_items: 2,
+            }
+        );
+        assert_eq!(summary.loot_tables, 5);
+        assert_eq!(
+            summary.loot_categories,
+            LootCategorySummary {
+                blocks: 1,
+                entities: 1,
+                chests: 1,
+                gameplay: 1,
+                archaeology: 1,
+            }
+        );
+        assert_eq!(
+            summary.unsupported_loot_nodes,
+            UnsupportedLootSummary {
+                count: 4,
+                kinds: vec![
+                    "minecraft:exploration_map".to_owned(),
+                    "testns:custom_cond".to_owned(),
+                    "testns:custom_fn".to_owned(),
+                ],
+            }
+        );
+        assert_eq!(
+            summary.protocol_ids,
+            ProtocolIdSummary {
+                items: 3,
+                component_types: 2,
+                potions: 4,
+                mob_effects: 2,
             }
         );
     }
@@ -481,6 +780,14 @@ mod tests {
         assert!(matches!(err, VanillaRulesError::EnchantmentRegistry(_)));
         assert!(err.to_string().contains("EnchantmentRegistry"));
         assert!(err.source().is_some());
+
+        let bad_ids = ScratchDir::new("bad-registries");
+        write_minimal_valid_root(&bad_ids);
+        bad_ids.write("reports/registries.json", "{not json");
+        let err = VanillaRules::load(bad_ids.path()).expect_err("bad registries must fail");
+        assert!(matches!(err, VanillaRulesError::ProtocolIds(_)));
+        assert!(err.to_string().contains("ProtocolIds"));
+        assert!(err.source().is_some());
     }
 
     /// Run with:
@@ -501,6 +808,11 @@ mod tests {
                     enchantment: 22,
                 },
                 items: 1658,
+                item_components: ItemComponentSummary {
+                    foods: 44,
+                    tools: 38,
+                    damageable_items: 84,
+                },
                 recipes: RecipeSummary {
                     cooking: CookingSummary {
                         smelting: 73,
@@ -510,6 +822,8 @@ mod tests {
                     },
                     crafting_shaped: 827,
                     crafting_shapeless: 358,
+                    crafting_transmute: 33,
+                    crafting_special_repairitem: 1,
                     stonecutting: 351,
                     smithing_transform: 12,
                     smithing_trim: 18,
@@ -517,8 +831,28 @@ mod tests {
                     // 48 previously skipped minus 1 loaded `minecraft:crafting_special_repairitem` file = 47.
                     skipped: 47,
                 },
-                loot_tables: 1201,
+                loot_tables: 1201 + 109 + 58 + 26 + 6,
+                loot_categories: LootCategorySummary {
+                    blocks: 1201,
+                    entities: 109,
+                    chests: 58,
+                    gameplay: 26,
+                    archaeology: 6,
+                },
+                unsupported_loot_nodes: UnsupportedLootSummary {
+                    count: 36,
+                    kinds: vec![
+                        "minecraft:exploration_map".to_owned(),
+                        "minecraft:filtered".to_owned(),
+                    ],
+                },
                 enchantments: 43,
+                protocol_ids: ProtocolIdSummary {
+                    items: 1658,
+                    component_types: 122,
+                    potions: 46,
+                    mob_effects: 40,
+                },
             }
         );
     }

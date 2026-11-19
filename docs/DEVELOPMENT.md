@@ -187,10 +187,21 @@ and [ADR-0013](decisions/ADR-0013.md).
 
 ## Vanilla 26.3 rule data root
 
-The recipe, fuel, brewing, smithing, anvil, enchantment, item default
-component, tool rule, and block loot loaders read Java 26.3 data and reports at
+The recipe (crafting, cooking, stonecutting, transmute, item repair, brewing,
+and smithing), fuel, anvil, enchanting table, grindstone, enchantment, item
+default component, tool rule, loot table (block, entity, chest, gameplay, and
+archaeology), and static protocol ID loaders read Java 26.3 data and reports at
 runtime from an operator-provisioned directory. These files are library logic
-and are not wired into live play yet.
+and are not wired into live play yet (aside from the opt-in local preview's
+server-side creative inventory when configured with vanilla data, which is not
+yet verified with a real client).
+
+In addition to recipes, tags, loot tables, and enchantments, the data root
+needs `data/minecraft/instrument`, `data/minecraft/tags/instrument`, and
+`data/minecraft/tags/worldgen/**` (such as `tags/worldgen/biome`), all of
+which come with extracting `data/minecraft/**`, as well as
+`reports/registries.json` alongside `reports/minecraft/components/item` from
+`--reports`.
 
 To provision a local data root from your own official Java 26.3 `server.jar`
 (requires Java 25 and `unzip`), extract `data/minecraft/**` from the versioned
