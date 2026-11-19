@@ -154,14 +154,14 @@ dispatch is below 10 %.
 Method: same single-threaded release measurement as above (seed 2026, cold
 first pass on a freshly constructed generator, 4×4 chunk square at origin plus
 one isolated chunk at `(500, 500)`, operator-provisioned 26.3 data root),
-measured back to back on the baseline and updated builds.
+comparing the pre-change baseline against the updated build.
 
 | Mode (ms per chunk) | Before | After |
 | --- | ---: | ---: |
-| `columns` (4×4) | 241.27 | 192.92 |
-| `substance` (4×4) | 15.65 | 18.20 |
-| `heights` (4×4) | 10.64 | 10.99 |
-| `columns` isolated `(500, 500)` | 862.87 | 1,085.51 |
+| `columns` (4×4) | 241.27 | 169.78 |
+| `substance` (4×4) | 15.65 | 16.13 |
+| `heights` (4×4) | 10.64 | 12.15 |
+| `columns` isolated `(500, 500)` | 862.87 | 714.36 |
 
 What changed:
 
@@ -169,33 +169,49 @@ What changed:
   `VanillaGenerator::chunk_biomes` into runs whose five non-depth quantized
   targets (`temperature`, `humidity`, `continentalness`, `erosion`, `weirdness`)
   are equal (`fixed_run_len`), computes each row's fixed-part fitness `A_i`
-  once per run, sorts `(A_i, row, depth)` by `(A_i, row)` ascending, and scans
-  each uncached cell's depth in that order stopping as soon as
-  `A_i > best_fitness` (and skipping rows with `row > best_row` when
-  `A_i == best_fitness`) so ties keep the earlier table row.
+  once per run, partitions the `COLUMN_SCAN_FALLBACK_ROWS = 1024` smallest
+  `(A_i, row)` pairs with `select_nth_unstable_by` (tuned across
+  `128..2048` by measurement), and sorts only that prefix by `(A_i, row)`
+  ascending so ties keep the earlier table row.
+- Each `BiomePlacement` precomputes the sorted, merged, disjoint union of all
+  rows' `depth` intervals (`depth_ranges`) so `min_depth_fitness` yields the
+  exact lower bound `D(t4) = min_i distance_depth(t4)^2` in `O(log |depth_ranges|)`
+  (0 inside any interval). The column scan stops as soon as
+  `A_i + D(t4) > best_fitness` (or `A_i + D(t4) == best_fitness` with
+  `row > best_row`), avoiding full-table scans at negative depth targets when
+  all placement rows have `depth.min >= 0`.
+- When a cell has not terminated after examining `COLUMN_SCAN_FALLBACK_ROWS`
+  rows and the `(K + 1)`-th row's bound does not prove termination,
+  `find_column` stops the scan and resolves that cell through the bounding-box
+  tree (`find_row_with_seed`, seeded with the better of the scanned prefix
+  winner and `last_winner`), updating `last_winner` across both paths to keep
+  the vertical warm start tight.
 - Reusable scratch buffers (`ColumnSearchScratch` inside `ClimateScratch`)
-  keep the 7,594-row `A_i` and sort buffers across runs and chunks without
-  per-run or per-cell allocations, while `BiomePlacement::find` retains the
-  bounding-box tree for out-of-grid point lookups (`biome(x, z, y)` misses,
-  point queries, and tests).
+  keep the 7,594-row order buffer across runs and chunks without per-run or
+  per-cell allocations, while `BiomePlacement::find` retains the bounding-box
+  tree for out-of-grid point lookups (`biome(x, z, y)` misses, point queries,
+  and tests).
 
 Evidence: 289/289 chunk packets around spawn (radius 8) are byte-identical to
 the baseline build, oracle `census_compare` and `biome_volume` outputs against
-the seed-2026 save are byte-identical, all 973 workspace tests pass (`cargo test`
-with 64 ignored), and all 64 ignored data-root tests pass in release mode
-(including exact `find_column == find == brute force` checks across all 12,288
-quart cells of 8 chunks, 3,000 random synthetic runs with deliberate ties and
-mid-column splits, and a quantized overflow-bound check asserting
+the seed-2026 save are byte-identical, all 975 workspace tests pass (with 64
+ignored), and all 64 ignored data-root tests pass in release mode (including
+exact `find_column == find == brute force` checks across all 12,288 quart
+cells of 8 chunks, 3,000 random synthetic runs with deliberate ties and
+mid-column splits, 2,000 negative-depth runs above non-negative depth
+intervals, a fallback-limit test verifying winners beyond
+`COLUMN_SCAN_FALLBACK_ROWS`, and a quantized overflow-bound check asserting
 `|A_i| + max_depth_term <= 7.27e12` against `i64::MAX`, with an observed
-maximum of `1,516,900,650` across the 8 chunks). On the 4×4 square `columns`
-improves by 20 % (`241.27` to `192.92 ms/chunk`), whereas `columns` isolated
-`(500, 500)` regresses (`862.87` to `1,085.51 ms/chunk`) because an isolated
-chunk builds 25 `chunk_biomes` halo chunks and every row in the 26.3 overworld
-placement table has `depth.min >= 0`, so high-altitude negative-depth cells
-yield `best_fitness >= depth^2` above `A_i` for thousands or all 7,594 rows
-and prevent early stopping. In a CPU profile of `columns` (2×2 square),
-`BiomePlacement::search` from `biome(x, z, y)` cache misses accounts for
-21.40 %, `find_column` plus sorting accounts for 29.23 % (`15.65 %`
-`find_column`, `6.86 %` `small_sort_general`, `6.72 %` `quicksort`), and
-`PerlinNoise` sampling accounts for 20.23 % (`12.41 %` `sample_and_lerp`,
-`4.45 %` `get_smeared`, `3.37 %` `get`).
+maximum of `1,516,900,650` across the 8 chunks). Compared with the baseline,
+`columns` (4×4) improves by 29.6 % (`241.27` to `169.78 ms/chunk`) and
+`columns` isolated `(500, 500)` improves by 17.2 % (`862.87` to
+`714.36 ms/chunk`). In a CPU profile of `columns` (2×2 square),
+`BiomePlacement::search` (cache-miss `biome` lookups plus tree fallbacks
+beyond 1,024 rows) accounts for 28.58 %, `PerlinNoise` sampling accounts for
+26.09 % (`15.86 %` `sample_and_lerp`, `8.37 %` `get_smeared`, `1.86 %` `get`),
+`Density::sample` accounts for 7.49 %, `NoiseBasedAquifer::substance` accounts
+for 4.89 %, `BiomePlacement::find_column` accounts for 4.04 %,
+`FeatureData::run_chain` accounts for 3.84 %, `partition_at_index` plus
+`small_sort_general` accounts for 3.58 % (`2.29 %` + `1.29 %`),
+`sample_interpolated_block_step` accounts for 2.68 %, and
+`Density::sample_volume` accounts for 2.42 %.
