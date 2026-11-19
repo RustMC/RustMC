@@ -10006,4 +10006,496 @@ mod tests {
         ]);
         assert_eq!(unsupported, expected_unsupported);
     }
+
+    fn parse_json_int_range(value: &serde_json::Value) -> (u32, u32) {
+        if let Some(n) = value.as_f64() {
+            let v = n.round() as u32;
+            return (v, v);
+        }
+        if let Some(obj) = value.as_object() {
+            if obj.get("type").and_then(|v| v.as_str()) == Some("minecraft:constant") {
+                return parse_json_int_range(&obj["value"]);
+            }
+            if let (Some(min_v), Some(max_v)) = (obj.get("min"), obj.get("max")) {
+                let (lo, _) = parse_json_int_range(min_v);
+                let (_, hi) = parse_json_int_range(max_v);
+                return (lo, hi);
+            }
+        }
+        panic!("unsupported number provider JSON in test: {value}");
+    }
+
+    struct JsonItemSpec {
+        item: String,
+        weight: u64,
+        min_count: u32,
+        max_count: u32,
+        potion: Option<String>,
+        expects_enchanted: bool,
+    }
+
+    fn parse_json_item_entry(entry: &serde_json::Value) -> JsonItemSpec {
+        let raw_item = entry["name"].as_str().expect("item entry name");
+        let weight = entry.get("weight").and_then(|v| v.as_u64()).unwrap_or(1);
+        let mut min_count = 1_u32;
+        let mut max_count = 1_u32;
+        let mut potion = None;
+        let mut expects_enchanted = false;
+
+        let mut mods: Vec<&serde_json::Value> = Vec::new();
+        if let Some(m) = entry.get("modifier") {
+            if let Some(arr) = m.as_array() {
+                mods.extend(arr.iter());
+            } else if m.is_object() {
+                mods.push(m);
+            }
+        }
+        if let Some(arr) = entry.get("functions").and_then(|v| v.as_array()) {
+            mods.extend(arr.iter());
+        }
+
+        for func in mods {
+            let kind = func
+                .get("type")
+                .or_else(|| func.get("function"))
+                .and_then(|v| v.as_str())
+                .expect("modifier type");
+            let short = kind.strip_prefix("minecraft:").unwrap_or(kind);
+            match short {
+                "set_count" => {
+                    let (lo, hi) = parse_json_int_range(&func["count"]);
+                    if func.get("add").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        min_count += lo;
+                        max_count += hi;
+                    } else {
+                        min_count = lo;
+                        max_count = hi;
+                    }
+                }
+                "enchant_randomly" | "enchant_with_levels" | "set_enchantments" => {
+                    expects_enchanted = true;
+                }
+                "set_potion" => {
+                    potion = func.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+
+        let item = if expects_enchanted && raw_item == "minecraft:book" {
+            "minecraft:enchanted_book".to_string()
+        } else {
+            raw_item.to_string()
+        };
+
+        JsonItemSpec {
+            item,
+            weight,
+            min_count,
+            max_count,
+            potion,
+            expects_enchanted,
+        }
+    }
+
+    /// Pin vanilla `minecraft:chests/simple_dungeon` item set, per-entry count bounds,
+    /// and total stacks per roll against the JSON definition across 10,000 seeds.
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_simple_dungeon_chest_loot_bounds`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_simple_dungeon_chest_loot_bounds() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_chests(&root).expect("load chests");
+        let defaults = tables.item_defaults().expect("item defaults");
+        let json_path = root.join("data/minecraft/loot_table/chests/simple_dungeon.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).expect("read simple_dungeon"))
+                .expect("parse simple_dungeon");
+
+        let pools = doc["pools"].as_array().expect("pools");
+        let mut min_rolls = 0_usize;
+        let mut max_rolls = 0_usize;
+        let mut allowed: std::collections::BTreeMap<String, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        let mut pool_items: Vec<std::collections::BTreeSet<String>> =
+            Vec::with_capacity(pools.len());
+
+        for pool in pools {
+            assert_eq!(
+                pool.get("bonus_rolls")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                0.0
+            );
+            let (r_min, r_max) = parse_json_int_range(&pool["rolls"]);
+            min_rolls += r_min as usize;
+            max_rolls += r_max as usize;
+
+            let mut this_pool_items = std::collections::BTreeSet::new();
+            for entry in pool["entries"].as_array().expect("entries") {
+                assert_eq!(entry["type"].as_str(), Some("minecraft:item"));
+                let spec = parse_json_item_entry(entry);
+                let max_stack = u32::from(
+                    defaults
+                        .max_stack_size(&spec.item)
+                        .expect("vanilla item max_stack_size"),
+                );
+                assert!(
+                    spec.max_count <= max_stack,
+                    "{} max_count {} exceeds max_stack {max_stack}",
+                    spec.item,
+                    spec.max_count
+                );
+                this_pool_items.insert(spec.item.clone());
+                allowed
+                    .entry(spec.item)
+                    .and_modify(|(lo, hi)| {
+                        *lo = (*lo).min(spec.min_count);
+                        *hi = (*hi).max(spec.max_count);
+                    })
+                    .or_insert((spec.min_count, spec.max_count));
+            }
+            pool_items.push(this_pool_items);
+        }
+
+        assert!(allowed.contains_key("minecraft:enchanted_book"));
+        let mut seen = std::collections::BTreeSet::new();
+
+        for seed in 0_u64..10_000 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let rolled = tables
+                .roll_chest(
+                    "minecraft:chests/simple_dungeon",
+                    &LootContext::default(),
+                    &mut rng,
+                )
+                .expect("roll simple_dungeon");
+            assert!(
+                (min_rolls..=max_rolls).contains(&rolled.items.len()),
+                "seed {seed}: stack count {} outside {min_rolls}..={max_rolls}",
+                rolled.items.len()
+            );
+            for stack in &rolled.items {
+                let (lo, hi) = allowed
+                    .get(stack.item())
+                    .unwrap_or_else(|| panic!("seed {seed}: unexpected item {}", stack.item()));
+                let count = u32::from(stack.count());
+                assert!(
+                    (*lo..=*hi).contains(&count),
+                    "seed {seed}: item {} count {count} outside {lo}..={hi}",
+                    stack.item()
+                );
+                if stack.item() == "minecraft:enchanted_book" {
+                    assert!(
+                        !stack.components().stored_enchantments().is_empty(),
+                        "seed {seed}: simple_dungeon enchanted_book has empty stored_enchantments"
+                    );
+                }
+                seen.insert(stack.item().to_string());
+            }
+        }
+
+        for (idx, set) in pool_items.iter().enumerate() {
+            assert!(
+                set.iter().any(|item| seen.contains(item)),
+                "pool {idx} produced no items over 10,000 seeds"
+            );
+        }
+        assert!(seen.contains("minecraft:enchanted_book"));
+    }
+
+    /// Pin `minecraft:gameplay/piglin_bartering` item frequencies within ±0.01 of the
+    /// JSON weights over 20,000 seeds and cross-check two entries against `minecraft.wiki`
+    /// `Bartering` (rev `3848806`).
+    ///
+    /// Wiki quotes (`Bartering`, rev `3848806`):
+    /// - "Enchanted Book with Soul Speed (random level)" -> Chance `5/469` (~1.07%), Quantity `1`
+    /// - "Iron Boots with Soul Speed (random level)" -> Chance `8/469` (~1.71%), Quantity `1`
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_piglin_bartering_frequencies_and_wiki_probabilities`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_piglin_bartering_frequencies_and_wiki_probabilities() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_gameplay(&root).expect("load gameplay");
+        let defaults = tables.item_defaults().expect("item defaults");
+        let json_path = root.join("data/minecraft/loot_table/gameplay/piglin_bartering.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).expect("read bartering"))
+                .expect("parse bartering");
+
+        let pools = doc["pools"].as_array().expect("pools");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(parse_json_int_range(&pools[0]["rolls"]), (1, 1));
+
+        type BarterKey = (String, Option<String>);
+        let mut expected_entries: std::collections::BTreeMap<BarterKey, (u64, u32, u32, bool)> =
+            std::collections::BTreeMap::new();
+        let mut total_weight = 0_u64;
+
+        for entry in pools[0]["entries"].as_array().expect("entries") {
+            assert_eq!(entry["type"].as_str(), Some("minecraft:item"));
+            let spec = parse_json_item_entry(entry);
+            assert!(
+                spec.max_count
+                    <= u32::from(
+                        defaults
+                            .max_stack_size(&spec.item)
+                            .expect("vanilla item max_stack_size"),
+                    )
+            );
+            total_weight += spec.weight;
+            let key = (spec.item, spec.potion);
+            let prev = expected_entries.insert(
+                key.clone(),
+                (
+                    spec.weight,
+                    spec.min_count,
+                    spec.max_count,
+                    spec.expects_enchanted,
+                ),
+            );
+            assert!(prev.is_none(), "duplicate bartering key {key:?}");
+        }
+
+        // Cross-check wiki `Bartering` (rev 3848806) probabilities against parsed JSON weights.
+        assert_eq!(total_weight, 469);
+        assert_eq!(
+            expected_entries[&("minecraft:enchanted_book".to_string(), None)],
+            (5, 1, 1, true)
+        );
+        assert_eq!(
+            expected_entries[&("minecraft:iron_boots".to_string(), None)],
+            (8, 1, 1, true)
+        );
+
+        let trials = 20_000_usize;
+        let mut counts: std::collections::BTreeMap<BarterKey, usize> =
+            std::collections::BTreeMap::new();
+
+        for seed in 0..trials as u64 {
+            let mut rng = RandomSource::from_world_seed(seed);
+            let rolled = tables
+                .roll_gameplay(
+                    "minecraft:gameplay/piglin_bartering",
+                    &LootContext::default(),
+                    &mut rng,
+                )
+                .expect("roll bartering");
+            assert_eq!(rolled.items.len(), 1, "seed {seed}");
+            let stack = &rolled.items[0];
+            let key = (
+                stack.item().to_string(),
+                stack.components().potion().map(str::to_string),
+            );
+            let &(_weight, min_c, max_c, expects_soul_speed) = expected_entries
+                .get(&key)
+                .unwrap_or_else(|| panic!("seed {seed}: unexpected bartering drop {key:?}"));
+            let count = u32::from(stack.count());
+            assert!(
+                (min_c..=max_c).contains(&count),
+                "seed {seed}: {key:?} count {count} outside {min_c}..={max_c}"
+            );
+            if expects_soul_speed {
+                let ench_map = if stack.item() == "minecraft:enchanted_book" {
+                    stack.components().stored_enchantments()
+                } else {
+                    stack.components().enchantments()
+                };
+                assert_eq!(ench_map.len(), 1);
+                let level = ench_map
+                    .get("minecraft:soul_speed")
+                    .copied()
+                    .expect("soul_speed enchantment");
+                assert!((1..=3).contains(&level), "soul_speed level {level}");
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        for (key, &(weight, ..)) in &expected_entries {
+            let expected = weight as f64 / total_weight as f64;
+            let actual = *counts.get(key).unwrap_or(&0) as f64 / trials as f64;
+            assert!(
+                (actual - expected).abs() <= 0.01,
+                "bartering {key:?}: observed {actual:.5} vs expected {expected:.5} (diff {:.5})",
+                (actual - expected).abs()
+            );
+        }
+    }
+
+    /// Pin `minecraft:gameplay/fishing` so treasure items appear in open water and never appear
+    /// when the fishing hook is not in open water (or absent).
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_fishing_open_water_controls_treasure`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_fishing_open_water_controls_treasure() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_gameplay(&root).expect("load gameplay");
+        let lt_dir = root.join("data/minecraft/loot_table/gameplay");
+
+        let fishing_doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(lt_dir.join("fishing.json")).expect("fishing"),
+        )
+        .expect("parse fishing");
+        let entries = fishing_doc["pools"][0]["entries"]
+            .as_array()
+            .expect("fishing pool entries");
+        let mut saw_treasure_open_water_check = false;
+        for entry in entries {
+            if entry["value"].as_str() == Some("minecraft:gameplay/fishing/treasure") {
+                let cond = &entry["condition"];
+                assert_eq!(cond["type"].as_str(), Some("minecraft:entity_properties"));
+                assert_eq!(
+                    cond["predicate"]["minecraft:type_specific/fishing_hook"]["in_open_water"]
+                        .as_bool(),
+                    Some(true)
+                );
+                saw_treasure_open_water_check = true;
+            }
+        }
+        assert!(saw_treasure_open_water_check);
+
+        let treasure_doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(lt_dir.join("fishing/treasure.json")).expect("treasure"),
+        )
+        .expect("parse treasure");
+        let mut treasure_specs: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
+        for entry in treasure_doc["pools"][0]["entries"]
+            .as_array()
+            .expect("treasure entries")
+        {
+            let spec = parse_json_item_entry(entry);
+            treasure_specs.insert(spec.item, spec.expects_enchanted);
+        }
+
+        let is_treasure = |stack: &ItemStack| -> bool {
+            match treasure_specs.get(stack.item()) {
+                None => false,
+                Some(false) => true,
+                Some(true) => {
+                    !stack.components().enchantments().is_empty()
+                        || !stack.components().stored_enchantments().is_empty()
+                }
+            }
+        };
+
+        let trials = 2_000_usize;
+        let open_ctx = LootContext::default().with_entity(
+            EntityContext::new("minecraft:fishing_bobber").with_fishing_hook_in_open_water(true),
+        );
+        let closed_ctx = LootContext::default().with_entity(
+            EntityContext::new("minecraft:fishing_bobber").with_fishing_hook_in_open_water(false),
+        );
+
+        let mut open_treasure = 0_usize;
+        let mut open_other = 0_usize;
+        let mut closed_treasure = 0_usize;
+        let mut closed_other = 0_usize;
+        let mut empty_treasure = 0_usize;
+
+        for seed in 0..trials as u64 {
+            let open_roll = tables
+                .roll_gameplay(
+                    "minecraft:gameplay/fishing",
+                    &open_ctx,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll open fishing");
+            assert_eq!(open_roll.items.len(), 1, "seed {seed}");
+            if is_treasure(&open_roll.items[0]) {
+                open_treasure += 1;
+            } else {
+                open_other += 1;
+            }
+
+            let closed_roll = tables
+                .roll_gameplay(
+                    "minecraft:gameplay/fishing",
+                    &closed_ctx,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll closed fishing");
+            assert_eq!(closed_roll.items.len(), 1, "seed {seed}");
+            if is_treasure(&closed_roll.items[0]) {
+                closed_treasure += 1;
+            } else {
+                closed_other += 1;
+            }
+
+            let empty_roll = tables
+                .roll_gameplay(
+                    "minecraft:gameplay/fishing",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll empty fishing");
+            assert_eq!(empty_roll.items.len(), 1, "seed {seed}");
+            if is_treasure(&empty_roll.items[0]) {
+                empty_treasure += 1;
+            }
+        }
+
+        assert!(
+            open_treasure > 0,
+            "expected treasure catches in open water across {trials} seeds"
+        );
+        assert!(open_other > 0);
+        assert_eq!(
+            closed_treasure, 0,
+            "treasure caught with in_open_water=false"
+        );
+        assert_eq!(closed_other, trials);
+        assert_eq!(
+            empty_treasure, 0,
+            "treasure caught without a fishing_bobber entity"
+        );
+    }
+
+    /// Roll every loaded vanilla `chests/`, `gameplay/`, and `archaeology/` loot table once
+    /// with an empty context and confirm valid stack counts and no errors.
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_all_chest_gameplay_and_archaeology_tables_roll_without_panic_in_empty_context`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_all_chest_gameplay_and_archaeology_tables_roll_without_panic_in_empty_context() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_categories(&root, &["chests", "gameplay", "archaeology"])
+            .expect("load chest, gameplay and archaeology tables");
+        let defaults = tables.item_defaults().expect("item defaults");
+        assert_eq!(tables.len(), 90);
+
+        let ctx = LootContext::default();
+        let mut rng = RandomSource::from_world_seed(0x4C6F_6F74);
+        for (id, _) in tables.iter() {
+            let rolled = tables
+                .roll_table(id, &ctx, &mut rng)
+                .unwrap_or_else(|| panic!("table {id} returned None in empty context"));
+            for stack in &rolled.items {
+                assert!(
+                    stack.count() >= 1 && stack.count() <= stack.max_stack(),
+                    "table {id}: invalid stack count {} (max {}) for {}",
+                    stack.count(),
+                    stack.max_stack(),
+                    stack.item()
+                );
+                assert_eq!(
+                    stack.max_stack(),
+                    u16::from(
+                        defaults
+                            .max_stack_size(stack.item())
+                            .expect("vanilla item max_stack_size"),
+                    ),
+                    "table {id}: max_stack mismatch for {}",
+                    stack.item()
+                );
+            }
+        }
+    }
 }
