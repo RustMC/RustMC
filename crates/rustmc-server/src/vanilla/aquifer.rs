@@ -146,6 +146,55 @@ impl Aquifer {
     }
 }
 
+const LOCAL_MIN_GRID_Y: i32 = -16;
+const LOCAL_GRID_Y_LEN: usize = 48;
+const LOCAL_GRID_SLOTS: usize = 3 * 3 * LOCAL_GRID_Y_LEN;
+const UNSET_CENTER: [i32; 3] = [i32::MIN; 3];
+
+/// Single-chunk flat cache of the `3 x 48 x 3` aquifer grid cells touched by
+/// one chunk, eliminating per-block `BoundedCache` hash lookups.
+struct LocalAquiferChunk {
+    chunk: (i32, i32),
+    valid: bool,
+    skip_y: i32,
+    centers: [[i32; 3]; LOCAL_GRID_SLOTS],
+    statuses: [Option<FluidStatus>; LOCAL_GRID_SLOTS],
+}
+
+impl LocalAquiferChunk {
+    fn new() -> Self {
+        Self {
+            chunk: (0, 0),
+            valid: false,
+            skip_y: 0,
+            centers: [UNSET_CENTER; LOCAL_GRID_SLOTS],
+            statuses: [None; LOCAL_GRID_SLOTS],
+        }
+    }
+
+    fn reset(&mut self, chunk: (i32, i32), skip_y: i32) {
+        self.chunk = chunk;
+        self.valid = true;
+        self.skip_y = skip_y;
+        self.centers.fill(UNSET_CENTER);
+        self.statuses.fill(None);
+    }
+
+    fn slot(&self, cell: [i32; 3]) -> Option<usize> {
+        let dx = cell[0] - (self.chunk.0 - 1);
+        let dz = cell[2] - (self.chunk.1 - 1);
+        let dy = cell[1] - LOCAL_MIN_GRID_Y;
+        if (0..3).contains(&dx)
+            && (0..3).contains(&dz)
+            && (0..LOCAL_GRID_Y_LEN as i32).contains(&dy)
+        {
+            Some(((dx as usize * 3 + dz as usize) * LOCAL_GRID_Y_LEN) + dy as usize)
+        } else {
+            None
+        }
+    }
+}
+
 /// The noise-based aquifer: a hashed grid of fluid cells whose statuses
 /// adjust density-empty positions through barrier pressure and per-cell
 /// fluid levels.
@@ -159,6 +208,7 @@ pub struct NoiseBasedAquifer {
     statuses: RefCell<BoundedCache<[i32; 3], FluidStatus>>,
     surface_cache: RefCell<BoundedCache<[i32; 2], i32>>,
     skip_cache: RefCell<BoundedCache<[i32; 2], i32>>,
+    local: RefCell<Box<LocalAquiferChunk>>,
 }
 
 impl NoiseBasedAquifer {
@@ -229,6 +279,7 @@ impl NoiseBasedAquifer {
             statuses: RefCell::new(BoundedCache::new(Self::STATUS_CACHE_CAPACITY)),
             surface_cache: RefCell::new(BoundedCache::new(Self::SURFACE_CACHE_CAPACITY)),
             skip_cache: RefCell::new(BoundedCache::new(Self::SKIP_CACHE_CAPACITY)),
+            local: RefCell::new(Box::new(LocalAquiferChunk::new())),
         }
     }
 
@@ -351,7 +402,13 @@ impl NoiseBasedAquifer {
             return Substance::Solid;
         }
         let global = self.fluids.pick(y);
-        if y > self.skip_sampling_above_y(x, z) {
+        let chunk = (x >> 4, z >> 4);
+        let mut local = self.local.borrow_mut();
+        if !local.valid || local.chunk != chunk {
+            let skip_y = self.skip_sampling_above_y(x, z);
+            local.reset(chunk, skip_y);
+        }
+        if y > local.skip_y {
             return substance_of(global.at(y));
         }
         if global.at(y) == Some(Fluid::Lava) {
@@ -371,7 +428,7 @@ impl NoiseBasedAquifer {
             for dy in -1..=1 {
                 for dz in 0..=1 {
                     let cell = [anchor[0] + dx, anchor[1] + dy, anchor[2] + dz];
-                    let center = self.cell_center(cell);
+                    let center = self.local_cell_center(&mut local, cell);
                     let dx = center[0] - x;
                     let dy = center[1] - y;
                     let dz = center[2] - z;
@@ -384,7 +441,7 @@ impl NoiseBasedAquifer {
         let (cell_one, distance_one) = nearest[0];
         let (cell_two, distance_two) = nearest[1];
         let (cell_three, distance_three) = nearest[2];
-        let status_one = self.cell_status(cell_one);
+        let status_one = self.local_cell_status(&mut local, cell_one);
         let similarity_one_two = similarity(distance_one, distance_two);
         let fluid_state = status_one.at(y);
         if similarity_one_two <= 0.0 {
@@ -399,13 +456,13 @@ impl NoiseBasedAquifer {
 
         let density = f64::from(density);
         let mut barrier_noise = f64::NAN;
-        let status_two = self.cell_status(cell_two);
+        let status_two = self.local_cell_status(&mut local, cell_two);
         let barrier_one_two = similarity_one_two
             * self.pressure(x, y, z, &mut barrier_noise, &status_one, &status_two);
         if density + barrier_one_two > 0.0 {
             return Substance::Solid;
         }
-        let status_three = self.cell_status(cell_three);
+        let status_three = self.local_cell_status(&mut local, cell_three);
         let similarity_one_three = similarity(distance_one, distance_three);
         if similarity_one_three > 0.0 {
             let barrier_one_three = similarity_one_two
@@ -425,6 +482,31 @@ impl NoiseBasedAquifer {
             }
         }
         substance_of(fluid_state)
+    }
+
+    fn local_cell_center(&self, local: &mut LocalAquiferChunk, cell: [i32; 3]) -> [i32; 3] {
+        if let Some(slot) = local.slot(cell) {
+            let cached = local.centers[slot];
+            if cached != UNSET_CENTER {
+                return cached;
+            }
+            let center = self.cell_center(cell);
+            local.centers[slot] = center;
+            return center;
+        }
+        self.cell_center(cell)
+    }
+
+    fn local_cell_status(&self, local: &mut LocalAquiferChunk, cell: [i32; 3]) -> FluidStatus {
+        if let Some(slot) = local.slot(cell) {
+            if let Some(cached) = local.statuses[slot] {
+                return cached;
+            }
+            let status = self.cell_status(cell);
+            local.statuses[slot] = Some(status);
+            return status;
+        }
+        self.cell_status(cell)
     }
 
     /// Barrier pressure between two cell statuses at a block row. The

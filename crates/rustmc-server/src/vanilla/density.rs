@@ -911,6 +911,29 @@ impl Density {
                 volume,
                 out,
             ),
+            _ if self.is_y_independent() => {
+                let first_slot = |x: usize, z: usize| volume.index(x, 0, z);
+                let height = volume.size[1] as usize;
+                let neg_count = (0..volume.size[1])
+                    .take_while(|&y| volume.block(1, y) < 0)
+                    .count();
+                for z in 0..volume.size[2] {
+                    let block_z = volume.block(2, z);
+                    for x in 0..volume.size[0] {
+                        let block_x = volume.block(0, x);
+                        let start = first_slot(x as usize, z as usize);
+                        if neg_count > 0 {
+                            let val = self.sample(block_x, volume.block(1, 0), block_z);
+                            out[start..start + neg_count].fill(val);
+                        }
+                        if neg_count < height {
+                            let val =
+                                self.sample(block_x, volume.block(1, neg_count as i32), block_z);
+                            out[start + neg_count..start + height].fill(val);
+                        }
+                    }
+                }
+            }
             _ => {
                 for z in 0..volume.size[2] {
                     for x in 0..volume.size[0] {

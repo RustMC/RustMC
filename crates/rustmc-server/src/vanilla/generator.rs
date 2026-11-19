@@ -276,6 +276,8 @@ pub struct VanillaGenerator {
     chunk_density: RefCell<BoundedCache<(i32, i32), ChunkDensities>>,
     /// Reusable buffer for `chunk_density` volume fills.
     density_scratch: RefCell<Vec<f32>>,
+    /// Reusable buffers for `chunk_biomes` climate volume fills.
+    climate_scratch: RefCell<(Vec<f32>, Vec<[i64; 6]>)>,
 }
 
 impl VanillaGenerator {
@@ -434,6 +436,7 @@ impl VanillaGenerator {
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
             chunk_density: RefCell::new(BoundedCache::new(Self::CHUNK_DENSITY_CACHE_CAPACITY)),
             density_scratch: RefCell::new(Vec::new()),
+            climate_scratch: RefCell::new((Vec::new(), Vec::new())),
         })
     }
 
@@ -460,19 +463,60 @@ impl VanillaGenerator {
         if let Some(region) = self.biome_regions.borrow_mut().get_mut(&(chunk_x, chunk_z)) {
             return Rc::clone(region);
         }
+        let Some(placement) = self.placement.as_ref() else {
+            let region = Rc::new(Vec::new());
+            self.biome_regions
+                .borrow_mut()
+                .insert((chunk_x, chunk_z), Rc::clone(&region));
+            return region;
+        };
         let min_y = self.router.min_y;
+        let quart_height = self.router.height / 4;
+        let Some(volume) = DensityVolume::new(
+            [4, quart_height, 4],
+            [chunk_x * 16, min_y, chunk_z * 16],
+            [4, 4, 4],
+        ) else {
+            return Rc::new(Vec::new());
+        };
+        let mut scratch_guard = self.climate_scratch.borrow_mut();
+        let (density_scratch, targets) = &mut *scratch_guard;
+        self.climate
+            .targets_for_volume(&volume, density_scratch, targets);
         let mut names = BTreeSet::new();
-        for local_x in 0..4 {
-            for local_z in 0..4 {
+        let mut biomes = self.biomes.borrow_mut();
+        // Iterate column by column with y innermost so consecutive lookups are
+        // vertically adjacent and keep BiomePlacement's warm start tight.
+        for local_z in 0..4 {
+            let z = chunk_z * 16 + local_z * 4;
+            let qz = z >> 2;
+            for local_x in 0..4 {
                 let x = chunk_x * 16 + local_x * 4;
-                let z = chunk_z * 16 + local_z * 4;
-                for row in 0..self.router.height / 4 {
-                    if let Some(name) = self.biome(x, z, min_y + row * 4) {
+                let qx = x >> 2;
+                let base_slot = volume.index(local_x as usize, 0, local_z as usize);
+                for (row, target) in targets[base_slot..base_slot + quart_height as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    let qy = (min_y + row as i32 * 4) >> 2;
+                    let key = (qx, qy, qz);
+                    let id = if let Some(cached) = biomes.get_mut(&key) {
+                        cached.clone()
+                    } else {
+                        let found = placement.find(target).map(str::to_owned);
+                        biomes.insert(key, found.clone());
+                        found
+                    };
+                    if let Some(name) = id
+                        && !names.contains(&name)
+                    {
                         names.insert(name);
                     }
                 }
             }
         }
+        drop(biomes);
+        drop(scratch_guard);
         let region = Rc::new(names.into_iter().collect::<BiomeRegion>());
         self.biome_regions
             .borrow_mut()
