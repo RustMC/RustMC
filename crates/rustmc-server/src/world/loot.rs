@@ -88,13 +88,16 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::item::{
-    ItemComponents, ItemDefaults, ItemDefaultsError, ItemStack, MAX_STACK_LIMIT, default_max_stack,
-    items_equal, normalize_item_id,
+    ItemComponents, ItemDefaults, ItemDefaultsError, ItemStack, MAX_STACK_LIMIT,
+    MIN_ENCHANTMENT_LEVEL, default_max_stack, items_equal, normalize_item_id,
 };
 use crate::vanilla::feature::{BlockTags, EnchantmentTags, ItemTags, load_tag_entries};
 use crate::vanilla::random::RandomSource;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
-use crate::world::enchantment::{EnchantmentError, EnchantmentRegistry};
+use crate::world::enchanting::select_enchantments_for_loot;
+use crate::world::enchantment::{
+    EnchantmentDefinition, EnchantmentError, EnchantmentRegistry, MAX_ENCHANTMENT_LEVEL,
+};
 use crate::world::recipe_data::{CookingKind, RecipeData, RecipeDataError};
 
 /// Maximum nesting depth allowed when resolving or evaluating `loot_table` entries.
@@ -1242,7 +1245,13 @@ impl LootTable {
     ///   - `enchanted_count_increase`: `"Adjusts the stack size based on the level of the specified enchantment on the killer entity provided by loot context."` / `count`: `"Specifies the number of additional items per level of the enchantment. Note the number may be fractional, rounded after multiplying by the enchantment level."` / `limit`: `"Specifies the maximum amount of items in the stack after the enchantment calculation. If the value is 0, no limit is applied. Defaults to 0."`
     ///   - `furnace_smelt`: `"Smelts the item as it would be in a furnace without changing its count."` Looks up `CookingKind::Smelting` in loaded `RecipeData`; when no recipe matches, leaves the item unchanged.
     ///   - `set_potion`: `"Sets the potion_contents component of an item."` (`"The potion ID. Set to empty to remove the Potion tag."`)
-    ///   - `set_ominous_bottle_amplifier`: kept as [`LootModifier::Unsupported`] because `ItemComponents` has no ominous bottle amplifier field.
+    ///   - `set_damage` (`Item modifier` rev 3896146; `Data component format/damage` rev 3536877): `"Sets the item's damage value (durability)."` `damage`: `"Specifies the durability fraction to set (1.0 is undamaged, 0.0 is zero durability left)."` `add`: `"If true, change is relative to current damage. Defaults to false."` Converts remaining durability fraction to `minecraft:damage` uses consumed from `ItemDefaults::max_damage`, leaving non-damageable items unchanged.
+    ///   - `set_name` (`Item modifier` rev 3896146; `Data component format/custom name` rev 3863465): `"Adds or changes the item's custom name."` `target`: `"Allowed values are custom_name or item_name, corresponding with the component to be set. Defaults to custom_name."` Plain-text `custom_name` sets `ItemComponents::set_custom_name`; `target: "item_name"` and non-plain-text text components stay [`LootModifier::Unsupported`] with [`LootNote::UnsupportedModifier`].
+    ///   - `set_enchantments` (`Item modifier` rev 3896146): `"Modifies the item's enchantments. A book converts to an enchanted book."` `"Powers are clamped at a maximum of 255. Decreasing an enchantment power below 1 remove the enchantment, through a relative negative add or through a direct value assignemnt."` `add`: `"If true, change is relative to current level. A nonexistent enchantment is presumed to start at 0. Defaults to false."`
+    ///   - `enchant_randomly` (`Item modifier` rev 3896146): `"Enchants the item with one randomly-selected enchantment. The level of the enchantment, if applicable, is random. A book converts to an enchanted book when enchanted."` `only_compatible`: `"Whether only enchantments that are compatible with the item should be chosen (i.e. the item is listed in the enchantments supported_items). Books are always considered compatible."`
+    ///   - `enchant_with_levels` (`Item modifier` rev 3896146; `Enchanting table mechanics` rev 3881519): `"Enchants the item, with the specified enchantment level (roughly equivalent to using an enchanting table at that level). A book converts to an enchanted book."` Reuses [`select_enchantments_for_loot`], keeping multiple selected enchantments on books (`"if the item is a book, an enchanting table is used, and multiple enchantments were selected, a random one is removed"`).
+    ///   - `filtered` & `discard` (`Item modifier` rev 3896146; `Advancement/Conditions/item` rev 3286549; `Data component predicate` rev 3826514): `"Applies an Item Predicate to the target item, and runs modifiers according to whether the predicate passes or fails."` `discard`: `"Removes the item stack."` Unmodeled item predicates (such as `minecraft:map_id`) keep `filtered` as [`LootModifier::Unsupported`].
+    ///   - `set_ominous_bottle_amplifier`, `exploration_map`, `set_stew_effect`, `set_instrument`: kept as [`LootModifier::Unsupported`] because `ItemComponents` does not model those components.
     ///   - `apply_bonus` (`ore_drops`): `"Count *= (max(1; randomInt(0(inclusive) .. (Level + 2)(exclusive))))"` — reviewer decision: `count *= max(1, random_int(0 ..= level + 1))`.
     ///   - `apply_bonus` (`uniform_bonus_count`): `"uniform distribution (from 0 to level * bonusMultiplier)"` — reviewer decision: `count += random_int(0 ..= level * bonusMultiplier)`.
     ///   - `apply_bonus` (`binomial_with_bonus_count`): `Item modifier` rev 3896146 writes `"for 1 bonus item plus bonus determined by binomial distribution with n=level + extra, p=probability"`, whereas `Fortune` rev 3864999 shows `"the binomial distribution in the default case is created by rolling three times (n=3) with a drop probability of 57% (p=4/7), then an additional seed is added"` (`"Average drops"` = `"2.71 (2 5/7)"` = `1 + 3 * 4/7`). Reviewer decision: `count += Binomial(n = level + extra, p = probability)` with **no extra +1**, and missing enchantment = level 0.
@@ -1283,9 +1292,11 @@ impl LootTable {
             item_tags,
             block_tags,
             enchantment_tags: &self.registries.enchantment_tags,
+            enchantments: &self.registries.enchantments,
             entity_type_tags: &self.registries.entity_type_tags,
             damage_type_tags: &self.registries.damage_type_tags,
             recipes: self.registries.recipes.as_deref(),
+            item_defaults,
         };
         let mut outcome = LootRoll::default();
         let mut drops = Vec::new();
@@ -4289,9 +4300,11 @@ struct EvalCtx<'a> {
     item_tags: &'a ItemTags,
     block_tags: &'a BlockTags,
     enchantment_tags: &'a EnchantmentTags,
+    enchantments: &'a EnchantmentRegistry,
     entity_type_tags: &'a HashMap<String, Vec<String>>,
     damage_type_tags: &'a HashMap<String, Vec<String>>,
     recipes: Option<&'a RecipeData>,
+    item_defaults: Option<&'a ItemDefaults>,
 }
 
 struct PendingDrop {
@@ -4650,34 +4663,37 @@ fn match_block_state(
         .all(|(prop, expected)| properties.get(prop) == Some(expected))
 }
 
+fn item_matches_spec_list(specs: &[String], item_id: &str, item_tags: &ItemTags) -> bool {
+    if item_id.is_empty() {
+        return false;
+    }
+    specs.iter().any(|spec| {
+        if let Some(tag_id) = spec.strip_prefix('#') {
+            let tag = ensure_namespaced(tag_id);
+            item_tags
+                .members(&tag)
+                .is_some_and(|members| members.iter().any(|m| items_equal(m, item_id)))
+        } else {
+            items_equal(spec, item_id)
+        }
+    })
+}
+
 fn match_tool_predicate(predicate: &ToolPredicate, tool: &ToolContext, ctx: &EvalCtx<'_>) -> bool {
-    if !predicate.items.is_empty() {
-        if tool.item.is_empty() {
-            return false;
-        }
-        let item_matches = predicate.items.iter().any(|spec| {
-            if let Some(tag_id) = spec.strip_prefix('#') {
-                let tag = ensure_namespaced(tag_id);
-                ctx.item_tags
-                    .members(&tag)
-                    .is_some_and(|members| members.iter().any(|m| items_equal(m, &tool.item)))
-            } else {
-                items_equal(spec, &tool.item)
-            }
-        });
-        if !item_matches {
-            return false;
-        }
+    if !predicate.items.is_empty()
+        && !item_matches_spec_list(&predicate.items, &tool.item, ctx.item_tags)
+    {
+        return false;
     }
     predicate
         .enchantments
         .iter()
-        .all(|ench_pred| match_enchantment_predicate(ench_pred, tool, ctx.enchantment_tags))
+        .all(|ench_pred| match_enchantment_map(ench_pred, &tool.enchantments, ctx.enchantment_tags))
 }
 
-fn match_enchantment_predicate(
+fn match_enchantment_map(
     pred: &EnchantmentPredicate,
-    tool: &ToolContext,
+    enchantments: &BTreeMap<String, u8>,
     enchantment_tags: &EnchantmentTags,
 ) -> bool {
     let matches_level = |lvl: u8| -> bool {
@@ -4686,25 +4702,75 @@ fn match_enchantment_predicate(
             && pred.max_level.is_none_or(|max| u32::from(lvl) <= max)
     };
     if pred.enchantments.is_empty() {
-        tool.enchantments.values().copied().any(matches_level)
+        enchantments.values().copied().any(matches_level)
     } else {
         pred.enchantments.iter().any(|target| {
             if let Some(tag_id) = target.strip_prefix('#') {
                 let tag = ensure_namespaced(tag_id);
                 enchantment_tags.members(&tag).is_some_and(|members| {
                     members.iter().any(|member| {
-                        tool.enchantments
+                        enchantments
                             .iter()
                             .any(|(id, &lvl)| items_equal(id, member) && matches_level(lvl))
                     })
                 })
             } else {
-                tool.enchantments
+                enchantments
                     .iter()
                     .any(|(id, &lvl)| items_equal(id, target) && matches_level(lvl))
             }
         })
     }
+}
+
+fn match_item_filter(filter: &ItemFilterPredicate, drop: &PendingDrop, ctx: &EvalCtx<'_>) -> bool {
+    if !filter.items.is_empty() && !item_matches_spec_list(&filter.items, &drop.item, ctx.item_tags)
+    {
+        return false;
+    }
+    if let Some(count_range) = filter.count
+        && !count_range.matches(drop.count)
+    {
+        return false;
+    }
+    if !filter.enchantments.iter().all(|pred| {
+        match_enchantment_map(pred, drop.components.enchantments(), ctx.enchantment_tags)
+    }) {
+        return false;
+    }
+    if !filter.stored_enchantments.iter().all(|pred| {
+        match_enchantment_map(
+            pred,
+            drop.components.stored_enchantments(),
+            ctx.enchantment_tags,
+        )
+    }) {
+        return false;
+    }
+    if let Some(dmg_pred) = filter.damage {
+        let max_damage = ctx
+            .item_defaults
+            .and_then(|defaults| defaults.max_damage(&drop.item));
+        if max_damage.is_none() && drop.components.damage().is_none() {
+            return false;
+        }
+        let dmg = drop.components.damage().unwrap_or(0);
+        if let Some(dmg_range) = dmg_pred.damage
+            && !i32::try_from(dmg).is_ok_and(|v| dmg_range.matches(v))
+        {
+            return false;
+        }
+        if let Some(dur_range) = dmg_pred.durability {
+            let Some(max_dmg) = max_damage else {
+                return false;
+            };
+            let remaining = max_dmg.saturating_sub(dmg);
+            if !i32::try_from(remaining).is_ok_and(|v| dur_range.matches(v)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn match_entity_predicate(
@@ -4986,13 +5052,59 @@ fn apply_modifier(
                 properties: properties.clone(),
             });
         }
-        LootModifier::SetDamage { .. }
-        | LootModifier::SetName { .. }
-        | LootModifier::SetEnchantments { .. }
-        | LootModifier::EnchantRandomly { .. }
-        | LootModifier::EnchantWithLevels { .. }
-        | LootModifier::Filtered { .. }
-        | LootModifier::Discard { .. } => {}
+        LootModifier::SetDamage { damage, add, .. } => {
+            apply_set_damage(damage, *add, drop, ctx.item_defaults, random);
+        }
+        LootModifier::SetName { name, target, .. } => match target {
+            SetNameTarget::CustomName => drop.components.set_custom_name(Some(name.clone())),
+            SetNameTarget::ItemName => {
+                notes.push(LootNote::UnsupportedModifier {
+                    item: ensure_namespaced(&drop.item),
+                    what: "minecraft:set_name".to_owned(),
+                });
+            }
+        },
+        LootModifier::SetEnchantments {
+            enchantments, add, ..
+        } => {
+            apply_set_enchantments(enchantments, *add, drop, random);
+        }
+        LootModifier::EnchantRandomly {
+            options,
+            only_compatible,
+            ..
+        } => {
+            apply_enchant_randomly(options.as_deref(), *only_compatible, drop, ctx, random);
+        }
+        LootModifier::EnchantWithLevels {
+            levels, options, ..
+        } => {
+            apply_enchant_with_levels(levels, options.as_deref(), drop, ctx, random);
+        }
+        LootModifier::Filtered {
+            item_filter,
+            on_pass,
+            on_fail,
+            ..
+        } => {
+            let branch = if match_item_filter(item_filter, drop, ctx) {
+                on_pass
+            } else {
+                on_fail
+            };
+            for inner in branch {
+                if drop.discarded {
+                    break;
+                }
+                if eval_conditions(inner.conditions(), ctx, random) {
+                    apply_modifier(inner, drop, ctx, random, notes);
+                }
+            }
+        }
+        LootModifier::Discard { .. } => {
+            drop.count = 0;
+            drop.discarded = true;
+        }
         LootModifier::Unsupported { what } => {
             notes.push(LootNote::UnsupportedModifier {
                 item: ensure_namespaced(&drop.item),
@@ -5000,6 +5112,180 @@ fn apply_modifier(
             });
         }
     }
+}
+
+const BOOK_ITEM_ID: &str = "minecraft:book";
+const ENCHANTED_BOOK_ITEM_ID: &str = "minecraft:enchanted_book";
+
+fn is_book_item(item: &str) -> bool {
+    items_equal(item, BOOK_ITEM_ID) || items_equal(item, ENCHANTED_BOOK_ITEM_ID)
+}
+
+fn apply_set_damage(
+    damage: &NumberProvider,
+    add: bool,
+    drop: &mut PendingDrop,
+    item_defaults: Option<&ItemDefaults>,
+    random: &mut RandomSource,
+) {
+    let Some(max_damage) = item_defaults
+        .and_then(|defaults| defaults.max_damage(&drop.item))
+        .filter(|&max| max > 0)
+    else {
+        return;
+    };
+    let max_f = f64::from(max_damage);
+    let sampled = sample_float_provider(damage, random);
+    let base_fraction = if add {
+        1.0 - f64::from(drop.components.damage().unwrap_or(0)) / max_f
+    } else {
+        0.0
+    };
+    let remaining_fraction = (base_fraction + sampled).clamp(0.0, 1.0);
+    let consumed_fraction = 1.0 - remaining_fraction;
+    let new_damage = (consumed_fraction * max_f).round().clamp(0.0, max_f) as u32;
+    drop.components
+        .set_damage((new_damage > 0).then_some(new_damage));
+}
+
+fn apply_set_enchantments(
+    enchantments: &BTreeMap<String, NumberProvider>,
+    add: bool,
+    drop: &mut PendingDrop,
+    random: &mut RandomSource,
+) {
+    let is_book = is_book_item(&drop.item);
+    for (ench_id, provider) in enchantments {
+        let id = ensure_namespaced(ench_id);
+        let delta = sample_count_provider(provider, random);
+        let current = if add {
+            let map = if is_book {
+                drop.components.stored_enchantments()
+            } else {
+                drop.components.enchantments()
+            };
+            i32::from(map.get(&id).copied().unwrap_or(0))
+        } else {
+            0
+        };
+        let next = current.saturating_add(delta);
+        if next < i32::from(MIN_ENCHANTMENT_LEVEL) {
+            if is_book {
+                drop.components.remove_stored_enchantment(&id);
+            } else {
+                drop.components.remove_enchantment(&id);
+            }
+        } else {
+            let level = next.min(i32::from(MAX_ENCHANTMENT_LEVEL)) as u8;
+            if is_book {
+                let _ = drop.components.set_stored_enchantment(id, level);
+            } else {
+                let _ = drop.components.set_enchantment(id, level);
+            }
+        }
+    }
+    if items_equal(&drop.item, BOOK_ITEM_ID) && !drop.components.stored_enchantments().is_empty() {
+        drop.item = ENCHANTED_BOOK_ITEM_ID.to_owned();
+    }
+}
+
+fn resolve_enchant_option_ids(options: Option<&[String]>, ctx: &EvalCtx<'_>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    match options {
+        None => {
+            for (id, _) in ctx.enchantments.iter() {
+                if seen.insert(id.to_owned()) {
+                    out.push(id.to_owned());
+                }
+            }
+        }
+        Some(specs) => {
+            for spec in specs {
+                if let Some(tag) = spec.strip_prefix('#') {
+                    if let Some(members) = ctx.enchantment_tags.members(tag) {
+                        for member in members {
+                            let normalized = ensure_namespaced(member);
+                            if seen.insert(normalized.clone()) {
+                                out.push(normalized);
+                            }
+                        }
+                    }
+                } else {
+                    let normalized = ensure_namespaced(spec);
+                    if seen.insert(normalized.clone()) {
+                        out.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn apply_selected_enchantments(drop: &mut PendingDrop, selected: Vec<(String, u8)>) {
+    if selected.is_empty() {
+        return;
+    }
+    if is_book_item(&drop.item) {
+        if items_equal(&drop.item, BOOK_ITEM_ID) {
+            drop.item = ENCHANTED_BOOK_ITEM_ID.to_owned();
+        }
+        for (id, level) in selected {
+            let _ = drop.components.set_stored_enchantment(id, level);
+        }
+    } else {
+        for (id, level) in selected {
+            let _ = drop.components.set_enchantment(id, level);
+        }
+    }
+}
+
+fn apply_enchant_randomly(
+    options: Option<&[String]>,
+    only_compatible: bool,
+    drop: &mut PendingDrop,
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+) {
+    let candidate_ids = resolve_enchant_option_ids(options, ctx);
+    let is_book = is_book_item(&drop.item);
+    let candidates: Vec<&EnchantmentDefinition> = candidate_ids
+        .iter()
+        .filter_map(|id| ctx.enchantments.get(id))
+        .filter(|def| {
+            !only_compatible || is_book || ctx.enchantments.can_apply(def.id(), &drop.item)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let idx = random.next_int_bounded(u32::try_from(candidates.len()).unwrap_or(u32::MAX)) as usize;
+    let chosen = candidates[idx];
+    let level = 1 + random.next_int_bounded(u32::from(chosen.max_level())) as u8;
+    apply_selected_enchantments(drop, vec![(chosen.id().to_owned(), level)]);
+}
+
+fn apply_enchant_with_levels(
+    levels: &NumberProvider,
+    options: Option<&[String]>,
+    drop: &mut PendingDrop,
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+) {
+    let level = u32::try_from(sample_count_provider(levels, random).max(0)).unwrap_or(u32::MAX);
+    let allowed = options.map(|specs| resolve_enchant_option_ids(Some(specs), ctx));
+    let fallback_defaults = ItemDefaults::default();
+    let defaults = ctx.item_defaults.unwrap_or(&fallback_defaults);
+    let selected = select_enchantments_for_loot(
+        &drop.item,
+        level,
+        allowed.as_deref(),
+        ctx.enchantments,
+        defaults,
+        random,
+    );
+    apply_selected_enchantments(drop, selected);
 }
 
 fn apply_bonus(
@@ -8839,6 +9125,740 @@ mod tests {
             );
             fs::remove_dir_all(&root).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn set_damage_modifier_sets_and_adds_durability_fraction_from_max_damage() {
+        let root = scratch_root("mod_set_damage");
+        write(
+            &root.join("reports/minecraft/components/item/test_blade.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 100}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/stick.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/damage.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "minecraft:test_blade", "modifier": {"type": "minecraft:set_damage", "damage": 0.25}}]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "minecraft:test_blade", "modifier": {"type": "minecraft:set_damage", "damage": 1.0}}]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "minecraft:test_blade", "modifier": {"type": "minecraft:set_damage", "damage": 0.0}}]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:test_blade",
+                            "modifier": [
+                                {"type": "minecraft:set_damage", "damage": 0.8},
+                                {"type": "minecraft:set_damage", "damage": -0.3, "add": true}
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:test_blade",
+                            "modifier": [
+                                {"type": "minecraft:set_damage", "damage": 0.5},
+                                {"type": "minecraft:set_damage", "damage": 0.75, "add": true}
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "minecraft:stick", "modifier": {"type": "minecraft:set_damage", "damage": 0.5}}]
+                    }
+                ]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/uniform_damage.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:test_blade",
+                        "modifier": {"type": "minecraft:set_damage", "damage": {"type": "minecraft:uniform", "min": 0.1, "max": 0.9}}
+                    }]
+                }]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load set_damage tables");
+        let items = tables
+            .roll_chest(
+                "testns:damage",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(7),
+            )
+            .expect("damage table")
+            .items;
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[0].components().damage(), Some(75));
+        assert_eq!(items[1].components().damage(), None);
+        assert_eq!(items[2].components().damage(), Some(100));
+        assert_eq!(items[3].components().damage(), Some(50));
+        assert_eq!(items[4].components().damage(), None);
+        assert_eq!(items[5].components().damage(), None);
+
+        let uniform_table = tables
+            .get_chest("testns:uniform_damage")
+            .expect("uniform_damage");
+        let mut saw_low = false;
+        let mut saw_high = false;
+        for seed in 0..200_u64 {
+            let rolled = uniform_table.roll(
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(seed),
+            );
+            assert_eq!(rolled.len(), 1);
+            let dmg = rolled[0].components().damage().expect("damaged");
+            assert!((10..=90).contains(&dmg), "damage {dmg} out of 10..=90");
+            if dmg < 50 {
+                saw_low = true;
+            } else {
+                saw_high = true;
+            }
+        }
+        assert!(saw_low && saw_high);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn set_name_modifier_sets_plain_custom_name_and_leaves_unmodeled_targets_unsupported() {
+        let root = scratch_root("mod_set_name");
+        write(
+            &root.join("data/testns/loot_table/chests/names.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:iron_sword",
+                            "modifier": [
+                                {"type": "minecraft:set_name", "name": "Old Blade"},
+                                {"type": "minecraft:set_name", "name": {"text": "Excalibur"}, "target": "custom_name"}
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:compass",
+                            "modifier": {"type": "minecraft:set_name", "name": "Wayfinder", "target": "item_name"}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:map",
+                            "modifier": {"type": "minecraft:set_name", "name": {"translate": "filled_map.buried_treasure"}}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:stick",
+                            "modifier": {"type": "minecraft:set_name", "name": {"text": "Styled", "color": "gold"}}
+                        }]
+                    }
+                ]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load set_name");
+        let roll = tables
+            .roll_chest(
+                "testns:names",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("names table");
+        assert_eq!(roll.items.len(), 4);
+        assert_eq!(roll.items[0].components().custom_name(), Some("Excalibur"));
+        assert_eq!(roll.items[1].components().custom_name(), None);
+        assert_eq!(roll.items[2].components().custom_name(), None);
+        assert_eq!(roll.items[3].components().custom_name(), None);
+        assert_eq!(
+            roll.notes,
+            vec![
+                LootNote::UnsupportedModifier {
+                    item: "minecraft:compass".to_owned(),
+                    what: "minecraft:set_name".to_owned(),
+                },
+                LootNote::UnsupportedModifier {
+                    item: "minecraft:map".to_owned(),
+                    what: "minecraft:set_name".to_owned(),
+                },
+                LootNote::UnsupportedModifier {
+                    item: "minecraft:stick".to_owned(),
+                    what: "minecraft:set_name".to_owned(),
+                },
+            ]
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn set_enchantments_modifier_modifies_clamps_removes_and_converts_books() {
+        let root = scratch_root("mod_set_enchantments");
+        write(
+            &root.join("data/testns/loot_table/chests/enchs.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:iron_sword",
+                            "modifier": [
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:sharpness": 3, "minecraft:looting": 2}},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:sharpness": 2, "minecraft:fire_aspect": 1}, "add": true},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:looting": -5}, "add": true},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:fire_aspect": 0}},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:unbreaking": 400}, "add": true}
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:book",
+                            "modifier": [
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:wind_burst": 1}},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:wind_burst": 2}, "add": true}
+                            ]
+                        }]
+                    }
+                ]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load set_enchantments");
+        let items = tables
+            .roll_chest(
+                "testns:enchs",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(11),
+            )
+            .expect("enchs")
+            .items;
+        assert_eq!(items.len(), 2);
+
+        let mut expected_sword = BTreeMap::new();
+        expected_sword.insert("minecraft:sharpness".to_owned(), 5);
+        expected_sword.insert("minecraft:unbreaking".to_owned(), 255);
+        assert_eq!(items[0].item(), "minecraft:iron_sword");
+        assert_eq!(items[0].components().enchantments(), &expected_sword);
+        assert!(items[0].components().stored_enchantments().is_empty());
+
+        let mut expected_book = BTreeMap::new();
+        expected_book.insert("minecraft:wind_burst".to_owned(), 3);
+        assert_eq!(items[1].item(), "minecraft:enchanted_book");
+        assert_eq!(items[1].max_stack(), 1);
+        assert!(items[1].components().enchantments().is_empty());
+        assert_eq!(items[1].components().stored_enchantments(), &expected_book);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn enchant_randomly_modifier_respects_options_compatibility_levels_and_books() {
+        let root = scratch_root("mod_enchant_randomly");
+        write(
+            &root.join("data/testns/tags/enchantment/loot_pool.json"),
+            r#"{"values": ["testns:sharpness", "testns:soul_speed", "testns:mending"]}"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/sharpness.json"),
+            r#"{
+                "max_level": 5,
+                "anvil_cost": 1,
+                "weight": 10,
+                "min_cost": {"base": 1, "per_level_above_first": 11},
+                "max_cost": {"base": 21, "per_level_above_first": 11},
+                "slots": ["mainhand"],
+                "supported_items": "minecraft:diamond_sword"
+            }"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/soul_speed.json"),
+            r#"{
+                "max_level": 3,
+                "anvil_cost": 4,
+                "weight": 1,
+                "min_cost": {"base": 10, "per_level_above_first": 10},
+                "max_cost": {"base": 25, "per_level_above_first": 10},
+                "slots": ["feet"],
+                "supported_items": "minecraft:iron_boots"
+            }"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/mending.json"),
+            r#"{
+                "max_level": 1,
+                "anvil_cost": 4,
+                "weight": 2,
+                "min_cost": {"base": 25, "per_level_above_first": 25},
+                "max_cost": {"base": 75, "per_level_above_first": 25},
+                "slots": ["any"],
+                "supported_items": ["minecraft:diamond_sword", "minecraft:iron_boots"]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/rnd_sword.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "minecraft:diamond_sword", "modifier": {"type": "minecraft:enchant_randomly"}}]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/rnd_sword_any.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "minecraft:diamond_sword", "modifier": {"type": "minecraft:enchant_randomly", "options": "#testns:loot_pool", "only_compatible": false}}]
+                }]
+            }"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/rnd_sword_incompatible.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "minecraft:diamond_sword", "modifier": {"type": "minecraft:enchant_randomly", "options": "testns:soul_speed"}}]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/rnd_book.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "minecraft:book", "modifier": {"type": "minecraft:enchant_randomly", "options": "testns:soul_speed"}}]
+                }]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load enchant_randomly");
+
+        // `only_compatible: true` on sword never picks `soul_speed`, picks `sharpness` 1..=5 or `mending` 1.
+        let mut sharp_levels = HashSet::new();
+        let mut saw_mending = false;
+        for seed in 0..200_u64 {
+            let items = tables
+                .roll_chest(
+                    "testns:rnd_sword",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("rnd_sword")
+                .items;
+            assert_eq!(items.len(), 1);
+            let enchs = items[0].components().enchantments();
+            assert_eq!(enchs.len(), 1);
+            assert!(!enchs.contains_key("testns:soul_speed"));
+            if let Some(&lvl) = enchs.get("testns:sharpness") {
+                assert!((1..=5).contains(&lvl));
+                sharp_levels.insert(lvl);
+            }
+            if let Some(&lvl) = enchs.get("testns:mending") {
+                assert_eq!(lvl, 1);
+                saw_mending = true;
+            }
+        }
+        assert_eq!(sharp_levels.len(), 5, "expected all sharpness levels 1..=5");
+        assert!(saw_mending);
+
+        // `only_compatible: false` allows `soul_speed` on `diamond_sword`.
+        let mut saw_incompat_soul_speed = false;
+        for seed in 0..100_u64 {
+            let items = tables
+                .roll_chest(
+                    "testns:rnd_sword_any",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("rnd_sword_any")
+                .items;
+            if items[0]
+                .components()
+                .enchantments()
+                .contains_key("testns:soul_speed")
+            {
+                saw_incompat_soul_speed = true;
+                break;
+            }
+        }
+        assert!(saw_incompat_soul_speed);
+
+        // Compatible filter with zero matching candidates leaves sword unenchanted.
+        let empty_incompat = tables
+            .roll_chest(
+                "testns:rnd_sword_incompatible",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("rnd_sword_incompatible")
+            .items;
+        assert!(empty_incompat[0].components().enchantments().is_empty());
+
+        // Books are always compatible, convert to `minecraft:enchanted_book` (`max_stack = 1`),
+        // and store enchantments in `stored_enchantments`.
+        let mut book_levels = HashSet::new();
+        for seed in 0..100_u64 {
+            let items = tables
+                .roll_chest(
+                    "testns:rnd_book",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("rnd_book")
+                .items;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].item(), "minecraft:enchanted_book");
+            assert_eq!(items[0].max_stack(), 1);
+            assert!(items[0].components().enchantments().is_empty());
+            let stored = items[0].components().stored_enchantments();
+            assert_eq!(stored.len(), 1);
+            let &lvl = stored.get("testns:soul_speed").expect("soul_speed stored");
+            assert!((1..=3).contains(&lvl));
+            book_levels.insert(lvl);
+        }
+        assert_eq!(book_levels.len(), 3);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn enchant_with_levels_modifier_reuses_select_enchantments_and_keeps_book_multi_enchants() {
+        let root = scratch_root("mod_enchant_with_levels");
+        write(
+            &root.join("reports/minecraft/components/item/diamond_sword.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:enchantable": {"value": 10}}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/book.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64, "minecraft:enchantable": {"value": 1}}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/enchanted_book.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1}}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/stick.json"),
+            r#"{"components": {"minecraft:max_stack_size": 64}}"#,
+        );
+        write(
+            &root.join("data/minecraft/tags/enchantment/in_enchanting_table.json"),
+            r#"{"values": ["testns:sharpness", "testns:power"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/enchantment/on_random_loot.json"),
+            r#"{"values": ["testns:sharpness", "testns:mending", "testns:power"]}"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/sharpness.json"),
+            r#"{
+                "max_level": 5,
+                "anvil_cost": 1,
+                "weight": 10,
+                "min_cost": {"base": 1, "per_level_above_first": 10},
+                "max_cost": {"base": 60, "per_level_above_first": 10},
+                "slots": ["mainhand"],
+                "supported_items": "minecraft:diamond_sword"
+            }"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/mending.json"),
+            r#"{
+                "max_level": 1,
+                "anvil_cost": 4,
+                "weight": 5,
+                "min_cost": {"base": 1, "per_level_above_first": 0},
+                "max_cost": {"base": 100, "per_level_above_first": 0},
+                "slots": ["any"],
+                "supported_items": ["minecraft:diamond_sword", "minecraft:bow"]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/enchantment/power.json"),
+            r#"{
+                "max_level": 5,
+                "anvil_cost": 1,
+                "weight": 10,
+                "min_cost": {"base": 1, "per_level_above_first": 10},
+                "max_cost": {"base": 60, "per_level_above_first": 10},
+                "slots": ["mainhand"],
+                "supported_items": "minecraft:bow"
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/lvl_sword.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:diamond_sword",
+                        "modifier": {
+                            "type": "minecraft:enchant_with_levels",
+                            "levels": {"type": "minecraft:uniform", "min": 25, "max": 35},
+                            "options": "#testns:on_random_loot"
+                        }
+                    }]
+                }]
+            }"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/lvl_book.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:book",
+                        "modifier": {
+                            "type": "minecraft:enchant_with_levels",
+                            "levels": 80,
+                            "options": "#testns:on_random_loot"
+                        }
+                    }]
+                }]
+            }"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/lvl_stick.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:stick",
+                        "modifier": {
+                            "type": "minecraft:enchant_with_levels",
+                            "levels": 30
+                        }
+                    }]
+                }]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load enchant_with_levels");
+
+        let mut saw_mending_on_sword = false;
+        for seed in 0..200_u64 {
+            let items = tables
+                .roll_chest(
+                    "testns:lvl_sword",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("lvl_sword")
+                .items;
+            assert_eq!(items.len(), 1);
+            let enchs = items[0].components().enchantments();
+            assert!(!enchs.is_empty());
+            assert!(
+                !enchs.contains_key("testns:power"),
+                "bow-only enchantment must not appear on diamond_sword"
+            );
+            if enchs.contains_key("testns:mending") {
+                saw_mending_on_sword = true;
+            }
+        }
+        assert!(
+            saw_mending_on_sword,
+            "on_random_loot must include treasure enchantments outside in_enchanting_table"
+        );
+
+        // Unlike the enchanting table, `enchant_with_levels` keeps multiple enchantments on books.
+        let mut saw_multi_book = false;
+        let mut saw_power_on_book = false;
+        for seed in 0..50_u64 {
+            let items = tables
+                .roll_chest(
+                    "testns:lvl_book",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("lvl_book")
+                .items;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].item(), "minecraft:enchanted_book");
+            assert_eq!(items[0].max_stack(), 1);
+            let stored = items[0].components().stored_enchantments();
+            assert!(!stored.is_empty());
+            if stored.len() >= 2 {
+                saw_multi_book = true;
+            }
+            if stored.contains_key("testns:power") {
+                saw_power_on_book = true;
+            }
+        }
+        assert!(saw_multi_book, "loot books keep multiple enchantments");
+        assert!(saw_power_on_book, "books treat all options as primary");
+
+        let stick = tables
+            .roll_chest(
+                "testns:lvl_stick",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("lvl_stick")
+            .items;
+        assert!(stick[0].components().enchantments().is_empty());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn filtered_modifier_evaluates_item_filter_and_runs_pass_fail_or_discard() {
+        let root = scratch_root("mod_filtered");
+        write(
+            &root.join("data/testns/tags/item/swords.json"),
+            r#"{"values": ["minecraft:iron_sword"]}"#,
+        );
+        write(
+            &root.join("reports/minecraft/components/item/iron_sword.json"),
+            r#"{"components": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 100}}"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/filter.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:iron_sword",
+                            "modifier": [
+                                {"type": "minecraft:set_damage", "damage": 0.6},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:sharpness": 3}},
+                                {
+                                    "type": "minecraft:filtered",
+                                    "item_filter": {
+                                        "items": "#testns:swords",
+                                        "count": {"min": 1, "max": 1},
+                                        "predicates": {
+                                            "minecraft:enchantments": [{"enchantments": "minecraft:sharpness", "levels": {"min": 2}}],
+                                            "minecraft:damage": {"damage": {"min": 30, "max": 50}, "durability": {"min": 50, "max": 70}}
+                                        }
+                                    },
+                                    "on_pass": {"type": "minecraft:set_name", "name": "FilteredMatch"},
+                                    "on_fail": {"type": "minecraft:discard"}
+                                }
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:iron_sword",
+                            "modifier": [
+                                {"type": "minecraft:set_damage", "damage": 0.9},
+                                {
+                                    "type": "minecraft:filtered",
+                                    "item_filter": {
+                                        "predicates": {
+                                            "minecraft:damage": {"durability": {"max": 50}}
+                                        }
+                                    },
+                                    "on_pass": {"type": "minecraft:set_name", "name": "Worn"},
+                                    "on_fail": {"type": "minecraft:set_name", "name": "Fresh"}
+                                }
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:book",
+                            "modifier": [
+                                {"type": "minecraft:set_enchantments", "enchantments": {"minecraft:mending": 1}},
+                                {
+                                    "type": "minecraft:filtered",
+                                    "item_filter": {
+                                        "items": "minecraft:enchanted_book",
+                                        "predicates": {
+                                            "minecraft:stored_enchantments": [{"enchantments": "minecraft:mending"}]
+                                        }
+                                    },
+                                    "on_pass": {"type": "minecraft:set_name", "name": "MendingBook"},
+                                    "on_fail": {"type": "minecraft:discard"}
+                                }
+                            ]
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:stick",
+                            "modifier": {
+                                "type": "minecraft:filtered",
+                                "item_filter": {"items": "minecraft:diamond"},
+                                "on_fail": {"type": "minecraft:discard"}
+                            }
+                        }]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load filtered");
+        let items = tables
+            .roll_chest(
+                "testns:filter",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(5),
+            )
+            .expect("filter")
+            .items;
+        assert_eq!(items.len(), 3, "stick must be discarded on_fail");
+        assert_eq!(items[0].components().custom_name(), Some("FilteredMatch"));
+        assert_eq!(items[0].components().damage(), Some(40));
+        assert_eq!(items[1].components().custom_name(), Some("Fresh"));
+        assert_eq!(items[2].item(), "minecraft:enchanted_book");
+        assert_eq!(items[2].components().custom_name(), Some("MendingBook"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     /// Pin vanilla Java 26.3 `chests/` (58), `gameplay/` (26, including `fishing/` and

@@ -95,6 +95,10 @@ const IN_ENCHANTING_TABLE_TAG: &str = "minecraft:in_enchanting_table";
 /// a primary item are removed." / "Books being primary to all enchantments is hardcoded."
 const BOOK_ITEM_ID: &str = "minecraft:book";
 
+/// Canonical item identifier for enchanted books (used when `enchant_with_levels`
+/// runs on an already-converted book in loot evaluation).
+const ENCHANTED_BOOK_ITEM_ID: &str = "minecraft:enchanted_book";
+
 /// Constant offset added before applying the two enchantability modifiers.
 ///
 /// Source: minecraft.wiki `Enchanting table mechanics` (revision 3881519):
@@ -191,16 +195,31 @@ fn draw_modified_level(level: u32, enchantability: u32, random: &mut RandomSourc
         .clamp(1.0, f64::from(i32::MAX)) as i32
 }
 
+enum EnchantmentPool<'a> {
+    Table(&'a EnchantmentTags),
+    Loot(Option<&'a [String]>),
+}
+
+impl EnchantmentPool<'_> {
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::Table(tags) => tags.contains(IN_ENCHANTING_TABLE_TAG, id),
+            Self::Loot(None) => true,
+            Self::Loot(Some(allowed)) => allowed.iter().any(|cand| items_equal(cand, id)),
+        }
+    }
+}
+
 fn collect_candidates<'a>(
     item: &str,
     is_book: bool,
     modified_level: i32,
     registry: &'a EnchantmentRegistry,
-    tags: &EnchantmentTags,
+    pool: &EnchantmentPool<'_>,
 ) -> Vec<Candidate<'a>> {
     let mut candidates = Vec::new();
     for (id, def) in registry.iter() {
-        if !tags.contains(IN_ENCHANTING_TABLE_TAG, id) {
+        if !pool.contains(id) {
             continue;
         }
         if !is_book
@@ -246,6 +265,65 @@ fn pick_weighted<'a>(
         roll -= candidate.weight;
     }
     None
+}
+
+fn select_enchantments_inner(
+    item: &str,
+    level: u32,
+    registry: &EnchantmentRegistry,
+    pool: EnchantmentPool<'_>,
+    defaults: &ItemDefaults,
+    is_enchanting_table: bool,
+    random: &mut RandomSource,
+) -> Vec<(String, u8)> {
+    let is_book = items_equal(item, BOOK_ITEM_ID)
+        || (!is_enchanting_table && items_equal(item, ENCHANTED_BOOK_ITEM_ID));
+    let enchantability = defaults
+        .enchantability(item)
+        .or_else(|| {
+            if !is_enchanting_table && items_equal(item, ENCHANTED_BOOK_ITEM_ID) {
+                defaults.enchantability(BOOK_ITEM_ID)
+            } else {
+                None
+            }
+        })
+        .filter(|&value| value > 0);
+    let Some(enchantability) = enchantability else {
+        return Vec::new();
+    };
+
+    let modified_level = draw_modified_level(level, enchantability, random);
+    let mut candidates = collect_candidates(item, is_book, modified_level, registry, &pool);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut remaining_cost = modified_level;
+    let mut selected = Vec::new();
+
+    while let Some((chosen_id, chosen_level)) = pick_weighted(&candidates, random) {
+        selected.push((chosen_id.to_owned(), chosen_level));
+
+        candidates.retain(|candidate| registry.are_compatible(chosen_id, candidate.id));
+        if candidates.is_empty() {
+            break;
+        }
+
+        if remaining_cost < 0
+            || (random.next_int_bounded(REPEAT_CHANCE_DENOMINATOR) as i32) > remaining_cost
+        {
+            break;
+        }
+        remaining_cost /= COST_HALVING_DIVISOR;
+    }
+
+    if is_enchanting_table && is_book && selected.len() > 1 {
+        let len = u32::try_from(selected.len()).unwrap_or(u32::MAX);
+        let remove_idx = random.next_int_bounded(len) as usize;
+        selected.remove(remove_idx);
+    }
+
+    selected
 }
 
 /// Selects enchantments for `item` at slot `level` using enchanting table rules.
@@ -297,43 +375,47 @@ pub fn select_enchantments(
     defaults: &ItemDefaults,
     random: &mut RandomSource,
 ) -> Vec<(String, u8)> {
-    let Some(enchantability) = defaults.enchantability(item).filter(|&value| value > 0) else {
-        return Vec::new();
-    };
+    select_enchantments_inner(
+        item,
+        level,
+        registry,
+        EnchantmentPool::Table(tags),
+        defaults,
+        true,
+        random,
+    )
+}
 
-    let modified_level = draw_modified_level(level, enchantability, random);
-    let is_book = items_equal(item, BOOK_ITEM_ID);
-    let mut candidates = collect_candidates(item, is_book, modified_level, registry, tags);
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let mut remaining_cost = modified_level;
-    let mut selected = Vec::new();
-
-    while let Some((chosen_id, chosen_level)) = pick_weighted(&candidates, random) {
-        selected.push((chosen_id.to_owned(), chosen_level));
-
-        candidates.retain(|candidate| registry.are_compatible(chosen_id, candidate.id));
-        if candidates.is_empty() {
-            break;
-        }
-
-        if remaining_cost < 0
-            || (random.next_int_bounded(REPEAT_CHANCE_DENOMINATOR) as i32) > remaining_cost
-        {
-            break;
-        }
-        remaining_cost /= COST_HALVING_DIVISOR;
-    }
-
-    if is_book && selected.len() > 1 {
-        let len = u32::try_from(selected.len()).unwrap_or(u32::MAX);
-        let remove_idx = random.next_int_bounded(len) as usize;
-        selected.remove(remove_idx);
-    }
-
-    selected
+/// Selects enchantments for `item` at experience cost `level` for the
+/// `minecraft:enchant_with_levels` item modifier.
+///
+/// Reuses the exact modified-level, primary-item, cost-range, weight, and
+/// repetition selection rules of [`select_enchantments`], differing only per
+/// `minecraft.wiki` `Enchanting table mechanics` (revision `3881519`) and
+/// `Item modifier` (revision `3896146`):
+/// - Uses `allowed_enchantments` (from `options`) when `Some`, or all registered
+///   enchantments when `None` (`"If omitted, all enchantments are possible."`).
+/// - Does not drop an enchantment when multiple are selected on a book
+///   (`"if the item is a book, an enchanting table is used, and multiple
+///   enchantments were selected, a random one is removed."`).
+#[must_use]
+pub fn select_enchantments_for_loot(
+    item: &str,
+    level: u32,
+    allowed_enchantments: Option<&[String]>,
+    registry: &EnchantmentRegistry,
+    defaults: &ItemDefaults,
+    random: &mut RandomSource,
+) -> Vec<(String, u8)> {
+    select_enchantments_inner(
+        item,
+        level,
+        registry,
+        EnchantmentPool::Loot(allowed_enchantments),
+        defaults,
+        false,
+        random,
+    )
 }
 
 #[cfg(test)]
