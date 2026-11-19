@@ -17,7 +17,8 @@
 //! from [`ItemDefaults`], [`ItemTags`], and [`EnchantmentRegistry`].
 
 use crate::item::{
-    DEFAULT_MAX_STACK, ItemDefaults, ItemStack, ItemStackError, items_equal, normalize_item_id,
+    DEFAULT_MAX_STACK, ItemDefaults, ItemStack, ItemStackError, TextComponent, items_equal,
+    normalize_item_id,
 };
 use crate::vanilla::feature::ItemTags;
 use crate::vanilla::random::RandomSource;
@@ -343,7 +344,7 @@ fn apply_anvil_components(
         let components = stack.components_mut();
         components.set_damage(damage_for_durability(durability, max_durability));
         components.set_repair_cost((repair_cost > 0).then_some(repair_cost));
-        components.set_custom_name(custom_name);
+        components.set_custom_name(custom_name.map(TextComponent::Literal));
     }
     set_item_enchantments(&mut stack, is_enchanted_book, enchantments)?;
     Ok(stack)
@@ -620,7 +621,9 @@ impl AnvilItem {
             max_durability,
             Some(&name),
         )?;
-        self.stack.components_mut().set_custom_name(Some(name));
+        self.stack
+            .components_mut()
+            .set_custom_name(Some(TextComponent::Literal(name)));
         Ok(self)
     }
 

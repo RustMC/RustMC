@@ -43,7 +43,17 @@
 //!   ```
 //!   A plain-text name is encoded as a `TAG_String` text component ("As a String Tag:
 //!   For components only containing text (no styling, no events etc.)") via
-//!   `java_wire::put_nbt_text`; decoding also accepts a `{"text": …}` compound.
+//!   `java_wire::put_nbt_text`; a translatable name (`{"translate": key}`) is encoded
+//!   as a `TAG_Compound` containing only `translate` ("As a Compound Tag: Every other
+//!   case."); decoding also accepts a `{"text": …}` compound.
+//! - `minecraft:item_name` (see also `Data component format/item name`, revision `3728022`,
+//!   and `Java Edition protocol/Data types`, revision `3855787`, `Text Component`):
+//!   ```text
+//!   | Name | Type           | Description
+//!   | Name | Text Component |
+//!   ```
+//!   Encoded and decoded with the same plain/translatable `TextComponent` layout as
+//!   `minecraft:custom_name`.
 //! - `minecraft:enchantments` (see also `Data component format/enchantments`, revision `3849825`):
 //!   ```text
 //!   | Name                  | Type                        | Description
@@ -71,6 +81,12 @@
 //!   ```
 //!   RustMC models the base `Potion ID` only (`Some(potion_id)` followed by `Custom Color = false`,
 //!   `Custom Effects = []`, `Custom Name = false`).
+//! - `minecraft:suspicious_stew_effects` (see also `Data component format/suspicious stew effects`, revision `3277335`):
+//!   ```text
+//!   | Name              | Type                        | Description
+//!   | Effect / Type ID  | Prefixed Array: VarInt Enum | The ID of the effect in the `minecraft:mob_effect` registry.
+//!   | Effect / Duration | Prefixed Array: VarInt      | The duration of the effect.
+//!   ```
 //! - `minecraft:trim` (see also `Data component format/trim`, revision `3685746`, and
 //!   `Java Edition protocol/Data types`, revision `3855787`, `=== ID or X ===`):
 //!   ```text
@@ -84,23 +100,34 @@
 //!   | ID         | VarInt     | 0 if value of type X is given inline; otherwise registry ID + 1.
 //!   | Value      | Optional X | Only present if ID is 0.
 //!   ```
+//! - `minecraft:instrument` (see also `Data component format/instrument`, revision `3685633`):
+//!   ```text
+//!   | Name       | Type             | Description
+//!   | Instrument | ID or Instrument | ID in the `minecraft:instrument` registry, or an inline definition.
+//!   ```
+//! - `minecraft:ominous_bottle_amplifier` (see also `Data component format/ominous bottle amplifier`, revision `3277333`):
+//!   ```text
+//!   | Name      | Type   | Description
+//!   | Amplifier | VarInt | Between 0 and 4.
+//!   ```
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use crate::item::{
-    ArmorTrim, ItemComponents, ItemStack, ItemStackError, MAX_STACK_LIMIT, MIN_ENCHANTMENT_LEVEL,
-    default_max_stack,
+    ArmorTrim, ItemComponents, ItemStack, ItemStackError, MAX_OMINOUS_BOTTLE_AMPLIFIER,
+    MAX_STACK_LIMIT, MIN_ENCHANTMENT_LEVEL, MIN_OMINOUS_BOTTLE_AMPLIFIER, SuspiciousStewEffect,
+    TextComponent, default_max_stack,
 };
-use crate::java_wire::{self, MAX_NBT_STRING_BYTES, WireError, put_varint};
+use crate::java_wire::{self, MAX_NBT_STRING_BYTES, NBT_TAG_STRING, WireError, put_varint};
 use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
 use crate::world::block_entity::{BlockEntityError, NbtTag, read_anonymous_network_nbt};
 use crate::world::enchantment::MAX_ENCHANTMENT_LEVEL;
 
 /// RustMC policy bound on component additions or removals in a single network `Slot`.
 ///
-/// RustMC models 7 item data components (and vanilla 26.3 defines 122
+/// RustMC models 11 item data components (and vanilla 26.3 defines 122
 /// `minecraft:data_component_type` entries in total).
 pub const MAX_SLOT_COMPONENTS: usize = 32;
 
@@ -110,18 +137,30 @@ pub const MAX_SLOT_COMPONENTS: usize = 32;
 /// Vanilla 26.3 defines 43 enchantments in `data/minecraft/enchantment/`.
 pub const MAX_ENCHANTMENTS_PER_COMPONENT: usize = 64;
 
-/// Maximum modified UTF-8 byte length of a `minecraft:custom_name` text string,
-/// matching the `u16::MAX` (`65,535`) NBT `TAG_String` length prefix limit
+/// RustMC policy bound on entries in a single `minecraft:suspicious_stew_effects` component.
+///
+/// Vanilla 26.3 defines 40 mob effects in `minecraft:mob_effect`.
+pub const MAX_STEW_EFFECTS_PER_COMPONENT: usize = 64;
+
+/// Maximum modified UTF-8 byte length of a `minecraft:custom_name` or `minecraft:item_name`
+/// string value, matching the `u16::MAX` (`65,535`) NBT `TAG_String` length prefix limit
 /// (`Java Edition protocol/Data types` revision `3855787`).
 pub const MAX_CUSTOM_NAME_BYTES: usize = MAX_NBT_STRING_BYTES;
 
 const COMPONENT_DAMAGE: &str = "minecraft:damage";
 const COMPONENT_CUSTOM_NAME: &str = "minecraft:custom_name";
+const COMPONENT_ITEM_NAME: &str = "minecraft:item_name";
 const COMPONENT_ENCHANTMENTS: &str = "minecraft:enchantments";
 const COMPONENT_REPAIR_COST: &str = "minecraft:repair_cost";
 const COMPONENT_STORED_ENCHANTMENTS: &str = "minecraft:stored_enchantments";
 const COMPONENT_POTION_CONTENTS: &str = "minecraft:potion_contents";
+const COMPONENT_SUSPICIOUS_STEW_EFFECTS: &str = "minecraft:suspicious_stew_effects";
 const COMPONENT_TRIM: &str = "minecraft:trim";
+const COMPONENT_INSTRUMENT: &str = "minecraft:instrument";
+const COMPONENT_OMINOUS_BOTTLE_AMPLIFIER: &str = "minecraft:ominous_bottle_amplifier";
+
+const NBT_TAG_END: u8 = 0;
+const NBT_TAG_COMPOUND: u8 = 10;
 
 /// Errors returned while encoding or decoding a Java Edition 26.3 network `Slot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +177,8 @@ pub enum SlotError {
     TooManyComponents { count: u32, max: usize },
     /// Enchantment count in a component is zero or exceeds [`MAX_ENCHANTMENTS_PER_COMPONENT`].
     InvalidEnchantmentCount { count: u32, max: usize },
+    /// Suspicious stew effect count exceeds [`MAX_STEW_EFFECTS_PER_COMPONENT`].
+    TooManyStewEffects { count: u32, max: usize },
     /// An added component type ID or removed component entry is unknown or not modeled by RustMC.
     UnsupportedComponent(u32),
     /// The same data component type ID appeared more than once in `Components to add`.
@@ -162,6 +203,10 @@ pub enum SlotError {
     UnknownPotionId(u32),
     /// `minecraft:potion_contents` omitted the base potion or set unmodeled custom fields.
     UnsupportedPotionContents,
+    /// A mob effect name could not be resolved in [`ProtocolIds`] during encoding.
+    UnknownMobEffectName(String),
+    /// A mob effect numeric ID could not be resolved in [`ProtocolIds`] during decoding.
+    UnknownMobEffectId(u32),
     /// A trim pattern name could not be resolved in [`DynamicRegistryIds`] during encoding.
     UnknownTrimPatternName(String),
     /// A trim pattern numeric ID could not be resolved in [`DynamicRegistryIds`] during decoding.
@@ -170,12 +215,21 @@ pub enum SlotError {
     UnknownTrimMaterialName(String),
     /// A trim material numeric ID could not be resolved in [`DynamicRegistryIds`] during decoding.
     UnknownTrimMaterialId(u32),
+    /// An instrument name could not be resolved in [`DynamicRegistryIds`] during encoding.
+    UnknownInstrumentName(String),
+    /// An instrument numeric ID could not be resolved in [`DynamicRegistryIds`] during decoding.
+    UnknownInstrumentId(u32),
     /// An `ID or X` field used an inline value (`ID == 0`) or exceeded `i32::MAX`.
     UnsupportedInlineHolder,
-    /// `minecraft:damage` or `minecraft:repair_cost` is negative as a signed 32-bit VarInt (`> i32::MAX`).
+    /// `minecraft:ominous_bottle_amplifier` on the wire is outside `0..=4`.
+    InvalidOminousBottleAmplifier(u32),
+    /// Integer component field is negative as a signed 32-bit VarInt (`> i32::MAX`).
     NegativeComponentInt { component: &'static str, raw: u32 },
-    /// `minecraft:custom_name` exceeds [`MAX_CUSTOM_NAME_BYTES`] or is not a plain text component.
-    InvalidCustomName(&'static str),
+    /// `minecraft:custom_name` or `minecraft:item_name` exceeds [`MAX_CUSTOM_NAME_BYTES`] or is unmodeled.
+    InvalidTextComponent {
+        component: &'static str,
+        reason: &'static str,
+    },
     /// Constructing the validated [`ItemStack`] or [`ItemComponents`] failed.
     InvalidStack(ItemStackError),
 }
@@ -199,6 +253,12 @@ impl fmt::Display for SlotError {
             }
             Self::InvalidEnchantmentCount { count, max } => {
                 write!(f, "slot enchantment count {count} must be in 1..={max}")
+            }
+            Self::TooManyStewEffects { count, max } => {
+                write!(
+                    f,
+                    "slot suspicious stew effect count {count} exceeds limit of {max}"
+                )
             }
             Self::UnsupportedComponent(id) => {
                 write!(f, "unsupported or removed data component type id {id}")
@@ -248,6 +308,15 @@ impl fmt::Display for SlotError {
             Self::UnsupportedPotionContents => {
                 f.write_str("potion_contents must carry a base potion id and no custom fields")
             }
+            Self::UnknownMobEffectName(name) => {
+                write!(f, "mob effect `{name}` is not present in protocol ids")
+            }
+            Self::UnknownMobEffectId(id) => {
+                write!(
+                    f,
+                    "mob effect protocol id {id} is not present in protocol ids"
+                )
+            }
             Self::UnknownTrimPatternName(name) => {
                 write!(
                     f,
@@ -272,8 +341,26 @@ impl fmt::Display for SlotError {
                     "trim material network id {id} is not present in dynamic registry ids"
                 )
             }
-            Self::UnsupportedInlineHolder => {
-                f.write_str("inline registry holder definitions are not supported in slot trim")
+            Self::UnknownInstrumentName(name) => {
+                write!(
+                    f,
+                    "instrument `{name}` is not present in dynamic registry ids"
+                )
+            }
+            Self::UnknownInstrumentId(id) => {
+                write!(
+                    f,
+                    "instrument network id {id} is not present in dynamic registry ids"
+                )
+            }
+            Self::UnsupportedInlineHolder => f.write_str(
+                "inline registry holder definitions are not supported in slot component",
+            ),
+            Self::InvalidOminousBottleAmplifier(amp) => {
+                write!(
+                    f,
+                    "ominous bottle amplifier {amp} must be in {MIN_OMINOUS_BOTTLE_AMPLIFIER}..={MAX_OMINOUS_BOTTLE_AMPLIFIER}"
+                )
             }
             Self::NegativeComponentInt { component, raw } => {
                 write!(
@@ -281,8 +368,8 @@ impl fmt::Display for SlotError {
                     "component `{component}` value {raw} exceeds non-negative i32::MAX"
                 )
             }
-            Self::InvalidCustomName(reason) => {
-                write!(f, "invalid custom_name component: {reason}")
+            Self::InvalidTextComponent { component, reason } => {
+                write!(f, "invalid {component} component: {reason}")
             }
             Self::InvalidStack(err) => write!(f, "{err}"),
         }
@@ -312,7 +399,10 @@ fn read_slot_varint(input: &[u8]) -> Result<(u32, usize), SlotError> {
             Err(SlotError::InvalidVarInt)
         }
         Err(WireError::TooLong { .. } | WireError::InvalidText) => {
-            Err(SlotError::InvalidCustomName("invalid wire text"))
+            Err(SlotError::InvalidTextComponent {
+                component: "slot",
+                reason: "invalid wire text",
+            })
         }
     }
 }
@@ -331,42 +421,82 @@ fn require_component_id(ids: &ProtocolIds, name: &'static str) -> Result<u32, Sl
         .ok_or(SlotError::UnknownComponentTypeName(name))
 }
 
-fn encode_custom_name(name: &str, out: &mut Vec<u8>) -> Result<(), SlotError> {
-    java_wire::put_nbt_text(name, out).map_err(|_| {
-        SlotError::InvalidCustomName("custom_name exceeds maximum NBT string byte length")
-    })
+fn encode_text_component(
+    component_name: &'static str,
+    text: &TextComponent,
+    out: &mut Vec<u8>,
+) -> Result<(), SlotError> {
+    let map_err = |_| SlotError::InvalidTextComponent {
+        component: component_name,
+        reason: "text exceeds maximum NBT string byte length",
+    };
+    match text {
+        TextComponent::Literal(plain) => java_wire::put_nbt_text(plain, out).map_err(map_err),
+        TextComponent::Translatable { key } => {
+            let start = out.len();
+            out.push(NBT_TAG_COMPOUND);
+            out.push(NBT_TAG_STRING);
+            if let Err(err) = java_wire::put_nbt_string_payload("translate", out)
+                .and_then(|()| java_wire::put_nbt_string_payload(key, out))
+            {
+                out.truncate(start);
+                return Err(map_err(err));
+            }
+            out.push(NBT_TAG_END);
+            Ok(())
+        }
+    }
 }
 
-fn decode_custom_name(input: &[u8]) -> Result<(String, usize), SlotError> {
+fn decode_text_component(
+    input: &[u8],
+    component_name: &'static str,
+) -> Result<(TextComponent, usize), SlotError> {
     let (tag, consumed) = read_anonymous_network_nbt(input).map_err(|err| match err {
         BlockEntityError::UnexpectedEof => SlotError::Truncated,
-        BlockEntityError::Malformed(msg) => SlotError::InvalidCustomName(msg),
-        _ => SlotError::InvalidCustomName("invalid network NBT in custom_name"),
+        BlockEntityError::Malformed(msg) => SlotError::InvalidTextComponent {
+            component: component_name,
+            reason: msg,
+        },
+        _ => SlotError::InvalidTextComponent {
+            component: component_name,
+            reason: "invalid network NBT in text component",
+        },
     })?;
     match tag {
-        NbtTag::String(text) => Ok((text, consumed)),
+        NbtTag::String(text) => Ok((TextComponent::Literal(text), consumed)),
         NbtTag::Compound(entries) => {
             if entries.len() != 1 {
-                return Err(SlotError::InvalidCustomName(
-                    "custom_name compound must contain only the `text` field",
-                ));
+                return Err(SlotError::InvalidTextComponent {
+                    component: component_name,
+                    reason: "text component compound must contain only `text` or `translate`",
+                });
             }
             let (key, value) = &entries[0];
-            if key != "text" {
-                return Err(SlotError::InvalidCustomName(
-                    "custom_name compound is missing `text` field",
-                ));
-            }
-            match value {
-                NbtTag::String(text) => Ok((text.clone(), consumed)),
-                _ => Err(SlotError::InvalidCustomName(
-                    "custom_name `text` field must be a TAG_String",
+            match (key.as_str(), value) {
+                ("text", NbtTag::String(text)) => {
+                    Ok((TextComponent::Literal(text.clone()), consumed))
+                }
+                ("translate", NbtTag::String(tr_key)) => Ok((
+                    TextComponent::Translatable {
+                        key: tr_key.clone(),
+                    },
+                    consumed,
                 )),
+                ("text" | "translate", _) => Err(SlotError::InvalidTextComponent {
+                    component: component_name,
+                    reason: "text component field value must be a TAG_String",
+                }),
+                _ => Err(SlotError::InvalidTextComponent {
+                    component: component_name,
+                    reason: "unsupported field in text component compound",
+                }),
             }
         }
-        _ => Err(SlotError::InvalidCustomName(
-            "custom_name root tag must be TAG_Compound or TAG_String",
-        )),
+        _ => Err(SlotError::InvalidTextComponent {
+            component: component_name,
+            reason: "text component root tag must be TAG_Compound or TAG_String",
+        }),
     }
 }
 
@@ -545,6 +675,98 @@ fn decode_trim(
     Ok((trim, start_len - input.len()))
 }
 
+fn encode_suspicious_stew_effects(
+    effects: &[SuspiciousStewEffect],
+    ids: &ProtocolIds,
+    out: &mut Vec<u8>,
+) -> Result<(), SlotError> {
+    if effects.len() > MAX_STEW_EFFECTS_PER_COMPONENT {
+        return Err(SlotError::TooManyStewEffects {
+            count: u32::try_from(effects.len()).unwrap_or(u32::MAX),
+            max: MAX_STEW_EFFECTS_PER_COMPONENT,
+        });
+    }
+    let mut resolved = Vec::with_capacity(effects.len());
+    for effect in effects {
+        let duration = effect.duration_ticks();
+        if duration > i32::MAX as u32 {
+            return Err(SlotError::NegativeComponentInt {
+                component: COMPONENT_SUSPICIOUS_STEW_EFFECTS,
+                raw: duration,
+            });
+        }
+        let effect_id = ids
+            .mob_effect_id(effect.id())
+            .ok_or_else(|| SlotError::UnknownMobEffectName(effect.id().to_owned()))?;
+        resolved.push((effect_id, duration));
+    }
+    put_varint(resolved.len() as u32, out);
+    for (effect_id, duration) in resolved {
+        put_varint(effect_id, out);
+        put_varint(duration, out);
+    }
+    Ok(())
+}
+
+fn decode_suspicious_stew_effects(
+    mut input: &[u8],
+    ids: &ProtocolIds,
+) -> Result<(Vec<SuspiciousStewEffect>, usize), SlotError> {
+    let start_len = input.len();
+    let (count, prefix) = read_slot_varint(input)?;
+    input = &input[prefix..];
+    if count as usize > MAX_STEW_EFFECTS_PER_COMPONENT {
+        return Err(SlotError::TooManyStewEffects {
+            count,
+            max: MAX_STEW_EFFECTS_PER_COMPONENT,
+        });
+    }
+    let mut effects = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (effect_id, id_len) = read_slot_varint(input)?;
+        input = &input[id_len..];
+        let effect_name = ids
+            .mob_effect_name(effect_id)
+            .ok_or(SlotError::UnknownMobEffectId(effect_id))?;
+        let (duration, dur_len) = read_slot_varint(input)?;
+        input = &input[dur_len..];
+        if duration > i32::MAX as u32 {
+            return Err(SlotError::NegativeComponentInt {
+                component: COMPONENT_SUSPICIOUS_STEW_EFFECTS,
+                raw: duration,
+            });
+        }
+        let entry = SuspiciousStewEffect::try_new(effect_name, duration)
+            .map_err(|err| SlotError::InvalidStack(ItemStackError::from(err)))?;
+        effects.push(entry);
+    }
+    Ok((effects, start_len - input.len()))
+}
+
+fn encode_instrument(
+    instrument: &str,
+    dynamic_ids: &DynamicRegistryIds,
+    out: &mut Vec<u8>,
+) -> Result<(), SlotError> {
+    let id = dynamic_ids
+        .instrument_id(instrument)
+        .ok_or_else(|| SlotError::UnknownInstrumentName(instrument.to_owned()))?;
+    encode_registry_holder(id, out)
+}
+
+fn decode_instrument(
+    mut input: &[u8],
+    dynamic_ids: &DynamicRegistryIds,
+) -> Result<(String, usize), SlotError> {
+    let start_len = input.len();
+    let (id, n) = decode_registry_holder(input)?;
+    input = &input[n..];
+    let name = dynamic_ids
+        .instrument_name(id)
+        .ok_or(SlotError::UnknownInstrumentId(id))?;
+    Ok((name.to_owned(), start_len - input.len()))
+}
+
 /// Encodes `slot` into `out` using the Java Edition 26.3 (protocol 777) `Slot` format.
 ///
 /// Present data components on the stack are emitted in ascending
@@ -584,10 +806,17 @@ pub fn encode_slot(
         encoded_components.push((type_id, data));
     }
 
-    if let Some(custom_name) = components.custom_name() {
+    if let Some(custom_name) = components.custom_name_component() {
         let type_id = require_component_id(ids, COMPONENT_CUSTOM_NAME)?;
         let mut data = Vec::new();
-        encode_custom_name(custom_name, &mut data)?;
+        encode_text_component(COMPONENT_CUSTOM_NAME, custom_name, &mut data)?;
+        encoded_components.push((type_id, data));
+    }
+
+    if let Some(item_name) = components.item_name_component() {
+        let type_id = require_component_id(ids, COMPONENT_ITEM_NAME)?;
+        let mut data = Vec::new();
+        encode_text_component(COMPONENT_ITEM_NAME, item_name, &mut data)?;
         encoded_components.push((type_id, data));
     }
 
@@ -625,10 +854,36 @@ pub fn encode_slot(
         encoded_components.push((type_id, data));
     }
 
+    if !components.suspicious_stew_effects().is_empty() {
+        let type_id = require_component_id(ids, COMPONENT_SUSPICIOUS_STEW_EFFECTS)?;
+        let mut data = Vec::new();
+        encode_suspicious_stew_effects(components.suspicious_stew_effects(), ids, &mut data)?;
+        encoded_components.push((type_id, data));
+    }
+
     if let Some(trim) = components.trim() {
         let type_id = require_component_id(ids, COMPONENT_TRIM)?;
         let mut data = Vec::new();
         encode_trim(trim, dynamic_ids, &mut data)?;
+        encoded_components.push((type_id, data));
+    }
+
+    if let Some(instrument) = components.instrument() {
+        let type_id = require_component_id(ids, COMPONENT_INSTRUMENT)?;
+        let mut data = Vec::new();
+        encode_instrument(instrument, dynamic_ids, &mut data)?;
+        encoded_components.push((type_id, data));
+    }
+
+    if let Some(amplifier) = components.ominous_bottle_amplifier() {
+        if amplifier > MAX_OMINOUS_BOTTLE_AMPLIFIER {
+            return Err(SlotError::InvalidOminousBottleAmplifier(u32::from(
+                amplifier,
+            )));
+        }
+        let type_id = require_component_id(ids, COMPONENT_OMINOUS_BOTTLE_AMPLIFIER)?;
+        let mut data = Vec::new();
+        put_varint(u32::from(amplifier), &mut data);
         encoded_components.push((type_id, data));
     }
 
@@ -718,9 +973,14 @@ pub fn decode_slot(
                 components.set_damage(Some(damage));
             }
             COMPONENT_CUSTOM_NAME => {
-                let (name, n) = decode_custom_name(input)?;
+                let (name, n) = decode_text_component(input, COMPONENT_CUSTOM_NAME)?;
                 input = &input[n..];
                 components.set_custom_name(Some(name));
+            }
+            COMPONENT_ITEM_NAME => {
+                let (name, n) = decode_text_component(input, COMPONENT_ITEM_NAME)?;
+                input = &input[n..];
+                components.set_item_name(Some(name));
             }
             COMPONENT_ENCHANTMENTS => {
                 let (map, n) = decode_enchantment_map(input, dynamic_ids)?;
@@ -754,10 +1014,34 @@ pub fn decode_slot(
                     .set_potion(Some(potion))
                     .map_err(|err| SlotError::InvalidStack(ItemStackError::from(err)))?;
             }
+            COMPONENT_SUSPICIOUS_STEW_EFFECTS => {
+                let (effects, n) = decode_suspicious_stew_effects(input, ids)?;
+                input = &input[n..];
+                components
+                    .set_suspicious_stew_effects(effects)
+                    .map_err(|err| SlotError::InvalidStack(ItemStackError::from(err)))?;
+            }
             COMPONENT_TRIM => {
                 let (trim, n) = decode_trim(input, dynamic_ids)?;
                 input = &input[n..];
                 components.set_trim(Some(trim));
+            }
+            COMPONENT_INSTRUMENT => {
+                let (instrument, n) = decode_instrument(input, dynamic_ids)?;
+                input = &input[n..];
+                components
+                    .set_instrument(Some(instrument))
+                    .map_err(|err| SlotError::InvalidStack(ItemStackError::from(err)))?;
+            }
+            COMPONENT_OMINOUS_BOTTLE_AMPLIFIER => {
+                let (raw_amp, n) = read_slot_varint(input)?;
+                input = &input[n..];
+                let Ok(amp) = u8::try_from(raw_amp) else {
+                    return Err(SlotError::InvalidOminousBottleAmplifier(raw_amp));
+                };
+                components
+                    .set_ominous_bottle_amplifier(Some(amp))
+                    .map_err(|_| SlotError::InvalidOminousBottleAmplifier(raw_amp))?;
             }
             _ => return Err(SlotError::UnsupportedComponent(type_id)),
         }
@@ -788,7 +1072,11 @@ mod tests {
                 "minecraft:diamond_sword": { "protocol_id": 851 },
                 "minecraft:enchanted_book": { "protocol_id": 1120 },
                 "minecraft:potion": { "protocol_id": 1044 },
-                "minecraft:iron_chestplate": { "protocol_id": 883 }
+                "minecraft:iron_chestplate": { "protocol_id": 883 },
+                "minecraft:suspicious_stew": { "protocol_id": 1200 },
+                "minecraft:goat_horn": { "protocol_id": 1250 },
+                "minecraft:ominous_bottle": { "protocol_id": 1300 },
+                "minecraft:map": { "protocol_id": 1100 }
             }
         },
         "minecraft:data_component_type": {
@@ -797,11 +1085,15 @@ mod tests {
                 "minecraft:damage": { "protocol_id": 3 },
                 "minecraft:unbreakable": { "protocol_id": 4 },
                 "minecraft:custom_name": { "protocol_id": 6 },
+                "minecraft:item_name": { "protocol_id": 9 },
                 "minecraft:enchantments": { "protocol_id": 13 },
                 "minecraft:repair_cost": { "protocol_id": 19 },
                 "minecraft:stored_enchantments": { "protocol_id": 45 },
                 "minecraft:potion_contents": { "protocol_id": 53 },
-                "minecraft:trim": { "protocol_id": 58 }
+                "minecraft:suspicious_stew_effects": { "protocol_id": 55 },
+                "minecraft:trim": { "protocol_id": 58 },
+                "minecraft:instrument": { "protocol_id": 63 },
+                "minecraft:ominous_bottle_amplifier": { "protocol_id": 65 }
             }
         },
         "minecraft:potion": {
@@ -809,6 +1101,14 @@ mod tests {
                 "minecraft:water": { "protocol_id": 0 },
                 "minecraft:awkward": { "protocol_id": 3 },
                 "minecraft:healing": { "protocol_id": 21 }
+            }
+        },
+        "minecraft:mob_effect": {
+            "entries": {
+                "minecraft:speed": { "protocol_id": 0 },
+                "minecraft:night_vision": { "protocol_id": 15 },
+                "minecraft:poison": { "protocol_id": 18 },
+                "minecraft:saturation": { "protocol_id": 22 }
             }
         }
     }"#;
@@ -837,6 +1137,19 @@ mod tests {
                     vec![
                         "minecraft:amethyst".to_owned(),
                         "minecraft:diamond".to_owned(),
+                    ],
+                ),
+                (
+                    "minecraft:instrument".to_owned(),
+                    vec![
+                        "minecraft:admire_goat_horn".to_owned(),
+                        "minecraft:call_goat_horn".to_owned(),
+                        "minecraft:dream_goat_horn".to_owned(),
+                        "minecraft:feel_goat_horn".to_owned(),
+                        "minecraft:ponder_goat_horn".to_owned(),
+                        "minecraft:seek_goat_horn".to_owned(),
+                        "minecraft:sing_goat_horn".to_owned(),
+                        "minecraft:yearn_goat_horn".to_owned(),
                     ],
                 ),
             ],
@@ -928,11 +1241,28 @@ mod tests {
                 1,
                 ItemComponents::new().with_damage(42),
             ),
-            // custom_name (including non-ASCII & NUL for modified UTF-8)
+            // custom_name (literal and translatable)
             make_stack(
                 "minecraft:diamond_sword",
                 1,
                 ItemComponents::new().with_custom_name("Excalibur \u{2694}"),
+            ),
+            make_stack(
+                "minecraft:diamond_sword",
+                1,
+                ItemComponents::new().with_custom_name(TextComponent::translatable("item.blade")),
+            ),
+            // item_name (literal and translatable)
+            make_stack(
+                "minecraft:map",
+                1,
+                ItemComponents::new().with_item_name("Wayfinder"),
+            ),
+            make_stack(
+                "minecraft:map",
+                1,
+                ItemComponents::new()
+                    .with_item_name(TextComponent::translatable("filled_map.buried_treasure")),
             ),
             // enchantments
             make_stack(
@@ -966,6 +1296,16 @@ mod tests {
                     .with_potion("minecraft:awkward")
                     .expect("awkward"),
             ),
+            // suspicious_stew_effects
+            make_stack(
+                "minecraft:suspicious_stew",
+                1,
+                ItemComponents::new()
+                    .with_suspicious_stew_effect("minecraft:night_vision", 160)
+                    .expect("night_vision")
+                    .with_suspicious_stew_effect("minecraft:saturation", 7)
+                    .expect("saturation"),
+            ),
             // trim
             make_stack(
                 "minecraft:iron_chestplate",
@@ -973,6 +1313,22 @@ mod tests {
                 ItemComponents::new().with_trim(
                     ArmorTrim::try_new("minecraft:ward", "minecraft:diamond").expect("trim"),
                 ),
+            ),
+            // instrument
+            make_stack(
+                "minecraft:goat_horn",
+                1,
+                ItemComponents::new()
+                    .with_instrument("minecraft:ponder_goat_horn")
+                    .expect("instrument"),
+            ),
+            // ominous_bottle_amplifier
+            make_stack(
+                "minecraft:ominous_bottle",
+                1,
+                ItemComponents::new()
+                    .with_ominous_bottle_amplifier(4)
+                    .expect("amplifier"),
             ),
         ];
 
@@ -988,7 +1344,8 @@ mod tests {
             assert_eq!(decoded, Some(stack));
         }
 
-        // Pin exact component bytes for custom_name, potion_contents, and trim.
+        // Pin exact component bytes for custom_name, item_name (literal & translatable),
+        // potion_contents, suspicious_stew_effects, trim, instrument, and ominous_bottle_amplifier.
         let named = make_stack(
             "minecraft:stone",
             2,
@@ -1007,6 +1364,90 @@ mod tests {
                 0x08, // TAG_String text component
                 0x00, 0x02, b'H', b'i', // "Hi"
             ]
+        );
+
+        let translatable_item = make_stack(
+            "minecraft:stone",
+            1,
+            ItemComponents::new().with_item_name(TextComponent::translatable("a.b")),
+        );
+        let mut tr_bytes = Vec::new();
+        encode_slot(&Some(translatable_item), &ids, &dynamic_ids, &mut tr_bytes)
+            .expect("encode translatable item_name");
+        assert_eq!(
+            tr_bytes,
+            [
+                0x01, // count = 1
+                0x01, // item_id = 1 (stone)
+                0x01, // add_count = 1
+                0x00, // remove_count = 0
+                0x09, // component_type = 9 (minecraft:item_name)
+                0x0a, // TAG_Compound
+                0x08, // TAG_String field
+                0x00, 0x09, b't', b'r', b'a', b'n', b's', b'l', b'a', b't',
+                b'e', // "translate"
+                0x00, 0x03, b'a', b'.', b'b', // "a.b"
+                0x00, // TAG_End
+            ]
+        );
+
+        let stew = make_stack(
+            "minecraft:suspicious_stew",
+            1,
+            ItemComponents::new()
+                .with_suspicious_stew_effect("minecraft:night_vision", 140)
+                .expect("night_vision")
+                .with_suspicious_stew_effect("minecraft:saturation", 7)
+                .expect("saturation"),
+        );
+        let mut stew_bytes = Vec::new();
+        encode_slot(&Some(stew.clone()), &ids, &dynamic_ids, &mut stew_bytes).expect("encode stew");
+        assert_eq!(
+            &stew_bytes[stew_bytes.len() - 7..],
+            &[
+                55, // component_type = 55 (minecraft:suspicious_stew_effects)
+                2,  // count = 2
+                15, // minecraft:night_vision = 15
+                0x8c, 0x01, // 140 ticks (VarInt)
+                22,   // minecraft:saturation = 22
+                7,    // 7 ticks
+            ]
+        );
+        assert_eq!(
+            decode_slot(&stew_bytes, &ids, &dynamic_ids),
+            Ok((Some(stew), stew_bytes.len()))
+        );
+
+        let horn = make_stack(
+            "minecraft:goat_horn",
+            1,
+            ItemComponents::new()
+                .with_instrument("minecraft:sing_goat_horn")
+                .expect("sing_goat_horn"),
+        );
+        let mut horn_bytes = Vec::new();
+        encode_slot(&Some(horn.clone()), &ids, &dynamic_ids, &mut horn_bytes).expect("encode horn");
+        // sing_goat_horn is index 6 -> ID or X encodes 6 + 1 = 7
+        assert_eq!(&horn_bytes[horn_bytes.len() - 2..], &[63, 7]);
+        assert_eq!(
+            decode_slot(&horn_bytes, &ids, &dynamic_ids),
+            Ok((Some(horn), horn_bytes.len()))
+        );
+
+        let bottle = make_stack(
+            "minecraft:ominous_bottle",
+            1,
+            ItemComponents::new()
+                .with_ominous_bottle_amplifier(3)
+                .expect("amp 3"),
+        );
+        let mut bottle_bytes = Vec::new();
+        encode_slot(&Some(bottle.clone()), &ids, &dynamic_ids, &mut bottle_bytes)
+            .expect("encode ominous bottle");
+        assert_eq!(&bottle_bytes[bottle_bytes.len() - 2..], &[65, 3]);
+        assert_eq!(
+            decode_slot(&bottle_bytes, &ids, &dynamic_ids),
+            Ok((Some(bottle), bottle_bytes.len()))
         );
 
         let potion = make_stack(
@@ -1051,10 +1492,11 @@ mod tests {
         // trim_pattern "minecraft:ward" has dynamic id 1 -> holder VarInt(2)
         assert_eq!(&trim_bytes[trim_bytes.len() - 3..], &[58, 1, 2]);
 
-        // All 7 components together on one stack:
+        // All 11 components together on one stack:
         let all_components = ItemComponents::new()
             .with_damage(17)
             .with_custom_name("Relic")
+            .with_item_name(TextComponent::translatable("item.relic"))
             .with_enchantment("minecraft:unbreaking", 3)
             .expect("unbreaking")
             .with_enchantment("minecraft:sharpness", 4)
@@ -1064,7 +1506,13 @@ mod tests {
             .expect("mending")
             .with_potion("minecraft:healing")
             .expect("healing")
-            .with_trim(ArmorTrim::try_new("minecraft:coast", "minecraft:diamond").expect("trim"));
+            .with_suspicious_stew_effect("minecraft:poison", 200)
+            .expect("poison")
+            .with_trim(ArmorTrim::try_new("minecraft:coast", "minecraft:diamond").expect("trim"))
+            .with_instrument("minecraft:ponder_goat_horn")
+            .expect("instrument")
+            .with_ominous_bottle_amplifier(2)
+            .expect("amplifier");
         let all_stack = make_stack("minecraft:diamond_sword", 1, all_components);
 
         let mut all_bytes = Vec::new();
@@ -1089,6 +1537,9 @@ mod tests {
                 }
             },
             "minecraft:potion": {
+                "entries": {}
+            },
+            "minecraft:mob_effect": {
                 "entries": {}
             }
         }"#;
@@ -1275,19 +1726,81 @@ mod tests {
             Err(SlotError::DuplicateComponent(3))
         );
 
-        // 11. Inline trim holder (ID == 0) is rejected.
-        let inline_trim_packet = [
+        // 11. Inline trim/instrument holders (ID == 0) are rejected.
+        for comp_id in [58_u8, 63_u8] {
+            let inline_packet = [
+                0x01,    // count = 1
+                0x01,    // item_id = 1
+                0x01,    // add_count = 1
+                0x00,    // remove_count = 0
+                comp_id, // minecraft:trim or minecraft:instrument
+                0x00,    // inline ID = 0
+            ];
+            assert_eq!(
+                decode_slot(&inline_packet, &ids, &dynamic_ids),
+                Err(SlotError::UnsupportedInlineHolder)
+            );
+        }
+
+        // 12. Out-of-range ominous_bottle_amplifier (> 4) is rejected.
+        let bad_amp_packet = [
             0x01, // count = 1
             0x01, // item_id = 1
             0x01, // add_count = 1
             0x00, // remove_count = 0
-            58,   // minecraft:trim
-            0x00, // inline Trim Material (ID = 0)
+            65,   // minecraft:ominous_bottle_amplifier
+            5,    // > 4
         ];
         assert_eq!(
-            decode_slot(&inline_trim_packet, &ids, &dynamic_ids),
-            Err(SlotError::UnsupportedInlineHolder)
+            decode_slot(&bad_amp_packet, &ids, &dynamic_ids),
+            Err(SlotError::InvalidOminousBottleAmplifier(5))
         );
+
+        // 13. Oversized suspicious_stew_effects count (> MAX_STEW_EFFECTS_PER_COMPONENT).
+        let mut oversized_stew_count = Vec::new();
+        put_varint(1, &mut oversized_stew_count);
+        put_varint(1, &mut oversized_stew_count);
+        put_varint(1, &mut oversized_stew_count);
+        put_varint(0, &mut oversized_stew_count);
+        put_varint(55, &mut oversized_stew_count); // minecraft:suspicious_stew_effects
+        put_varint(
+            (MAX_STEW_EFFECTS_PER_COMPONENT + 1) as u32,
+            &mut oversized_stew_count,
+        );
+        assert_eq!(
+            decode_slot(&oversized_stew_count, &ids, &dynamic_ids),
+            Err(SlotError::TooManyStewEffects {
+                count: (MAX_STEW_EFFECTS_PER_COMPONENT + 1) as u32,
+                max: MAX_STEW_EFFECTS_PER_COMPONENT,
+            })
+        );
+
+        // 14. Unknown mob effect ID and richer text compound (with extra field) are rejected.
+        let bad_effect_packet = [
+            0x01, 0x01, 0x01, 0x00, 55, // suspicious_stew_effects
+            1,  // count = 1
+            99, // unknown mob_effect id
+            10, // duration
+        ];
+        assert_eq!(
+            decode_slot(&bad_effect_packet, &ids, &dynamic_ids),
+            Err(SlotError::UnknownMobEffectId(99))
+        );
+
+        let styled_item_name_packet = [
+            0x01, 0x01, 0x01, 0x00, 9,    // item_name
+            0x0a, // TAG_Compound
+            0x08, 0x00, 0x09, b't', b'r', b'a', b'n', b's', b'l', b'a', b't', b'e', 0x00, 0x01,
+            b'k', 0x08, 0x00, 0x05, b'c', b'o', b'l', b'o', b'r', 0x00, 0x04, b'g', b'o', b'l',
+            b'd', 0x00, // TAG_End
+        ];
+        assert!(matches!(
+            decode_slot(&styled_item_name_packet, &ids, &dynamic_ids),
+            Err(SlotError::InvalidTextComponent {
+                component: "minecraft:item_name",
+                ..
+            })
+        ));
     }
 
     /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_registries_round_trip_slot_with_all_components`
@@ -1309,6 +1822,7 @@ mod tests {
             ItemComponents::new()
                 .with_damage(5)
                 .with_custom_name("Vanilla Blade")
+                .with_item_name(TextComponent::translatable("item.minecraft.diamond_sword"))
                 .with_enchantment("minecraft:sharpness", 5)
                 .expect("sharpness")
                 .with_repair_cost(3)
@@ -1316,9 +1830,15 @@ mod tests {
                 .expect("unbreaking")
                 .with_potion("minecraft:awkward")
                 .expect("awkward")
-                .with_trim(
-                    ArmorTrim::try_new("minecraft:ward", "minecraft:diamond").expect("trim"),
-                ),
+                .with_suspicious_stew_effect("minecraft:night_vision", 160)
+                .expect("night_vision")
+                .with_suspicious_stew_effect("minecraft:saturation", 8)
+                .expect("saturation")
+                .with_trim(ArmorTrim::try_new("minecraft:ward", "minecraft:diamond").expect("trim"))
+                .with_instrument("minecraft:ponder_goat_horn")
+                .expect("instrument")
+                .with_ominous_bottle_amplifier(4)
+                .expect("amplifier"),
         )
         .expect("components");
 
@@ -1329,5 +1849,68 @@ mod tests {
             decode_slot(&bytes, &ids, &dynamic_ids).expect("decode with vanilla registries.json");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, Some(stack));
+
+        for real_stack in [
+            ItemStack::try_new(
+                "minecraft:goat_horn",
+                1,
+                default_max_stack("minecraft:goat_horn"),
+            )
+            .expect("goat horn")
+            .with_components(
+                ItemComponents::new()
+                    .with_instrument("minecraft:sing_goat_horn")
+                    .expect("sing"),
+            )
+            .expect("horn comps"),
+            ItemStack::try_new(
+                "minecraft:suspicious_stew",
+                1,
+                default_max_stack("minecraft:suspicious_stew"),
+            )
+            .expect("stew")
+            .with_components(
+                ItemComponents::new()
+                    .with_suspicious_stew_effect("minecraft:poison", 240)
+                    .expect("poison"),
+            )
+            .expect("stew comps"),
+            ItemStack::try_new(
+                "minecraft:ominous_bottle",
+                1,
+                default_max_stack("minecraft:ominous_bottle"),
+            )
+            .expect("bottle")
+            .with_components(
+                ItemComponents::new()
+                    .with_ominous_bottle_amplifier(0)
+                    .expect("amp 0"),
+            )
+            .expect("bottle comps"),
+            ItemStack::try_new(
+                "minecraft:filled_map",
+                1,
+                default_max_stack("minecraft:filled_map"),
+            )
+            .expect("map")
+            .with_components(
+                ItemComponents::new()
+                    .with_item_name(TextComponent::translatable("filled_map.buried_treasure")),
+            )
+            .expect("map comps"),
+        ] {
+            let mut item_bytes = Vec::new();
+            encode_slot(
+                &Some(real_stack.clone()),
+                &ids,
+                &dynamic_ids,
+                &mut item_bytes,
+            )
+            .expect("encode item");
+            let (decoded_item, len) =
+                decode_slot(&item_bytes, &ids, &dynamic_ids).expect("decode item");
+            assert_eq!(len, item_bytes.len());
+            assert_eq!(decoded_item, Some(real_stack));
+        }
     }
 }
