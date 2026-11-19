@@ -32,7 +32,7 @@
 //!   and `"expand": true`), and `alternatives` (1). Singleton entries may carry `weight`.
 //! - Modifiers used: `set_count` (89), `enchanted_count_increase` (80, with
 //!   optional `limit`), `furnace_smelt` (19), `set_potion` (3), and
-//!   `set_ominous_bottle_amplifier` (1 in `pillager`, left `Unsupported`).
+//!   `set_ominous_bottle_amplifier` (1 in `pillager`).
 //! - Conditions used: `entity_properties` (61, testing `this`, `attacker`,
 //!   `direct_attacker`), `killed_by_player` (24), `any_of` (19), `all_of` (13),
 //!   `random_chance_with_enchanted_bonus` (11, using `minecraft:linear`),
@@ -47,15 +47,15 @@
 //! - `gameplay/fishing` uses `quality` on `loot_table` entries (`-2`, `2`, `-1`)
 //!   and `entity_properties` with `minecraft:type_specific/fishing_hook`
 //!   (`in_open_water`). `gameplay/chicken_lay` uses `minecraft:components`
-//!   (`minecraft:chicken/variant`). Biome-based `location_check` stays `Unsupported`.
+//!   (`minecraft:chicken/variant`). Biome-based `location_check` tests
+//!   `predicate.biomes` against [`LootContext::biome_at`] and `tags/worldgen/biome`.
 //! - Modifiers used: `set_count` (517), `enchant_randomly` (52),
 //!   `enchant_with_levels` (34), `set_potion` (29), `set_damage` (28),
 //!   `exploration_map` (18, left `Unsupported`), `filtered` (18, using
 //!   `minecraft:map_id` in vanilla so those stay `Unsupported`), `set_name` (8,
-//!   using `translate` + `target: "item_name"` in vanilla so those stay
-//!   `Unsupported`), `set_stew_effect` (3, left `Unsupported`),
-//!   `set_ominous_bottle_amplifier` (2, left `Unsupported`),
-//!   `set_instrument` (1, left `Unsupported`), and `set_enchantments` (1).
+//!   using `translate` + `target: "item_name"`), `set_stew_effect` (3),
+//!   `set_ominous_bottle_amplifier` (2), `set_instrument` (1), and
+//!   `set_enchantments` (1).
 //!
 //! Schema definitions follow `minecraft.wiki`:
 //! - `Loot table` (revision 3893957): root fields `type`, `modifier`, `pools`,
@@ -75,7 +75,8 @@
 //!   `enchanted_count_increase`, `explosion_decay`, `filtered` (with
 //!   `Advancement/Conditions/item` revision 3286549 & `Data component predicate`
 //!   revision 3826514), `furnace_smelt`, `limit_count`, `set_count`,
-//!   `set_damage`, `set_enchantments`, `set_name`, `set_potion`.
+//!   `set_damage`, `set_enchantments`, `set_instrument`, `set_name`,
+//!   `set_ominous_bottle_amplifier`, `set_potion`, `set_stew_effect`.
 //! - `Number provider` (revision 3869456): constant numbers, `uniform`, and
 //!   `binomial`.
 //! - `Enchantment definition` (revision 3843772): `Level-based value` (`linear`, etc.).
@@ -88,8 +89,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::item::{
-    ItemComponents, ItemDefaults, ItemDefaultsError, ItemStack, MAX_STACK_LIMIT,
-    MIN_ENCHANTMENT_LEVEL, TextComponent, default_max_stack, items_equal, normalize_item_id,
+    ItemComponents, ItemDefaults, ItemDefaultsError, ItemStack, MAX_OMINOUS_BOTTLE_AMPLIFIER,
+    MAX_STACK_LIMIT, MIN_ENCHANTMENT_LEVEL, MIN_OMINOUS_BOTTLE_AMPLIFIER, SuspiciousStewEffect,
+    TextComponent, default_max_stack, items_equal, normalize_item_id, valid_item_id,
 };
 use crate::vanilla::feature::{BlockTags, EnchantmentTags, ItemTags, load_tag_entries};
 use crate::vanilla::random::RandomSource;
@@ -415,12 +417,14 @@ pub enum LootCondition {
         blocks: Vec<String>,
         state: BTreeMap<String, String>,
     },
-    /// `minecraft:location_check` — matches relative block at
-    /// `(offsetX, offsetY, offsetZ)` against `predicate.block` (`blocks` and `state`).
+    /// `minecraft:location_check` — matches relative block (`predicate.block`)
+    /// and/or relative biome (`predicate.biomes`) at `(offsetX, offsetY, offsetZ)`.
     LocationCheck {
         offset_x: i32,
         offset_y: i32,
         offset_z: i32,
+        biomes: Option<Vec<String>>,
+        has_block: bool,
         blocks: Vec<String>,
         state: BTreeMap<String, String>,
     },
@@ -482,8 +486,22 @@ pub enum BonusFormula {
 pub enum SetNameTarget {
     /// Sets `minecraft:custom_name` on [`ItemComponents`].
     CustomName,
-    /// Targets `minecraft:item_name`, which [`ItemComponents`] does not model.
+    /// Sets `minecraft:item_name` on [`ItemComponents`].
     ItemName,
+}
+
+/// Single status effect entry inside [`LootModifier::SetStewEffect`].
+///
+/// Mirrors `minecraft.wiki` `Item modifier` (revision `3896146`):
+/// `"Instant effects (instant health, instant damage, and saturation) use the value
+/// as the number of ticks the effect lasts. Other effects use it as the number of
+/// seconds the effect lasts."`
+#[derive(Debug, Clone, PartialEq)]
+pub struct StewEffectSpec {
+    /// Namespaced mob effect identifier (for example `"minecraft:night_vision"`).
+    pub effect_type: String,
+    /// Duration number provider (ticks for instant effects; seconds otherwise).
+    pub duration: NumberProvider,
 }
 
 /// Damage and remaining-durability bounds inside `predicates.minecraft:damage`.
@@ -532,10 +550,25 @@ pub enum LootModifier {
         add: bool,
         conditions: Vec<LootCondition>,
     },
-    /// `minecraft:set_name` — sets plain-text item name component (`target` defaults to `custom_name`).
+    /// `minecraft:set_name` — sets plain or translatable item name component (`target` defaults to `custom_name`).
     SetName {
-        name: String,
+        name: TextComponent,
         target: SetNameTarget,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:set_stew_effect` — picks one effect from `effects` and sets `minecraft:suspicious_stew_effects` on `minecraft:suspicious_stew`.
+    SetStewEffect {
+        effects: Vec<StewEffectSpec>,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:set_instrument` — sets `minecraft:instrument` to a randomly selected entry from `options`.
+    SetInstrument {
+        options: Vec<String>,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:set_ominous_bottle_amplifier` — sets `minecraft:ominous_bottle_amplifier`, clamped to `0..=4`.
+    SetOminousBottleAmplifier {
+        amplifier: NumberProvider,
         conditions: Vec<LootCondition>,
     },
     /// `minecraft:set_enchantments` — sets or adds enchantment levels (`book` converts to `enchanted_book`).
@@ -617,6 +650,9 @@ impl LootModifier {
             Self::SetCount { conditions, .. }
             | Self::SetDamage { conditions, .. }
             | Self::SetName { conditions, .. }
+            | Self::SetStewEffect { conditions, .. }
+            | Self::SetInstrument { conditions, .. }
+            | Self::SetOminousBottleAmplifier { conditions, .. }
             | Self::SetEnchantments { conditions, .. }
             | Self::EnchantRandomly { conditions, .. }
             | Self::EnchantWithLevels { conditions, .. }
@@ -759,6 +795,25 @@ where
     F: Fn(i32, i32, i32) -> Option<(String, BTreeMap<String, String>)> + Send + Sync,
 {
     fn block_at(&self, dx: i32, dy: i32, dz: i32) -> Option<(String, BTreeMap<String, String>)> {
+        self(dx, dy, dz)
+    }
+}
+
+/// Relative biome lookup supplied to [`LootContext`] for `minecraft:location_check`.
+///
+/// Receives offsets `(dx, dy, dz)` relative to the loot origin and returns
+/// `Some(biome_id)` for loaded locations, or `None` when unloaded or unavailable.
+pub trait BiomeLookup: Send + Sync {
+    /// Returns the namespaced biome identifier at relative offset `(dx, dy, dz)`,
+    /// or `None` if unavailable/unloaded.
+    fn biome_at(&self, dx: i32, dy: i32, dz: i32) -> Option<String>;
+}
+
+impl<F> BiomeLookup for F
+where
+    F: Fn(i32, i32, i32) -> Option<String> + Send + Sync,
+{
+    fn biome_at(&self, dx: i32, dy: i32, dz: i32) -> Option<String> {
         self(dx, dy, dz)
     }
 }
@@ -941,9 +996,13 @@ pub struct LootContext {
     /// Explosion radius when destroyed by an explosion, or `None` otherwise.
     pub explosion_radius: Option<f32>,
     /// Optional relative block lookup `(dx, dy, dz) -> Option<(block_id, properties)>`
-    /// used by `minecraft:location_check`. When `None`, `location_check` evaluates
+    /// used by `minecraft:location_check`. When `None`, block `location_check` evaluates
     /// to `false`.
     pub neighbor_blocks: Option<Arc<dyn BlockLookup>>,
+    /// Optional relative biome lookup `(dx, dy, dz) -> Option<biome_id>`
+    /// used by `minecraft:location_check` (`predicate.biomes`). When `None`,
+    /// biome `location_check` evaluates to `false`.
+    pub biome_lookup: Option<Arc<dyn BiomeLookup>>,
     /// Whether the entity was killed by a player (`minecraft:killed_by_player`).
     pub killed_by_player: bool,
     /// Attacker weapon used for `random_chance_with_enchanted_bonus` and
@@ -969,6 +1028,7 @@ impl fmt::Debug for LootContext {
             .field("tool", &self.tool)
             .field("explosion_radius", &self.explosion_radius)
             .field("has_neighbor_blocks", &self.neighbor_blocks.is_some())
+            .field("has_biome_lookup", &self.biome_lookup.is_some())
             .field("killed_by_player", &self.killed_by_player)
             .field("attacker_weapon", &self.attacker_weapon)
             .field("entity", &self.entity)
@@ -1068,6 +1128,22 @@ impl LootContext {
             .as_ref()
             .and_then(|lookup| lookup.block_at(dx, dy, dz))
     }
+
+    /// Attaches an optional relative biome lookup used by `minecraft:location_check`.
+    #[must_use]
+    pub fn with_biome_lookup(mut self, lookup: impl BiomeLookup + 'static) -> Self {
+        self.biome_lookup = Some(Arc::new(lookup));
+        self
+    }
+
+    /// Looks up the biome id at offset `(dx, dy, dz)`, returning `None` if no
+    /// lookup is attached or the location is unloaded.
+    #[must_use]
+    pub fn biome_at(&self, dx: i32, dy: i32, dz: i32) -> Option<String> {
+        self.biome_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.biome_at(dx, dy, dz))
+    }
 }
 
 /// Typed note emitted by [`LootTable::roll_with_notes`] when component data or
@@ -1110,6 +1186,8 @@ struct LootRegistries {
     enchantments: Arc<EnchantmentRegistry>,
     entity_type_tags: Arc<HashMap<String, Vec<String>>>,
     damage_type_tags: Arc<HashMap<String, Vec<String>>>,
+    instrument_tags: Arc<HashMap<String, Vec<String>>>,
+    biome_tags: Arc<HashMap<String, Vec<String>>>,
     recipes: Option<Arc<RecipeData>>,
     item_defaults: Option<Arc<ItemDefaults>>,
 }
@@ -1190,6 +1268,23 @@ impl LootTable {
         self
     }
 
+    /// Attaches instrument tags used by `minecraft:set_instrument`.
+    #[must_use]
+    pub fn with_instrument_tags(
+        mut self,
+        instrument_tags: Arc<HashMap<String, Vec<String>>>,
+    ) -> Self {
+        self.registries.instrument_tags = instrument_tags;
+        self
+    }
+
+    /// Attaches biome tags used by `minecraft:location_check` (`predicate.biomes`).
+    #[must_use]
+    pub fn with_biome_tags(mut self, biome_tags: Arc<HashMap<String, Vec<String>>>) -> Self {
+        self.registries.biome_tags = biome_tags;
+        self
+    }
+
     /// Returns the `what` labels of every [`LootCondition::Unsupported`] and
     /// [`LootModifier::Unsupported`] node anywhere in this table.
     #[must_use]
@@ -1237,7 +1332,7 @@ impl LootTable {
     ///   - `random_chance_with_enchanted_bonus`: `"Generates a random number between 0.0 and 1.0, and checks if it is less than the value determined using the level of a given enchantment. Requires attacker entity provided by loot context, and if not provided, the enchantment level is regarded as 0."` Uses `unenchanted_chance` at level 0 and `enchanted_chance` (`Level-based value`, e.g. `linear`: `"The final value is base + per_level_above_first * (level - 1)."`) when present.
     ///   - `killed_by_player`: `"Checks if there is a attacking_player entity provided by loot context. Requires attacking_player entity provided by loot context, and always fails if not provided."`
     ///   - `match_tool`: `"Checks tool used to mine the block. Requires tool provided by loot context, and always fails if not provided."` (`minecraft:enchantments`: `"Array of conditions. The sub-predicate succeeds when all the conditions succeed."`)
-    ///   - `location_check` (`Predicate` rev 3888899, `Advancement/Conditions/location` rev 3684921, `Advancement/Conditions/block` rev 3684708): `"Checks the current location against location criteria. Requires origin provided by loot context, and always fails if not provided."` Queries `LootContext::block_at(offsetX, offsetY, offsetZ)` and matches `predicate.block` (`blocks` and `state`); evaluates to `false` when no neighbour lookup is attached or `block_at` returns `None`. Any other location or block predicate field remains `Unsupported` (`false`).
+    ///   - `location_check` (`Predicate` rev 3888899, `Advancement/Conditions/location` rev 3684921, `Advancement/Conditions/block` rev 3684708): `"Checks the current location against location criteria. Requires origin provided by loot context, and always fails if not provided."` Evaluates `predicate.block` against `LootContext::block_at(offsetX, offsetY, offsetZ)` and `predicate.biomes` (`id`, list, or `#tag`) against `LootContext::biome_at(offsetX, offsetY, offsetZ)` and loaded `tags/worldgen/biome`; evaluates to `false` when the required lookup is absent or returns `None`. Any other location or block predicate field remains `Unsupported` (`false`).
     ///   - `entity_properties`: `"Checks properties of an entity. Invokable from any context."` Evaluates `this`, `attacker`, or `direct_attacker` from [`LootContext`], returning `false` if absent; only tested fields (`minecraft:flags`, `minecraft:entity_type`, `minecraft:vehicle`, `minecraft:equipment.mainhand`, `minecraft:components`, `minecraft:type_specific/sheep.sheared`, `minecraft:type_specific/cube_mob.size`, `minecraft:type_specific/raider.is_captain`) are modeled and all others stay `Unsupported`.
     ///   - `damage_source_properties`: `"Checks properties of the damage source. Requires origin and damage source provided by loot context, and always fails if not provided."` Matches `direct_entity`, `source_entity`, and `tags` (`id`, `expected`); unmodeled fields stay `Unsupported`.
     ///   - `Unsupported`: evaluates to `false`.
@@ -1246,12 +1341,15 @@ impl LootTable {
     ///   - `furnace_smelt`: `"Smelts the item as it would be in a furnace without changing its count."` Looks up `CookingKind::Smelting` in loaded `RecipeData`; when no recipe matches, leaves the item unchanged.
     ///   - `set_potion`: `"Sets the potion_contents component of an item."` (`"The potion ID. Set to empty to remove the Potion tag."`)
     ///   - `set_damage` (`Item modifier` rev 3896146; `Data component format/damage` rev 3536877): `"Sets the item's damage value (durability)."` `damage`: `"Specifies the durability fraction to set (1.0 is undamaged, 0.0 is zero durability left)."` `add`: `"If true, change is relative to current damage. Defaults to false."` Converts remaining durability fraction to `minecraft:damage` uses consumed from `ItemDefaults::max_damage`, leaving non-damageable items unchanged.
-    ///   - `set_name` (`Item modifier` rev 3896146; `Data component format/custom name` rev 3863465): `"Adds or changes the item's custom name."` `target`: `"Allowed values are custom_name or item_name, corresponding with the component to be set. Defaults to custom_name."` Plain-text `custom_name` sets `ItemComponents::set_custom_name`; `target: "item_name"` and non-plain-text text components stay [`LootModifier::Unsupported`] with [`LootNote::UnsupportedModifier`].
+    ///   - `set_name` (`Item modifier` rev 3896146; `Data component format/custom name` rev 3863465; `Data component format/item name` rev 3728022; `Text component format` rev 3862222): `"Adds or changes the item's custom name."` `target`: `"Allowed values are custom_name or item_name, corresponding with the component to be set. Defaults to custom_name."` Plain text and `{"translate": key}` set `ItemComponents::set_custom_name` or `ItemComponents::set_item_name`; `entity`-scoped or richer styled text components stay [`LootModifier::Unsupported`] with [`LootNote::UnsupportedModifier`].
+    ///   - `set_stew_effect` (`Item modifier` rev 3896146; `Data component format/suspicious stew effects` rev 3277335): `"Sets the status effects for suspicious stew. Fails if invoked on an item that is not suspicious stew."` `"Instant effects (instant health, instant damage, and saturation) use the value as the number of ticks the effect lasts. Other effects use it as the number of seconds the effect lasts."` Picks one entry uniformly from `effects` and sets `ItemComponents::set_suspicious_stew_effects`.
+    ///   - `set_instrument` (`Item modifier` rev 3896146; `Java Edition 26.1` rev 3880954; `Data component format/instrument` rev 3685633): `"Sets the item tags for instrument items to a random value from a tag."` Picks uniformly from `options` (`#tag` over `tags/instrument`, single id, or id list) and sets `ItemComponents::set_instrument`.
+    ///   - `set_ominous_bottle_amplifier` (`Item modifier` rev 3896146; `Data component format/ominous bottle amplifier` rev 3277333): `"Sets the ominous_bottle_amplifier component of an item."` `"Must be a non-negative integer from 0 to 4 (inclusive)."` Samples `amplifier` and clamps to `0..=4`.
     ///   - `set_enchantments` (`Item modifier` rev 3896146): `"Modifies the item's enchantments. A book converts to an enchanted book."` `"Powers are clamped at a maximum of 255. Decreasing an enchantment power below 1 remove the enchantment, through a relative negative add or through a direct value assignemnt."` `add`: `"If true, change is relative to current level. A nonexistent enchantment is presumed to start at 0. Defaults to false."`
     ///   - `enchant_randomly` (`Item modifier` rev 3896146): `"Enchants the item with one randomly-selected enchantment. The level of the enchantment, if applicable, is random. A book converts to an enchanted book when enchanted."` `only_compatible`: `"Whether only enchantments that are compatible with the item should be chosen (i.e. the item is listed in the enchantments supported_items). Books are always considered compatible."`
     ///   - `enchant_with_levels` (`Item modifier` rev 3896146; `Enchanting table mechanics` rev 3881519): `"Enchants the item, with the specified enchantment level (roughly equivalent to using an enchanting table at that level). A book converts to an enchanted book."` Reuses [`select_enchantments_for_loot`], keeping multiple selected enchantments on books (`"if the item is a book, an enchanting table is used, and multiple enchantments were selected, a random one is removed"`).
     ///   - `filtered` & `discard` (`Item modifier` rev 3896146; `Advancement/Conditions/item` rev 3286549; `Data component predicate` rev 3826514): `"Applies an Item Predicate to the target item, and runs modifiers according to whether the predicate passes or fails."` `discard`: `"Removes the item stack."` Unmodeled item predicates (such as `minecraft:map_id`) keep `filtered` as [`LootModifier::Unsupported`].
-    ///   - `set_ominous_bottle_amplifier`, `exploration_map`, `set_stew_effect`, `set_instrument`: kept as [`LootModifier::Unsupported`] because `ItemComponents` does not model those components.
+    ///   - `exploration_map` (and its `minecraft:map_id` `filtered` wrappers): kept as [`LootModifier::Unsupported`] because they require world structure search and map state.
     ///   - `apply_bonus` (`ore_drops`): `"Count *= (max(1; randomInt(0(inclusive) .. (Level + 2)(exclusive))))"` — reviewer decision: `count *= max(1, random_int(0 ..= level + 1))`.
     ///   - `apply_bonus` (`uniform_bonus_count`): `"uniform distribution (from 0 to level * bonusMultiplier)"` — reviewer decision: `count += random_int(0 ..= level * bonusMultiplier)`.
     ///   - `apply_bonus` (`binomial_with_bonus_count`): `Item modifier` rev 3896146 writes `"for 1 bonus item plus bonus determined by binomial distribution with n=level + extra, p=probability"`, whereas `Fortune` rev 3864999 shows `"the binomial distribution in the default case is created by rolling three times (n=3) with a drop probability of 57% (p=4/7), then an additional seed is added"` (`"Average drops"` = `"2.71 (2 5/7)"` = `1 + 3 * 4/7`). Reviewer decision: `count += Binomial(n = level + extra, p = probability)` with **no extra +1**, and missing enchantment = level 0.
@@ -1295,6 +1393,8 @@ impl LootTable {
             enchantments: &self.registries.enchantments,
             entity_type_tags: &self.registries.entity_type_tags,
             damage_type_tags: &self.registries.damage_type_tags,
+            instrument_tags: &self.registries.instrument_tags,
+            biome_tags: &self.registries.biome_tags,
             recipes: self.registries.recipes.as_deref(),
             item_defaults,
         };
@@ -1486,6 +1586,8 @@ impl LootTables {
         let enchantment_tags = Arc::new(EnchantmentTags::load(root)?);
         let entity_type_tags = Arc::new(load_tag_entries(root, "entity_type")?);
         let damage_type_tags = Arc::new(load_tag_entries(root, "damage_type")?);
+        let instrument_tags = Arc::new(load_tag_entries(root, "instrument")?);
+        let biome_tags = Arc::new(load_tag_entries(root, "worldgen/biome")?);
         let item_defaults = match ItemDefaults::load(root) {
             Ok(defaults) => Some(Arc::new(defaults)),
             Err(ItemDefaultsError::MissingReports(_)) => None,
@@ -1570,6 +1672,8 @@ impl LootTables {
             enchantments,
             entity_type_tags,
             damage_type_tags,
+            instrument_tags,
+            biome_tags,
             recipes,
             item_defaults,
         };
@@ -1763,6 +1867,18 @@ impl LootTables {
     #[must_use]
     pub fn recipes(&self) -> Option<&RecipeData> {
         self.registries.recipes.as_deref()
+    }
+
+    /// Returns the loaded `tags/instrument` map used by `minecraft:set_instrument`.
+    #[must_use]
+    pub fn instrument_tags(&self) -> &HashMap<String, Vec<String>> {
+        &self.registries.instrument_tags
+    }
+
+    /// Returns the loaded `tags/worldgen/biome` map used by `minecraft:location_check`.
+    #[must_use]
+    pub fn biome_tags(&self) -> &HashMap<String, Vec<String>> {
+        &self.registries.biome_tags
     }
 
     /// Returns the number of loaded primary loot tables.
@@ -2689,13 +2805,24 @@ fn parse_location_check(
         .get("predicate")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(file, "location_check missing or non-object `predicate`"))?;
-    if pred_obj.keys().any(|k| k != "block") {
+    if pred_obj.keys().any(|k| k != "block" && k != "biomes") {
         return Ok(LootCondition::Unsupported {
             what: kind.to_owned(),
         });
     }
-    let (blocks, state) = match pred_obj.get("block") {
-        None => (Vec::new(), BTreeMap::new()),
+    let biomes = match pred_obj.get("biomes") {
+        None => None,
+        Some(raw_biomes) => {
+            let specs = parse_string_or_list(raw_biomes, "location_check.predicate.biomes", file)?;
+            let normalized = specs
+                .into_iter()
+                .map(|spec| normalize_tag_or_id_spec(&spec, "biome", file))
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(normalized)
+        }
+    };
+    let (has_block, blocks, state) = match pred_obj.get("block") {
+        None => (false, Vec::new(), BTreeMap::new()),
         Some(raw_block) => {
             let block_obj = raw_block.as_object().ok_or_else(|| {
                 invalid(
@@ -2708,13 +2835,17 @@ fn parse_location_check(
                     what: kind.to_owned(),
                 });
             }
-            parse_block_match_fields(block_obj, "location_check.predicate.block", file)?
+            let (blocks, state) =
+                parse_block_match_fields(block_obj, "location_check.predicate.block", file)?;
+            (true, blocks, state)
         }
     };
     Ok(LootCondition::LocationCheck {
         offset_x,
         offset_y,
         offset_z,
+        biomes,
+        has_block,
         blocks,
         state,
     })
@@ -3508,6 +3639,9 @@ fn parse_single_modifier(
         }
         "set_damage" => parse_set_damage(obj, conditions, file),
         "set_name" => parse_set_name(obj, kind, conditions, file),
+        "set_stew_effect" => parse_set_stew_effect(obj, conditions, file),
+        "set_instrument" => parse_set_instrument(obj, conditions, file),
+        "set_ominous_bottle_amplifier" => parse_set_ominous_bottle_amplifier(obj, conditions, file),
         "set_enchantments" => parse_set_enchantments(obj, conditions, file),
         "enchant_randomly" => parse_enchant_randomly(obj, kind, conditions, file),
         "enchant_with_levels" => parse_enchant_with_levels(obj, kind, conditions, file),
@@ -3601,13 +3735,30 @@ fn parse_set_damage(
     })
 }
 
-fn extract_plain_text_name(value: &Value) -> Option<String> {
+fn extract_simple_text_component(
+    value: &Value,
+    file: &Path,
+) -> Result<Option<TextComponent>, LootError> {
     match value {
-        Value::String(s) => Some(s.clone()),
+        Value::String(s) => Ok(Some(TextComponent::Literal(s.clone()))),
         Value::Object(obj) if obj.len() == 1 => {
-            obj.get("text").and_then(Value::as_str).map(str::to_owned)
+            if let Some(raw_text) = obj.get("text") {
+                let text = raw_text
+                    .as_str()
+                    .ok_or_else(|| invalid(file, "set_name `name.text` must be a string"))?;
+                Ok(Some(TextComponent::Literal(text.to_owned())))
+            } else if let Some(raw_key) = obj.get("translate") {
+                let key = raw_key
+                    .as_str()
+                    .ok_or_else(|| invalid(file, "set_name `name.translate` must be a string"))?;
+                Ok(Some(TextComponent::Translatable {
+                    key: key.to_owned(),
+                }))
+            } else {
+                Ok(None)
+            }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -3664,9 +3815,8 @@ fn parse_set_name(
             ));
         }
     };
-    if target == SetNameTarget::CustomName
-        && entity.is_none()
-        && let Some(name) = extract_plain_text_name(raw_name)
+    if entity.is_none()
+        && let Some(name) = extract_simple_text_component(raw_name, file)?
     {
         return Ok(LootModifier::SetName {
             name,
@@ -3676,6 +3826,98 @@ fn parse_set_name(
     }
     Ok(LootModifier::Unsupported {
         what: kind.to_owned(),
+    })
+}
+
+fn parse_set_stew_effect(
+    obj: &Map<String, Value>,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "effects", "condition"],
+        "set_stew_effect modifier",
+        file,
+    )?;
+    let raw_effects = obj
+        .get("effects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid(file, "set_stew_effect missing or non-array `effects`"))?;
+    let mut effects = Vec::with_capacity(raw_effects.len());
+    for entry in raw_effects {
+        let entry_obj = entry
+            .as_object()
+            .ok_or_else(|| invalid(file, "set_stew_effect effect entry must be a JSON object"))?;
+        check_allowed_keys(
+            entry_obj,
+            &["type", "duration"],
+            "set_stew_effect effect entry",
+            file,
+        )?;
+        let raw_type = required_str(entry_obj, "type", "set_stew_effect effect entry", file)?;
+        let effect_type = normalize_strict_resource_id(raw_type, "mob_effect", file)?;
+        let raw_duration = entry_obj
+            .get("duration")
+            .ok_or_else(|| invalid(file, "set_stew_effect effect entry missing `duration`"))?;
+        let duration = parse_number_provider(raw_duration, file)?;
+        effects.push(StewEffectSpec {
+            effect_type,
+            duration,
+        });
+    }
+    Ok(LootModifier::SetStewEffect {
+        effects,
+        conditions,
+    })
+}
+
+fn parse_set_instrument(
+    obj: &Map<String, Value>,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "options", "condition"],
+        "set_instrument modifier",
+        file,
+    )?;
+    let raw_options = obj
+        .get("options")
+        .ok_or_else(|| invalid(file, "set_instrument modifier missing `options`"))?;
+    let entries = parse_string_or_list(raw_options, "set_instrument.options", file)?;
+    let options = entries
+        .into_iter()
+        .map(|entry| normalize_tag_or_id_spec(&entry, "instrument", file))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LootModifier::SetInstrument {
+        options,
+        conditions,
+    })
+}
+
+fn parse_set_ominous_bottle_amplifier(
+    obj: &Map<String, Value>,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "amplifier", "condition"],
+        "set_ominous_bottle_amplifier modifier",
+        file,
+    )?;
+    let raw_amplifier = obj.get("amplifier").ok_or_else(|| {
+        invalid(
+            file,
+            "set_ominous_bottle_amplifier modifier missing `amplifier`",
+        )
+    })?;
+    let amplifier = parse_number_provider(raw_amplifier, file)?;
+    Ok(LootModifier::SetOminousBottleAmplifier {
+        amplifier,
+        conditions,
     })
 }
 
@@ -3714,15 +3956,26 @@ fn parse_set_enchantments(
     })
 }
 
-fn normalize_enchant_option_spec(raw: &str, file: &Path) -> Result<String, LootError> {
+fn normalize_strict_resource_id(raw: &str, kind: &str, file: &Path) -> Result<String, LootError> {
+    let normalized = ensure_namespaced(raw);
+    validate_resource_id(&normalized, kind, file)?;
+    if !valid_item_id(&normalized) {
+        return Err(invalid(file, format!("invalid {kind} id `{raw}`")));
+    }
+    Ok(normalized)
+}
+
+fn normalize_tag_or_id_spec(raw: &str, kind: &str, file: &Path) -> Result<String, LootError> {
     if let Some(tag) = raw.strip_prefix('#') {
         let normalized = ensure_namespaced(tag);
-        validate_resource_id(&normalized, "enchantment tag", file)?;
+        let tag_kind = format!("{kind} tag");
+        validate_resource_id(&normalized, &tag_kind, file)?;
+        if !valid_item_id(&normalized) {
+            return Err(invalid(file, format!("invalid {tag_kind} id `{raw}`")));
+        }
         Ok(format!("#{normalized}"))
     } else {
-        let normalized = ensure_namespaced(raw);
-        validate_resource_id(&normalized, "enchantment", file)?;
-        Ok(normalized)
+        normalize_strict_resource_id(raw, kind, file)
     }
 }
 
@@ -3737,7 +3990,7 @@ fn parse_enchant_options(
     let entries = parse_string_or_list(raw, &format!("{context}.options"), file)?;
     let normalized = entries
         .into_iter()
-        .map(|entry| normalize_enchant_option_spec(&entry, file))
+        .map(|entry| normalize_tag_or_id_spec(&entry, "enchantment", file))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(normalized))
 }
@@ -4303,6 +4556,8 @@ struct EvalCtx<'a> {
     enchantments: &'a EnchantmentRegistry,
     entity_type_tags: &'a HashMap<String, Vec<String>>,
     damage_type_tags: &'a HashMap<String, Vec<String>>,
+    instrument_tags: &'a HashMap<String, Vec<String>>,
+    biome_tags: &'a HashMap<String, Vec<String>>,
     recipes: Option<&'a RecipeData>,
     item_defaults: Option<&'a ItemDefaults>,
 }
@@ -4535,14 +4790,34 @@ fn eval_condition(condition: &LootCondition, ctx: &EvalCtx<'_>, random: &mut Ran
             offset_x,
             offset_y,
             offset_z,
+            biomes,
+            has_block,
             blocks,
             state,
         } => {
-            let Some((block_id, properties)) = ctx.loot.block_at(*offset_x, *offset_y, *offset_z)
-            else {
-                return false;
-            };
-            match_block_state(blocks, state, &block_id, &properties, ctx.block_tags)
+            if *has_block {
+                let Some((block_id, properties)) =
+                    ctx.loot.block_at(*offset_x, *offset_y, *offset_z)
+                else {
+                    return false;
+                };
+                if !match_block_state(blocks, state, &block_id, &properties, ctx.block_tags) {
+                    return false;
+                }
+            }
+            if let Some(biome_specs) = biomes {
+                let Some(biome_id) = ctx.loot.biome_at(*offset_x, *offset_y, *offset_z) else {
+                    return false;
+                };
+                if !biome_matches_spec_list(biome_specs, &biome_id, ctx.biome_tags) {
+                    return false;
+                }
+            }
+            if !*has_block && biomes.is_none() {
+                return ctx.loot.block_at(*offset_x, *offset_y, *offset_z).is_some()
+                    || ctx.loot.biome_at(*offset_x, *offset_y, *offset_z).is_some();
+            }
+            true
         }
         LootCondition::TableBonus {
             enchantment,
@@ -4633,6 +4908,25 @@ fn match_block(blocks: &[String], state: &BTreeMap<String, String>, ctx: &EvalCt
     match_block_state(blocks, state, block_id, properties, ctx.block_tags)
 }
 
+fn match_spec_list<'a>(
+    specs: &[String],
+    actual_id: &str,
+    tag_members: impl Fn(&str) -> Option<&'a [String]>,
+) -> bool {
+    if actual_id.is_empty() {
+        return false;
+    }
+    specs.iter().any(|spec| {
+        if let Some(tag_id) = spec.strip_prefix('#') {
+            let tag = ensure_namespaced(tag_id);
+            tag_members(&tag)
+                .is_some_and(|members| members.iter().any(|m| items_equal(m, actual_id)))
+        } else {
+            items_equal(spec, actual_id)
+        }
+    })
+}
+
 fn match_block_state(
     blocks: &[String],
     state: &BTreeMap<String, String>,
@@ -4640,43 +4934,26 @@ fn match_block_state(
     properties: &BTreeMap<String, String>,
     block_tags: &BlockTags,
 ) -> bool {
-    if !blocks.is_empty() {
-        if block_id.is_empty() {
-            return false;
-        }
-        let id_matches = blocks.iter().any(|spec| {
-            if let Some(tag_id) = spec.strip_prefix('#') {
-                let tag = ensure_namespaced(tag_id);
-                block_tags
-                    .members(&tag)
-                    .is_some_and(|members| members.iter().any(|m| items_equal(m, block_id)))
-            } else {
-                items_equal(spec, block_id)
-            }
-        });
-        if !id_matches {
-            return false;
-        }
+    if !blocks.is_empty() && !match_spec_list(blocks, block_id, |tag| block_tags.members(tag)) {
+        return false;
     }
     state
         .iter()
         .all(|(prop, expected)| properties.get(prop) == Some(expected))
 }
 
-fn item_matches_spec_list(specs: &[String], item_id: &str, item_tags: &ItemTags) -> bool {
-    if item_id.is_empty() {
-        return false;
-    }
-    specs.iter().any(|spec| {
-        if let Some(tag_id) = spec.strip_prefix('#') {
-            let tag = ensure_namespaced(tag_id);
-            item_tags
-                .members(&tag)
-                .is_some_and(|members| members.iter().any(|m| items_equal(m, item_id)))
-        } else {
-            items_equal(spec, item_id)
-        }
+fn biome_matches_spec_list(
+    specs: &[String],
+    biome_id: &str,
+    biome_tags: &HashMap<String, Vec<String>>,
+) -> bool {
+    match_spec_list(specs, biome_id, |tag| {
+        biome_tags.get(tag).map(Vec::as_slice)
     })
+}
+
+fn item_matches_spec_list(specs: &[String], item_id: &str, item_tags: &ItemTags) -> bool {
+    match_spec_list(specs, item_id, |tag| item_tags.members(tag))
 }
 
 fn match_tool_predicate(predicate: &ToolPredicate, tool: &ToolContext, ctx: &EvalCtx<'_>) -> bool {
@@ -5056,16 +5333,18 @@ fn apply_modifier(
             apply_set_damage(damage, *add, drop, ctx.item_defaults, random);
         }
         LootModifier::SetName { name, target, .. } => match target {
-            SetNameTarget::CustomName => drop
-                .components
-                .set_custom_name(Some(TextComponent::Literal(name.clone()))),
-            SetNameTarget::ItemName => {
-                notes.push(LootNote::UnsupportedModifier {
-                    item: ensure_namespaced(&drop.item),
-                    what: "minecraft:set_name".to_owned(),
-                });
-            }
+            SetNameTarget::CustomName => drop.components.set_custom_name(Some(name.clone())),
+            SetNameTarget::ItemName => drop.components.set_item_name(Some(name.clone())),
         },
+        LootModifier::SetStewEffect { effects, .. } => {
+            apply_set_stew_effect(effects, drop, random);
+        }
+        LootModifier::SetInstrument { options, .. } => {
+            apply_set_instrument(options, drop, ctx, random);
+        }
+        LootModifier::SetOminousBottleAmplifier { amplifier, .. } => {
+            apply_set_ominous_bottle_amplifier(amplifier, drop, random);
+        }
         LootModifier::SetEnchantments {
             enchantments, add, ..
         } => {
@@ -5118,9 +5397,70 @@ fn apply_modifier(
 
 const BOOK_ITEM_ID: &str = "minecraft:book";
 const ENCHANTED_BOOK_ITEM_ID: &str = "minecraft:enchanted_book";
+const SUSPICIOUS_STEW_ITEM_ID: &str = "minecraft:suspicious_stew";
 
 fn is_book_item(item: &str) -> bool {
     items_equal(item, BOOK_ITEM_ID) || items_equal(item, ENCHANTED_BOOK_ITEM_ID)
+}
+
+fn is_instant_effect(effect_id: &str) -> bool {
+    matches!(
+        normalize_item_id(effect_id),
+        "instant_health" | "instant_damage" | "saturation"
+    )
+}
+
+fn apply_set_stew_effect(
+    effects: &[StewEffectSpec],
+    drop: &mut PendingDrop,
+    random: &mut RandomSource,
+) {
+    if !items_equal(&drop.item, SUSPICIOUS_STEW_ITEM_ID) || effects.is_empty() {
+        return;
+    }
+    let idx = random.next_int_bounded(u32::try_from(effects.len()).unwrap_or(u32::MAX)) as usize;
+    let chosen = &effects[idx];
+    let raw = sample_count_provider(&chosen.duration, random);
+    let count = u32::try_from(raw.max(0)).unwrap_or(u32::MAX);
+    let duration_ticks = if is_instant_effect(&chosen.effect_type) {
+        count
+    } else {
+        count.saturating_mul(20)
+    };
+    if let Ok(entry) = SuspiciousStewEffect::try_new(chosen.effect_type.clone(), duration_ticks) {
+        let _ = drop.components.set_suspicious_stew_effects(vec![entry]);
+    }
+}
+
+fn apply_set_instrument(
+    options: &[String],
+    drop: &mut PendingDrop,
+    ctx: &EvalCtx<'_>,
+    random: &mut RandomSource,
+) {
+    let candidates = resolve_tag_spec_ids(options, |tag| {
+        ctx.instrument_tags.get(tag).map(Vec::as_slice)
+    });
+    if candidates.is_empty() {
+        return;
+    }
+    let idx = random.next_int_bounded(u32::try_from(candidates.len()).unwrap_or(u32::MAX)) as usize;
+    let _ = drop
+        .components
+        .set_instrument(Some(candidates[idx].clone()));
+}
+
+fn apply_set_ominous_bottle_amplifier(
+    amplifier: &NumberProvider,
+    drop: &mut PendingDrop,
+    random: &mut RandomSource,
+) {
+    let sampled = sample_count_provider(amplifier, random);
+    let clamped = sampled.clamp(
+        i32::from(MIN_OMINOUS_BOTTLE_AMPLIFIER),
+        i32::from(MAX_OMINOUS_BOTTLE_AMPLIFIER),
+    ) as u8;
+    let _ = drop.components.set_ominous_bottle_amplifier(Some(clamped));
 }
 
 fn apply_set_damage(
@@ -5191,38 +5531,47 @@ fn apply_set_enchantments(
     }
 }
 
-fn resolve_enchant_option_ids(options: Option<&[String]>, ctx: &EvalCtx<'_>) -> Vec<String> {
+fn resolve_tag_spec_ids<'a>(
+    specs: &[String],
+    tag_members: impl Fn(&str) -> Option<&'a [String]>,
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    match options {
-        None => {
-            for (id, _) in ctx.enchantments.iter() {
-                if seen.insert(id.to_owned()) {
-                    out.push(id.to_owned());
-                }
-            }
-        }
-        Some(specs) => {
-            for spec in specs {
-                if let Some(tag) = spec.strip_prefix('#') {
-                    if let Some(members) = ctx.enchantment_tags.members(tag) {
-                        for member in members {
-                            let normalized = ensure_namespaced(member);
-                            if seen.insert(normalized.clone()) {
-                                out.push(normalized);
-                            }
-                        }
-                    }
-                } else {
-                    let normalized = ensure_namespaced(spec);
+    for spec in specs {
+        if let Some(tag) = spec.strip_prefix('#') {
+            let normalized_tag = ensure_namespaced(tag);
+            if let Some(members) = tag_members(&normalized_tag) {
+                for member in members {
+                    let normalized = ensure_namespaced(member);
                     if seen.insert(normalized.clone()) {
                         out.push(normalized);
                     }
                 }
             }
+        } else {
+            let normalized = ensure_namespaced(spec);
+            if seen.insert(normalized.clone()) {
+                out.push(normalized);
+            }
         }
     }
     out
+}
+
+fn resolve_enchant_option_ids(options: Option<&[String]>, ctx: &EvalCtx<'_>) -> Vec<String> {
+    match options {
+        None => {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for (id, _) in ctx.enchantments.iter() {
+                if seen.insert(id.to_owned()) {
+                    out.push(id.to_owned());
+                }
+            }
+            out
+        }
+        Some(specs) => resolve_tag_spec_ids(specs, |tag| ctx.enchantment_tags.members(tag)),
+    }
 }
 
 fn apply_selected_enchantments(drop: &mut PendingDrop, selected: Vec<(String, u8)>) {
@@ -7128,7 +7477,7 @@ mod tests {
                             "offsetY": 1,
                             "predicate": {
                                 "block": {"blocks": "testns:top"},
-                                "biomes": "minecraft:plains"
+                                "dimension": "minecraft:overworld"
                             }
                         },
                         "entries": [{"type": "minecraft:item", "name": "testns:drop"}]
@@ -7500,15 +7849,20 @@ mod tests {
         assert!(tables.get_entity("testns:entities/mob").is_some());
         assert!(tables.get_entity("testns:sheep/red").is_some());
         assert!(tables.get_entity("testns:entities/sheep/red").is_some());
-        assert_eq!(
-            tables.unsupported(),
-            vec![(
-                "testns:entities/mob",
-                "minecraft:set_ominous_bottle_amplifier"
-            )]
-        );
+        assert!(tables.unsupported().is_empty());
 
         let mob = tables.get_entity("testns:mob").expect("mob table");
+        assert!(matches!(
+            &mob.pools[1].entries[0],
+            LootEntry::Item { modifiers, .. }
+                if matches!(
+                    modifiers.as_slice(),
+                    [LootModifier::SetOminousBottleAmplifier {
+                        amplifier: NumberProvider::Uniform { min, max },
+                        ..
+                    }] if (*min - 0.0).abs() < f64::EPSILON && (*max - 4.0).abs() < f64::EPSILON
+                )
+        ));
         match &mob.pools[0].entries[2] {
             LootEntry::Tag { tag, expand, .. } => {
                 assert_eq!(tag, "testns:discs");
@@ -7651,13 +8005,9 @@ mod tests {
         }
 
         let unsupported = tables.unsupported();
-        println!("entity loot unsupported nodes: {unsupported:?}");
-        assert_eq!(
-            unsupported,
-            vec![(
-                "minecraft:entities/pillager",
-                "minecraft:set_ominous_bottle_amplifier",
-            )]
+        assert!(
+            unsupported.is_empty(),
+            "expected all entity loot tables to have empty unsupported(), got {unsupported:?}"
         );
     }
 
@@ -8110,7 +8460,7 @@ mod tests {
     }
 
     #[test]
-    fn furnace_smelt_set_potion_and_unsupported_amplifier() {
+    fn furnace_smelt_set_potion_and_ominous_bottle_amplifier() {
         let root = scratch_root("smelt_potion_amp");
         write(
             &root.join("data/testns/recipe/cook_raw_meat.json"),
@@ -8208,13 +8558,12 @@ mod tests {
             Some("minecraft:poison")
         );
         assert_eq!(roll.items[3].item(), "minecraft:ominous_bottle");
-        assert_eq!(
-            roll.notes,
-            vec![LootNote::UnsupportedModifier {
-                item: "minecraft:ominous_bottle".to_owned(),
-                what: "minecraft:set_ominous_bottle_amplifier".to_owned(),
-            }]
-        );
+        let amp = roll.items[3]
+            .components()
+            .ominous_bottle_amplifier()
+            .expect("ominous bottle amplifier set");
+        assert!((0..=4).contains(&amp));
+        assert!(roll.notes.is_empty());
 
         // Cold kill leaves meat raw.
         let cold_ctx = LootContext::for_entity("testns:cook_potion_mob");
@@ -8964,7 +9313,7 @@ mod tests {
                 assert_eq!(
                     modifiers[1],
                     LootModifier::SetName {
-                        name: "Blade".to_owned(),
+                        name: TextComponent::Literal("Blade".to_owned()),
                         target: SetNameTarget::CustomName,
                         conditions: Vec::new(),
                     }
@@ -9004,6 +9353,38 @@ mod tests {
                         && on_pass.len() == 1
                         && matches!(on_fail.as_slice(), [LootModifier::Discard { .. }])
                 ));
+                assert_eq!(
+                    modifiers[6],
+                    LootModifier::SetName {
+                        name: TextComponent::Translatable {
+                            key: "item.blade".to_owned(),
+                        },
+                        target: SetNameTarget::ItemName,
+                        conditions: Vec::new(),
+                    }
+                );
+                assert_eq!(
+                    modifiers[7],
+                    LootModifier::SetName {
+                        name: TextComponent::Literal("Ignored".to_owned()),
+                        target: SetNameTarget::ItemName,
+                        conditions: Vec::new(),
+                    }
+                );
+                assert_eq!(
+                    modifiers[10],
+                    LootModifier::SetInstrument {
+                        options: vec!["#minecraft:regular_goat_horns".to_owned()],
+                        conditions: Vec::new(),
+                    }
+                );
+                assert_eq!(
+                    modifiers[11],
+                    LootModifier::SetOminousBottleAmplifier {
+                        amplifier: NumberProvider::Constant(1.0),
+                        conditions: Vec::new(),
+                    }
+                );
             }
             other => panic!("expected Item entry, got {other:?}"),
         }
@@ -9011,16 +9392,8 @@ mod tests {
         assert_eq!(
             combined.unsupported(),
             vec![
-                ("testns:archaeology/pot", "minecraft:set_stew_effect"),
-                ("testns:chests/sub/stash", "minecraft:set_name"),
-                ("testns:chests/sub/stash", "minecraft:set_name"),
                 ("testns:chests/sub/stash", "minecraft:exploration_map"),
                 ("testns:chests/sub/stash", "minecraft:filtered"),
-                ("testns:chests/sub/stash", "minecraft:set_instrument"),
-                (
-                    "testns:chests/sub/stash",
-                    "minecraft:set_ominous_bottle_amplifier"
-                ),
             ]
         );
 
@@ -9243,7 +9616,7 @@ mod tests {
     }
 
     #[test]
-    fn set_name_modifier_sets_plain_custom_name_and_leaves_unmodeled_targets_unsupported() {
+    fn set_name_modifier_sets_custom_and_item_name_and_leaves_styled_unsupported() {
         let root = scratch_root("mod_set_name");
         write(
             &root.join("data/testns/loot_table/chests/names.json"),
@@ -9284,6 +9657,14 @@ mod tests {
                             "name": "minecraft:stick",
                             "modifier": {"type": "minecraft:set_name", "name": {"text": "Styled", "color": "gold"}}
                         }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:filled_map",
+                            "modifier": {"type": "minecraft:set_name", "name": {"translate": "filled_map.bamboo_camp_map"}, "target": "item_name"}
+                        }]
                     }
                 ]
             }"#,
@@ -9297,27 +9678,32 @@ mod tests {
                 &mut RandomSource::from_world_seed(1),
             )
             .expect("names table");
-        assert_eq!(roll.items.len(), 4);
+        assert_eq!(roll.items.len(), 5);
         assert_eq!(roll.items[0].components().custom_name(), Some("Excalibur"));
+        assert_eq!(roll.items[0].components().item_name(), None);
         assert_eq!(roll.items[1].components().custom_name(), None);
-        assert_eq!(roll.items[2].components().custom_name(), None);
+        assert_eq!(roll.items[1].components().item_name(), Some("Wayfinder"));
+        assert_eq!(
+            roll.items[2].components().custom_name_component(),
+            Some(&TextComponent::Translatable {
+                key: "filled_map.buried_treasure".to_owned(),
+            })
+        );
         assert_eq!(roll.items[3].components().custom_name(), None);
+        assert_eq!(roll.items[3].components().item_name(), None);
+        assert_eq!(
+            roll.items[4].components().item_name_component(),
+            Some(&TextComponent::Translatable {
+                key: "filled_map.bamboo_camp_map".to_owned(),
+            })
+        );
+        assert_eq!(roll.items[4].components().custom_name(), None);
         assert_eq!(
             roll.notes,
-            vec![
-                LootNote::UnsupportedModifier {
-                    item: "minecraft:compass".to_owned(),
-                    what: "minecraft:set_name".to_owned(),
-                },
-                LootNote::UnsupportedModifier {
-                    item: "minecraft:map".to_owned(),
-                    what: "minecraft:set_name".to_owned(),
-                },
-                LootNote::UnsupportedModifier {
-                    item: "minecraft:stick".to_owned(),
-                    what: "minecraft:set_name".to_owned(),
-                },
-            ]
+            vec![LootNote::UnsupportedModifier {
+                item: "minecraft:stick".to_owned(),
+                what: "minecraft:set_name".to_owned(),
+            }]
         );
 
         fs::remove_dir_all(&root).expect("cleanup");
@@ -9918,24 +10304,9 @@ mod tests {
         }
 
         let unsupported = tables.unsupported();
-        println!(
-            "chest/gameplay/archaeology unsupported nodes ({}): {unsupported:?}",
-            unsupported.len()
-        );
-        let mut expected_unsupported = vec![(
-            "minecraft:archaeology/desert_well",
-            "minecraft:set_stew_effect",
-        )];
+        let mut expected_unsupported = Vec::new();
         for _ in 0..8 {
             expected_unsupported.extend([
-                (
-                    "minecraft:chests/abandoned_camp_common_chest",
-                    "minecraft:location_check",
-                ),
-                (
-                    "minecraft:chests/abandoned_camp_common_chest",
-                    "minecraft:set_name",
-                ),
                 (
                     "minecraft:chests/abandoned_camp_common_chest",
                     "minecraft:exploration_map",
@@ -9960,34 +10331,10 @@ mod tests {
         }
         expected_unsupported.extend([
             (
-                "minecraft:chests/abandoned_mineshaft",
-                "minecraft:location_check",
-            ),
-            (
-                "minecraft:chests/ancient_city_ice_box",
-                "minecraft:set_stew_effect",
-            ),
-            (
-                "minecraft:chests/pillager_outpost",
-                "minecraft:set_instrument",
-            ),
-            (
                 "minecraft:chests/shipwreck_map",
                 "minecraft:exploration_map",
             ),
             ("minecraft:chests/shipwreck_map", "minecraft:filtered"),
-            (
-                "minecraft:chests/shipwreck_supply",
-                "minecraft:set_stew_effect",
-            ),
-            (
-                "minecraft:chests/trial_chambers/reward_common",
-                "minecraft:set_ominous_bottle_amplifier",
-            ),
-            (
-                "minecraft:chests/trial_chambers/reward_ominous_common",
-                "minecraft:set_ominous_bottle_amplifier",
-            ),
             (
                 "minecraft:chests/underwater_ruin_big",
                 "minecraft:exploration_map",
@@ -10000,10 +10347,6 @@ mod tests {
             (
                 "minecraft:chests/underwater_ruin_small",
                 "minecraft:filtered",
-            ),
-            (
-                "minecraft:gameplay/fishing/junk",
-                "minecraft:location_check",
             ),
         ]);
         assert_eq!(unsupported, expected_unsupported);
@@ -10499,5 +10842,744 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn set_stew_effect_picks_one_effect_converts_seconds_vs_instant_ticks_and_skips_non_stew() {
+        let root = scratch_root("mod_set_stew");
+        write(
+            &root.join("data/testns/loot_table/chests/stews.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:suspicious_stew",
+                            "modifier": {
+                                "type": "minecraft:set_stew_effect",
+                                "effects": [
+                                    {"type": "minecraft:night_vision", "duration": {"type": "minecraft:uniform", "min": 7, "max": 10}},
+                                    {"type": "minecraft:saturation", "duration": {"type": "minecraft:uniform", "min": 7, "max": 10}},
+                                    {"type": "minecraft:instant_health", "duration": 5},
+                                    {"type": "minecraft:instant_damage", "duration": 4}
+                                ]
+                            }
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:bowl",
+                            "modifier": {
+                                "type": "minecraft:set_stew_effect",
+                                "effects": [{"type": "minecraft:night_vision", "duration": 8}]
+                            }
+                        }]
+                    }
+                ]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load stews");
+        assert!(tables.unsupported().is_empty());
+
+        let mut seen_effects = std::collections::BTreeSet::new();
+        for seed in 0..200_u64 {
+            let roll = tables
+                .roll_chest(
+                    "testns:stews",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll stews");
+            assert_eq!(roll.items.len(), 2);
+            assert!(roll.notes.is_empty());
+
+            let stew = &roll.items[0];
+            assert_eq!(stew.item(), "minecraft:suspicious_stew");
+            let effects = stew.components().suspicious_stew_effects();
+            assert_eq!(effects.len(), 1, "seed {seed} must pick one stew effect");
+            let eff = &effects[0];
+            seen_effects.insert(eff.id().to_owned());
+            match eff.id() {
+                "minecraft:night_vision" => {
+                    assert!(
+                        (140..=200).contains(&eff.duration_ticks())
+                            && eff.duration_ticks().is_multiple_of(20),
+                        "unexpected night_vision ticks: {}",
+                        eff.duration_ticks()
+                    );
+                }
+                "minecraft:saturation" => {
+                    assert!(
+                        (7..=10).contains(&eff.duration_ticks()),
+                        "saturation duration must stay in ticks (7..=10), got {}",
+                        eff.duration_ticks()
+                    );
+                }
+                "minecraft:instant_health" => assert_eq!(eff.duration_ticks(), 5),
+                "minecraft:instant_damage" => assert_eq!(eff.duration_ticks(), 4),
+                other => panic!("unexpected stew effect {other}"),
+            }
+
+            let bowl = &roll.items[1];
+            assert_eq!(bowl.item(), "minecraft:bowl");
+            assert!(
+                bowl.components().suspicious_stew_effects().is_empty(),
+                "set_stew_effect must not modify non-suspicious_stew items"
+            );
+        }
+        assert_eq!(seen_effects.len(), 4);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn set_instrument_resolves_nested_tags_and_id_lists() {
+        let root = scratch_root("mod_set_instrument");
+        write(
+            &root.join("data/testns/tags/instrument/horns_a.json"),
+            r#"{"values": ["testns:horn_1", "testns:horn_2"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/instrument/horns_b.json"),
+            r#"{"values": ["testns:horn_3"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/instrument/all_horns.json"),
+            r##"{"values": ["#testns:horns_a", "#testns:horns_b"]}"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/horns.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:goat_horn",
+                            "modifier": {"type": "minecraft:set_instrument", "options": "#testns:all_horns"}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:goat_horn",
+                            "modifier": {"type": "minecraft:set_instrument", "options": "testns:solo"}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:goat_horn",
+                            "modifier": {"type": "minecraft:set_instrument", "options": ["testns:list_a", "testns:list_b"]}
+                        }]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load horns");
+        assert!(tables.unsupported().is_empty());
+
+        let mut seen_tag = std::collections::BTreeSet::new();
+        let mut seen_list = std::collections::BTreeSet::new();
+        for seed in 0..100_u64 {
+            let roll = tables
+                .roll_chest(
+                    "testns:horns",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll horns");
+            assert_eq!(roll.items.len(), 3);
+            let tagged = roll.items[0]
+                .components()
+                .instrument()
+                .expect("tagged horn instrument")
+                .to_owned();
+            assert!(
+                matches!(
+                    tagged.as_str(),
+                    "testns:horn_1" | "testns:horn_2" | "testns:horn_3"
+                ),
+                "unexpected tagged instrument {tagged}"
+            );
+            seen_tag.insert(tagged);
+
+            assert_eq!(roll.items[1].components().instrument(), Some("testns:solo"));
+
+            let listed = roll.items[2]
+                .components()
+                .instrument()
+                .expect("listed horn instrument")
+                .to_owned();
+            assert!(
+                matches!(listed.as_str(), "testns:list_a" | "testns:list_b"),
+                "unexpected listed instrument {listed}"
+            );
+            seen_list.insert(listed);
+        }
+        assert_eq!(seen_tag.len(), 3);
+        assert_eq!(seen_list.len(), 2);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn set_ominous_bottle_amplifier_clamps_to_zero_through_four() {
+        let root = scratch_root("mod_set_amplifier");
+        write(
+            &root.join("data/testns/loot_table/chests/bottles.json"),
+            r#"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:ominous_bottle",
+                            "modifier": {"type": "minecraft:set_ominous_bottle_amplifier", "amplifier": -3}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:ominous_bottle",
+                            "modifier": {"type": "minecraft:set_ominous_bottle_amplifier", "amplifier": 10}
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "minecraft:ominous_bottle",
+                            "modifier": {
+                                "type": "minecraft:set_ominous_bottle_amplifier",
+                                "amplifier": {"type": "minecraft:uniform", "min": 1, "max": 3}
+                            }
+                        }]
+                    }
+                ]
+            }"#,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load bottles");
+        assert!(tables.unsupported().is_empty());
+
+        let mut seen_ranged = std::collections::BTreeSet::new();
+        for seed in 0..100_u64 {
+            let roll = tables
+                .roll_chest(
+                    "testns:bottles",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("roll bottles");
+            assert_eq!(
+                roll.items[0].components().ominous_bottle_amplifier(),
+                Some(0)
+            );
+            assert_eq!(
+                roll.items[1].components().ominous_bottle_amplifier(),
+                Some(4)
+            );
+            let amp = roll.items[2]
+                .components()
+                .ominous_bottle_amplifier()
+                .expect("ranged amplifier");
+            assert!((1..=3).contains(&amp));
+            seen_ranged.insert(amp);
+        }
+        assert_eq!(seen_ranged, [1, 2, 3].into_iter().collect());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn location_check_biome_id_list_tag_offsets_and_missing_lookup() {
+        let root = scratch_root("location_check_biomes");
+        write(
+            &root.join("data/testns/tags/worldgen/biome/cold_biomes.json"),
+            r#"{"values": ["testns:frozen_peaks"]}"#,
+        );
+        write(
+            &root.join("data/testns/tags/worldgen/biome/has_structure/camp.json"),
+            r##"{"values": ["testns:dappled_forest", "#testns:cold_biomes"]}"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/biome_loot.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "testns:single_id",
+                            "condition": {
+                                "type": "minecraft:location_check",
+                                "predicate": {"biomes": "testns:sulfur_caves"}
+                            }
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "testns:list_id",
+                            "condition": {
+                                "type": "minecraft:location_check",
+                                "predicate": {"biomes": ["testns:jungle", "testns:bamboo_jungle"]}
+                            }
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "testns:tag_id",
+                            "condition": {
+                                "type": "minecraft:location_check",
+                                "offsetX": 2,
+                                "offsetY": -1,
+                                "offsetZ": 3,
+                                "predicate": {"biomes": "#testns:has_structure/camp"}
+                            }
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "testns:both_block_and_biome",
+                            "condition": {
+                                "type": "minecraft:location_check",
+                                "predicate": {
+                                    "block": {"blocks": "testns:pedestal"},
+                                    "biomes": "testns:sulfur_caves"
+                                }
+                            }
+                        }]
+                    },
+                    {
+                        "rolls": 1,
+                        "entries": [{
+                            "type": "minecraft:item",
+                            "name": "testns:empty_biomes",
+                            "condition": {
+                                "type": "minecraft:location_check",
+                                "predicate": {"biomes": []}
+                            }
+                        }]
+                    }
+                ]
+            }"##,
+        );
+
+        let tables = LootTables::load_chests(&root).expect("load biome_loot");
+        assert!(tables.unsupported().is_empty());
+
+        // Without biome_lookup, all biome-gated checks return false.
+        let no_lookup = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &LootContext::default(),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        assert!(no_lookup.items.is_empty());
+
+        // None returned from biome_lookup -> false.
+        let unloaded = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &LootContext::default().with_biome_lookup(|_, _, _| None),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        assert!(unloaded.items.is_empty());
+
+        // Sulfur caves without block_lookup: single_id passes, both_block_and_biome fails.
+        let sulfur_only = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &LootContext::default()
+                    .with_biome_lookup(|_, _, _| Some("testns:sulfur_caves".to_owned())),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        let names: Vec<&str> = sulfur_only.items.iter().map(ItemStack::item).collect();
+        assert_eq!(names, vec!["testns:single_id"]);
+
+        // Sulfur caves + pedestal block -> both_block_and_biome also passes.
+        let sulfur_and_block = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &LootContext::default()
+                    .with_biome_lookup(|_, _, _| Some("testns:sulfur_caves".to_owned()))
+                    .with_block_lookup(|_, _, _| {
+                        Some(("testns:pedestal".to_owned(), BTreeMap::new()))
+                    }),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        let names: Vec<&str> = sulfur_and_block.items.iter().map(ItemStack::item).collect();
+        assert_eq!(
+            names,
+            vec!["testns:single_id", "testns:both_block_and_biome"]
+        );
+
+        // Bamboo jungle -> list_id passes.
+        let jungle = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &LootContext::default()
+                    .with_biome_lookup(|_, _, _| Some("testns:bamboo_jungle".to_owned())),
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        let names: Vec<&str> = jungle.items.iter().map(ItemStack::item).collect();
+        assert_eq!(names, vec!["testns:list_id"]);
+
+        // Exact offset (2, -1, 3) returning nested tag member testns:frozen_peaks -> tag_id passes.
+        let tag_ctx = LootContext::default().with_biome_lookup(|dx, dy, dz| {
+            if (dx, dy, dz) == (2, -1, 3) {
+                Some("testns:frozen_peaks".to_owned())
+            } else {
+                Some("testns:plains".to_owned())
+            }
+        });
+        let tagged = tables
+            .roll_chest(
+                "testns:biome_loot",
+                &tag_ctx,
+                &mut RandomSource::from_world_seed(1),
+            )
+            .expect("roll");
+        let names: Vec<&str> = tagged.items.iter().map(ItemStack::item).collect();
+        assert_eq!(names, vec!["testns:tag_id"]);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn rejects_invalid_batch_18_modifier_and_biome_shapes() {
+        let cases = [
+            (
+                "missing_stew_effects.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:suspicious_stew","modifier":{"type":"minecraft:set_stew_effect"}}]}]}"#,
+            ),
+            (
+                "missing_stew_duration.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:suspicious_stew","modifier":{"type":"minecraft:set_stew_effect","effects":[{"type":"minecraft:night_vision"}]}}]}]}"#,
+            ),
+            (
+                "bad_stew_effect_id.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:suspicious_stew","modifier":{"type":"minecraft:set_stew_effect","effects":[{"type":"minecraft:BadEffect","duration":5}]}}]}]}"#,
+            ),
+            (
+                "missing_instrument_options.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:goat_horn","modifier":{"type":"minecraft:set_instrument"}}]}]}"#,
+            ),
+            (
+                "bad_instrument_tag.json",
+                r##"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:goat_horn","modifier":{"type":"minecraft:set_instrument","options":"#"}}]}]}"##,
+            ),
+            (
+                "missing_amplifier.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ominous_bottle","modifier":{"type":"minecraft:set_ominous_bottle_amplifier"}}]}]}"#,
+            ),
+            (
+                "bad_translate_type.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:map","modifier":{"type":"minecraft:set_name","name":{"translate":123}}}]}]}"#,
+            ),
+            (
+                "bad_biome_tag.json",
+                r##"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","condition":{"type":"minecraft:location_check","predicate":{"biomes":"#"}}}]}]}"##,
+            ),
+        ];
+        for (filename, body) in cases {
+            let root = scratch_root(filename);
+            write(
+                &root.join("data/testns/loot_table/chests").join(filename),
+                body,
+            );
+            let err = LootTables::load_chests(&root)
+                .expect_err("invalid batch 18 table must fail")
+                .to_string();
+            assert!(
+                err.contains(filename),
+                "error for {filename} must name file: {err}"
+            );
+            fs::remove_dir_all(&root).expect("cleanup");
+        }
+    }
+
+    /// Pin across all 5 modeled vanilla 26.3 loot categories (`blocks`, `entities`,
+    /// `chests`, `gameplay`, `archaeology`) that:
+    /// - `unsupported()` contains only `exploration_map` and its `filtered` wrappers;
+    /// - `minecraft:chests/pillager_outpost` goat horns receive an instrument in `#minecraft:regular_goat_horns`;
+    /// - `minecraft:archaeology/desert_well` suspicious stews receive one effect and duration in range;
+    /// - `minecraft:entities/pillager` captain drops an ominous bottle with amplifier in `0..=4`;
+    /// - `minecraft:chests/abandoned_camp_common_chest` sets translatable `item_name`;
+    /// - `minecraft:chests/abandoned_mineshaft` (`music_disc_bounce`) and
+    ///   `minecraft:gameplay/fishing/junk` (`bamboo`) only drop biome-gated entries in matching biomes.
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored vanilla_remaining_modifiers_and_biome_checks`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn vanilla_remaining_modifiers_and_biome_checks() {
+        let root = vanilla_data_root();
+        let tables = LootTables::load_categories(
+            &root,
+            &["blocks", "entities", "chests", "gameplay", "archaeology"],
+        )
+        .expect("load all five loot categories");
+        assert_eq!(tables.len(), 1201 + 109 + 58 + 26 + 6);
+
+        let mut expected_unsupported = Vec::new();
+        for _ in 0..8 {
+            expected_unsupported.extend([
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:exploration_map",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:filtered",
+                ),
+            ]);
+        }
+        for _ in 0..7 {
+            expected_unsupported.extend([
+                (
+                    "minecraft:chests/abandoned_camp_secret_chest",
+                    "minecraft:exploration_map",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_secret_chest",
+                    "minecraft:filtered",
+                ),
+            ]);
+        }
+        expected_unsupported.extend([
+            (
+                "minecraft:chests/shipwreck_map",
+                "minecraft:exploration_map",
+            ),
+            ("minecraft:chests/shipwreck_map", "minecraft:filtered"),
+            (
+                "minecraft:chests/underwater_ruin_big",
+                "minecraft:exploration_map",
+            ),
+            ("minecraft:chests/underwater_ruin_big", "minecraft:filtered"),
+            (
+                "minecraft:chests/underwater_ruin_small",
+                "minecraft:exploration_map",
+            ),
+            (
+                "minecraft:chests/underwater_ruin_small",
+                "minecraft:filtered",
+            ),
+        ]);
+        assert_eq!(tables.unsupported(), expected_unsupported);
+
+        // 1. Goat horns from `minecraft:chests/pillager_outpost` use `#minecraft:regular_goat_horns`.
+        let regular_horns: std::collections::BTreeSet<String> = tables
+            .instrument_tags()
+            .get("minecraft:regular_goat_horns")
+            .expect("regular_goat_horns tag loaded")
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(regular_horns.len(), 4);
+        let mut seen_horns = std::collections::BTreeSet::new();
+        for seed in 0..200_u64 {
+            let rolled = tables
+                .roll_chest(
+                    "minecraft:chests/pillager_outpost",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("pillager_outpost");
+            for stack in rolled.items {
+                if stack.item() == "minecraft:goat_horn" {
+                    let inst = stack
+                        .components()
+                        .instrument()
+                        .expect("goat_horn must have instrument")
+                        .to_owned();
+                    assert!(
+                        regular_horns.contains(&inst),
+                        "seed {seed}: unexpected goat horn instrument {inst}"
+                    );
+                    seen_horns.insert(inst);
+                }
+            }
+        }
+        assert_eq!(seen_horns, regular_horns);
+
+        // 2. Suspicious stews from `minecraft:archaeology/desert_well` pick one effect in range.
+        let mut seen_stew_effects = std::collections::BTreeSet::new();
+        for seed in 0..500_u64 {
+            let rolled = tables
+                .roll_archaeology(
+                    "minecraft:archaeology/desert_well",
+                    &LootContext::default(),
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("desert_well");
+            for stack in rolled.items {
+                if stack.item() == "minecraft:suspicious_stew" {
+                    let effects = stack.components().suspicious_stew_effects();
+                    assert_eq!(effects.len(), 1, "seed {seed}");
+                    let eff = &effects[0];
+                    seen_stew_effects.insert(eff.id().to_owned());
+                    let ticks = eff.duration_ticks();
+                    match eff.id() {
+                        "minecraft:night_vision" | "minecraft:jump_boost" => {
+                            assert!((140..=200).contains(&ticks) && ticks.is_multiple_of(20));
+                        }
+                        "minecraft:weakness" => {
+                            assert!((120..=160).contains(&ticks) && ticks.is_multiple_of(20));
+                        }
+                        "minecraft:blindness" => {
+                            assert!((100..=140).contains(&ticks) && ticks.is_multiple_of(20));
+                        }
+                        "minecraft:poison" => {
+                            assert!((200..=400).contains(&ticks) && ticks.is_multiple_of(20));
+                        }
+                        "minecraft:saturation" => {
+                            assert!((7..=10).contains(&ticks));
+                        }
+                        other => panic!("unexpected desert_well stew effect {other}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(seen_stew_effects.len(), 6);
+
+        // 3. Captain pillager drops ominous bottle with amplifier in 0..=4.
+        let captain_ctx = LootContext::for_entity("minecraft:pillager")
+            .with_entity(EntityContext::new("minecraft:pillager").with_raider_captain(true));
+        let mut seen_amps = std::collections::BTreeSet::new();
+        for seed in 0..200_u64 {
+            let rolled = tables
+                .roll_entity(
+                    "minecraft:entities/pillager",
+                    &captain_ctx,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("pillager");
+            let bottle = rolled
+                .items
+                .iter()
+                .find(|s| s.item() == "minecraft:ominous_bottle")
+                .expect("captain must drop ominous_bottle");
+            let amp = bottle
+                .components()
+                .ominous_bottle_amplifier()
+                .expect("amplifier set");
+            assert!((0..=4).contains(&amp));
+            seen_amps.insert(amp);
+        }
+        assert_eq!(seen_amps, [0, 1, 2, 3, 4].into_iter().collect());
+
+        // 4. `abandoned_camp_common_chest` sets translatable `item_name` on `abandoned_camp_map`.
+        let camp_ctx =
+            LootContext::default().with_biome_lookup(|_, _, _| Some("minecraft:plains".to_owned()));
+        let mut saw_camp_map = false;
+        for seed in 0..50_u64 {
+            let rolled = tables
+                .roll_chest(
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    &camp_ctx,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("abandoned_camp_common_chest");
+            for stack in rolled.items {
+                if stack.item() == "minecraft:abandoned_camp_map" {
+                    assert!(matches!(
+                        stack.components().item_name_component(),
+                        Some(TextComponent::Translatable { key }) if key.starts_with("filled_map.")
+                    ));
+                    saw_camp_map = true;
+                }
+            }
+        }
+        assert!(saw_camp_map);
+
+        // 5. Biome-gated drops in `abandoned_mineshaft` and `gameplay/fishing/junk`.
+        let sulfur_ctx = LootContext::default()
+            .with_biome_lookup(|_, _, _| Some("minecraft:sulfur_caves".to_owned()));
+        let plains_ctx =
+            LootContext::default().with_biome_lookup(|_, _, _| Some("minecraft:plains".to_owned()));
+        let mut bounce_sulfur = 0_usize;
+        let mut bounce_plains = 0_usize;
+        let mut bounce_empty = 0_usize;
+        for seed in 0..300_u64 {
+            for (ctx, counter) in [
+                (&sulfur_ctx, &mut bounce_sulfur),
+                (&plains_ctx, &mut bounce_plains),
+                (&LootContext::default(), &mut bounce_empty),
+            ] {
+                let rolled = tables
+                    .roll_chest(
+                        "minecraft:chests/abandoned_mineshaft",
+                        ctx,
+                        &mut RandomSource::from_world_seed(seed),
+                    )
+                    .expect("abandoned_mineshaft");
+                *counter += rolled
+                    .items
+                    .iter()
+                    .filter(|s| s.item() == "minecraft:music_disc_bounce")
+                    .count();
+            }
+        }
+        assert!(
+            bounce_sulfur > 0,
+            "expected music_disc_bounce in sulfur_caves"
+        );
+        assert_eq!(bounce_plains, 0);
+        assert_eq!(bounce_empty, 0);
+
+        let jungle_ctx = LootContext::default()
+            .with_biome_lookup(|_, _, _| Some("minecraft:bamboo_jungle".to_owned()));
+        let mut bamboo_jungle = 0_usize;
+        let mut bamboo_plains = 0_usize;
+        let mut bamboo_empty = 0_usize;
+        for seed in 0..300_u64 {
+            for (ctx, counter) in [
+                (&jungle_ctx, &mut bamboo_jungle),
+                (&plains_ctx, &mut bamboo_plains),
+                (&LootContext::default(), &mut bamboo_empty),
+            ] {
+                let rolled = tables
+                    .roll_gameplay(
+                        "minecraft:gameplay/fishing/junk",
+                        ctx,
+                        &mut RandomSource::from_world_seed(seed),
+                    )
+                    .expect("fishing junk");
+                *counter += rolled
+                    .items
+                    .iter()
+                    .filter(|s| s.item() == "minecraft:bamboo")
+                    .count();
+            }
+        }
+        assert!(bamboo_jungle > 0, "expected bamboo in bamboo_jungle");
+        assert_eq!(bamboo_plains, 0);
+        assert_eq!(bamboo_empty, 0);
     }
 }
