@@ -1,7 +1,8 @@
-//! Typed block and entity loot table model and runtime loader for Java 26.3 datapacks.
+//! Typed block, entity, chest, gameplay, and archaeology loot table model and
+//! runtime loader for Java 26.3 datapacks.
 //!
-//! Reads `data/<namespace>/loot_table/blocks/**/*.json` or
-//! `data/<namespace>/loot_table/entities/**/*.json` from an
+//! Reads `data/<namespace>/loot_table/<category>/**/*.json` (for `blocks`,
+//! `entities`, `chests`, `gameplay`, and `archaeology`) from an
 //! operator-provisioned vanilla data root and resolves named predicate strings
 //! against `data/<namespace>/predicate/**/*.json` as well as `loot_table`
 //! entry references against `data/<namespace>/loot_table/**/*.json`.
@@ -37,21 +38,44 @@
 //!   `random_chance_with_enchanted_bonus` (11, using `minecraft:linear`),
 //!   `damage_source_properties` (8), `random_chance` (4), and `inverted` (2).
 //!
+//! Verified 26.3 chest, gameplay, and archaeology loot format facts (checked across
+//! all 90 JSON files under `chests/` 58, `gameplay/` 26 including `fishing/` and
+//! `hero_of_the_village/` subfolders, and `archaeology/` 6):
+//! - `chests/` uses `type: "minecraft:chest"`, `archaeology/` uses
+//!   `type: "minecraft:archaeology"`, and `gameplay/` spans `minecraft:gift` (21),
+//!   `minecraft:fishing` (4), and `minecraft:barter` (1).
+//! - `gameplay/fishing` uses `quality` on `loot_table` entries (`-2`, `2`, `-1`)
+//!   and `entity_properties` with `minecraft:type_specific/fishing_hook`
+//!   (`in_open_water`). `gameplay/chicken_lay` uses `minecraft:components`
+//!   (`minecraft:chicken/variant`). Biome-based `location_check` stays `Unsupported`.
+//! - Modifiers used: `set_count` (517), `enchant_randomly` (52),
+//!   `enchant_with_levels` (34), `set_potion` (29), `set_damage` (28),
+//!   `exploration_map` (18, left `Unsupported`), `filtered` (18, using
+//!   `minecraft:map_id` in vanilla so those stay `Unsupported`), `set_name` (8,
+//!   using `translate` + `target: "item_name"` in vanilla so those stay
+//!   `Unsupported`), `set_stew_effect` (3, left `Unsupported`),
+//!   `set_ominous_bottle_amplifier` (2, left `Unsupported`),
+//!   `set_instrument` (1, left `Unsupported`), and `set_enchantments` (1).
+//!
 //! Schema definitions follow `minecraft.wiki`:
 //! - `Loot table` (revision 3893957): root fields `type`, `modifier`, `pools`,
 //!   `random_sequence`; pool fields `condition`, `modifier`, `rolls`, `entries`;
 //!   entry types `item`, `loot_table`, `empty`, `tag`, `alternatives`, `dynamic`,
-//!   and `weight`.
+//!   `weight`, and `quality`.
 //! - `Predicate` (revision 3888899): `all_of`, `any_of`, `inverted`,
 //!   `location_check` (with `Advancement/Conditions/location` revision 3684921 &
 //!   `Advancement/Conditions/block` revision 3684708), `match_block`,
 //!   `match_tool`, `random_chance`, `random_chance_with_enchanted_bonus`,
 //!   `killed_by_player`, `survives_explosion`, `table_bonus`,
-//!   `entity_properties` (`Advancement/Conditions/entity` revision 3825655),
+//!   `entity_properties` (`Advancement/Conditions/entity` revision 3825655,
+//!   including `minecraft:type_specific/fishing_hook.in_open_water`),
 //!   and `damage_source_properties` (`Advancement/Conditions/damage type` revision 3778836).
 //! - `Item modifier` (revision 3896146): `apply_bonus`, `copy_components`,
-//!   `copy_state`, `enchanted_count_increase`, `explosion_decay`,
-//!   `furnace_smelt`, `limit_count`, `set_count`, `set_potion`.
+//!   `copy_state`, `discard`, `enchant_randomly`, `enchant_with_levels`,
+//!   `enchanted_count_increase`, `explosion_decay`, `filtered` (with
+//!   `Advancement/Conditions/item` revision 3286549 & `Data component predicate`
+//!   revision 3826514), `furnace_smelt`, `limit_count`, `set_count`,
+//!   `set_damage`, `set_enchantments`, `set_name`, `set_potion`.
 //! - `Number provider` (revision 3869456): constant numbers, `uniform`, and
 //!   `binomial`.
 //! - `Enchantment definition` (revision 3843772): `Level-based value` (`linear`, etc.).
@@ -70,6 +94,7 @@ use crate::item::{
 use crate::vanilla::feature::{BlockTags, EnchantmentTags, ItemTags, load_tag_entries};
 use crate::vanilla::random::RandomSource;
 use crate::vanilla::worldgen::{WorldgenError, read_dir_optional, read_json, walk_json};
+use crate::world::enchantment::{EnchantmentError, EnchantmentRegistry};
 use crate::world::recipe_data::{CookingKind, RecipeData, RecipeDataError};
 
 /// Maximum nesting depth allowed when resolving or evaluating `loot_table` entries.
@@ -84,6 +109,8 @@ pub enum LootError {
     ItemDefaults(ItemDefaultsError),
     /// Loading smelting recipes failed.
     RecipeData(RecipeDataError),
+    /// Loading enchantment definitions failed.
+    Enchantment(EnchantmentError),
     /// A loot table referenced a named predicate file that does not exist.
     MissingPredicate {
         table_file: PathBuf,
@@ -106,6 +133,7 @@ impl fmt::Display for LootError {
             Self::Worldgen(error) => write!(f, "{error}"),
             Self::ItemDefaults(error) => write!(f, "{error}"),
             Self::RecipeData(error) => write!(f, "{error}"),
+            Self::Enchantment(error) => write!(f, "{error}"),
             Self::MissingPredicate {
                 table_file,
                 predicate,
@@ -150,6 +178,12 @@ impl From<ItemDefaultsError> for LootError {
 impl From<RecipeDataError> for LootError {
     fn from(error: RecipeDataError) -> Self {
         Self::RecipeData(error)
+    }
+}
+
+impl From<EnchantmentError> for LootError {
+    fn from(error: EnchantmentError) -> Self {
+        Self::Enchantment(error)
     }
 }
 
@@ -308,7 +342,16 @@ pub struct EntityEquipmentPredicate {
     pub mainhand: Option<ToolPredicate>,
 }
 
-/// Typed entity predicate for the fields tested by vanilla entity loot tables.
+/// Fishing hook properties checked by `minecraft:type_specific/fishing_hook`.
+///
+/// Mirrors `minecraft.wiki` `Advancement/Conditions/entity` (revision `3825655`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FishingHookPredicate {
+    /// Matches whether the fishing bobber was in open water (`in_open_water`).
+    pub in_open_water: Option<bool>,
+}
+
+/// Typed entity predicate for the fields tested by vanilla entity and gameplay loot tables.
 ///
 /// Any unmodeled `entity_properties` predicate field causes the parser to emit
 /// [`LootCondition::Unsupported`] so coverage gaps remain visible.
@@ -330,6 +373,8 @@ pub struct EntityPredicate {
     pub cube_mob_size: Option<IntRange>,
     /// `minecraft:type_specific/raider.is_captain`.
     pub raider_is_captain: Option<bool>,
+    /// `minecraft:type_specific/fishing_hook` (`in_open_water`).
+    pub fishing_hook: Option<FishingHookPredicate>,
 }
 
 /// Damage type tag membership requirement inside `minecraft:damage_source_properties`.
@@ -426,6 +471,47 @@ pub enum BonusFormula {
     BinomialWithBonusCount { extra: u32, probability: f64 },
 }
 
+/// Target component for [`LootModifier::SetName`].
+///
+/// Mirrors `minecraft.wiki` `Item modifier` (revision `3896146`):
+/// `"Allowed values are custom_name or item_name, corresponding with the component to be set. Defaults to custom_name."`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetNameTarget {
+    /// Sets `minecraft:custom_name` on [`ItemComponents`].
+    CustomName,
+    /// Targets `minecraft:item_name`, which [`ItemComponents`] does not model.
+    ItemName,
+}
+
+/// Damage and remaining-durability bounds inside `predicates.minecraft:damage`.
+///
+/// Mirrors `minecraft.wiki` `Data component predicate` (revision `3826514`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DamagePredicate {
+    /// Consumed durability range (`minecraft:damage`).
+    pub damage: Option<IntRange>,
+    /// Remaining durability range (`max_damage - damage`).
+    pub durability: Option<IntRange>,
+}
+
+/// Item matcher inside `minecraft:filtered`'s `item_filter`.
+///
+/// Mirrors `minecraft.wiki` `Advancement/Conditions/item` (revision `3286549`)
+/// and `Data component predicate` (revision `3826514`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemFilterPredicate {
+    /// Accepted item ids or `#`-prefixed item tags (empty imposes no item restriction).
+    pub items: Vec<String>,
+    /// Optional stack size bounds (`count`).
+    pub count: Option<IntRange>,
+    /// Required active enchantment checks (`predicates.minecraft:enchantments`).
+    pub enchantments: Vec<EnchantmentPredicate>,
+    /// Required stored enchantment checks (`predicates.minecraft:stored_enchantments`).
+    pub stored_enchantments: Vec<EnchantmentPredicate>,
+    /// Required damage/durability check (`predicates.minecraft:damage`).
+    pub damage: Option<DamagePredicate>,
+}
+
 /// Item modifier attached to a table, pool, or entry.
 ///
 /// Mirrors `minecraft.wiki` `Item modifier` (revision 3896146).
@@ -437,6 +523,45 @@ pub enum LootModifier {
         add: bool,
         conditions: Vec<LootCondition>,
     },
+    /// `minecraft:set_damage` — sets or adjusts durability fraction (`1.0` undamaged, `0.0` zero durability left).
+    SetDamage {
+        damage: NumberProvider,
+        add: bool,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:set_name` — sets plain-text item name component (`target` defaults to `custom_name`).
+    SetName {
+        name: String,
+        target: SetNameTarget,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:set_enchantments` — sets or adds enchantment levels (`book` converts to `enchanted_book`).
+    SetEnchantments {
+        enchantments: BTreeMap<String, NumberProvider>,
+        add: bool,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:enchant_randomly` — applies one randomly chosen enchantment (`book` converts to `enchanted_book`).
+    EnchantRandomly {
+        options: Option<Vec<String>>,
+        only_compatible: bool,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:enchant_with_levels` — enchants the item at the given experience `levels` (`book` converts to `enchanted_book`).
+    EnchantWithLevels {
+        levels: NumberProvider,
+        options: Option<Vec<String>>,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:filtered` — tests `item_filter` and applies `on_pass` or `on_fail` modifiers.
+    Filtered {
+        item_filter: ItemFilterPredicate,
+        on_pass: Vec<LootModifier>,
+        on_fail: Vec<LootModifier>,
+        conditions: Vec<LootCondition>,
+    },
+    /// `minecraft:discard` — removes the item stack.
+    Discard { conditions: Vec<LootCondition> },
     /// `minecraft:enchanted_count_increase` — adds `round(count * level)` items
     /// based on `enchantment` on `attacker`, capped at `limit` when `limit > 0`.
     EnchantedCountIncrease {
@@ -487,6 +612,13 @@ impl LootModifier {
     fn conditions(&self) -> &[LootCondition] {
         match self {
             Self::SetCount { conditions, .. }
+            | Self::SetDamage { conditions, .. }
+            | Self::SetName { conditions, .. }
+            | Self::SetEnchantments { conditions, .. }
+            | Self::EnchantRandomly { conditions, .. }
+            | Self::EnchantWithLevels { conditions, .. }
+            | Self::Filtered { conditions, .. }
+            | Self::Discard { conditions }
             | Self::EnchantedCountIncrease { conditions, .. }
             | Self::FurnaceSmelt { conditions }
             | Self::SetPotion { conditions, .. }
@@ -525,6 +657,7 @@ pub enum LootEntry {
     Item {
         name: String,
         weight: u32,
+        quality: i32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -532,12 +665,14 @@ pub enum LootEntry {
     LootTable {
         source: LootTableSource,
         weight: u32,
+        quality: i32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
     /// `minecraft:empty` — drops nothing.
     Empty {
         weight: u32,
+        quality: i32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -547,6 +682,7 @@ pub enum LootEntry {
         tag: String,
         expand: bool,
         weight: u32,
+        quality: i32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -560,6 +696,7 @@ pub enum LootEntry {
     Dynamic {
         name: String,
         weight: u32,
+        quality: i32,
         conditions: Vec<LootCondition>,
         modifiers: Vec<LootModifier>,
     },
@@ -626,12 +763,14 @@ where
 /// Description of an entity supplied to [`LootContext`] for evaluating
 /// `minecraft:entity_properties` and `damage_source_properties` entity sub-predicates.
 ///
-/// Captures only the fields tested across the 61 `entity_properties` uses (and
-/// `damage_source_properties` sub-predicates) in the vanilla 26.3 entity tables:
-/// `entity_type`, `is_on_fire`, `is_baby`, `mainhand` equipment, `vehicle`,
-/// `components` (`minecraft:sheep/color`, `minecraft:frog/variant`),
-/// `type_specific/sheep.sheared`, `type_specific/cube_mob.size`, and
-/// `type_specific/raider.is_captain`.
+/// Captures only the fields tested across `entity_properties` uses (and
+/// `damage_source_properties` sub-predicates) in the vanilla 26.3 entity and
+/// gameplay tables: `entity_type`, `is_on_fire`, `is_baby`, `mainhand`
+/// equipment, `vehicle`, `components` (`minecraft:sheep/color`,
+/// `minecraft:frog/variant`, `minecraft:chicken/variant`),
+/// `type_specific/sheep.sheared`, `type_specific/cube_mob.size`,
+/// `type_specific/raider.is_captain`, and
+/// `type_specific/fishing_hook.in_open_water`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EntityContext {
     /// Namespaced entity type id (for example `"minecraft:cow"` or `"minecraft:frog"`).
@@ -647,8 +786,8 @@ pub struct EntityContext {
     pub mainhand: Option<ToolContext>,
     /// Mounted vehicle entity tested by `minecraft:vehicle`.
     pub vehicle: Option<Box<EntityContext>>,
-    /// String-valued components (for example `"minecraft:sheep/color"` or
-    /// `"minecraft:frog/variant"`).
+    /// String-valued components (for example `"minecraft:sheep/color"`,
+    /// `"minecraft:frog/variant"`, or `"minecraft:chicken/variant"`).
     pub components: BTreeMap<String, String>,
     /// `minecraft:type_specific/sheep.sheared`, if applicable.
     pub sheep_sheared: Option<bool>,
@@ -656,6 +795,8 @@ pub struct EntityContext {
     pub cube_mob_size: Option<i32>,
     /// `minecraft:type_specific/raider.is_captain`, if applicable.
     pub raider_is_captain: Option<bool>,
+    /// `minecraft:type_specific/fishing_hook.in_open_water`, if this entity is a fishing bobber.
+    pub fishing_hook_in_open_water: Option<bool>,
 }
 
 impl EntityContext {
@@ -724,6 +865,13 @@ impl EntityContext {
         self
     }
 
+    /// Sets `minecraft:type_specific/fishing_hook.in_open_water` (marks entity as a fishing bobber).
+    #[must_use]
+    pub fn with_fishing_hook_in_open_water(mut self, in_open_water: bool) -> Self {
+        self.fishing_hook_in_open_water = Some(in_open_water);
+        self
+    }
+
     /// Appends an entity-type tag matching this entity (for example `"#minecraft:skeletons"`).
     #[must_use]
     pub fn with_entity_type_tag(mut self, tag: impl Into<String>) -> Self {
@@ -780,12 +928,12 @@ impl DamageSourceContext {
     }
 }
 
-/// Execution context for evaluating a block or entity [`LootTable`].
+/// Execution context for evaluating a [`LootTable`].
 #[derive(Clone, Default)]
 pub struct LootContext {
     /// Broken block state as `(block_id, properties)`.
     pub block_state: (String, BTreeMap<String, String>),
-    /// Breaking tool, or `None` when broken bare-handed or without a tool.
+    /// Breaking tool or fishing rod (`tool`), or `None` when absent.
     pub tool: Option<ToolContext>,
     /// Explosion radius when destroyed by an explosion, or `None` otherwise.
     pub explosion_radius: Option<f32>,
@@ -799,7 +947,7 @@ pub struct LootContext {
     /// `enchanted_count_increase` (such as Looting). If `None`, falls back to
     /// `attacker.as_ref().and_then(|e| e.mainhand.as_ref())`.
     pub attacker_weapon: Option<ToolContext>,
-    /// Target/victim entity (`"this"` in `minecraft:entity_properties`).
+    /// Target/victim/hook entity (`"this"` in `minecraft:entity_properties`).
     pub entity: Option<EntityContext>,
     /// Attacking entity (`"attacker"` in `minecraft:entity_properties`).
     pub attacker: Option<EntityContext>,
@@ -807,6 +955,8 @@ pub struct LootContext {
     pub direct_attacker: Option<EntityContext>,
     /// Lethal damage source (`minecraft:damage_source_properties`).
     pub damage_source: Option<DamageSourceContext>,
+    /// Player luck modifier applied to singleton entry `quality` weights.
+    pub luck: f32,
 }
 
 impl fmt::Debug for LootContext {
@@ -822,6 +972,7 @@ impl fmt::Debug for LootContext {
             .field("attacker", &self.attacker)
             .field("direct_attacker", &self.direct_attacker)
             .field("damage_source", &self.damage_source)
+            .field("luck", &self.luck)
             .finish()
     }
 }
@@ -887,6 +1038,13 @@ impl LootContext {
         self
     }
 
+    /// Sets the player luck level used with singleton entry `quality`.
+    #[must_use]
+    pub fn with_luck(mut self, luck: f32) -> Self {
+        self.luck = luck;
+        self
+    }
+
     /// Attaches an optional relative block lookup used by `minecraft:location_check`.
     #[must_use]
     pub fn with_block_lookup(mut self, lookup: impl BlockLookup + 'static) -> Self {
@@ -946,16 +1104,17 @@ struct LootRegistries {
     item_tags: Arc<ItemTags>,
     block_tags: Arc<BlockTags>,
     enchantment_tags: Arc<EnchantmentTags>,
+    enchantments: Arc<EnchantmentRegistry>,
     entity_type_tags: Arc<HashMap<String, Vec<String>>>,
     damage_type_tags: Arc<HashMap<String, Vec<String>>>,
     recipes: Option<Arc<RecipeData>>,
     item_defaults: Option<Arc<ItemDefaults>>,
 }
 
-/// Parsed block or entity loot table loaded from `data/<ns>/loot_table/<category>/**/*.json`.
+/// Parsed loot table loaded from `data/<ns>/loot_table/<category>/**/*.json`.
 #[derive(Debug, Clone, Default)]
 pub struct LootTable {
-    /// Optional loot context type string (for example `"minecraft:block"` or `"minecraft:entity"`).
+    /// Optional loot context type string (for example `"minecraft:block"`, `"minecraft:entity"`, or `"minecraft:chest"`).
     pub table_type: Option<String>,
     /// Optional deterministic random sequence identifier.
     pub random_sequence: Option<String>,
@@ -1007,10 +1166,17 @@ impl LootTable {
         self
     }
 
-    /// Attaches enchantment tags used by `#tag` enchantment predicates (such as `#minecraft:smelts_loot`).
+    /// Attaches enchantment tags used by `#tag` enchantment predicates and modifier `options`.
     #[must_use]
     pub fn with_enchantment_tags(mut self, enchantment_tags: Arc<EnchantmentTags>) -> Self {
         self.registries.enchantment_tags = enchantment_tags;
+        self
+    }
+
+    /// Attaches loaded [`EnchantmentRegistry`] definitions used by enchantment modifiers.
+    #[must_use]
+    pub fn with_enchantments(mut self, enchantments: Arc<EnchantmentRegistry>) -> Self {
+        self.registries.enchantments = enchantments;
         self
     }
 
@@ -1103,7 +1269,7 @@ impl LootTable {
         )
     }
 
-    /// Evaluates this block or entity loot table using explicit `item_tags`, `block_tags`, and `item_defaults`.
+    /// Evaluates this loot table using explicit `item_tags`, `block_tags`, and `item_defaults`.
     pub fn roll_with(
         &self,
         ctx: &LootContext,
@@ -1141,6 +1307,25 @@ impl LootTable {
         if depth > MAX_LOOT_TABLE_DEPTH {
             return;
         }
+        let is_fishing = self
+            .table_type
+            .as_deref()
+            .is_some_and(|kind| normalize_item_id(kind) == "fishing");
+        let base_luck = if eval_ctx.loot.luck.is_finite() {
+            f64::from(eval_ctx.loot.luck)
+        } else {
+            0.0
+        };
+        let effective_luck = base_luck
+            + if is_fishing {
+                f64::from(tool_enchantment_level(
+                    eval_ctx.loot.tool.as_ref(),
+                    "minecraft:luck_of_the_sea",
+                ))
+            } else {
+                0.0
+            };
+
         for pool in &self.pools {
             if !eval_conditions(&pool.conditions, eval_ctx, random) {
                 continue;
@@ -1155,7 +1340,9 @@ impl LootTable {
                 for entry in &pool.entries {
                     expand_entry(entry, eval_ctx, random, &mut candidates);
                 }
-                let Some(selected) = pick_weighted_candidate(&mut candidates, random) else {
+                let Some(selected) =
+                    pick_weighted_candidate(&mut candidates, effective_luck, random)
+                else {
                     continue;
                 };
 
@@ -1196,11 +1383,14 @@ impl LootTable {
                         .chain(pool.modifiers.iter())
                         .chain(self.modifiers.iter());
                     for modifier in all_modifiers {
+                        if drop.discarded {
+                            break;
+                        }
                         if eval_conditions(modifier.conditions(), eval_ctx, random) {
                             apply_modifier(modifier, &mut drop, eval_ctx, random, notes);
                         }
                     }
-                    if drop.count > 0 {
+                    if !drop.discarded && drop.count > 0 {
                         out_drops.push(drop);
                     }
                 }
@@ -1209,7 +1399,8 @@ impl LootTable {
     }
 }
 
-/// Loaded collection of loot tables for one category (for example `blocks` or `entities`).
+/// Loaded collection of loot tables for one or more categories (for example `blocks`,
+/// `entities`, `chests`, `gameplay`, or `archaeology`).
 #[derive(Debug, Clone, Default)]
 pub struct LootTables {
     tables: BTreeMap<String, LootTable>,
@@ -1223,30 +1414,57 @@ impl PartialEq for LootTables {
     }
 }
 
+fn expected_type_for_category(category: &str) -> Option<&'static str> {
+    match category {
+        "blocks" => Some("block"),
+        "entities" => Some("entity"),
+        "chests" => Some("chest"),
+        "archaeology" => Some("archaeology"),
+        _ => None,
+    }
+}
+
 impl LootTables {
     /// Loads every `data/<ns>/loot_table/blocks/**/*.json` file under `root`,
     /// resolves string condition references through `data/<ns>/predicate/**`,
     /// resolves any `loot_table` entry references, and loads `ItemTags`,
-    /// `BlockTags`, and optional `ItemDefaults` (when
+    /// `BlockTags`, `EnchantmentRegistry`, and optional `ItemDefaults` (when
     /// `reports/minecraft/components/item` is present).
     pub fn load_blocks(root: &Path) -> Result<Self, LootError> {
-        Self::load_category(root, "blocks", Some("block"))
+        Self::load_categories(root, &["blocks"])
     }
 
     /// Loads every `data/<ns>/loot_table/entities/**/*.json` file under `root`
-    /// with table ids `<ns>:entities/<path>`, resolves predicate and
+    /// with table ids `<ns>:entities/<path>`, resolving predicate and
     /// `loot_table` references (including external sub-tables such as
-    /// `minecraft:gameplay/fishing/fish`), and loads `ItemTags`, `BlockTags`,
-    /// and optional `ItemDefaults`.
+    /// `minecraft:gameplay/fishing/fish`).
     pub fn load_entities(root: &Path) -> Result<Self, LootError> {
-        Self::load_category(root, "entities", Some("entity"))
+        Self::load_categories(root, &["entities"])
     }
 
-    fn load_category(
-        root: &Path,
-        category: &str,
-        expected_type: Option<&str>,
-    ) -> Result<Self, LootError> {
+    /// Loads every `data/<ns>/loot_table/chests/**/*.json` file under `root`
+    /// with table ids `<ns>:chests/<path>`.
+    pub fn load_chests(root: &Path) -> Result<Self, LootError> {
+        Self::load_categories(root, &["chests"])
+    }
+
+    /// Loads every `data/<ns>/loot_table/gameplay/**/*.json` file under `root`
+    /// (including subfolders such as `fishing/` and `hero_of_the_village/`)
+    /// with table ids `<ns>:gameplay/<path>`.
+    pub fn load_gameplay(root: &Path) -> Result<Self, LootError> {
+        Self::load_categories(root, &["gameplay"])
+    }
+
+    /// Loads every `data/<ns>/loot_table/archaeology/**/*.json` file under `root`
+    /// with table ids `<ns>:archaeology/<path>`.
+    pub fn load_archaeology(root: &Path) -> Result<Self, LootError> {
+        Self::load_categories(root, &["archaeology"])
+    }
+
+    /// Loads all specified `loot_table/<category>/**/*.json` categories under `root`
+    /// with ids `<ns>:<category>/<path>`, resolving `loot_table` references across
+    /// all loaded categories (as well as external categories under `data/<ns>/loot_table`).
+    pub fn load_categories(root: &Path, categories: &[&str]) -> Result<Self, LootError> {
         let data_dir = root.join("data");
         let Some(namespaces) = read_dir_optional(&data_dir)? else {
             return Ok(Self::default());
@@ -1267,15 +1485,6 @@ impl LootTables {
             &item_tags,
             item_defaults.as_deref(),
         )?));
-        let registries = LootRegistries {
-            item_tags,
-            block_tags,
-            enchantment_tags,
-            entity_type_tags,
-            damage_type_tags,
-            recipes,
-            item_defaults,
-        };
 
         let mut ns_dirs = Vec::new();
         for entry in namespaces {
@@ -1307,20 +1516,54 @@ impl LootTables {
             cache: HashMap::new(),
         };
 
+        let mut unique_categories = Vec::new();
+        for &category in categories {
+            if !unique_categories.contains(&category) {
+                unique_categories.push(category);
+            }
+        }
+
         let mut raw_tables: HashMap<String, (PathBuf, LootTable)> = HashMap::new();
         let mut ordered_ids = Vec::new();
-        for ns_path in &ns_dirs {
-            let ns = dir_name(ns_path);
-            let cat_dir = ns_path.join("loot_table").join(category);
-            for file in walk_json(&cat_dir)? {
-                let id = format!("{ns}:{category}/{}", relative_stem(&file, &cat_dir));
-                let value = read_json(&file)?;
-                let mut table =
-                    parse_loot_table_inner(&value, &file, &mut pred_resolver, expected_type)?;
-                table.registries = registries.clone();
-                ordered_ids.push(id.clone());
-                raw_tables.insert(id, (file, table));
+        for &category in &unique_categories {
+            let expected_type = expected_type_for_category(category);
+            for ns_path in &ns_dirs {
+                let ns = dir_name(ns_path);
+                let cat_dir = ns_path.join("loot_table").join(category);
+                for file in walk_json(&cat_dir)? {
+                    let id = format!("{ns}:{category}/{}", relative_stem(&file, &cat_dir));
+                    let value = read_json(&file)?;
+                    let table =
+                        parse_loot_table_inner(&value, &file, &mut pred_resolver, expected_type)?;
+                    ordered_ids.push(id.clone());
+                    raw_tables.insert(id, (file, table));
+                }
             }
+        }
+
+        let needs_enchantments = unique_categories.iter().any(|&c| c != "blocks")
+            || raw_tables.values().any(|(_, t)| table_uses_enchantments(t));
+        let enchantments = if needs_enchantments {
+            Arc::new(EnchantmentRegistry::load(
+                root,
+                &item_tags,
+                &enchantment_tags,
+            )?)
+        } else {
+            Arc::new(EnchantmentRegistry::default())
+        };
+        let registries = LootRegistries {
+            item_tags,
+            block_tags,
+            enchantment_tags,
+            enchantments,
+            entity_type_tags,
+            damage_type_tags,
+            recipes,
+            item_defaults,
+        };
+        for (_, table) in raw_tables.values_mut() {
+            table.registries = registries.clone();
         }
 
         let mut table_resolver = LootTableResolver {
@@ -1354,6 +1597,14 @@ impl LootTables {
         })
     }
 
+    /// Looks up a loot table by full `<ns>:<category>/<path>` identifier (defaulting
+    /// missing namespace to `minecraft:`).
+    #[must_use]
+    pub fn get_table(&self, table_id: &str) -> Option<&LootTable> {
+        let key = ensure_namespaced(table_id);
+        self.tables.get(&key)
+    }
+
     /// Looks up the block loot table for `block_id`.
     ///
     /// Accepts `"minecraft:stone"`, `"stone"`, or `"minecraft:blocks/stone"`
@@ -1372,6 +1623,44 @@ impl LootTables {
     pub fn get_entity(&self, entity_id: &str) -> Option<&LootTable> {
         let key = normalize_category_table_id(entity_id, "entities");
         self.tables.get(&key)
+    }
+
+    /// Looks up the chest loot table for `chest_id`.
+    ///
+    /// Accepts `"minecraft:simple_dungeon"`, `"simple_dungeon"`, or `"minecraft:chests/simple_dungeon"`.
+    #[must_use]
+    pub fn get_chest(&self, chest_id: &str) -> Option<&LootTable> {
+        let key = normalize_category_table_id(chest_id, "chests");
+        self.tables.get(&key)
+    }
+
+    /// Looks up the gameplay loot table for `gameplay_id`.
+    ///
+    /// Accepts `"minecraft:piglin_bartering"`, `"fishing/fish"`, or `"minecraft:gameplay/fishing/fish"`.
+    #[must_use]
+    pub fn get_gameplay(&self, gameplay_id: &str) -> Option<&LootTable> {
+        let key = normalize_category_table_id(gameplay_id, "gameplay");
+        self.tables.get(&key)
+    }
+
+    /// Looks up the archaeology loot table for `archaeology_id`.
+    ///
+    /// Accepts `"minecraft:desert_pyramid"`, `"desert_pyramid"`, or `"minecraft:archaeology/desert_pyramid"`.
+    #[must_use]
+    pub fn get_archaeology(&self, archaeology_id: &str) -> Option<&LootTable> {
+        let key = normalize_category_table_id(archaeology_id, "archaeology");
+        self.tables.get(&key)
+    }
+
+    /// Rolls the loot table identified by full `<ns>:<category>/<path>` id if present.
+    pub fn roll_table(
+        &self,
+        table_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get_table(table_id)
+            .map(|table| table.roll_with_notes(ctx, random))
     }
 
     /// Rolls the block loot table for `block_id` if present, returning stacks and typed notes.
@@ -1396,6 +1685,39 @@ impl LootTables {
             .map(|table| table.roll_with_notes(ctx, random))
     }
 
+    /// Rolls the chest loot table for `chest_id` if present, returning stacks and typed notes.
+    pub fn roll_chest(
+        &self,
+        chest_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get_chest(chest_id)
+            .map(|table| table.roll_with_notes(ctx, random))
+    }
+
+    /// Rolls the gameplay loot table for `gameplay_id` if present, returning stacks and typed notes.
+    pub fn roll_gameplay(
+        &self,
+        gameplay_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get_gameplay(gameplay_id)
+            .map(|table| table.roll_with_notes(ctx, random))
+    }
+
+    /// Rolls the archaeology loot table for `archaeology_id` if present, returning stacks and typed notes.
+    pub fn roll_archaeology(
+        &self,
+        archaeology_id: &str,
+        ctx: &LootContext,
+        random: &mut RandomSource,
+    ) -> Option<LootRoll> {
+        self.get_archaeology(archaeology_id)
+            .map(|table| table.roll_with_notes(ctx, random))
+    }
+
     /// Returns the loaded item tag registry used during condition matching.
     #[must_use]
     pub fn item_tags(&self) -> &ItemTags {
@@ -1414,10 +1736,16 @@ impl LootTables {
         self.registries.item_defaults.as_deref()
     }
 
-    /// Returns the loaded enchantment tag registry used during condition matching.
+    /// Returns the loaded enchantment tag registry used during condition matching and enchantment options.
     #[must_use]
     pub fn enchantment_tags(&self) -> &EnchantmentTags {
         &self.registries.enchantment_tags
+    }
+
+    /// Returns the loaded enchantment definition registry.
+    #[must_use]
+    pub fn enchantments(&self) -> &EnchantmentRegistry {
+        &self.registries.enchantments
     }
 
     /// Returns the loaded recipe registry used by `minecraft:furnace_smelt`.
@@ -1929,6 +2257,17 @@ fn parse_optional_weight(
     }
 }
 
+fn parse_optional_quality(
+    obj: &Map<String, Value>,
+    context: &str,
+    file: &Path,
+) -> Result<i32, LootError> {
+    match obj.get("quality") {
+        None => Ok(0),
+        Some(v) => parse_i32(v, &format!("{context}.quality"), file),
+    }
+}
+
 fn parse_entry(
     value: &Value,
     file: &Path,
@@ -1952,15 +2291,17 @@ fn parse_entry(
         "item" => {
             check_allowed_keys(
                 obj,
-                &["type", "name", "weight", "condition", "modifier"],
+                &["type", "name", "weight", "quality", "condition", "modifier"],
                 "item entry",
                 file,
             )?;
             let name = required_str(obj, "name", "item entry", file)?.to_owned();
             let weight = parse_optional_weight(obj, "item entry", file)?;
+            let quality = parse_optional_quality(obj, "item entry", file)?;
             Ok(LootEntry::Item {
                 name,
                 weight,
+                quality,
                 conditions,
                 modifiers,
             })
@@ -1968,11 +2309,19 @@ fn parse_entry(
         "loot_table" => {
             check_allowed_keys(
                 obj,
-                &["type", "value", "weight", "condition", "modifier"],
+                &[
+                    "type",
+                    "value",
+                    "weight",
+                    "quality",
+                    "condition",
+                    "modifier",
+                ],
                 "loot_table entry",
                 file,
             )?;
             let weight = parse_optional_weight(obj, "loot_table entry", file)?;
+            let quality = parse_optional_quality(obj, "loot_table entry", file)?;
             let raw_value = obj
                 .get("value")
                 .ok_or_else(|| invalid(file, "loot_table entry missing `value`"))?;
@@ -1998,6 +2347,7 @@ fn parse_entry(
             Ok(LootEntry::LootTable {
                 source,
                 weight,
+                quality,
                 conditions,
                 modifiers,
             })
@@ -2005,13 +2355,15 @@ fn parse_entry(
         "empty" => {
             check_allowed_keys(
                 obj,
-                &["type", "weight", "condition", "modifier"],
+                &["type", "weight", "quality", "condition", "modifier"],
                 "empty entry",
                 file,
             )?;
             let weight = parse_optional_weight(obj, "empty entry", file)?;
+            let quality = parse_optional_quality(obj, "empty entry", file)?;
             Ok(LootEntry::Empty {
                 weight,
+                quality,
                 conditions,
                 modifiers,
             })
@@ -2025,6 +2377,7 @@ fn parse_entry(
                     "name",
                     "expand",
                     "weight",
+                    "quality",
                     "condition",
                     "modifier",
                 ],
@@ -2053,10 +2406,12 @@ fn parse_entry(
                 .and_then(Value::as_bool)
                 .ok_or_else(|| invalid(file, "tag entry missing or non-boolean `expand`"))?;
             let weight = parse_optional_weight(obj, "tag entry", file)?;
+            let quality = parse_optional_quality(obj, "tag entry", file)?;
             Ok(LootEntry::Tag {
                 tag,
                 expand,
                 weight,
+                quality,
                 conditions,
                 modifiers,
             })
@@ -2087,15 +2442,17 @@ fn parse_entry(
         "dynamic" => {
             check_allowed_keys(
                 obj,
-                &["type", "name", "weight", "condition", "modifier"],
+                &["type", "name", "weight", "quality", "condition", "modifier"],
                 "dynamic entry",
                 file,
             )?;
             let name = required_str(obj, "name", "dynamic entry", file)?.to_owned();
             let weight = parse_optional_weight(obj, "dynamic entry", file)?;
+            let quality = parse_optional_quality(obj, "dynamic entry", file)?;
             Ok(LootEntry::Dynamic {
                 name,
                 weight,
+                quality,
                 conditions,
                 modifiers,
             })
@@ -2440,15 +2797,11 @@ fn parse_tool_predicate_fields(
             }
         }
         if let Some(raw_enchs) = preds_obj.get("minecraft:enchantments") {
-            let ench_arr = raw_enchs.as_array().ok_or_else(|| {
-                invalid(
-                    file,
-                    format!("{context}.predicates.minecraft:enchantments must be an array"),
-                )
-            })?;
-            for entry in ench_arr {
-                enchantments.push(parse_enchantment_predicate(entry, file)?);
-            }
+            enchantments = parse_enchantment_predicate_list(
+                raw_enchs,
+                &format!("{context}.predicates.minecraft:enchantments"),
+                file,
+            )?;
         }
     }
 
@@ -2456,6 +2809,20 @@ fn parse_tool_predicate_fields(
         items,
         enchantments,
     }))
+}
+
+fn parse_enchantment_predicate_list(
+    raw: &Value,
+    context: &str,
+    file: &Path,
+) -> Result<Vec<EnchantmentPredicate>, LootError> {
+    let ench_arr = raw
+        .as_array()
+        .ok_or_else(|| invalid(file, format!("{context} must be an array")))?;
+    ench_arr
+        .iter()
+        .map(|entry| parse_enchantment_predicate(entry, file))
+        .collect()
 }
 
 fn parse_match_tool(obj: &Map<String, Value>, file: &Path) -> Result<LootCondition, LootError> {
@@ -2678,6 +3045,22 @@ fn parse_entity_predicate(
                 }
                 out.raider_is_captain =
                     parse_bool_field(raider_obj, "is_captain", "type_specific/raider", file)?;
+            }
+            "type_specific/fishing_hook" => {
+                let hook_obj = value.as_object().ok_or_else(|| {
+                    invalid(file, "type_specific/fishing_hook must be a JSON object")
+                })?;
+                if hook_obj.keys().any(|k| k != "in_open_water") {
+                    return Ok(None);
+                }
+                out.fishing_hook = Some(FishingHookPredicate {
+                    in_open_water: parse_bool_field(
+                        hook_obj,
+                        "in_open_water",
+                        "type_specific/fishing_hook",
+                        file,
+                    )?,
+                });
             }
             _ => return Ok(None),
         }
@@ -3035,15 +3418,24 @@ fn parse_optional_modifiers(
     file: &Path,
     resolver: &mut PredicateResolver<'_>,
 ) -> Result<Vec<LootModifier>, LootError> {
+    parse_optional_modifiers_depth(value, file, resolver, 0)
+}
+
+fn parse_optional_modifiers_depth(
+    value: Option<&Value>,
+    file: &Path,
+    resolver: &mut PredicateResolver<'_>,
+    depth: usize,
+) -> Result<Vec<LootModifier>, LootError> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
     match value {
         Value::Array(items) => items
             .iter()
-            .map(|item| parse_single_modifier(item, file, resolver))
+            .map(|item| parse_single_modifier(item, file, resolver, depth))
             .collect(),
-        Value::Object(_) => Ok(vec![parse_single_modifier(value, file, resolver)?]),
+        Value::Object(_) => Ok(vec![parse_single_modifier(value, file, resolver, depth)?]),
         _ => Err(invalid(
             file,
             "modifier must be a JSON object or array of objects",
@@ -3051,11 +3443,33 @@ fn parse_optional_modifiers(
     }
 }
 
+fn parse_optional_bool(
+    obj: &Map<String, Value>,
+    key: &str,
+    default: bool,
+    context: &str,
+    file: &Path,
+) -> Result<bool, LootError> {
+    match obj.get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| invalid(file, format!("{context} `{key}` must be a boolean"))),
+    }
+}
+
 fn parse_single_modifier(
     value: &Value,
     file: &Path,
     resolver: &mut PredicateResolver<'_>,
+    depth: usize,
 ) -> Result<LootModifier, LootError> {
+    if depth > MAX_LOOT_TABLE_DEPTH {
+        return Err(invalid(
+            file,
+            format!("loot modifier nesting depth exceeds maximum ({MAX_LOOT_TABLE_DEPTH})"),
+        ));
+    }
     let obj = value
         .as_object()
         .ok_or_else(|| invalid(file, "modifier must be a JSON object"))?;
@@ -3074,17 +3488,22 @@ fn parse_single_modifier(
                 .get("count")
                 .ok_or_else(|| invalid(file, "set_count modifier missing `count`"))?;
             let count = parse_number_provider(raw_count, file)?;
-            let add = match obj.get("add") {
-                None => false,
-                Some(v) => v
-                    .as_bool()
-                    .ok_or_else(|| invalid(file, "set_count `add` must be a boolean"))?,
-            };
+            let add = parse_optional_bool(obj, "add", false, "set_count", file)?;
             Ok(LootModifier::SetCount {
                 count,
                 add,
                 conditions,
             })
+        }
+        "set_damage" => parse_set_damage(obj, conditions, file),
+        "set_name" => parse_set_name(obj, kind, conditions, file),
+        "set_enchantments" => parse_set_enchantments(obj, conditions, file),
+        "enchant_randomly" => parse_enchant_randomly(obj, kind, conditions, file),
+        "enchant_with_levels" => parse_enchant_with_levels(obj, kind, conditions, file),
+        "filtered" => parse_filtered(obj, kind, conditions, file, resolver, depth),
+        "discard" => {
+            check_allowed_keys(obj, &["type", "condition"], "discard modifier", file)?;
+            Ok(LootModifier::Discard { conditions })
         }
         "enchanted_count_increase" => {
             check_allowed_keys(
@@ -3146,6 +3565,375 @@ fn parse_single_modifier(
             what: kind.to_owned(),
         }),
     }
+}
+
+fn parse_set_damage(
+    obj: &Map<String, Value>,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "damage", "add", "condition"],
+        "set_damage modifier",
+        file,
+    )?;
+    let raw_damage = obj
+        .get("damage")
+        .ok_or_else(|| invalid(file, "set_damage modifier missing `damage`"))?;
+    let damage = parse_number_provider(raw_damage, file)?;
+    let add = parse_optional_bool(obj, "add", false, "set_damage", file)?;
+    Ok(LootModifier::SetDamage {
+        damage,
+        add,
+        conditions,
+    })
+}
+
+fn extract_plain_text_name(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(obj) if obj.len() == 1 => {
+            obj.get("text").and_then(Value::as_str).map(str::to_owned)
+        }
+        _ => None,
+    }
+}
+
+fn parse_set_name(
+    obj: &Map<String, Value>,
+    kind: &str,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "name", "entity", "target", "condition"],
+        "set_name modifier",
+        file,
+    )?;
+    let raw_name = obj
+        .get("name")
+        .ok_or_else(|| invalid(file, "set_name modifier missing `name`"))?;
+    if !matches!(
+        raw_name,
+        Value::String(_) | Value::Object(_) | Value::Array(_)
+    ) {
+        return Err(invalid(
+            file,
+            "set_name `name` must be a JSON text component",
+        ));
+    }
+    let entity = optional_str(obj, "entity", "set_name modifier", file)?;
+    if let Some(target_entity) = entity
+        && !matches!(
+            target_entity,
+            "this"
+                | "attacker"
+                | "direct_attacker"
+                | "attacking_player"
+                | "target_entity"
+                | "interacting_entity"
+        )
+    {
+        return Err(invalid(
+            file,
+            format!("unknown entity target `{target_entity}` in set_name"),
+        ));
+    }
+    let target = match optional_str(obj, "target", "set_name modifier", file)? {
+        None | Some("custom_name") => SetNameTarget::CustomName,
+        Some("item_name") => SetNameTarget::ItemName,
+        Some(other) => {
+            return Err(invalid(
+                file,
+                format!(
+                    "unknown set_name `target` `{other}` (expected `custom_name` or `item_name`)"
+                ),
+            ));
+        }
+    };
+    if target == SetNameTarget::CustomName
+        && entity.is_none()
+        && let Some(name) = extract_plain_text_name(raw_name)
+    {
+        return Ok(LootModifier::SetName {
+            name,
+            target,
+            conditions,
+        });
+    }
+    Ok(LootModifier::Unsupported {
+        what: kind.to_owned(),
+    })
+}
+
+fn parse_set_enchantments(
+    obj: &Map<String, Value>,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "enchantments", "add", "condition"],
+        "set_enchantments modifier",
+        file,
+    )?;
+    let raw_enchs = obj
+        .get("enchantments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(
+                file,
+                "set_enchantments missing or non-object `enchantments`",
+            )
+        })?;
+    let mut enchantments = BTreeMap::new();
+    for (ench_id, level_val) in raw_enchs {
+        let normalized = ensure_namespaced(ench_id);
+        validate_resource_id(&normalized, "enchantment", file)?;
+        let provider = parse_number_provider(level_val, file)?;
+        enchantments.insert(normalized, provider);
+    }
+    let add = parse_optional_bool(obj, "add", false, "set_enchantments", file)?;
+    Ok(LootModifier::SetEnchantments {
+        enchantments,
+        add,
+        conditions,
+    })
+}
+
+fn normalize_enchant_option_spec(raw: &str, file: &Path) -> Result<String, LootError> {
+    if let Some(tag) = raw.strip_prefix('#') {
+        let normalized = ensure_namespaced(tag);
+        validate_resource_id(&normalized, "enchantment tag", file)?;
+        Ok(format!("#{normalized}"))
+    } else {
+        let normalized = ensure_namespaced(raw);
+        validate_resource_id(&normalized, "enchantment", file)?;
+        Ok(normalized)
+    }
+}
+
+fn parse_enchant_options(
+    obj: &Map<String, Value>,
+    context: &str,
+    file: &Path,
+) -> Result<Option<Vec<String>>, LootError> {
+    let Some(raw) = obj.get("options") else {
+        return Ok(None);
+    };
+    let entries = parse_string_or_list(raw, &format!("{context}.options"), file)?;
+    let normalized = entries
+        .into_iter()
+        .map(|entry| normalize_enchant_option_spec(&entry, file))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(normalized))
+}
+
+fn parse_enchant_randomly(
+    obj: &Map<String, Value>,
+    kind: &str,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &[
+            "type",
+            "options",
+            "only_compatible",
+            "include_additional_cost_component",
+            "condition",
+        ],
+        "enchant_randomly modifier",
+        file,
+    )?;
+    let options = parse_enchant_options(obj, "enchant_randomly", file)?;
+    let only_compatible =
+        parse_optional_bool(obj, "only_compatible", true, "enchant_randomly", file)?;
+    let include_additional_cost = parse_optional_bool(
+        obj,
+        "include_additional_cost_component",
+        false,
+        "enchant_randomly",
+        file,
+    )?;
+    if include_additional_cost {
+        return Ok(LootModifier::Unsupported {
+            what: kind.to_owned(),
+        });
+    }
+    Ok(LootModifier::EnchantRandomly {
+        options,
+        only_compatible,
+        conditions,
+    })
+}
+
+fn parse_enchant_with_levels(
+    obj: &Map<String, Value>,
+    kind: &str,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &[
+            "type",
+            "levels",
+            "options",
+            "include_additional_cost_component",
+            "condition",
+        ],
+        "enchant_with_levels modifier",
+        file,
+    )?;
+    let raw_levels = obj
+        .get("levels")
+        .ok_or_else(|| invalid(file, "enchant_with_levels modifier missing `levels`"))?;
+    let levels = parse_number_provider(raw_levels, file)?;
+    let options = parse_enchant_options(obj, "enchant_with_levels", file)?;
+    let include_additional_cost = parse_optional_bool(
+        obj,
+        "include_additional_cost_component",
+        false,
+        "enchant_with_levels",
+        file,
+    )?;
+    if include_additional_cost {
+        return Ok(LootModifier::Unsupported {
+            what: kind.to_owned(),
+        });
+    }
+    Ok(LootModifier::EnchantWithLevels {
+        levels,
+        options,
+        conditions,
+    })
+}
+
+fn parse_damage_predicate(
+    value: &Value,
+    file: &Path,
+) -> Result<Option<DamagePredicate>, LootError> {
+    let obj = value.as_object().ok_or_else(|| {
+        invalid(
+            file,
+            "item_filter.predicates.minecraft:damage must be a JSON object",
+        )
+    })?;
+    let mut out = DamagePredicate::default();
+    for (key, val) in obj {
+        match key.as_str() {
+            "damage" => {
+                out.damage = Some(parse_int_range(
+                    val,
+                    "item_filter.predicates.minecraft:damage.damage",
+                    file,
+                )?);
+            }
+            "durability" => {
+                out.durability = Some(parse_int_range(
+                    val,
+                    "item_filter.predicates.minecraft:damage.durability",
+                    file,
+                )?);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+fn parse_item_filter(
+    filter_obj: &Map<String, Value>,
+    file: &Path,
+) -> Result<Option<ItemFilterPredicate>, LootError> {
+    let mut out = ItemFilterPredicate::default();
+    for (key, value) in filter_obj {
+        match key.as_str() {
+            "items" => {
+                out.items = parse_string_or_list(value, "filtered.item_filter.items", file)?;
+            }
+            "count" => {
+                out.count = Some(parse_int_range(value, "filtered.item_filter.count", file)?);
+            }
+            "predicates" => {
+                let preds_obj = value.as_object().ok_or_else(|| {
+                    invalid(
+                        file,
+                        "filtered.item_filter.predicates must be a JSON object",
+                    )
+                })?;
+                for (pred_key, pred_val) in preds_obj {
+                    match pred_key.as_str() {
+                        "minecraft:enchantments" => {
+                            out.enchantments = parse_enchantment_predicate_list(
+                                pred_val,
+                                "filtered.item_filter.predicates.minecraft:enchantments",
+                                file,
+                            )?;
+                        }
+                        "minecraft:stored_enchantments" => {
+                            out.stored_enchantments = parse_enchantment_predicate_list(
+                                pred_val,
+                                "filtered.item_filter.predicates.minecraft:stored_enchantments",
+                                file,
+                            )?;
+                        }
+                        "minecraft:damage" => {
+                            let Some(dmg) = parse_damage_predicate(pred_val, file)? else {
+                                return Ok(None);
+                            };
+                            out.damage = Some(dmg);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+fn parse_filtered(
+    obj: &Map<String, Value>,
+    kind: &str,
+    conditions: Vec<LootCondition>,
+    file: &Path,
+    resolver: &mut PredicateResolver<'_>,
+    depth: usize,
+) -> Result<LootModifier, LootError> {
+    check_allowed_keys(
+        obj,
+        &["type", "item_filter", "on_pass", "on_fail", "condition"],
+        "filtered modifier",
+        file,
+    )?;
+    let filter_obj = obj
+        .get("item_filter")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            invalid(
+                file,
+                "filtered modifier missing or non-object `item_filter`",
+            )
+        })?;
+    let on_pass = parse_optional_modifiers_depth(obj.get("on_pass"), file, resolver, depth + 1)?;
+    let on_fail = parse_optional_modifiers_depth(obj.get("on_fail"), file, resolver, depth + 1)?;
+    let Some(item_filter) = parse_item_filter(filter_obj, file)? else {
+        return Ok(LootModifier::Unsupported {
+            what: kind.to_owned(),
+        });
+    };
+    Ok(LootModifier::Filtered {
+        item_filter,
+        on_pass,
+        on_fail,
+        conditions,
+    })
 }
 
 fn parse_apply_bonus(
@@ -3369,12 +4157,67 @@ fn collect_unsupported_condition<'a>(condition: &'a LootCondition, out: &mut Vec
     }
 }
 
+fn modifier_uses_enchantments(modifier: &LootModifier) -> bool {
+    match modifier {
+        LootModifier::EnchantRandomly { .. } | LootModifier::EnchantWithLevels { .. } => true,
+        LootModifier::Filtered {
+            on_pass, on_fail, ..
+        } => {
+            on_pass.iter().any(modifier_uses_enchantments)
+                || on_fail.iter().any(modifier_uses_enchantments)
+        }
+        _ => false,
+    }
+}
+
+fn entry_uses_enchantments(entry: &LootEntry) -> bool {
+    match entry {
+        LootEntry::Item { modifiers, .. }
+        | LootEntry::Empty { modifiers, .. }
+        | LootEntry::Tag { modifiers, .. }
+        | LootEntry::Dynamic { modifiers, .. } => modifiers.iter().any(modifier_uses_enchantments),
+        LootEntry::LootTable {
+            source, modifiers, ..
+        } => {
+            modifiers.iter().any(modifier_uses_enchantments)
+                || matches!(source, LootTableSource::Inline(inline) if table_uses_enchantments(inline))
+        }
+        LootEntry::Alternatives {
+            children,
+            modifiers,
+            ..
+        } => {
+            modifiers.iter().any(modifier_uses_enchantments)
+                || children.iter().any(entry_uses_enchantments)
+        }
+    }
+}
+
+fn table_uses_enchantments(table: &LootTable) -> bool {
+    table.modifiers.iter().any(modifier_uses_enchantments)
+        || table.pools.iter().any(|pool| {
+            pool.modifiers.iter().any(modifier_uses_enchantments)
+                || pool.entries.iter().any(entry_uses_enchantments)
+        })
+}
+
 fn collect_unsupported_modifier<'a>(modifier: &'a LootModifier, out: &mut Vec<&'a str>) {
     for condition in modifier.conditions() {
         collect_unsupported_condition(condition, out);
     }
-    if let LootModifier::Unsupported { what } = modifier {
-        out.push(what.as_str());
+    match modifier {
+        LootModifier::Unsupported { what } => out.push(what.as_str()),
+        LootModifier::Filtered {
+            on_pass, on_fail, ..
+        } => {
+            for inner in on_pass {
+                collect_unsupported_modifier(inner, out);
+            }
+            for inner in on_fail {
+                collect_unsupported_modifier(inner, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3455,6 +4298,7 @@ struct PendingDrop {
     item: String,
     count: i32,
     components: ItemComponents,
+    discarded: bool,
 }
 
 impl PendingDrop {
@@ -3463,6 +4307,7 @@ impl PendingDrop {
             item,
             count: 1,
             components: ItemComponents::default(),
+            discarded: false,
         }
     }
 }
@@ -3478,19 +4323,33 @@ enum SelectedEntryKind<'a> {
 struct SelectedEntry<'a> {
     kind: SelectedEntryKind<'a>,
     weight: u32,
+    quality: i32,
     modifiers: Vec<&'a LootModifier>,
+}
+
+fn effective_weight(weight: u32, quality: i32, luck: f64) -> u64 {
+    let raw = (f64::from(weight) + f64::from(quality) * luck).floor();
+    if !raw.is_finite() || raw <= 0.0 {
+        0
+    } else if raw >= f64::from(u32::MAX) {
+        u64::from(u32::MAX)
+    } else {
+        raw as u64
+    }
 }
 
 fn pick_weighted_candidate<'a>(
     candidates: &mut Vec<SelectedEntry<'a>>,
+    luck: f64,
     random: &mut RandomSource,
 ) -> Option<SelectedEntry<'a>> {
     let mut total_weight = 0_u64;
     let mut positive_count = 0_usize;
     let mut single_positive_idx = 0_usize;
     for (idx, candidate) in candidates.iter().enumerate() {
-        if candidate.weight > 0 {
-            total_weight = total_weight.saturating_add(u64::from(candidate.weight));
+        let eff = effective_weight(candidate.weight, candidate.quality, luck);
+        if eff > 0 {
+            total_weight = total_weight.saturating_add(eff);
             positive_count += 1;
             single_positive_idx = idx;
         }
@@ -3505,7 +4364,7 @@ fn pick_weighted_candidate<'a>(
     let mut remaining = u64::from(random.next_int_bounded(bound));
     let mut chosen_idx = single_positive_idx;
     for (idx, candidate) in candidates.iter().enumerate() {
-        let weight = u64::from(candidate.weight);
+        let weight = effective_weight(candidate.weight, candidate.quality, luck);
         if weight == 0 {
             continue;
         }
@@ -3531,12 +4390,14 @@ fn expand_entry<'a>(
         LootEntry::Item {
             name,
             weight,
+            quality,
             modifiers,
             ..
         } => {
             out.push(SelectedEntry {
                 kind: SelectedEntryKind::Item(name.as_str()),
                 weight: *weight,
+                quality: *quality,
                 modifiers: modifiers.iter().collect(),
             });
             true
@@ -3544,12 +4405,14 @@ fn expand_entry<'a>(
         LootEntry::Dynamic {
             name,
             weight,
+            quality,
             modifiers,
             ..
         } => {
             out.push(SelectedEntry {
                 kind: SelectedEntryKind::Dynamic(name.as_str()),
                 weight: *weight,
+                quality: *quality,
                 modifiers: modifiers.iter().collect(),
             });
             true
@@ -3557,22 +4420,28 @@ fn expand_entry<'a>(
         LootEntry::LootTable {
             source,
             weight,
+            quality,
             modifiers,
             ..
         } => {
             out.push(SelectedEntry {
                 kind: SelectedEntryKind::LootTable(source),
                 weight: *weight,
+                quality: *quality,
                 modifiers: modifiers.iter().collect(),
             });
             true
         }
         LootEntry::Empty {
-            weight, modifiers, ..
+            weight,
+            quality,
+            modifiers,
+            ..
         } => {
             out.push(SelectedEntry {
                 kind: SelectedEntryKind::Empty,
                 weight: *weight,
+                quality: *quality,
                 modifiers: modifiers.iter().collect(),
             });
             true
@@ -3581,6 +4450,7 @@ fn expand_entry<'a>(
             tag,
             expand,
             weight,
+            quality,
             modifiers,
             ..
         } => {
@@ -3595,6 +4465,7 @@ fn expand_entry<'a>(
                     out.push(SelectedEntry {
                         kind: SelectedEntryKind::Item(member.as_str()),
                         weight: *weight,
+                        quality: *quality,
                         // minecraft.wiki `Loot table` rev 3893957: expanded tag entries
                         // do not apply entry-level item modifiers (Bug MC-212671).
                         modifiers: Vec::new(),
@@ -3605,6 +4476,7 @@ fn expand_entry<'a>(
                 out.push(SelectedEntry {
                     kind: SelectedEntryKind::Tag(tag.as_str()),
                     weight: *weight,
+                    quality: *quality,
                     modifiers: modifiers.iter().collect(),
                 });
                 true
@@ -3925,6 +4797,18 @@ fn match_entity_predicate(
     {
         return false;
     }
+    if let Some(hook_pred) = pred.fishing_hook {
+        let is_fishing_bobber = entity.fishing_hook_in_open_water.is_some()
+            || items_equal(&entity.entity_type, "minecraft:fishing_bobber");
+        if !is_fishing_bobber {
+            return false;
+        }
+        if let Some(expected) = hook_pred.in_open_water
+            && entity.fishing_hook_in_open_water != Some(expected)
+        {
+            return false;
+        }
+    }
     true
 }
 
@@ -4102,6 +4986,13 @@ fn apply_modifier(
                 properties: properties.clone(),
             });
         }
+        LootModifier::SetDamage { .. }
+        | LootModifier::SetName { .. }
+        | LootModifier::SetEnchantments { .. }
+        | LootModifier::EnchantRandomly { .. }
+        | LootModifier::EnchantWithLevels { .. }
+        | LootModifier::Filtered { .. }
+        | LootModifier::Discard { .. } => {}
         LootModifier::Unsupported { what } => {
             notes.push(LootNote::UnsupportedModifier {
                 item: ensure_namespaced(&drop.item),
@@ -4461,6 +5352,7 @@ mod tests {
             LootEntry::Item {
                 name: "testns:gadget".to_owned(),
                 weight: 1,
+                quality: 0,
                 conditions: vec![LootCondition::MatchTool {
                     predicate: ToolPredicate {
                         items: vec!["testns:wrench".to_owned()],
@@ -4653,6 +5545,7 @@ mod tests {
             LootEntry::Item {
                 name: "testns:listy".to_owned(),
                 weight: 1,
+                quality: 0,
                 conditions: Vec::new(),
                 modifiers: vec![LootModifier::LimitCount {
                     min: Some(3),
@@ -7050,6 +7943,7 @@ mod tests {
                 entries: vec![LootEntry::Item {
                     name: "minecraft:potion".to_owned(),
                     weight: 1,
+                    quality: 0,
                     conditions: vec![],
                     modifiers: vec![
                         LootModifier::SetPotion {
@@ -7231,6 +8125,7 @@ mod tests {
                 entries: vec![LootEntry::Item {
                     name: "testns:deep_item".to_owned(),
                     weight: 1,
+                    quality: 0,
                     conditions: vec![],
                     modifiers: vec![],
                 }],
@@ -7248,6 +8143,7 @@ mod tests {
                     entries: vec![LootEntry::LootTable {
                         source: LootTableSource::Inline(Box::new(deep_table)),
                         weight: 1,
+                        quality: 0,
                         conditions: vec![],
                         modifiers: vec![],
                     }],
@@ -7598,5 +8494,496 @@ mod tests {
             top_level_nothing,
             top_level_total
         );
+    }
+
+    #[test]
+    fn loads_chests_gameplay_archaeology_and_parses_new_modifiers() {
+        let root = scratch_root("more_categories");
+        write(
+            &root.join("data/testns/enchantment/sharp.json"),
+            r#"{
+                "max_level": 5,
+                "anvil_cost": 1,
+                "weight": 10,
+                "min_cost": {"base": 1, "per_level_above_first": 11},
+                "max_cost": {"base": 21, "per_level_above_first": 11},
+                "slots": ["mainhand"],
+                "supported_items": "testns:sword"
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/archaeology/pot.json"),
+            r#"{
+                "type": "minecraft:archaeology",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {"type": "minecraft:item", "name": "testns:shard"},
+                        {
+                            "type": "minecraft:item",
+                            "name": "testns:stew",
+                            "modifier": {
+                                "type": "minecraft:set_stew_effect",
+                                "effects": [{"type": "minecraft:night_vision", "duration": 8}]
+                            }
+                        }
+                    ]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/gameplay/fishing/fish.json"),
+            r#"{
+                "type": "minecraft:fishing",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "testns:cod"}]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/gameplay/fishing/treasure.json"),
+            r#"{
+                "type": "minecraft:fishing",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [{"type": "minecraft:item", "name": "testns:pearl"}]
+                }]
+            }"#,
+        );
+        write(
+            &root.join("data/testns/loot_table/gameplay/fishing.json"),
+            r##"{
+                "type": "minecraft:fishing",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {
+                            "type": "minecraft:loot_table",
+                            "value": "testns:gameplay/fishing/fish",
+                            "weight": 1,
+                            "quality": -1
+                        },
+                        {
+                            "type": "minecraft:loot_table",
+                            "value": "testns:gameplay/fishing/treasure",
+                            "weight": 1,
+                            "quality": 2,
+                            "condition": {
+                                "type": "minecraft:entity_properties",
+                                "entity": "this",
+                                "predicate": {
+                                    "minecraft:type_specific/fishing_hook": {"in_open_water": true}
+                                }
+                            }
+                        }
+                    ]
+                }]
+            }"##,
+        );
+        write(
+            &root.join("data/testns/loot_table/chests/sub/stash.json"),
+            r##"{
+                "type": "minecraft:chest",
+                "pools": [{
+                    "rolls": 1,
+                    "entries": [
+                        {
+                            "type": "minecraft:item",
+                            "name": "testns:sword",
+                            "modifier": [
+                                {"type": "minecraft:set_damage", "damage": {"type": "minecraft:uniform", "min": 0.25, "max": 0.75}, "add": true},
+                                {"type": "minecraft:set_name", "name": {"text": "Blade"}, "target": "custom_name"},
+                                {"type": "minecraft:set_enchantments", "enchantments": {"testns:sharp": 2}, "add": true},
+                                {"type": "minecraft:enchant_randomly", "options": ["testns:sharp"], "only_compatible": false},
+                                {"type": "minecraft:enchant_with_levels", "levels": 20, "options": "#minecraft:on_random_loot"},
+                                {
+                                    "type": "minecraft:filtered",
+                                    "item_filter": {
+                                        "items": "testns:sword",
+                                        "count": {"min": 1, "max": 1},
+                                        "predicates": {
+                                            "minecraft:enchantments": [{"enchantments": "testns:sharp", "levels": {"min": 1}}],
+                                            "minecraft:damage": {"damage": {"min": 0}}
+                                        }
+                                    },
+                                    "on_pass": {"type": "minecraft:set_count", "count": 2},
+                                    "on_fail": {"type": "minecraft:discard"}
+                                },
+                                {"type": "minecraft:set_name", "name": {"translate": "item.blade"}, "target": "item_name"},
+                                {"type": "minecraft:set_name", "name": "Ignored", "target": "item_name"},
+                                {"type": "minecraft:exploration_map", "destination": "#minecraft:on_treasure_maps"},
+                                {"type": "minecraft:filtered", "item_filter": {"predicates": {"minecraft:map_id": {}}}, "on_fail": {"type": "minecraft:discard"}},
+                                {"type": "minecraft:set_instrument", "options": "#minecraft:regular_goat_horns"},
+                                {"type": "minecraft:set_ominous_bottle_amplifier", "amplifier": 1}
+                            ]
+                        },
+                        {"type": "minecraft:loot_table", "value": "testns:gameplay/fishing"},
+                        {"type": "minecraft:loot_table", "value": "testns:archaeology/pot"}
+                    ]
+                }]
+            }"##,
+        );
+
+        let chests = LootTables::load_chests(&root).expect("load chests");
+        assert_eq!(chests.len(), 1);
+        assert!(chests.get_chest("testns:sub/stash").is_some());
+        assert!(chests.get_chest("testns:chests/sub/stash").is_some());
+        assert_eq!(chests.enchantments().len(), 1);
+
+        let gameplay = LootTables::load_gameplay(&root).expect("load gameplay");
+        assert_eq!(gameplay.len(), 3);
+        assert!(gameplay.get_gameplay("testns:fishing").is_some());
+        assert!(gameplay.get_gameplay("testns:fishing/fish").is_some());
+        assert!(
+            gameplay
+                .get_gameplay("testns:gameplay/fishing/treasure")
+                .is_some()
+        );
+
+        let arch = LootTables::load_archaeology(&root).expect("load archaeology");
+        assert_eq!(arch.len(), 1);
+        assert!(arch.get_archaeology("testns:pot").is_some());
+
+        let combined = LootTables::load_categories(&root, &["chests", "gameplay", "archaeology"])
+            .expect("load combined categories");
+        assert_eq!(combined.len(), 5);
+        assert!(combined.get_table("testns:chests/sub/stash").is_some());
+        assert!(combined.get_table("testns:gameplay/fishing/fish").is_some());
+        assert!(combined.get_table("testns:archaeology/pot").is_some());
+
+        for (_id, table) in combined.iter() {
+            for pool in &table.pools {
+                for entry in &pool.entries {
+                    assert_entry_loot_table_refs_resolved(entry);
+                }
+            }
+        }
+
+        let stash = combined
+            .get_chest("testns:sub/stash")
+            .expect("stash chest table");
+        match &stash.pools[0].entries[0] {
+            LootEntry::Item { modifiers, .. } => {
+                assert!(matches!(
+                    &modifiers[0],
+                    LootModifier::SetDamage {
+                        damage: NumberProvider::Uniform { min, max },
+                        add: true,
+                        ..
+                    } if (*min - 0.25).abs() < f64::EPSILON && (*max - 0.75).abs() < f64::EPSILON
+                ));
+                assert_eq!(
+                    modifiers[1],
+                    LootModifier::SetName {
+                        name: "Blade".to_owned(),
+                        target: SetNameTarget::CustomName,
+                        conditions: Vec::new(),
+                    }
+                );
+                assert!(matches!(
+                    &modifiers[2],
+                    LootModifier::SetEnchantments { enchantments, add: true, .. }
+                        if enchantments.get("testns:sharp") == Some(&NumberProvider::Constant(2.0))
+                ));
+                assert_eq!(
+                    modifiers[3],
+                    LootModifier::EnchantRandomly {
+                        options: Some(vec!["testns:sharp".to_owned()]),
+                        only_compatible: false,
+                        conditions: Vec::new(),
+                    }
+                );
+                assert_eq!(
+                    modifiers[4],
+                    LootModifier::EnchantWithLevels {
+                        levels: NumberProvider::Constant(20.0),
+                        options: Some(vec!["#minecraft:on_random_loot".to_owned()]),
+                        conditions: Vec::new(),
+                    }
+                );
+                assert!(matches!(
+                    &modifiers[5],
+                    LootModifier::Filtered {
+                        item_filter,
+                        on_pass,
+                        on_fail,
+                        ..
+                    } if item_filter.items == vec!["testns:sword".to_owned()]
+                        && item_filter.count == Some(IntRange { min: Some(1), max: Some(1) })
+                        && item_filter.enchantments.len() == 1
+                        && item_filter.damage.is_some()
+                        && on_pass.len() == 1
+                        && matches!(on_fail.as_slice(), [LootModifier::Discard { .. }])
+                ));
+            }
+            other => panic!("expected Item entry, got {other:?}"),
+        }
+
+        assert_eq!(
+            combined.unsupported(),
+            vec![
+                ("testns:archaeology/pot", "minecraft:set_stew_effect"),
+                ("testns:chests/sub/stash", "minecraft:set_name"),
+                ("testns:chests/sub/stash", "minecraft:set_name"),
+                ("testns:chests/sub/stash", "minecraft:exploration_map"),
+                ("testns:chests/sub/stash", "minecraft:filtered"),
+                ("testns:chests/sub/stash", "minecraft:set_instrument"),
+                (
+                    "testns:chests/sub/stash",
+                    "minecraft:set_ominous_bottle_amplifier"
+                ),
+            ]
+        );
+
+        // Verify fishing_hook in_open_water + quality/luck evaluation on fishing table.
+        let open_hook = LootContext::default().with_entity(
+            EntityContext::new("minecraft:fishing_bobber").with_fishing_hook_in_open_water(true),
+        );
+        let closed_hook = LootContext::default().with_entity(
+            EntityContext::new("minecraft:fishing_bobber").with_fishing_hook_in_open_water(false),
+        );
+        let non_hook = LootContext::for_entity("minecraft:cod");
+        let mut saw_treasure_open = false;
+        for seed in 0..200_u64 {
+            let open_res = gameplay
+                .roll_gameplay(
+                    "testns:fishing",
+                    &open_hook,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("fishing table");
+            if open_res.items.iter().any(|s| s.item() == "testns:pearl") {
+                saw_treasure_open = true;
+            }
+            let closed_res = gameplay
+                .roll_gameplay(
+                    "testns:fishing",
+                    &closed_hook,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("fishing table");
+            assert!(
+                closed_res.items.iter().all(|s| s.item() == "testns:cod"),
+                "closed water must never yield treasure"
+            );
+            let non_hook_res = gameplay
+                .roll_gameplay(
+                    "testns:fishing",
+                    &non_hook,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("fishing table");
+            assert!(
+                non_hook_res.items.iter().all(|s| s.item() == "testns:cod"),
+                "non-bobber entity must fail fishing_hook check"
+            );
+        }
+        assert!(saw_treasure_open, "open water fishing must allow treasure");
+
+        // Luck 1 reduces fish weight (1 + (-1)*1 = 0) and raises treasure weight (1 + 2*1 = 3).
+        let lucky_hook = open_hook.with_luck(1.0);
+        for seed in 0..50_u64 {
+            let res = gameplay
+                .roll_gameplay(
+                    "testns:fishing",
+                    &lucky_hook,
+                    &mut RandomSource::from_world_seed(seed),
+                )
+                .expect("fishing table");
+            assert!(
+                res.items.iter().all(|s| s.item() == "testns:pearl"),
+                "luck 1 zeros out fish (weight 1 + quality -1 * 1 = 0)"
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn rejects_invalid_new_modifier_and_quality_shapes() {
+        let cases = [
+            (
+                "bad_set_name_target.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","modifier":{"type":"minecraft:set_name","name":"A","target":"lore"}}]}]}"#,
+            ),
+            (
+                "missing_set_damage.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","modifier":{"type":"minecraft:set_damage"}}]}]}"#,
+            ),
+            (
+                "bad_set_enchantments.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","modifier":{"type":"minecraft:set_enchantments","enchantments":["minecraft:sharpness"]}}]}]}"#,
+            ),
+            (
+                "missing_filtered_predicate.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","modifier":{"type":"minecraft:filtered"}}]}]}"#,
+            ),
+            (
+                "bad_quality.json",
+                r#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"testns:x","quality":"high"}]}]}"#,
+            ),
+        ];
+        for (filename, body) in cases {
+            let root = scratch_root(filename);
+            write(
+                &root.join("data/testns/loot_table/chests").join(filename),
+                body,
+            );
+            let err = LootTables::load_chests(&root)
+                .expect_err("invalid table must fail")
+                .to_string();
+            assert!(
+                err.contains(filename),
+                "error for {filename} must name the file: {err}"
+            );
+            fs::remove_dir_all(&root).expect("cleanup");
+        }
+    }
+
+    /// Pin vanilla Java 26.3 `chests/` (58), `gameplay/` (26, including `fishing/` and
+    /// `hero_of_the_village/` subfolders), and `archaeology/` (6) loot tables and
+    /// their unsupported modifier/condition nodes.
+    ///
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored loads_all_vanilla_chest_gameplay_and_archaeology_loot_tables`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn loads_all_vanilla_chest_gameplay_and_archaeology_loot_tables() {
+        let root = vanilla_data_root();
+        let lt_dir = root.join("data/minecraft/loot_table");
+        let chest_files = walk_json(&lt_dir.join("chests")).expect("walk chests");
+        let gameplay_files = walk_json(&lt_dir.join("gameplay")).expect("walk gameplay");
+        let archaeology_files = walk_json(&lt_dir.join("archaeology")).expect("walk archaeology");
+        assert_eq!(chest_files.len(), 58);
+        assert_eq!(gameplay_files.len(), 26);
+        assert_eq!(archaeology_files.len(), 6);
+
+        let chests = LootTables::load_chests(&root).expect("load vanilla chest loot tables");
+        let gameplay = LootTables::load_gameplay(&root).expect("load vanilla gameplay loot tables");
+        let archaeology =
+            LootTables::load_archaeology(&root).expect("load vanilla archaeology loot tables");
+        assert_eq!(chests.len(), 58);
+        assert_eq!(gameplay.len(), 26);
+        assert_eq!(archaeology.len(), 6);
+
+        let tables = LootTables::load_categories(&root, &["chests", "gameplay", "archaeology"])
+            .expect("load vanilla chest, gameplay, and archaeology loot tables");
+        assert_eq!(tables.len(), 58 + 26 + 6);
+        assert!(tables.get_chest("simple_dungeon").is_some());
+        assert!(tables.get_chest("trial_chambers/reward").is_some());
+        assert!(tables.get_gameplay("piglin_bartering").is_some());
+        assert!(tables.get_gameplay("fishing").is_some());
+        assert!(tables.get_gameplay("fishing/fish").is_some());
+        assert!(
+            tables
+                .get_gameplay("hero_of_the_village/fletcher_gift")
+                .is_some()
+        );
+        assert!(tables.get_archaeology("desert_pyramid").is_some());
+        assert!(
+            tables
+                .get_table("minecraft:chests/simple_dungeon")
+                .is_some()
+        );
+
+        for (_id, table) in tables.iter() {
+            for pool in &table.pools {
+                for entry in &pool.entries {
+                    assert_entry_loot_table_refs_resolved(entry);
+                }
+            }
+        }
+
+        let unsupported = tables.unsupported();
+        println!(
+            "chest/gameplay/archaeology unsupported nodes ({}): {unsupported:?}",
+            unsupported.len()
+        );
+        let mut expected_unsupported = vec![(
+            "minecraft:archaeology/desert_well",
+            "minecraft:set_stew_effect",
+        )];
+        for _ in 0..8 {
+            expected_unsupported.extend([
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:location_check",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:set_name",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:exploration_map",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_common_chest",
+                    "minecraft:filtered",
+                ),
+            ]);
+        }
+        for _ in 0..7 {
+            expected_unsupported.extend([
+                (
+                    "minecraft:chests/abandoned_camp_secret_chest",
+                    "minecraft:exploration_map",
+                ),
+                (
+                    "minecraft:chests/abandoned_camp_secret_chest",
+                    "minecraft:filtered",
+                ),
+            ]);
+        }
+        expected_unsupported.extend([
+            (
+                "minecraft:chests/abandoned_mineshaft",
+                "minecraft:location_check",
+            ),
+            (
+                "minecraft:chests/ancient_city_ice_box",
+                "minecraft:set_stew_effect",
+            ),
+            (
+                "minecraft:chests/pillager_outpost",
+                "minecraft:set_instrument",
+            ),
+            (
+                "minecraft:chests/shipwreck_map",
+                "minecraft:exploration_map",
+            ),
+            ("minecraft:chests/shipwreck_map", "minecraft:filtered"),
+            (
+                "minecraft:chests/shipwreck_supply",
+                "minecraft:set_stew_effect",
+            ),
+            (
+                "minecraft:chests/trial_chambers/reward_common",
+                "minecraft:set_ominous_bottle_amplifier",
+            ),
+            (
+                "minecraft:chests/trial_chambers/reward_ominous_common",
+                "minecraft:set_ominous_bottle_amplifier",
+            ),
+            (
+                "minecraft:chests/underwater_ruin_big",
+                "minecraft:exploration_map",
+            ),
+            ("minecraft:chests/underwater_ruin_big", "minecraft:filtered"),
+            (
+                "minecraft:chests/underwater_ruin_small",
+                "minecraft:exploration_map",
+            ),
+            (
+                "minecraft:chests/underwater_ruin_small",
+                "minecraft:filtered",
+            ),
+            (
+                "minecraft:gameplay/fishing/junk",
+                "minecraft:location_check",
+            ),
+        ]);
+        assert_eq!(unsupported, expected_unsupported);
     }
 }
