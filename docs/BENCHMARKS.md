@@ -62,3 +62,48 @@ client timestamp or first-render interval was captured. The current encoder
 sends direct vertical skylight and has no full light propagation. A proper
 performance study must use a release build, repeated runs, controlled client
 movement, profiling, and end-to-end delivery timestamps before comparison.
+
+## Data-driven Overworld generation speed (19 November 2026)
+
+The September client recording above used the original preview terrain,
+which generates a chunk in about a millisecond. The opt-in data-driven
+Overworld generator was far slower: in a real Java 26.3 session with eight
+generation workers the server logged a median of 6.7 s (maximum 15 s) of
+`generation_us` per chunk, so a radius-32 view could not fill in play.
+
+Method: release build of `bench_vanilla_chunks`, seed 2026, the default 4x4
+chunk square at origin, one pass with a freshly constructed generator (cold
+caches), single thread, operator-provisioned 26.3 data root. The machine is a
+shared 20-thread desktop; each before/after pair was run back to back, so the
+numbers are diagnostic, not a capacity claim. A CPU profile (`perf`) of the
+full-chunk mode guided each change.
+
+| Mode (ms per chunk) | Before | After |
+| --- | --- | --- |
+| `columns` (full chunk) | 2,795 | 509 |
+| `substance` | 822 | 162 |
+| `heights` | 381 | 72 |
+
+What changed:
+
+- `minecraft:cache` density nodes now memoise values per column when the
+  wrapped function provably does not depend on `y` (zero-`y_scale` noise,
+  y-slices, the horizontal shift noises, `find_top_surface`, and expressions
+  built only from those). Before, the climate and terrain-shaping trees were
+  re-evaluated for every block of a column. The memo key keeps the sign of
+  `y`, because a zero-`y_scale` noise multiplies `y` by `0.0`, which is `-0.0`
+  below zero.
+- Biome selection searches a bounding-box tree over the 7,594-row
+  multi-noise table instead of scanning every row. Subtrees are skipped only
+  when their distance lower bound proves no row inside can beat the current
+  best `(fitness, row)`, so ties still resolve to the earlier table row.
+- One libm `floor` call per smeared noise sample became an exact
+  truncate-and-correct conversion.
+
+Output is unchanged: 81 chunk packets around spawn (radius 4) produced by
+the new build are byte-identical to the previous build's cached packets; a
+unit test and an ignored data-root test compare the tree search with the
+full scan on 5,000 synthetic and 50,000 random targets against the vanilla
+table; all ignored data-root tests pass. Still open: the remaining time is
+spread between Perlin sampling (about half) and biome search (about a
+third); end-to-end client delivery timings are not yet recorded.

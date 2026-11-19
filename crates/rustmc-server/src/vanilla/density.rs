@@ -387,7 +387,13 @@ enum Node {
         functions: Rc<[Density]>,
     },
     Spline(Spline),
-    Cache(Density),
+    /// `minecraft:cache`: the input's values are memoised. When the input is
+    /// provably independent of `y` (see [`Density::is_y_independent`]) the
+    /// memo is per column; otherwise the node evaluates its input directly.
+    Cache {
+        input: Density,
+        columns: Option<RefCell<BoundedCache<ColumnKey, f32>>>,
+    },
     Interpolated {
         input: Density,
         cell_size_xz: i32,
@@ -451,6 +457,68 @@ impl Density {
         match &*self.0 {
             Node::Constant(value) => Some(*value),
             _ => None,
+        }
+    }
+
+    /// Whether the value provably does not depend on `y` beyond its sign
+    /// (see [`ColumnKey`]). Conservative: anything not proven independent
+    /// counts as dependent, which only costs a missed memo.
+    fn is_y_independent(&self) -> bool {
+        match &*self.0 {
+            // `find_top_surface` samples its bounds at y = 0 and its density at
+            // fixed probe heights: it never reads the queried y.
+            Node::Constant(_)
+            | Node::BlendAlpha
+            | Node::BlendOffset
+            | Node::Beardifier
+            | Node::FindTopSurface { .. } => true,
+            Node::Noise {
+                y_scale,
+                shift_x,
+                shift_y,
+                shift_z,
+                ..
+            } => {
+                *y_scale == 0.0
+                    && shift_x.is_y_independent()
+                    && shift_y.is_y_independent()
+                    && shift_z.is_y_independent()
+            }
+            Node::ShiftNoise { kind, .. } => *kind != ShiftKind::X,
+            Node::Axial { axis, .. } => *axis != Axis::Y,
+            Node::Unary(_, input)
+            | Node::BlendDensity(input)
+            | Node::PowConstExponent { input, .. }
+            | Node::Clamp { input, .. } => input.is_y_independent(),
+            Node::PowConstBase { exponent, .. } => exponent.is_y_independent(),
+            Node::Binary(_, left, right) | Node::Pow(left, right) => {
+                left.is_y_independent() && right.is_y_independent()
+            }
+            Node::Round {
+                input, multiple, ..
+            } => input.is_y_independent() && multiple.is_y_independent(),
+            Node::Lerp {
+                alpha,
+                first,
+                second,
+            } => alpha.is_y_independent() && first.is_y_independent() && second.is_y_independent(),
+            Node::RangeChoice {
+                input,
+                when_in_range,
+                when_out_of_range,
+                ..
+            } => {
+                input.is_y_independent()
+                    && when_in_range.is_y_independent()
+                    && when_out_of_range.is_y_independent()
+            }
+            Node::IntervalSelect {
+                input, functions, ..
+            } => input.is_y_independent() && functions.iter().all(Density::is_y_independent),
+            Node::Spline(spline) => spline_is_y_independent(spline),
+            Node::Cache { input, .. } => input.is_y_independent(),
+            Node::Slice { axis, input, .. } => *axis == Axis::Y || input.is_y_independent(),
+            Node::Interpolated { .. } | Node::DistanceToPoint { .. } | Node::Blended(_) => false,
         }
     }
 
@@ -616,7 +684,18 @@ impl Density {
                 functions[index].sample(x, y, z)
             }
             Node::Spline(spline) => sample_spline(spline, x, y, z),
-            Node::Cache(input) => input.sample(x, y, z),
+            Node::Cache { input, columns } => match columns {
+                Some(columns) => {
+                    let key = column_key(x, y, z);
+                    if let Some(value) = columns.borrow_mut().get_mut(&key) {
+                        return *value;
+                    }
+                    let value = input.sample(x, y, z);
+                    columns.borrow_mut().insert(key, value);
+                    value
+                }
+                None => input.sample(x, y, z),
+            },
             Node::Interpolated {
                 input,
                 cell_size_xz,
@@ -1362,6 +1441,39 @@ fn linear_extend(
     }
 }
 
+/// Memo key for a `y`-independent cached node: the column plus the sign of
+/// `y`. A zero-`y_scale` noise multiplies `y` by `0.0`, which is `-0.0` for
+/// negative `y`; keeping the sign in the key returns exactly the bits the
+/// direct evaluation would produce.
+type ColumnKey = (i32, i32, bool);
+
+/// Columns each cached node remembers per generation of its two-generation
+/// [`BoundedCache`]: a chunk plus a one-cell interpolation margin
+/// (`(16 + 2 * 4)^2` = 576) rounded up.
+const CACHE_NODE_COLUMNS: usize = 1024;
+
+fn column_key(x: i32, y: i32, z: i32) -> ColumnKey {
+    (x, z, y < 0)
+}
+
+/// Builds a `minecraft:cache` node, giving it a per-column memo when its
+/// input cannot depend on `y`.
+fn cache_node(input: Density) -> Node {
+    let columns = input
+        .is_y_independent()
+        .then(|| RefCell::new(BoundedCache::new(CACHE_NODE_COLUMNS)));
+    Node::Cache { input, columns }
+}
+
+fn spline_is_y_independent(spline: &Spline) -> bool {
+    match spline {
+        Spline::Constant(_) => true,
+        Spline::Multipoint {
+            coordinate, values, ..
+        } => coordinate.is_y_independent() && values.iter().all(spline_is_y_independent),
+    }
+}
+
 fn sample_spline(spline: &Spline, x: i32, y: i32, z: i32) -> f32 {
     match spline {
         Spline::Constant(value) => *value,
@@ -1537,12 +1649,12 @@ impl<'e> DensityRegistry<'e> {
                 from_value: BUILTIN_Y_FROM as f32,
                 coordinate_factor: 1.0,
             },
-            "minecraft:shift_x" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
+            "minecraft:shift_x" => cache_node(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Xy,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
                 horizontal: RefCell::new(BoundedCache::new(512)),
             }))),
-            "minecraft:shift_z" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
+            "minecraft:shift_z" => cache_node(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Z,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
                 horizontal: RefCell::new(BoundedCache::new(512)),
@@ -1663,7 +1775,7 @@ impl<'e> DensityRegistry<'e> {
         object: &'v serde_json::Map<String, Value>,
     ) -> Result<Node, DensityError> {
         let node = match kind {
-            "cache" => Node::Cache(self.child(get("input")?)?),
+            "cache" => cache_node(self.child(get("input")?)?),
             "interpolated" => {
                 let cell_size_xz = positive_int(get("cell_size_xz")?)?;
                 let cell_size_y = positive_int(get("cell_size_y")?)?;
@@ -1992,7 +2104,7 @@ fn fold_pow(base: Density, exponent: Density) -> Node {
             UnaryKind::Sqrt
         } else if absolute == 1.0 {
             if value > 0.0 {
-                return Node::Cache(base);
+                return cache_node(base);
             }
             UnaryKind::Reciprocal
         } else if absolute == 2.0 {

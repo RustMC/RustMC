@@ -48,6 +48,19 @@ fn lattice_floor(x: f64) -> i32 {
     truncated - i32::from(x < f64::from(truncated))
 }
 
+/// `value.floor() as i32` without the libm call: truncate, then step down
+/// when truncation rounded a negative fraction up. Saturation and NaN match
+/// the `as` cast (NaN gives 0; out-of-range values give `i32::MIN`/`MAX`).
+#[inline]
+fn floor_to_i32(value: f64) -> i32 {
+    let truncated = value as i32;
+    if f64::from(truncated) > value {
+        truncated.saturating_sub(1)
+    } else {
+        truncated
+    }
+}
+
 fn grad_dot(hash: i32, x: f32, y: f32, z: f32) -> f32 {
     let g = GRADIENT[(hash & 15) as usize];
     g.0 * x + g.1 * y + g.2 * z
@@ -269,7 +282,9 @@ fn compute_fudge_y(original_y: f64, relative_y: f64, fudge_y_scale: f64) -> f64 
     } else {
         relative_y
     };
-    f64::from((fudge_limit / fudge_y_scale + f64::from(1.0e-7_f32)).floor() as i32) * fudge_y_scale
+    f64::from(floor_to_i32(
+        fudge_limit / fudge_y_scale + f64::from(1.0e-7_f32),
+    )) * fudge_y_scale
 }
 
 #[derive(Clone)]
@@ -498,6 +513,31 @@ pub fn create_blended_fbm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_to_i32_matches_floor_cast_everywhere() {
+        let mut values = vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f64::from(i32::MAX) + 10.0,
+            f64::from(i32::MIN) - 10.0,
+            f64::from(i32::MIN) - 0.5,
+            f64::from(i32::MIN),
+            f64::from(i32::MAX),
+        ];
+        for integer in [-1_000_000, -4096, -2, -1, 0, 1, 2, 4096, 1_000_000] {
+            for fraction in [0.0, 1.0e-9, 0.25, 0.5, 0.999_999_999] {
+                values.push(f64::from(integer) + fraction);
+                values.push(f64::from(integer) - fraction);
+            }
+        }
+        for value in values {
+            assert_eq!(floor_to_i32(value), value.floor() as i32, "{value}");
+        }
+    }
 
     #[test]
     fn lattice_floor_matches_floor_inside_wrapped_coordinate_band() {
