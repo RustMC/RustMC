@@ -119,7 +119,7 @@ impl Error for ProtocolIdsError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RegistryLookup {
     name_to_id: BTreeMap<String, u32>,
     id_to_name: BTreeMap<u32, String>,
@@ -205,7 +205,7 @@ impl RegistryLookup {
 
 /// Static Java Edition protocol IDs loaded from `reports/registries.json` for
 /// items, data component types, potions, and mob effects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProtocolIds {
     items: RegistryLookup,
     component_types: RegistryLookup,

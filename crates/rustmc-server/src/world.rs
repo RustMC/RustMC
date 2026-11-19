@@ -96,7 +96,8 @@ pub use recipe_data::{
     RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe, repair_combined_damage,
 };
 pub use vanilla_rules::{
-    CookingSummary, RecipeSummary, TagSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,
+    CookingSummary, ItemComponentSummary, LootCategorySummary, ProtocolIdSummary, RecipeSummary,
+    TagSummary, UnsupportedLootSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,
 };
 pub mod inventory;
 pub use inventory::{

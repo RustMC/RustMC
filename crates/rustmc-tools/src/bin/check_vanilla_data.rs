@@ -34,6 +34,11 @@ fn summary_json(summary: &VanillaRulesSummary) -> Value {
             "enchantment": summary.tags.enchantment,
         },
         "items": summary.items,
+        "item_components": {
+            "foods": summary.item_components.foods,
+            "tools": summary.item_components.tools,
+            "damageable_items": summary.item_components.damageable_items,
+        },
         "recipes": {
             "cooking": {
                 "smelting": summary.recipes.cooking.smelting,
@@ -43,6 +48,8 @@ fn summary_json(summary: &VanillaRulesSummary) -> Value {
             },
             "crafting_shaped": summary.recipes.crafting_shaped,
             "crafting_shapeless": summary.recipes.crafting_shapeless,
+            "crafting_transmute": summary.recipes.crafting_transmute,
+            "crafting_special_repairitem": summary.recipes.crafting_special_repairitem,
             "stonecutting": summary.recipes.stonecutting,
             "smithing_transform": summary.recipes.smithing_transform,
             "smithing_trim": summary.recipes.smithing_trim,
@@ -50,7 +57,24 @@ fn summary_json(summary: &VanillaRulesSummary) -> Value {
             "skipped": summary.recipes.skipped,
         },
         "loot_tables": summary.loot_tables,
+        "loot_categories": {
+            "blocks": summary.loot_categories.blocks,
+            "entities": summary.loot_categories.entities,
+            "chests": summary.loot_categories.chests,
+            "gameplay": summary.loot_categories.gameplay,
+            "archaeology": summary.loot_categories.archaeology,
+        },
+        "unsupported_loot_nodes": {
+            "count": summary.unsupported_loot_nodes.count,
+            "kinds": summary.unsupported_loot_nodes.kinds,
+        },
         "enchantments": summary.enchantments,
+        "protocol_ids": {
+            "items": summary.protocol_ids.items,
+            "component_types": summary.protocol_ids.component_types,
+            "potions": summary.protocol_ids.potions,
+            "mob_effects": summary.protocol_ids.mob_effects,
+        },
     })
 }
 
@@ -90,7 +114,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustmc_server::world::vanilla_rules::{CookingSummary, RecipeSummary, TagSummary};
+    use rustmc_server::world::vanilla_rules::{
+        CookingSummary, ItemComponentSummary, LootCategorySummary, ProtocolIdSummary,
+        RecipeSummary, TagSummary, UnsupportedLootSummary,
+    };
 
     #[test]
     fn resolve_data_root_prefers_arg_then_env_and_rejects_extra_args() {
@@ -118,6 +145,11 @@ mod tests {
                 enchantment: 3,
             },
             items: 4,
+            item_components: ItemComponentSummary {
+                foods: 18,
+                tools: 19,
+                damageable_items: 20,
+            },
             recipes: RecipeSummary {
                 cooking: CookingSummary {
                     smelting: 5,
@@ -127,6 +159,8 @@ mod tests {
                 },
                 crafting_shaped: 9,
                 crafting_shapeless: 10,
+                crafting_transmute: 21,
+                crafting_special_repairitem: 22,
                 stonecutting: 11,
                 smithing_transform: 12,
                 smithing_trim: 13,
@@ -134,25 +168,64 @@ mod tests {
                 skipped: 15,
             },
             loot_tables: 16,
+            loot_categories: LootCategorySummary {
+                blocks: 23,
+                entities: 24,
+                chests: 25,
+                gameplay: 26,
+                archaeology: 27,
+            },
+            unsupported_loot_nodes: UnsupportedLootSummary {
+                count: 28,
+                kinds: vec![
+                    "minecraft:exploration_map".to_owned(),
+                    "minecraft:filtered".to_owned(),
+                ],
+            },
             enchantments: 17,
+            protocol_ids: ProtocolIdSummary {
+                items: 29,
+                component_types: 30,
+                potions: 31,
+                mob_effects: 32,
+            },
         };
         let value = summary_json(&summary);
         assert_eq!(value["tags"]["item"], 1);
         assert_eq!(value["tags"]["block"], 2);
         assert_eq!(value["tags"]["enchantment"], 3);
         assert_eq!(value["items"], 4);
+        assert_eq!(value["item_components"]["foods"], 18);
+        assert_eq!(value["item_components"]["tools"], 19);
+        assert_eq!(value["item_components"]["damageable_items"], 20);
         assert_eq!(value["recipes"]["cooking"]["smelting"], 5);
         assert_eq!(value["recipes"]["cooking"]["blasting"], 6);
         assert_eq!(value["recipes"]["cooking"]["smoking"], 7);
         assert_eq!(value["recipes"]["cooking"]["campfire_cooking"], 8);
         assert_eq!(value["recipes"]["crafting_shaped"], 9);
         assert_eq!(value["recipes"]["crafting_shapeless"], 10);
+        assert_eq!(value["recipes"]["crafting_transmute"], 21);
+        assert_eq!(value["recipes"]["crafting_special_repairitem"], 22);
         assert_eq!(value["recipes"]["stonecutting"], 11);
         assert_eq!(value["recipes"]["smithing_transform"], 12);
         assert_eq!(value["recipes"]["smithing_trim"], 13);
         assert_eq!(value["recipes"]["brewing"], 14);
         assert_eq!(value["recipes"]["skipped"], 15);
         assert_eq!(value["loot_tables"], 16);
+        assert_eq!(value["loot_categories"]["blocks"], 23);
+        assert_eq!(value["loot_categories"]["entities"], 24);
+        assert_eq!(value["loot_categories"]["chests"], 25);
+        assert_eq!(value["loot_categories"]["gameplay"], 26);
+        assert_eq!(value["loot_categories"]["archaeology"], 27);
+        assert_eq!(value["unsupported_loot_nodes"]["count"], 28);
+        assert_eq!(
+            value["unsupported_loot_nodes"]["kinds"],
+            json!(["minecraft:exploration_map", "minecraft:filtered"])
+        );
         assert_eq!(value["enchantments"], 17);
+        assert_eq!(value["protocol_ids"]["items"], 29);
+        assert_eq!(value["protocol_ids"]["component_types"], 30);
+        assert_eq!(value["protocol_ids"]["potions"], 31);
+        assert_eq!(value["protocol_ids"]["mob_effects"], 32);
     }
 }

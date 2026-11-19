@@ -1412,6 +1412,24 @@ impl ItemDefaults {
         })
     }
 
+    /// Returns the number of items carrying a `minecraft:food` default component.
+    #[must_use]
+    pub fn food_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.food.is_some())
+            .count()
+    }
+
+    /// Returns the number of items carrying a `minecraft:tool` default component.
+    #[must_use]
+    pub fn tool_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.tool.is_some())
+            .count()
+    }
+
     /// Returns the number of items loaded from the report.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -2885,6 +2903,9 @@ mod tests {
             None
         );
 
+        assert_eq!(defaults.tool_count(), 3);
+        assert_eq!(defaults.food_count(), 0);
+
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -3191,6 +3212,9 @@ mod tests {
         assert_eq!(defaults.consume_seconds("plain"), None);
         assert_eq!(defaults.food("missing"), None);
         assert_eq!(defaults.consume_seconds("missing"), None);
+
+        assert_eq!(defaults.food_count(), 3);
+        assert_eq!(defaults.tool_count(), 0);
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }
