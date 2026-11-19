@@ -125,6 +125,10 @@ impl ParameterPoint {
 /// Rows per search-tree leaf; small leaves keep the bounding boxes tight.
 const SEARCH_LEAF_ROWS: usize = 8;
 
+/// Maximum rows [`BiomePlacement::find_column`] examines per cell before
+/// falling back to [`BiomePlacement::find_row`].
+const COLUMN_SCAN_FALLBACK_ROWS: usize = 1024;
+
 /// One node of the placement table's bounding-box tree: the union of its
 /// rows' six intervals, their smallest offset penalty, and their lowest row
 /// index (for the earlier-row tie rule).
@@ -278,12 +282,34 @@ struct SortedRow {
     depth: Param,
 }
 
+fn cmp_sorted_row(lhs: &SortedRow, rhs: &SortedRow) -> std::cmp::Ordering {
+    lhs.fixed_cost
+        .cmp(&rhs.fixed_cost)
+        .then_with(|| lhs.row.cmp(&rhs.row))
+}
+
+/// Builds the sorted, merged, disjoint union of all rows' `depth` intervals.
+fn merge_depth_ranges(entries: &[(String, ParameterPoint)]) -> Vec<Param> {
+    let mut ranges: Vec<Param> = entries.iter().map(|(_, point)| point.depth).collect();
+    ranges.sort_unstable_by(|lhs, rhs| lhs.min.cmp(&rhs.min).then_with(|| lhs.max.cmp(&rhs.max)));
+    let mut merged: Vec<Param> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.min <= last.max
+        {
+            last.max = last.max.max(range.max);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
 /// Reusable scratch buffers for [`BiomePlacement::find_column`], holding one
-/// run's per-row fixed-dimension fitness `A_i` and sorted row entries across
-/// runs and chunks without per-cell allocations.
+/// run's sorted row entries across runs and chunks without per-cell
+/// allocations.
 #[derive(Debug, Default, Clone)]
 pub struct ColumnSearchScratch {
-    fixed_costs: Vec<i64>,
     order: Vec<SortedRow>,
 }
 
@@ -294,6 +320,9 @@ pub struct BiomePlacement {
     entries: Vec<(String, ParameterPoint)>,
     /// Bounding-box tree over `entries` for exact nearest-row search.
     tree: Vec<SearchNode>,
+    /// Union of all rows' `depth` intervals, sorted and merged into disjoint
+    /// ranges for exact `D(t4)` lower bounds.
+    depth_ranges: Vec<Param>,
     /// Row that won the previous lookup. Neighbouring quart cells usually
     /// select the same biome, so testing it first gives a tight bound for
     /// pruning; it never changes which row wins (see [`Self::find`]).
@@ -377,6 +406,27 @@ impl BiomePlacement {
         self.entries.get(row).map(|(id, _)| id.as_str())
     }
 
+    /// Minimum squared depth distance `D(t4)` across every row in the table:
+    /// zero when `depth` lies inside any row's depth interval, otherwise the
+    /// squared distance to the nearest interval endpoint.
+    fn min_depth_fitness(&self, depth: i64) -> i64 {
+        let idx = self.depth_ranges.partition_point(|range| range.max < depth);
+        let mut best_dist = match self.depth_ranges.get(idx) {
+            Some(right) => right.distance(depth),
+            None => i64::MAX,
+        };
+        if best_dist > 0
+            && let Some(left) = idx.checked_sub(1).and_then(|i| self.depth_ranges.get(i))
+        {
+            best_dist = best_dist.min(depth - left.max);
+        }
+        if best_dist == i64::MAX {
+            0
+        } else {
+            square(best_dist)
+        }
+    }
+
     /// Resolves a run of cells sharing the five non-depth coordinates
     /// `fixed = [temperature, humidity, continentalness, erosion, weirdness]`
     /// across `depths`, writing the winning table row index for each depth to
@@ -396,56 +446,91 @@ impl BiomePlacement {
             return;
         }
         let n = self.entries.len();
-        scratch.fixed_costs.clear();
-        scratch.fixed_costs.reserve(n);
         scratch.order.clear();
         scratch.order.reserve(n);
         for (row, (_, point)) in self.entries.iter().enumerate() {
-            let fixed_cost = point.fixed_fitness(&fixed);
-            scratch.fixed_costs.push(fixed_cost);
             scratch.order.push(SortedRow {
-                fixed_cost,
+                fixed_cost: point.fixed_fitness(&fixed),
                 row,
                 depth: point.depth,
             });
         }
-        scratch.order.sort_unstable_by(|lhs, rhs| {
-            lhs.fixed_cost
-                .cmp(&rhs.fixed_cost)
-                .then_with(|| lhs.row.cmp(&rhs.row))
-        });
+        let (scan_len, next_beyond_limit) = if n > COLUMN_SCAN_FALLBACK_ROWS {
+            scratch
+                .order
+                .select_nth_unstable_by(COLUMN_SCAN_FALLBACK_ROWS, cmp_sorted_row);
+            scratch.order[..COLUMN_SCAN_FALLBACK_ROWS].sort_unstable_by(cmp_sorted_row);
+            (
+                COLUMN_SCAN_FALLBACK_ROWS,
+                Some(scratch.order[COLUMN_SCAN_FALLBACK_ROWS]),
+            )
+        } else {
+            scratch.order.sort_unstable_by(cmp_sorted_row);
+            (n, None)
+        };
 
         out.reserve(depths.len());
-        let Some((&first, rest)) = scratch.order.split_first() else {
+        let scan_rows = &scratch.order[..scan_len];
+        let Some((&first, rest)) = scan_rows.split_first() else {
             return;
         };
         for &depth in depths {
+            let min_depth_term = self.min_depth_fitness(depth);
             let mut best_fitness = first.fixed_cost + square(first.depth.distance(depth));
             let mut best_row = first.row;
+            let mut terminated = next_beyond_limit.is_none();
 
             for item in rest {
-                let a = item.fixed_cost;
-                if a > best_fitness {
+                if cannot_beat(
+                    item.fixed_cost + min_depth_term,
+                    item.row,
+                    Some((best_fitness, best_row)),
+                ) {
+                    terminated = true;
                     break;
                 }
-                if a == best_fitness && item.row > best_row {
-                    continue;
-                }
-                let fitness = a + square(item.depth.distance(depth));
-                if fitness < best_fitness || (fitness == best_fitness && item.row < best_row) {
+                let fitness = item.fixed_cost + square(item.depth.distance(depth));
+                if beats(fitness, item.row, Some((best_fitness, best_row))) {
                     best_fitness = fitness;
                     best_row = item.row;
                 }
             }
-            out.push(best_row);
+            if !terminated
+                && let Some(next) = next_beyond_limit
+                && cannot_beat(
+                    next.fixed_cost + min_depth_term,
+                    next.row,
+                    Some((best_fitness, best_row)),
+                )
+            {
+                terminated = true;
+            }
+            let winner = if terminated {
+                self.last_winner.set(Some(best_row));
+                best_row
+            } else {
+                let target = [fixed[0], fixed[1], fixed[2], fixed[3], depth, fixed[4]];
+                self.find_row_with_seed(&target, Some((best_fitness, best_row)))
+                    .unwrap_or(best_row)
+            };
+            out.push(winner);
         }
     }
 
     fn find_row(&self, target: &[i64; 6]) -> Option<usize> {
-        let mut best: Option<(i64, usize)> = self
-            .last_winner
-            .get()
-            .and_then(|row| Some((self.entries.get(row)?.1.fitness(target), row)));
+        self.find_row_with_seed(target, None)
+    }
+
+    fn find_row_with_seed(&self, target: &[i64; 6], seed: Option<(i64, usize)>) -> Option<usize> {
+        let mut best = seed;
+        if let Some(row) = self.last_winner.get()
+            && let Some((_, point)) = self.entries.get(row)
+        {
+            let fitness = point.fitness(target);
+            if beats(fitness, row, best) {
+                best = Some((fitness, row));
+            }
+        }
         if !self.tree.is_empty() {
             self.search(0, target, &mut best);
         }
@@ -466,9 +551,11 @@ impl BiomePlacement {
         if !rows.is_empty() {
             build_node(&entries, &mut rows, &mut tree);
         }
+        let depth_ranges = merge_depth_ranges(&entries);
         Self {
             entries,
             tree,
+            depth_ranges,
             last_winner: Cell::new(None),
         }
     }
@@ -1030,6 +1117,267 @@ mod tests {
     }
 
     #[test]
+    fn column_search_handles_negative_depths_above_non_negative_intervals() {
+        let entry = |name: &str, t: Param, d: Param, off: i64| {
+            let zero = Param { min: 0, max: 0 };
+            (
+                name.to_owned(),
+                ParameterPoint {
+                    temperature: t,
+                    humidity: zero,
+                    continentalness: zero,
+                    erosion: zero,
+                    depth: d,
+                    weirdness: zero,
+                    offset: off,
+                },
+            )
+        };
+        let p = |min, max| Param { min, max };
+        // Every row has depth.min >= 0, with overlapping, merged, and disjoint
+        // intervals plus deliberate A_i + D(t4) == best_fitness ties.
+        let table = BiomePlacement::from_entries(vec![
+            entry("deep_low_a", p(0, 0), p(2000, 9000), 0),
+            entry("surface_tie_early", p(100, 100), p(0, 0), 0),
+            entry("mid_a", p(10, 10), p(500, 1200), 0),
+            entry("mid_b_overlap", p(10, 10), p(100, 500), 0),
+            entry("surface_tie_late", p(100, 100), p(0, 0), 0),
+            entry("surface_offset", p(0, 0), p(0, 0), 100),
+            entry("deepest_point", p(20, 20), p(11000, 11000), 0),
+            entry("ceiling_point", p(5, 5), p(10000, 10000), 0),
+        ]);
+
+        // Merged depth union must be sorted and strictly disjoint.
+        assert_eq!(
+            table.depth_ranges,
+            vec![
+                p(0, 0),
+                p(100, 1200),
+                p(2000, 9000),
+                p(10000, 10000),
+                p(11000, 11000),
+            ]
+        );
+        for d in [
+            -20_000, -5_000, -1, 0, 50, 100, 1500, 5000, 9500, 10500, 15000,
+        ] {
+            let brute_d = table
+                .entries
+                .iter()
+                .map(|(_, pt)| square(pt.depth.distance(d)))
+                .min()
+                .expect("non-empty");
+            assert_eq!(table.min_depth_fitness(d), brute_d, "depth {d}");
+        }
+
+        let mut scratch = ColumnSearchScratch::default();
+        let mut depths = Vec::new();
+        let mut rows = Vec::new();
+        let mut resolved = Vec::new();
+
+        let edge_column = [
+            [0, 0, 0, 0, -20_000, 0],
+            [0, 0, 0, 0, -5_000, 0],
+            [0, 0, 0, 0, -100, 0],
+            [0, 0, 0, 0, -1, 0],
+            [0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 50, 0],
+            [0, 0, 0, 0, 1_500, 0],
+            [0, 0, 0, 0, 5_000, 0],
+            [0, 0, 0, 0, 12_000, 0],
+        ];
+        resolve_column_by_runs(
+            &table,
+            &edge_column,
+            &mut scratch,
+            &mut depths,
+            &mut rows,
+            &mut resolved,
+        );
+        for (target, &row) in edge_column.iter().zip(&resolved) {
+            assert_eq!(Some(row), brute_force_row(&table, target), "{target:?}");
+            assert_eq!(Some(row), table.find_row_for_test(target), "{target:?}");
+        }
+
+        let mut state = 0x517C_C1B7_2722_0A95_u64;
+        let mut next_i64 = |low: i64, high: i64| -> i64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let span = (high - low + 1) as u64;
+            low + ((state >> 32) % span) as i64
+        };
+        let mut column = Vec::with_capacity(24);
+        for run in 0..2_000 {
+            column.clear();
+            let t = next_i64(-300, 300);
+            for _ in 0..16 {
+                let d = next_i64(-20_000, -1);
+                column.push([t, 0, 0, 0, d, 0]);
+            }
+            resolve_column_by_runs(
+                &table,
+                &column,
+                &mut scratch,
+                &mut depths,
+                &mut rows,
+                &mut resolved,
+            );
+            for (target, &row) in column.iter().zip(&resolved) {
+                assert_eq!(
+                    Some(row),
+                    brute_force_row(&table, target),
+                    "run {run} {target:?}"
+                );
+                assert_eq!(
+                    Some(row),
+                    table.find_row_for_test(target),
+                    "run {run} {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn column_search_fallback_matches_brute_force_when_limit_exceeded() {
+        let zero = Param { min: 0, max: 0 };
+        let far_depth = Param {
+            min: 5_000,
+            max: 5_000,
+        };
+        let surface_depth = Param { min: 0, max: 0 };
+        let total = COLUMN_SCAN_FALLBACK_ROWS + 64;
+        let mut entries = Vec::with_capacity(total);
+        // First COLUMN_SCAN_FALLBACK_ROWS + 20 rows have smaller fixed cost A_i
+        // at fixed = [0; 5], but a large depth gap at t4 <= 0 so the scan
+        // cannot terminate within COLUMN_SCAN_FALLBACK_ROWS rows.
+        for i in 0..COLUMN_SCAN_FALLBACK_ROWS + 20 {
+            let coord = i as i64;
+            entries.push((
+                format!("far_{i}"),
+                ParameterPoint {
+                    temperature: Param {
+                        min: coord,
+                        max: coord,
+                    },
+                    humidity: zero,
+                    continentalness: zero,
+                    erosion: zero,
+                    depth: far_depth,
+                    weirdness: zero,
+                    offset: 0,
+                },
+            ));
+        }
+        // Remaining rows sit beyond COLUMN_SCAN_FALLBACK_ROWS in sorted A_i
+        // order, including deliberate ties at surface_depth = 0.
+        let winner_coord = (COLUMN_SCAN_FALLBACK_ROWS + 25) as i64;
+        let tie_coord = (COLUMN_SCAN_FALLBACK_ROWS + 30) as i64;
+        let early_beyond_row = entries.len();
+        entries.push((
+            "surface_winner".to_owned(),
+            ParameterPoint {
+                temperature: Param {
+                    min: winner_coord,
+                    max: winner_coord,
+                },
+                humidity: zero,
+                continentalness: zero,
+                erosion: zero,
+                depth: surface_depth,
+                weirdness: zero,
+                offset: 0,
+            },
+        ));
+        entries.push((
+            "surface_tie_earlier".to_owned(),
+            ParameterPoint {
+                temperature: Param {
+                    min: tie_coord,
+                    max: tie_coord,
+                },
+                humidity: zero,
+                continentalness: zero,
+                erosion: zero,
+                depth: surface_depth,
+                weirdness: zero,
+                offset: 0,
+            },
+        ));
+        entries.push((
+            "surface_tie_later".to_owned(),
+            ParameterPoint {
+                temperature: Param {
+                    min: tie_coord,
+                    max: tie_coord,
+                },
+                humidity: zero,
+                continentalness: zero,
+                erosion: zero,
+                depth: surface_depth,
+                weirdness: zero,
+                offset: 0,
+            },
+        ));
+        while entries.len() < total {
+            let coord = (entries.len() + 40) as i64;
+            entries.push((
+                format!("tail_{coord}"),
+                ParameterPoint {
+                    temperature: Param {
+                        min: coord,
+                        max: coord,
+                    },
+                    humidity: zero,
+                    continentalness: zero,
+                    erosion: zero,
+                    depth: surface_depth,
+                    weirdness: zero,
+                    offset: 0,
+                },
+            ));
+        }
+        let table = BiomePlacement::from_entries(entries);
+        // Confirm the winning row at t4 = 0 sits strictly beyond the scan limit.
+        let fixed = [0; 5];
+        let winner_a = table.entries[early_beyond_row].1.fixed_fitness(&fixed);
+        let smaller_a_count = table
+            .entries
+            .iter()
+            .filter(|(_, pt)| pt.fixed_fitness(&fixed) < winner_a)
+            .count();
+        assert!(smaller_a_count >= COLUMN_SCAN_FALLBACK_ROWS);
+
+        let depths = [5_000, 2_500, 1_000, 0, -500, -5_000];
+        let mut scratch = ColumnSearchScratch::default();
+        let mut out = Vec::new();
+        // Prime last_winner to a late tying row before the column search.
+        table.last_winner.set(Some(early_beyond_row + 2));
+        table.find_column(fixed, &depths, &mut scratch, &mut out);
+        assert_eq!(out.len(), depths.len());
+        assert_eq!(out[0], 0);
+        assert_eq!(out[3], early_beyond_row);
+        assert_eq!(out[4], early_beyond_row);
+        assert_eq!(out[5], early_beyond_row);
+
+        for (&depth, &row) in depths.iter().zip(&out) {
+            let target = [fixed[0], fixed[1], fixed[2], fixed[3], depth, fixed[4]];
+            assert_eq!(Some(row), brute_force_row(&table, &target), "depth {depth}");
+            assert_eq!(Some(row), table.find_row_for_test(&target), "depth {depth}");
+        }
+
+        // Verify ties among rows beyond COLUMN_SCAN_FALLBACK_ROWS keep the earlier row.
+        let tie_fixed = [tie_coord, 0, 0, 0, 0];
+        table.last_winner.set(Some(early_beyond_row + 2));
+        table.find_column(tie_fixed, &[0, -200], &mut scratch, &mut out);
+        assert_eq!(out, vec![early_beyond_row + 1, early_beyond_row + 1]);
+        for &depth in &[0, -200] {
+            let target = [tie_fixed[0], 0, 0, 0, depth, 0];
+            assert_eq!(brute_force_row(&table, &target), Some(early_beyond_row + 1));
+        }
+    }
+
+    #[test]
     fn column_search_fixed_and_depth_terms_stay_far_below_i64_max() {
         // Documented bound for quantized coordinates (`value * 10_000`):
         // Overworld climate noises stay roughly within [-2.0, 2.0] (+/-20_000)
@@ -1173,10 +1521,9 @@ mod tests {
                         checked_cells += 1;
                     }
                     let max_a = col_scratch
-                        .fixed_costs
+                        .order
                         .iter()
-                        .copied()
-                        .map(i64::abs)
+                        .map(|item| item.fixed_cost.abs())
                         .max()
                         .unwrap_or(0);
                     let max_d = col
