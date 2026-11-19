@@ -16,6 +16,7 @@
 //! the placement answer is the raw resolver value; blender-driven biome
 //! borders near structures remain a known residual.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +74,162 @@ impl ParameterPoint {
     }
 }
 
+impl ParameterPoint {
+    /// [`Self::fitness`], or `None` as soon as the partial sum proves this
+    /// row (at index `row`) cannot beat `best` under the `(fitness, row)`
+    /// order. Terms are summed in the same order as `fitness`, so a
+    /// returned value is identical to it.
+    fn fitness_if_better(
+        &self,
+        t: &[i64; 6],
+        best: Option<(i64, usize)>,
+        row: usize,
+    ) -> Option<i64> {
+        let loses = |partial: i64| {
+            best.is_some_and(|(best_fitness, best_row)| {
+                partial > best_fitness || (partial == best_fitness && row > best_row)
+            })
+        };
+        let dims = [
+            &self.temperature,
+            &self.humidity,
+            &self.continentalness,
+            &self.erosion,
+            &self.depth,
+            &self.weirdness,
+        ];
+        let mut partial = 0i64;
+        for (param, target) in dims.iter().zip(t) {
+            partial += square(param.distance(*target));
+            if loses(partial) {
+                return None;
+            }
+        }
+        partial += square(self.offset);
+        (!loses(partial)).then_some(partial)
+    }
+}
+
+/// Rows per search-tree leaf; small leaves keep the bounding boxes tight.
+const SEARCH_LEAF_ROWS: usize = 8;
+
+/// One node of the placement table's bounding-box tree: the union of its
+/// rows' six intervals, their smallest offset penalty, and their lowest row
+/// index (for the earlier-row tie rule).
+#[derive(Debug, Clone)]
+struct SearchNode {
+    bounds: [Param; 6],
+    min_offset_squared: i64,
+    first_row: usize,
+    kind: SearchKind,
+}
+
+#[derive(Debug, Clone)]
+enum SearchKind {
+    Leaf(Box<[usize]>),
+    Branch(usize, usize),
+}
+
+impl SearchNode {
+    /// No row in this subtree has a smaller fitness for `target`: each
+    /// row's intervals lie inside `bounds`, so each per-dimension distance is
+    /// at least the box's, and its offset is at least the minimum.
+    fn lower_bound(&self, target: &[i64; 6]) -> i64 {
+        self.bounds
+            .iter()
+            .zip(target)
+            .map(|(param, value)| square(param.distance(*value)))
+            .sum::<i64>()
+            + self.min_offset_squared
+    }
+}
+
+/// `(fitness, row)` strictly precedes `best`: lower fitness, or equal
+/// fitness at an earlier row.
+fn beats(fitness: i64, row: usize, best: Option<(i64, usize)>) -> bool {
+    best.is_none_or(|(best_fitness, best_row)| {
+        fitness < best_fitness || (fitness == best_fitness && row < best_row)
+    })
+}
+
+/// No row with fitness at least `lower` and index at least `first_row` can
+/// precede `best`.
+fn cannot_beat(lower: i64, first_row: usize, best: Option<(i64, usize)>) -> bool {
+    best.is_some_and(|(best_fitness, best_row)| {
+        lower > best_fitness || (lower == best_fitness && first_row > best_row)
+    })
+}
+
+fn point_params(point: &ParameterPoint) -> [Param; 6] {
+    [
+        point.temperature,
+        point.humidity,
+        point.continentalness,
+        point.erosion,
+        point.depth,
+        point.weirdness,
+    ]
+}
+
+/// Builds the subtree for `rows` into `tree` and returns its index. Rows
+/// are split at the median of the widest dimension's interval midpoints.
+fn build_node(
+    entries: &[(String, ParameterPoint)],
+    rows: &mut [usize],
+    tree: &mut Vec<SearchNode>,
+) -> usize {
+    let mut bounds = [Param {
+        min: i64::MAX,
+        max: i64::MIN,
+    }; 6];
+    let mut min_offset_squared = i64::MAX;
+    let mut first_row = usize::MAX;
+    for &row in rows.iter() {
+        let Some((_, point)) = entries.get(row) else {
+            continue;
+        };
+        for (bound, param) in bounds.iter_mut().zip(point_params(point)) {
+            bound.min = bound.min.min(param.min);
+            bound.max = bound.max.max(param.max);
+        }
+        min_offset_squared = min_offset_squared.min(square(point.offset));
+        first_row = first_row.min(row);
+    }
+    let index = tree.len();
+    tree.push(SearchNode {
+        bounds,
+        min_offset_squared,
+        first_row,
+        kind: SearchKind::Leaf(Box::new([])),
+    });
+    if rows.len() <= SEARCH_LEAF_ROWS {
+        if let Some(node) = tree.get_mut(index) {
+            node.kind = SearchKind::Leaf(rows.to_vec().into_boxed_slice());
+        }
+        return index;
+    }
+    let axis = (0..6)
+        .max_by_key(|&axis| bounds[axis].max.saturating_sub(bounds[axis].min))
+        .unwrap_or(0);
+    let midpoint = |row: &usize| {
+        entries
+            .get(*row)
+            .map(|(_, point)| {
+                let param = point_params(point)[axis];
+                param.min / 2 + param.max / 2
+            })
+            .unwrap_or(0)
+    };
+    rows.sort_unstable_by_key(midpoint);
+    let (low, high) = rows.split_at_mut(rows.len() / 2);
+    let left = build_node(entries, low, tree);
+    let right = build_node(entries, high, tree);
+    if let Some(node) = tree.get_mut(index) {
+        node.kind = SearchKind::Branch(left, right);
+    }
+    index
+}
+
 fn square(value: i64) -> i64 {
     value * value
 }
@@ -87,6 +244,12 @@ pub fn quantize_coord(value: f32) -> i64 {
 #[derive(Debug, Clone)]
 pub struct BiomePlacement {
     entries: Vec<(String, ParameterPoint)>,
+    /// Bounding-box tree over `entries` for exact nearest-row search.
+    tree: Vec<SearchNode>,
+    /// Row that won the previous lookup. Neighbouring quart cells usually
+    /// select the same biome, so testing it first gives a tight bound for
+    /// pruning; it never changes which row wins (see [`Self::find`]).
+    last_winner: Cell<Option<usize>>,
 }
 
 impl BiomePlacement {
@@ -143,21 +306,90 @@ impl BiomePlacement {
             };
             entries.push((id.to_owned(), point));
         }
-        (!entries.is_empty()).then_some(Self { entries })
+        (!entries.is_empty()).then(|| Self::from_entries(entries))
     }
 
     /// Nearest entry for a quantized target; ties resolve to the earlier
     /// table entry, matching the reference (brute-force) implementation
     /// the game itself uses for testing.
+    ///
+    /// The scan is exact but pruned: a row's fitness is a sum of
+    /// non-negative terms, so once its partial sum shows it cannot beat the
+    /// best `(fitness, row)` so far under that order it is skipped. The
+    /// previous lookup's winner is evaluated first to start with a tight
+    /// bound. Both only skip rows that cannot win, so the result is the
+    /// row the full scan returns.
     pub fn find(&self, target: &[i64; 6]) -> Option<&str> {
-        let mut best: Option<(i64, &str)> = None;
-        for (id, point) in &self.entries {
-            let fitness = point.fitness(target);
-            if best.is_none_or(|(previous, _)| fitness < previous) {
-                best = Some((fitness, id));
+        let mut best: Option<(i64, usize)> = self
+            .last_winner
+            .get()
+            .and_then(|row| Some((self.entries.get(row)?.1.fitness(target), row)));
+        if !self.tree.is_empty() {
+            self.search(0, target, &mut best);
+        }
+        let (_, row) = best?;
+        self.last_winner.set(Some(row));
+        self.entries.get(row).map(|(id, _)| id.as_str())
+    }
+
+    /// Builds the table and its search tree.
+    fn from_entries(entries: Vec<(String, ParameterPoint)>) -> Self {
+        let mut tree = Vec::new();
+        let mut rows: Vec<usize> = (0..entries.len()).collect();
+        if !rows.is_empty() {
+            build_node(&entries, &mut rows, &mut tree);
+        }
+        Self {
+            entries,
+            tree,
+            last_winner: Cell::new(None),
+        }
+    }
+
+    /// Depth-first search below `node`, updating `best` with any row that
+    /// beats it under the `(fitness, row)` order. A subtree is skipped only
+    /// when its lower bound proves none of its rows can.
+    fn search(&self, node: usize, target: &[i64; 6], best: &mut Option<(i64, usize)>) {
+        let Some(current) = self.tree.get(node) else {
+            return;
+        };
+        match &current.kind {
+            SearchKind::Leaf(rows) => {
+                for &row in rows.iter() {
+                    if best.is_some_and(|(_, best_row)| best_row == row) {
+                        continue;
+                    }
+                    let Some((_, point)) = self.entries.get(row) else {
+                        continue;
+                    };
+                    if let Some(fitness) = point.fitness_if_better(target, *best, row)
+                        && beats(fitness, row, *best)
+                    {
+                        *best = Some((fitness, row));
+                    }
+                }
+            }
+            SearchKind::Branch(left, right) => {
+                let bound = |child: usize| {
+                    self.tree
+                        .get(child)
+                        .map(|node| (node.lower_bound(target), node.first_row))
+                };
+                let mut children = [(*left, bound(*left)), (*right, bound(*right))];
+                if children[1].1 < children[0].1 {
+                    children.swap(0, 1);
+                }
+                for (child, child_bound) in children {
+                    let Some((lower, first_row)) = child_bound else {
+                        continue;
+                    };
+                    if cannot_beat(lower, first_row, *best) {
+                        continue;
+                    }
+                    self.search(child, target, best);
+                }
             }
         }
-        best.map(|(_, id)| id)
     }
 
     /// The biomes this table can select, in the order the table declares
@@ -260,6 +492,93 @@ fn test_table() -> BiomePlacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference rule `find` must reproduce: the first row with the
+    /// smallest fitness.
+    fn brute_force<'a>(table: &'a BiomePlacement, target: &[i64; 6]) -> Option<&'a str> {
+        let mut best: Option<(i64, &str)> = None;
+        for (id, point) in &table.entries {
+            let fitness = point.fitness(target);
+            if best.is_none_or(|(previous, _)| fitness < previous) {
+                best = Some((fitness, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    fn lcg_targets(count: usize, spread: i64) -> Vec<[i64; 6]> {
+        let mut state = 0x2026_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as i64 % (2 * spread + 1)) - spread
+        };
+        (0..count)
+            .map(|_| [next(), next(), next(), next(), next(), next()])
+            .collect()
+    }
+
+    #[test]
+    fn pruned_search_matches_brute_force_including_ties() {
+        // Identical rows and rows that tie at many targets: the earlier row
+        // must keep winning however the previous lookup primed the search.
+        let row = |name: &str, min: i64, max: i64, offset: i64| {
+            let param = Param { min, max };
+            (
+                name.to_owned(),
+                ParameterPoint {
+                    temperature: param,
+                    humidity: param,
+                    continentalness: param,
+                    erosion: param,
+                    depth: param,
+                    weirdness: param,
+                    offset,
+                },
+            )
+        };
+        let table = BiomePlacement::from_entries(vec![
+            row("a", -100, 100, 0),
+            row("b", -100, 100, 0),
+            row("c", 0, 500, 0),
+            row("d", -500, 0, 0),
+            row("e", 0, 500, 0),
+            row("f", -50, 50, 10),
+        ]);
+        for target in lcg_targets(5_000, 800) {
+            assert_eq!(
+                table.find(&target),
+                brute_force(&table, &target),
+                "{target:?}"
+            );
+        }
+        // Prime with a later tying row, then ask for a point where an earlier
+        // row ties with it.
+        table.last_winner.set(Some(4));
+        assert_eq!(table.find(&[300; 6]), Some("c"));
+        table.last_winner.set(Some(1));
+        assert_eq!(table.find(&[0; 6]), Some("a"));
+    }
+
+    /// Run with:
+    /// `RUSTMC_VANILLA_DATA=<root> cargo test -p rustmc-server --lib -- --ignored pruned_search_matches_brute_force_on_the_vanilla_table`
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pruned_search_matches_brute_force_on_the_vanilla_table() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .expect("set RUSTMC_VANILLA_DATA to the provisioned 26.3 data root");
+        let table = BiomePlacement::load(&root, "overworld").expect("overworld placement table");
+        // Quantized climate values span roughly +/-2 * 10_000.
+        for target in lcg_targets(50_000, 20_000) {
+            assert_eq!(
+                table.find(&target),
+                brute_force(&table, &target),
+                "{target:?}"
+            );
+        }
+    }
 
     #[test]
     fn quantization_truncates_toward_zero() {
