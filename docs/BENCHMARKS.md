@@ -107,3 +107,44 @@ full scan on 5,000 synthetic and 50,000 random targets against the vanilla
 table; all ignored data-root tests pass. Still open: the remaining time is
 spread between Perlin sampling (about half) and biome search (about a
 third); end-to-end client delivery timings are not yet recorded.
+
+### Per-chunk density volume fill and local hot caches
+
+Method: same single-threaded release measurement as above (seed 2026, cold
+first pass on a freshly constructed generator, 4×4 chunk square at origin plus
+one isolated chunk at `(500, 500)`).
+
+| Mode (ms per chunk) | Before | After per-chunk density fill | After climate fill + local aquifer cache |
+| --- | ---: | ---: | ---: |
+| `columns` (4×4) | 528.06 | 260.96 | 221.55 |
+| `substance` (4×4) | 178.52 | 26.24 | 17.15 |
+| `heights` (4×4) | 73.68 | 17.72 | 12.20 |
+| `columns` isolated `(500, 500)` | 3,233.18 | 1,027.94 | 901.95 |
+
+What changed:
+
+- `VanillaGenerator` now fills `final_density` once per chunk (`16 × height × 16`)
+  via `Density::sample_volume` into a bounded 16-chunk (two-generation, 32-entry
+  / 12 MiB cap) cache, and all per-chunk column readers (`base_column_ids`,
+  `surface`, `top_block`, `substance`, `terrain_top`, `terrain_top_exhaustive`)
+  index into that array instead of calling `Density::sample` block-by-block.
+- `Density::sample_volume` also dispatches `Unary`, `Clamp`, `BlendDensity`,
+  `RangeChoice`, and `y`-independent leaves, and `fill_interpolated_cell`
+  evaluates in `lerp3` order so volume-filled `final_density` values are
+  bit-identical to point samples.
+- `chunk_biomes` fills the six climate densities over a chunk's `4 × (height/4) × 4`
+  quart grid via `sample_volume` and populates the quart biome cache column by
+  column (`y` innermost).
+- `NoiseBasedAquifer` keeps a single-chunk flat `3 × 48 × 3` cell-center and
+  fluid-status array plus cached skip bound so per-block queries avoid repeated
+  hash lookups while keeping the cross-chunk `BoundedCache` stores intact.
+
+Evidence: 81/81 chunk packets around spawn (radius 4) are byte-identical to
+the baseline build, oracle `substance` and `census_compare` outputs against the
+seed-2026 save are byte-identical, and all 63 ignored data-root tests pass
+(including bit-identical volume-vs-point `final_density` and climate-target
+checks over four chunks). In a CPU profile of `columns`, the remaining time is
+dominated by `BiomePlacement::search` (58.51 %), `PerlinNoise` sampling (17.06 %
+across `sample_and_lerp`, `get_smeared`, and `get`), and `Density::sample`
+(5.52 %); a flat compiled density program was skipped because `Density::sample`
+dispatch is below 10 %.
