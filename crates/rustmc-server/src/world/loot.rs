@@ -89,7 +89,7 @@ use serde_json::{Map, Value};
 
 use crate::item::{
     ItemComponents, ItemDefaults, ItemDefaultsError, ItemStack, MAX_STACK_LIMIT,
-    MIN_ENCHANTMENT_LEVEL, default_max_stack, items_equal, normalize_item_id,
+    MIN_ENCHANTMENT_LEVEL, TextComponent, default_max_stack, items_equal, normalize_item_id,
 };
 use crate::vanilla::feature::{BlockTags, EnchantmentTags, ItemTags, load_tag_entries};
 use crate::vanilla::random::RandomSource;
@@ -5056,7 +5056,9 @@ fn apply_modifier(
             apply_set_damage(damage, *add, drop, ctx.item_defaults, random);
         }
         LootModifier::SetName { name, target, .. } => match target {
-            SetNameTarget::CustomName => drop.components.set_custom_name(Some(name.clone())),
+            SetNameTarget::CustomName => drop
+                .components
+                .set_custom_name(Some(TextComponent::Literal(name.clone()))),
             SetNameTarget::ItemName => {
                 notes.push(LootNote::UnsupportedModifier {
                     item: ensure_namespaced(&drop.item),

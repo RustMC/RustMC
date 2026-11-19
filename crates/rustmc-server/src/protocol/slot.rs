@@ -91,7 +91,7 @@ use std::fmt;
 
 use crate::item::{
     ArmorTrim, ItemComponents, ItemStack, ItemStackError, MAX_STACK_LIMIT, MIN_ENCHANTMENT_LEVEL,
-    default_max_stack,
+    TextComponent, default_max_stack,
 };
 use crate::java_wire::{self, MAX_NBT_STRING_BYTES, WireError, put_varint};
 use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
@@ -720,7 +720,7 @@ pub fn decode_slot(
             COMPONENT_CUSTOM_NAME => {
                 let (name, n) = decode_custom_name(input)?;
                 input = &input[n..];
-                components.set_custom_name(Some(name));
+                components.set_custom_name(Some(TextComponent::Literal(name)));
             }
             COMPONENT_ENCHANTMENTS => {
                 let (map, n) = decode_enchantment_map(input, dynamic_ids)?;

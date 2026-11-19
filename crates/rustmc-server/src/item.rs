@@ -62,6 +62,25 @@ pub const DEFAULT_CONSUME_PARTICLES: bool = true;
 /// "`can_always_eat`: If `true`, this item can be eaten even if the player is not hungry. Defaults to `false`."
 pub const DEFAULT_FOOD_CAN_ALWAYS_EAT: bool = false;
 
+/// Default effect duration in ticks (`8 seconds`) for an entry in
+/// `minecraft:suspicious_stew_effects` when `duration` is omitted.
+///
+/// Source: minecraft.wiki `Data component format/suspicious stew effects` (revision 3277335):
+/// "`duration`: The duration of the effect in ticks. Defaults to 160."
+pub const DEFAULT_STEW_EFFECT_DURATION_TICKS: u32 = 160;
+
+/// Minimum valid amplifier for `minecraft:ominous_bottle_amplifier` (`0`, Bad Omen I).
+///
+/// Source: minecraft.wiki `Data component format/ominous bottle amplifier` (revision 3277333):
+/// "`minecraft:ominous_bottle_amplifier`: ... Must be a non-negative integer from 0 to 4 (inclusive)."
+pub const MIN_OMINOUS_BOTTLE_AMPLIFIER: u8 = 0;
+
+/// Maximum valid amplifier for `minecraft:ominous_bottle_amplifier` (`4`, Bad Omen V).
+///
+/// Source: minecraft.wiki `Data component format/ominous bottle amplifier` (revision 3277333):
+/// "`minecraft:ominous_bottle_amplifier`: ... Must be a non-negative integer from 0 to 4 (inclusive)."
+pub const MAX_OMINOUS_BOTTLE_AMPLIFIER: u8 = 4;
+
 /// Strips an optional `minecraft:` namespace prefix for canonical item comparison.
 #[inline]
 #[must_use]
@@ -88,7 +107,8 @@ pub fn default_max_stack(item: &str) -> u16 {
     }
 }
 
-/// Rejection reasons when constructing or validating [`ItemComponents`] or [`ArmorTrim`].
+/// Rejection reasons when constructing or validating [`ItemComponents`],
+/// [`ArmorTrim`], or [`SuspiciousStewEffect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemComponentsError {
     /// Enchantment identifier is not a valid namespaced resource location.
@@ -101,6 +121,12 @@ pub enum ItemComponentsError {
     InvalidTrimPattern,
     /// Armor trim material identifier is not a valid namespaced resource location.
     InvalidTrimMaterial,
+    /// Suspicious stew mob effect identifier is not a valid namespaced resource location.
+    InvalidEffectId,
+    /// Instrument identifier is not a valid namespaced resource location.
+    InvalidInstrumentId,
+    /// Ominous bottle amplifier is outside `MIN_OMINOUS_BOTTLE_AMPLIFIER..=MAX_OMINOUS_BOTTLE_AMPLIFIER` (`0..=4`).
+    InvalidOminousBottleAmplifier(u8),
 }
 
 impl fmt::Display for ItemComponentsError {
@@ -114,6 +140,12 @@ impl fmt::Display for ItemComponentsError {
             Self::InvalidPotionId => f.write_str("invalid namespaced potion id"),
             Self::InvalidTrimPattern => f.write_str("invalid namespaced trim pattern id"),
             Self::InvalidTrimMaterial => f.write_str("invalid namespaced trim material id"),
+            Self::InvalidEffectId => f.write_str("invalid namespaced mob effect id"),
+            Self::InvalidInstrumentId => f.write_str("invalid namespaced instrument id"),
+            Self::InvalidOminousBottleAmplifier(amplifier) => write!(
+                f,
+                "ominous bottle amplifier {amplifier} must be in {MIN_OMINOUS_BOTTLE_AMPLIFIER}..={MAX_OMINOUS_BOTTLE_AMPLIFIER}"
+            ),
         }
     }
 }
@@ -238,6 +270,139 @@ fn replace_enchantments(
     Ok(())
 }
 
+/// Minimal text component for `minecraft:custom_name` and `minecraft:item_name`,
+/// modeling plain literal strings and unparameterized translation keys.
+///
+/// Sources (minecraft.wiki `Text component format` revision 3862222):
+/// - String / `{"text": ...}`: `"A string containing plain text to display directly."`
+/// - `{"translate": ...}`: `"A translation identifier, corresponding to the identifiers
+///   found in loaded language files."`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TextComponent {
+    /// Plain literal text (`"..."` or `{"text": "..."}`).
+    Literal(String),
+    /// Translation key (`{"translate": key}`).
+    Translatable { key: String },
+}
+
+impl TextComponent {
+    /// Constructs a plain literal text component.
+    #[must_use]
+    pub fn literal(text: impl Into<String>) -> Self {
+        Self::Literal(text.into())
+    }
+
+    /// Constructs a translatable text component from a translation key.
+    #[must_use]
+    pub fn translatable(key: impl Into<String>) -> Self {
+        Self::Translatable { key: key.into() }
+    }
+
+    /// Returns the plain text if this component is [`TextComponent::Literal`].
+    #[must_use]
+    pub fn as_literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(text) => Some(text),
+            Self::Translatable { .. } => None,
+        }
+    }
+
+    /// Returns the translation key if this component is [`TextComponent::Translatable`].
+    #[must_use]
+    pub fn translation_key(&self) -> Option<&str> {
+        match self {
+            Self::Translatable { key } => Some(key),
+            Self::Literal(_) => None,
+        }
+    }
+}
+
+impl From<String> for TextComponent {
+    fn from(text: String) -> Self {
+        Self::Literal(text)
+    }
+}
+
+impl From<&str> for TextComponent {
+    fn from(text: &str) -> Self {
+        Self::Literal(text.to_owned())
+    }
+}
+
+/// Single status effect entry stored in `minecraft:suspicious_stew_effects`.
+///
+/// Source: minecraft.wiki `Data component format/suspicious stew effects` (revision 3277335):
+/// "`minecraft:suspicious_stew_effects`: A list of unamplified mob effects given to the player
+/// or mob upon consuming this item (normally a suspicious stew)."
+/// "`id`: The ID of the effect. `duration`: The duration of the effect in ticks. Defaults to 160."
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SuspiciousStewEffect {
+    id: String,
+    duration_ticks: u32,
+}
+
+impl SuspiciousStewEffect {
+    /// Constructs a validated [`SuspiciousStewEffect`], ensuring `id` is a
+    /// non-empty namespaced resource location.
+    pub fn try_new(
+        id: impl Into<String>,
+        duration_ticks: u32,
+    ) -> Result<Self, ItemComponentsError> {
+        let entry = Self {
+            id: id.into(),
+            duration_ticks,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Constructs a validated [`SuspiciousStewEffect`] using
+    /// [`DEFAULT_STEW_EFFECT_DURATION_TICKS`] (`160`).
+    pub fn with_default_duration(id: impl Into<String>) -> Result<Self, ItemComponentsError> {
+        Self::try_new(id, DEFAULT_STEW_EFFECT_DURATION_TICKS)
+    }
+
+    /// Returns the namespaced mob effect identifier (for example `"minecraft:night_vision"`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the effect duration in ticks.
+    #[must_use]
+    pub const fn duration_ticks(&self) -> u32 {
+        self.duration_ticks
+    }
+
+    fn validate(&self) -> Result<(), ItemComponentsError> {
+        if !valid_item_id(&self.id) {
+            return Err(ItemComponentsError::InvalidEffectId);
+        }
+        Ok(())
+    }
+}
+
+fn validate_optional_id(
+    value: Option<&str>,
+    err: ItemComponentsError,
+) -> Result<(), ItemComponentsError> {
+    if let Some(id) = value
+        && !valid_item_id(id)
+    {
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn validate_ominous_bottle_amplifier(amplifier: Option<u8>) -> Result<(), ItemComponentsError> {
+    if let Some(amp) = amplifier
+        && !(MIN_OMINOUS_BOTTLE_AMPLIFIER..=MAX_OMINOUS_BOTTLE_AMPLIFIER).contains(&amp)
+    {
+        return Err(ItemComponentsError::InvalidOminousBottleAmplifier(amp));
+    }
+    Ok(())
+}
+
 /// Typed per-item data components modeled by RustMC.
 ///
 /// Sources (minecraft.wiki `Data component format` revision 3903955 and subpages):
@@ -247,6 +412,11 @@ fn replace_enchantments(
 /// - `Data component format/custom name` (revision 3863465):
 ///   "`minecraft:custom_name`: The player-assigned name of this item, block, or entity,
 ///   typically assigned with an anvil or a name tag."
+/// - `Data component format/item name` (revision 3728022):
+///   "`minecraft:item_name`: The default name of this item, as a text component, present on
+///   all items by default. Unlike the `minecraft:custom_name` component, this name cannot be
+///   erased using an anvil, is not italicized, and does not appear in some labels, such as
+///   banner markers and item frames."
 /// - `Data component format/enchantments` (revision 3849825):
 ///   "`minecraft:enchantments`: Contains a map of each of this item's enchantments to
 ///   its enchantment level."
@@ -262,15 +432,29 @@ fn replace_enchantments(
 ///   "`potion`: The ID of a potion type. Optional."
 /// - `Data component format/trim` (revision 3685746):
 ///   "`minecraft:trim`: Contains the trim applied to this armor piece."
+/// - `Data component format/suspicious stew effects` (revision 3277335):
+///   "`minecraft:suspicious_stew_effects`: A list of unamplified mob effects given to the
+///   player or mob upon consuming this item (normally a suspicious stew)."
+/// - `Data component format/instrument` (revision 3685633):
+///   "`minecraft:instrument`: ... If present on an item, the description of the instrument is
+///   shown in the item's tooltip as gray text."
+/// - `Data component format/ominous bottle amplifier` (revision 3277333):
+///   "`minecraft:ominous_bottle_amplifier`: The amplifier of the Bad Omen effect given to the
+///   player or mob upon consuming this item (normally an ominous bottle). Must be a
+///   non-negative integer from 0 to 4 (inclusive)."
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ItemComponents {
     damage: Option<u32>,
-    custom_name: Option<String>,
+    custom_name: Option<TextComponent>,
+    item_name: Option<TextComponent>,
     enchantments: BTreeMap<String, u8>,
     stored_enchantments: BTreeMap<String, u8>,
     repair_cost: Option<u32>,
     potion: Option<String>,
     trim: Option<ArmorTrim>,
+    suspicious_stew_effects: Vec<SuspiciousStewEffect>,
+    instrument: Option<String>,
+    ominous_bottle_amplifier: Option<u8>,
 }
 
 static EMPTY_COMPONENTS: ItemComponents = ItemComponents::new();
@@ -282,11 +466,15 @@ impl ItemComponents {
         Self {
             damage: None,
             custom_name: None,
+            item_name: None,
             enchantments: BTreeMap::new(),
             stored_enchantments: BTreeMap::new(),
             repair_cost: None,
             potion: None,
             trim: None,
+            suspicious_stew_effects: Vec::new(),
+            instrument: None,
+            ominous_bottle_amplifier: None,
         }
     }
 
@@ -295,11 +483,15 @@ impl ItemComponents {
     pub fn is_empty(&self) -> bool {
         self.damage.is_none()
             && self.custom_name.is_none()
+            && self.item_name.is_none()
             && self.enchantments.is_empty()
             && self.stored_enchantments.is_empty()
             && self.repair_cost.is_none()
             && self.potion.is_none()
             && self.trim.is_none()
+            && self.suspicious_stew_effects.is_empty()
+            && self.instrument.is_none()
+            && self.ominous_bottle_amplifier.is_none()
     }
 
     /// Returns the `minecraft:damage` component (uses consumed), if set.
@@ -308,10 +500,30 @@ impl ItemComponents {
         self.damage
     }
 
-    /// Returns the `minecraft:custom_name` component, if set.
+    /// Returns the plain-text `minecraft:custom_name` component, if set as literal text.
     #[must_use]
     pub fn custom_name(&self) -> Option<&str> {
-        self.custom_name.as_deref()
+        self.custom_name
+            .as_ref()
+            .and_then(TextComponent::as_literal)
+    }
+
+    /// Returns the `minecraft:custom_name` text component, if set.
+    #[must_use]
+    pub fn custom_name_component(&self) -> Option<&TextComponent> {
+        self.custom_name.as_ref()
+    }
+
+    /// Returns the plain-text `minecraft:item_name` component, if set as literal text.
+    #[must_use]
+    pub fn item_name(&self) -> Option<&str> {
+        self.item_name.as_ref().and_then(TextComponent::as_literal)
+    }
+
+    /// Returns the `minecraft:item_name` text component, if set.
+    #[must_use]
+    pub fn item_name_component(&self) -> Option<&TextComponent> {
+        self.item_name.as_ref()
     }
 
     /// Returns the active `minecraft:enchantments` map.
@@ -344,6 +556,24 @@ impl ItemComponents {
         self.trim.as_ref()
     }
 
+    /// Returns the `minecraft:suspicious_stew_effects` list.
+    #[must_use]
+    pub fn suspicious_stew_effects(&self) -> &[SuspiciousStewEffect] {
+        &self.suspicious_stew_effects
+    }
+
+    /// Returns the `minecraft:instrument` identifier, if set.
+    #[must_use]
+    pub fn instrument(&self) -> Option<&str> {
+        self.instrument.as_deref()
+    }
+
+    /// Returns the `minecraft:ominous_bottle_amplifier` level (`0..=4`), if set.
+    #[must_use]
+    pub fn ominous_bottle_amplifier(&self) -> Option<u8> {
+        self.ominous_bottle_amplifier
+    }
+
     /// Sets `minecraft:damage` (uses consumed) on this component set.
     #[must_use]
     pub fn with_damage(mut self, damage: u32) -> Self {
@@ -353,8 +583,15 @@ impl ItemComponents {
 
     /// Sets `minecraft:custom_name` on this component set.
     #[must_use]
-    pub fn with_custom_name(mut self, custom_name: impl Into<String>) -> Self {
+    pub fn with_custom_name(mut self, custom_name: impl Into<TextComponent>) -> Self {
         self.custom_name = Some(custom_name.into());
+        self
+    }
+
+    /// Sets `minecraft:item_name` on this component set.
+    #[must_use]
+    pub fn with_item_name(mut self, item_name: impl Into<TextComponent>) -> Self {
+        self.item_name = Some(item_name.into());
         self
     }
 
@@ -416,14 +653,56 @@ impl ItemComponents {
         self
     }
 
+    /// Appends a validated entry to `minecraft:suspicious_stew_effects`.
+    pub fn with_suspicious_stew_effect(
+        mut self,
+        id: impl Into<String>,
+        duration_ticks: u32,
+    ) -> Result<Self, ItemComponentsError> {
+        self.add_suspicious_stew_effect(id, duration_ticks)?;
+        Ok(self)
+    }
+
+    /// Replaces `minecraft:suspicious_stew_effects` after validating every entry.
+    pub fn with_suspicious_stew_effects(
+        mut self,
+        effects: Vec<SuspiciousStewEffect>,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_suspicious_stew_effects(effects)?;
+        Ok(self)
+    }
+
+    /// Sets `minecraft:instrument` after validating its resource location.
+    pub fn with_instrument(
+        mut self,
+        instrument: impl Into<String>,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_instrument(Some(instrument.into()))?;
+        Ok(self)
+    }
+
+    /// Sets `minecraft:ominous_bottle_amplifier` after validating it is in `0..=4`.
+    pub fn with_ominous_bottle_amplifier(
+        mut self,
+        amplifier: u8,
+    ) -> Result<Self, ItemComponentsError> {
+        self.set_ominous_bottle_amplifier(Some(amplifier))?;
+        Ok(self)
+    }
+
     /// Sets or clears `minecraft:damage`.
     pub fn set_damage(&mut self, damage: Option<u32>) {
         self.damage = damage;
     }
 
     /// Sets or clears `minecraft:custom_name`.
-    pub fn set_custom_name(&mut self, custom_name: Option<String>) {
+    pub fn set_custom_name(&mut self, custom_name: Option<TextComponent>) {
         self.custom_name = custom_name;
+    }
+
+    /// Sets or clears `minecraft:item_name`.
+    pub fn set_item_name(&mut self, item_name: Option<TextComponent>) {
+        self.item_name = item_name;
     }
 
     /// Inserts or updates a validated enchantment in `minecraft:enchantments`.
@@ -477,11 +756,7 @@ impl ItemComponents {
 
     /// Sets or clears the `minecraft:potion_contents` base potion ID, validating resource location syntax.
     pub fn set_potion(&mut self, potion: Option<String>) -> Result<(), ItemComponentsError> {
-        if let Some(ref id) = potion
-            && !valid_item_id(id)
-        {
-            return Err(ItemComponentsError::InvalidPotionId);
-        }
+        validate_optional_id(potion.as_deref(), ItemComponentsError::InvalidPotionId)?;
         self.potion = potion;
         Ok(())
     }
@@ -491,18 +766,68 @@ impl ItemComponents {
         self.trim = trim;
     }
 
+    /// Appends a validated effect entry to `minecraft:suspicious_stew_effects`.
+    pub fn add_suspicious_stew_effect(
+        &mut self,
+        id: impl Into<String>,
+        duration_ticks: u32,
+    ) -> Result<(), ItemComponentsError> {
+        let entry = SuspiciousStewEffect::try_new(id, duration_ticks)?;
+        self.suspicious_stew_effects.push(entry);
+        Ok(())
+    }
+
+    /// Replaces `minecraft:suspicious_stew_effects` after validating every entry.
+    pub fn set_suspicious_stew_effects(
+        &mut self,
+        effects: Vec<SuspiciousStewEffect>,
+    ) -> Result<(), ItemComponentsError> {
+        for effect in &effects {
+            effect.validate()?;
+        }
+        self.suspicious_stew_effects = effects;
+        Ok(())
+    }
+
+    /// Sets or clears `minecraft:instrument`, validating resource location syntax.
+    pub fn set_instrument(
+        &mut self,
+        instrument: Option<String>,
+    ) -> Result<(), ItemComponentsError> {
+        validate_optional_id(
+            instrument.as_deref(),
+            ItemComponentsError::InvalidInstrumentId,
+        )?;
+        self.instrument = instrument;
+        Ok(())
+    }
+
+    /// Sets or clears `minecraft:ominous_bottle_amplifier`, validating `0..=4`.
+    pub fn set_ominous_bottle_amplifier(
+        &mut self,
+        amplifier: Option<u8>,
+    ) -> Result<(), ItemComponentsError> {
+        validate_ominous_bottle_amplifier(amplifier)?;
+        self.ominous_bottle_amplifier = amplifier;
+        Ok(())
+    }
+
     /// Validates all component fields against Java Edition rules.
     pub fn validate(&self) -> Result<(), ItemComponentsError> {
         validate_enchantment_map(&self.enchantments)?;
         validate_enchantment_map(&self.stored_enchantments)?;
-        if let Some(ref id) = self.potion
-            && !valid_item_id(id)
-        {
-            return Err(ItemComponentsError::InvalidPotionId);
-        }
+        validate_optional_id(self.potion.as_deref(), ItemComponentsError::InvalidPotionId)?;
         if let Some(ref trim) = self.trim {
             trim.validate()?;
         }
+        for effect in &self.suspicious_stew_effects {
+            effect.validate()?;
+        }
+        validate_optional_id(
+            self.instrument.as_deref(),
+            ItemComponentsError::InvalidInstrumentId,
+        )?;
+        validate_ominous_bottle_amplifier(self.ominous_bottle_amplifier)?;
         Ok(())
     }
 }
@@ -1760,11 +2085,17 @@ mod tests {
         assert!(a.is_empty());
         assert_eq!(a.damage(), None);
         assert_eq!(a.custom_name(), None);
+        assert_eq!(a.custom_name_component(), None);
+        assert_eq!(a.item_name(), None);
+        assert_eq!(a.item_name_component(), None);
         assert!(a.enchantments().is_empty());
         assert!(a.stored_enchantments().is_empty());
         assert_eq!(a.repair_cost(), None);
         assert_eq!(a.potion(), None);
         assert_eq!(a.trim(), None);
+        assert!(a.suspicious_stew_effects().is_empty());
+        assert_eq!(a.instrument(), None);
+        assert_eq!(a.ominous_bottle_amplifier(), None);
 
         let stack = ItemStack::try_new("minecraft:stone", 1, 64).unwrap();
         assert_eq!(stack.components(), &a);
@@ -1812,7 +2143,36 @@ mod tests {
                 ArmorTrim::try_new("minecraft:coast", invalid_id),
                 Err(ItemComponentsError::InvalidTrimMaterial)
             );
+            assert_eq!(
+                SuspiciousStewEffect::try_new(invalid_id, 100),
+                Err(ItemComponentsError::InvalidEffectId)
+            );
+            assert_eq!(
+                ItemComponents::new().with_suspicious_stew_effect(invalid_id, 100),
+                Err(ItemComponentsError::InvalidEffectId)
+            );
+            assert_eq!(
+                ItemComponents::new().with_instrument(invalid_id),
+                Err(ItemComponentsError::InvalidInstrumentId)
+            );
         }
+
+        assert_eq!(
+            ItemComponents::new().with_ominous_bottle_amplifier(5),
+            Err(ItemComponentsError::InvalidOminousBottleAmplifier(5))
+        );
+        assert_eq!(
+            ItemComponents::new().set_ominous_bottle_amplifier(Some(255)),
+            Err(ItemComponentsError::InvalidOminousBottleAmplifier(255))
+        );
+
+        let stew_default = SuspiciousStewEffect::with_default_duration("minecraft:poison").unwrap();
+        assert_eq!(stew_default.id(), "minecraft:poison");
+        assert_eq!(
+            stew_default.duration_ticks(),
+            DEFAULT_STEW_EFFECT_DURATION_TICKS
+        );
+        assert_eq!(stew_default.duration_ticks(), 160);
 
         let trim = ArmorTrim::try_new("minecraft:coast", "minecraft:gold_ingot").unwrap();
         assert_eq!(trim.pattern(), "minecraft:coast");
@@ -1821,6 +2181,7 @@ mod tests {
         let built = ItemComponents::new()
             .with_damage(12)
             .with_custom_name("Blade")
+            .with_item_name(TextComponent::translatable("filled_map.buried_treasure"))
             .with_enchantment("minecraft:sharpness", 255)
             .unwrap()
             .with_stored_enchantment("minecraft:unbreaking", 1)
@@ -1828,11 +2189,28 @@ mod tests {
             .with_repair_cost(3)
             .with_potion("minecraft:healing")
             .unwrap()
-            .with_trim(trim.clone());
+            .with_trim(trim.clone())
+            .with_suspicious_stew_effect("minecraft:night_vision", 140)
+            .unwrap()
+            .with_instrument("minecraft:ponder_goat_horn")
+            .unwrap()
+            .with_ominous_bottle_amplifier(4)
+            .unwrap();
 
         assert!(!built.is_empty());
         assert_eq!(built.damage(), Some(12));
         assert_eq!(built.custom_name(), Some("Blade"));
+        assert_eq!(
+            built.custom_name_component(),
+            Some(&TextComponent::Literal("Blade".to_owned()))
+        );
+        assert_eq!(built.item_name(), None);
+        assert_eq!(
+            built.item_name_component(),
+            Some(&TextComponent::Translatable {
+                key: "filled_map.buried_treasure".to_owned()
+            })
+        );
         assert_eq!(built.enchantments().get("minecraft:sharpness"), Some(&255));
         assert_eq!(
             built.stored_enchantments().get("minecraft:unbreaking"),
@@ -1841,6 +2219,36 @@ mod tests {
         assert_eq!(built.repair_cost(), Some(3));
         assert_eq!(built.potion(), Some("minecraft:healing"));
         assert_eq!(built.trim(), Some(&trim));
+        assert_eq!(
+            built.suspicious_stew_effects(),
+            &[SuspiciousStewEffect::try_new("minecraft:night_vision", 140).unwrap()]
+        );
+        assert_eq!(built.instrument(), Some("minecraft:ponder_goat_horn"));
+        assert_eq!(built.ominous_bottle_amplifier(), Some(4));
+
+        let literal_item_name = ItemComponents::new().with_item_name("Wayfinder");
+        assert_eq!(literal_item_name.item_name(), Some("Wayfinder"));
+        assert_eq!(
+            literal_item_name.item_name_component(),
+            Some(&TextComponent::Literal("Wayfinder".to_owned()))
+        );
+
+        let translatable_custom = ItemComponents::new()
+            .with_custom_name(TextComponent::translatable("item.example.custom"));
+        assert_eq!(translatable_custom.custom_name(), None);
+        assert_eq!(
+            translatable_custom
+                .custom_name_component()
+                .and_then(TextComponent::translation_key),
+            Some("item.example.custom")
+        );
+
+        for amp in MIN_OMINOUS_BOTTLE_AMPLIFIER..=MAX_OMINOUS_BOTTLE_AMPLIFIER {
+            let ok = ItemComponents::new()
+                .with_ominous_bottle_amplifier(amp)
+                .expect("0..=4 is valid");
+            assert_eq!(ok.ominous_bottle_amplifier(), Some(amp));
+        }
 
         for err in [
             ItemComponentsError::InvalidEnchantmentId,
@@ -1848,6 +2256,9 @@ mod tests {
             ItemComponentsError::InvalidPotionId,
             ItemComponentsError::InvalidTrimPattern,
             ItemComponentsError::InvalidTrimMaterial,
+            ItemComponentsError::InvalidEffectId,
+            ItemComponentsError::InvalidInstrumentId,
+            ItemComponentsError::InvalidOminousBottleAmplifier(5),
         ] {
             let text = err.to_string();
             assert!(!text.is_empty());
@@ -1913,6 +2324,101 @@ mod tests {
         assert_eq!(rest.count(), 5);
         assert_eq!(rest.components(), &expected_components);
         assert!(taken.can_stack_with(&rest));
+
+        // Different instruments, stew effects, item_names, or ominous bottle amplifiers do not stack.
+        let horn_ponder = ItemStack::try_new("minecraft:goat_horn", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_instrument("minecraft:ponder_goat_horn")
+                    .unwrap(),
+            )
+            .unwrap();
+        let horn_sing = ItemStack::try_new("minecraft:goat_horn", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_instrument("minecraft:sing_goat_horn")
+                    .unwrap(),
+            )
+            .unwrap();
+        let horn_ponder_2 = ItemStack::try_new("minecraft:goat_horn", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_instrument("minecraft:ponder_goat_horn")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!horn_ponder.can_stack_with(&horn_sing));
+        assert!(horn_ponder.can_stack_with(&horn_ponder_2));
+
+        let stew_nv = ItemStack::try_new("minecraft:suspicious_stew", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_suspicious_stew_effect("minecraft:night_vision", 160)
+                    .unwrap(),
+            )
+            .unwrap();
+        let stew_nv_longer = ItemStack::try_new("minecraft:suspicious_stew", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_suspicious_stew_effect("minecraft:night_vision", 200)
+                    .unwrap(),
+            )
+            .unwrap();
+        let stew_blind = ItemStack::try_new("minecraft:suspicious_stew", 1, 1)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_suspicious_stew_effect("minecraft:blindness", 160)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!stew_nv.can_stack_with(&stew_nv_longer));
+        assert!(!stew_nv.can_stack_with(&stew_blind));
+
+        let bottle_0 = ItemStack::try_new("minecraft:ominous_bottle", 1, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_ominous_bottle_amplifier(0)
+                    .unwrap(),
+            )
+            .unwrap();
+        let bottle_1 = ItemStack::try_new("minecraft:ominous_bottle", 1, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_ominous_bottle_amplifier(1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let bottle_1b = ItemStack::try_new("minecraft:ominous_bottle", 2, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_ominous_bottle_amplifier(1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!bottle_0.can_stack_with(&bottle_1));
+        assert!(bottle_1.can_stack_with(&bottle_1b));
+
+        let item_named_lit = ItemStack::try_new("minecraft:map", 1, 64)
+            .unwrap()
+            .with_components(ItemComponents::new().with_item_name("Treasure Map"))
+            .unwrap();
+        let item_named_tr = ItemStack::try_new("minecraft:map", 1, 64)
+            .unwrap()
+            .with_components(
+                ItemComponents::new()
+                    .with_item_name(TextComponent::translatable("filled_map.buried_treasure")),
+            )
+            .unwrap();
+        assert!(!item_named_lit.can_stack_with(&item_named_tr));
     }
 
     #[test]

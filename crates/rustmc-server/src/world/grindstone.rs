@@ -176,8 +176,8 @@ fn single_item_result(
                 .max_stack_size(BOOK_ITEM_ID)
                 .map_or(DEFAULT_MAX_STACK, u16::from);
             let mut components = ItemComponents::new();
-            if let Some(name) = input.components().custom_name() {
-                components.set_custom_name(Some(name.to_owned()));
+            if let Some(name) = input.components().custom_name_component() {
+                components.set_custom_name(Some(name.clone()));
             }
             ItemStack::try_new(BOOK_ITEM_ID, input.count(), book_max_stack)
                 .ok()?
@@ -248,8 +248,8 @@ fn two_item_result(
     if result_damage > 0 {
         components.set_damage(Some(result_damage));
     }
-    if let Some(name) = top.components().custom_name() {
-        components.set_custom_name(Some(name.to_owned()));
+    if let Some(name) = top.components().custom_name_component() {
+        components.set_custom_name(Some(name.clone()));
     }
     if let Some(trim) = top.components().trim() {
         components.set_trim(Some(trim.clone()));
