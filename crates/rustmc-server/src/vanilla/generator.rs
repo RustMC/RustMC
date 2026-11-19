@@ -30,7 +30,9 @@ use std::rc::Rc;
 use crate::vanilla::aquifer::{
     Aquifer, AquiferOccupancy, Fluid, GlobalFluid, NoiseBasedAquifer, Substance,
 };
-use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
+use crate::vanilla::biome::{
+    BiomePlacement, ClimateSampler, ColumnSearchScratch, fixed_climate_coords, fixed_run_len,
+};
 use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
 use crate::vanilla::density::DensityVolume;
@@ -227,6 +229,24 @@ impl CacheOccupancy {
     }
 }
 
+/// Reusable buffers for `chunk_biomes` climate volume fills and column-run
+/// placement searches, preventing per-run and per-cell allocations.
+#[derive(Default)]
+struct ClimateScratch {
+    density: Vec<f32>,
+    targets: Vec<[i64; 6]>,
+    column: ColumnRunScratch,
+}
+
+/// Per-run scratch buffers owned by [`ClimateScratch`].
+#[derive(Default)]
+struct ColumnRunScratch {
+    search: ColumnSearchScratch,
+    depths: Vec<i64>,
+    keys: Vec<(i32, i32, i32)>,
+    rows: Vec<usize>,
+}
+
 /// One dimension's column-height, biome, and top-block source, built from
 /// operator-provisioned data (never committed) and a world seed. The
 /// compiled router owns its graph, and the surface program owns every
@@ -276,8 +296,8 @@ pub struct VanillaGenerator {
     chunk_density: RefCell<BoundedCache<(i32, i32), ChunkDensities>>,
     /// Reusable buffer for `chunk_density` volume fills.
     density_scratch: RefCell<Vec<f32>>,
-    /// Reusable buffers for `chunk_biomes` climate volume fills.
-    climate_scratch: RefCell<(Vec<f32>, Vec<[i64; 6]>)>,
+    /// Reusable buffers for `chunk_biomes` climate volume fills and column searches.
+    climate_scratch: RefCell<ClimateScratch>,
 }
 
 impl VanillaGenerator {
@@ -436,7 +456,7 @@ impl VanillaGenerator {
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
             chunk_density: RefCell::new(BoundedCache::new(Self::CHUNK_DENSITY_CACHE_CAPACITY)),
             density_scratch: RefCell::new(Vec::new()),
-            climate_scratch: RefCell::new((Vec::new(), Vec::new())),
+            climate_scratch: RefCell::new(ClimateScratch::default()),
         })
     }
 
@@ -480,13 +500,16 @@ impl VanillaGenerator {
             return Rc::new(Vec::new());
         };
         let mut scratch_guard = self.climate_scratch.borrow_mut();
-        let (density_scratch, targets) = &mut *scratch_guard;
-        self.climate
-            .targets_for_volume(&volume, density_scratch, targets);
+        let ClimateScratch {
+            density,
+            targets,
+            column,
+        } = &mut *scratch_guard;
+        self.climate.targets_for_volume(&volume, density, targets);
         let mut names = BTreeSet::new();
         let mut biomes = self.biomes.borrow_mut();
-        // Iterate column by column with y innermost so consecutive lookups are
-        // vertically adjacent and keep BiomePlacement's warm start tight.
+        // Iterate column by column with y innermost, grouping runs whose five
+        // non-depth targets are identical so placement searches sort once per run.
         for local_z in 0..4 {
             let z = chunk_z * 16 + local_z * 4;
             let qz = z >> 2;
@@ -494,25 +517,15 @@ impl VanillaGenerator {
                 let x = chunk_x * 16 + local_x * 4;
                 let qx = x >> 2;
                 let base_slot = volume.index(local_x as usize, 0, local_z as usize);
-                for (row, target) in targets[base_slot..base_slot + quart_height as usize]
-                    .iter()
-                    .enumerate()
-                {
-                    let qy = (min_y + row as i32 * 4) >> 2;
-                    let key = (qx, qy, qz);
-                    let id = if let Some(cached) = biomes.get_mut(&key) {
-                        cached.clone()
-                    } else {
-                        let found = placement.find(target).map(str::to_owned);
-                        biomes.insert(key, found.clone());
-                        found
-                    };
-                    if let Some(name) = id
-                        && !names.contains(&name)
-                    {
-                        names.insert(name);
-                    }
-                }
+                let col_targets = &targets[base_slot..base_slot + quart_height as usize];
+                Self::resolve_biome_column(
+                    placement,
+                    col_targets,
+                    (qx, qz, min_y),
+                    column,
+                    &mut biomes,
+                    &mut names,
+                );
             }
         }
         drop(biomes);
@@ -522,6 +535,57 @@ impl VanillaGenerator {
             .borrow_mut()
             .insert((chunk_x, chunk_z), Rc::clone(&region));
         region
+    }
+
+    /// Resolves one quart column's biome cells by grouping runs of equal
+    /// non-depth targets and populating `biomes` and `names` on cache misses.
+    fn resolve_biome_column(
+        placement: &BiomePlacement,
+        col_targets: &[[i64; 6]],
+        (qx, qz, min_y): (i32, i32, i32),
+        scratch: &mut ColumnRunScratch,
+        biomes: &mut BoundedCache<(i32, i32, i32), Option<String>>,
+        names: &mut BTreeSet<String>,
+    ) {
+        let mut offset = 0usize;
+        while offset < col_targets.len() {
+            let run_len = fixed_run_len(&col_targets[offset..]);
+            let fixed = fixed_climate_coords(&col_targets[offset]);
+            scratch.depths.clear();
+            scratch.keys.clear();
+            for (in_run, target) in col_targets[offset..offset + run_len].iter().enumerate() {
+                let qy = (min_y + (offset + in_run) as i32 * 4) >> 2;
+                let key = (qx, qy, qz);
+                if let Some(cached) = biomes.get_mut(&key) {
+                    if let Some(name) = cached
+                        && !names.contains(name.as_str())
+                    {
+                        names.insert(name.clone());
+                    }
+                } else {
+                    scratch.depths.push(target[4]);
+                    scratch.keys.push(key);
+                }
+            }
+            if !scratch.depths.is_empty() {
+                placement.find_column(
+                    fixed,
+                    &scratch.depths,
+                    &mut scratch.search,
+                    &mut scratch.rows,
+                );
+                for (&key, &row_idx) in scratch.keys.iter().zip(scratch.rows.iter()) {
+                    let found = placement.entry_id(row_idx);
+                    biomes.insert(key, found.map(str::to_owned));
+                    if let Some(name) = found
+                        && !names.contains(name)
+                    {
+                        names.insert(name.to_owned());
+                    }
+                }
+            }
+            offset += run_len;
+        }
     }
 
     /// The biome set one anchor chunk decorates with: the union of its own
