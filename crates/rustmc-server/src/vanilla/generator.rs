@@ -23,9 +23,10 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::vanilla::aquifer::{
     Aquifer, AquiferOccupancy, Fluid, GlobalFluid, NoiseBasedAquifer, Substance,
@@ -33,7 +34,7 @@ use crate::vanilla::aquifer::{
 use crate::vanilla::biome::{
     BiomePlacement, ClimateSampler, ColumnSearchScratch, fixed_climate_coords, fixed_run_len,
 };
-use crate::vanilla::cache::BoundedCache;
+use crate::vanilla::cache::{BoundedCache, ShardedBoundedCache};
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
 use crate::vanilla::density::DensityVolume;
 use crate::vanilla::feature::{DecorationTarget, FeatureData};
@@ -50,7 +51,10 @@ const WAY_BELOW_MIN_Y: i32 = -32512;
 type ChunkCarvers = Rc<Vec<Option<Rc<Carver>>>>;
 
 /// Cached `final_density` volume fill for one chunk (`16 x height x 16`).
-type ChunkDensities = Rc<[f32]>;
+type ChunkDensities = Arc<[f32]>;
+
+/// Local memo of quantized 4x4x4-cell biome identifiers.
+type BiomePointCache = BoundedCache<(i32, i32, i32), Option<Arc<str>>>;
 
 /// One chunk after the decoration pass: the material-rule columns with
 /// every vein that landed in them painted over.
@@ -141,12 +145,85 @@ type HaloColumns = HashMap<(i32, i32), Rc<Vec<Option<String>>>>;
 /// rows deep.
 const HALO_COLUMN_LIMIT: usize = 256;
 
-/// The biomes present somewhere in one chunk's whole 4x4x4-cell volume,
-/// ascending and deduplicated. The reference runtime collects the palette of
-/// every section of a chunk (`LevelChunkSection.getBiomes().getAll(sink)`)
-/// when it decides which features may run, so the set spans the full column
-/// height rather than only the surface band.
-type BiomeRegion = Vec<String>;
+/// One chunk's full `4 x (height/4) x 4` quart biome grid together with its
+/// ascending, deduplicated biome list (`region`).
+///
+/// The reference runtime collects the palette of every section of a chunk
+/// (`LevelChunkSection.getBiomes().getAll(sink)`) when it decides which features
+/// may run, so `region` spans the full column height rather than only the
+/// surface band. Storing the `1,536` `u16` palette slots alongside `region`
+/// also serves every surface, decoration, and packet biome lookup in the chunk
+/// in `O(1)` without extra per-cell allocations.
+struct ChunkBiomes {
+    quart_height: usize,
+    region: Arc<[Arc<str>]>,
+    cells: Arc<[u16]>,
+}
+
+impl ChunkBiomes {
+    fn empty() -> Self {
+        Self {
+            quart_height: 0,
+            region: Arc::from([]),
+            cells: Arc::from([]),
+        }
+    }
+
+    fn at_local(&self, local_qx: usize, local_qy: usize, local_qz: usize) -> Option<Arc<str>> {
+        if self.quart_height == 0 {
+            return None;
+        }
+        // Matches `DensityVolume::index`: `local_qy + (local_qx + local_qz * 4) * quart_height`.
+        let index = (local_qz * 4 + local_qx) * self.quart_height + local_qy;
+        let slot = *self.cells.get(index)?;
+        (slot != u16::MAX).then(|| Arc::clone(&self.region[slot as usize]))
+    }
+}
+
+struct ChunkBiomeBuild {
+    palette: Vec<Arc<str>>,
+    cells: Vec<u16>,
+}
+
+impl ChunkBiomeBuild {
+    fn intern(&mut self, name: &str) -> (u16, Arc<str>) {
+        if let Some(pos) = self
+            .palette
+            .iter()
+            .position(|existing| existing.as_ref() == name)
+        {
+            (pos as u16, Arc::clone(&self.palette[pos]))
+        } else {
+            let slot = self.palette.len() as u16;
+            let arc: Arc<str> = Arc::from(name);
+            self.palette.push(Arc::clone(&arc));
+            (slot, arc)
+        }
+    }
+
+    fn finish(mut self, quart_height: usize) -> ChunkBiomes {
+        let mut order: Vec<usize> = (0..self.palette.len()).collect();
+        order.sort_unstable_by(|&a, &b| self.palette[a].cmp(&self.palette[b]));
+        let region: Arc<[Arc<str>]> = order
+            .iter()
+            .map(|&idx| Arc::clone(&self.palette[idx]))
+            .collect();
+        let mut remap = vec![0u16; self.palette.len()];
+        for (new_idx, &old_idx) in order.iter().enumerate() {
+            remap[old_idx] = new_idx as u16;
+        }
+        for slot in &mut self.cells {
+            if *slot != u16::MAX {
+                *slot = remap[*slot as usize];
+            }
+        }
+        ChunkBiomes {
+            quart_height,
+            region,
+            cells: Arc::from(self.cells),
+        }
+    }
+}
 
 /// Sentinel for a heightmap row neither the chunk's fill pass nor an
 /// earlier anchor-gate lookup has answered yet. No real row value can
@@ -175,6 +252,88 @@ impl OceanFloorMap {
     /// Slot of one absolute column within its chunk's map.
     fn slot(x: i32, z: i32) -> usize {
         ((x & 15) * 16 + (z & 15)) as usize
+    }
+}
+
+/// Bounded, sharded cross-worker store of immutable per-chunk and per-column
+/// terrain products.
+///
+/// Workers generate scattered chunks in parallel while decoration touches a
+/// `5x5` neighbourhood of densities, biome volumes, carve masks, and
+/// heightmaps. Sharing those pure products in one `Arc<SharedChunkCaches>`
+/// prevents N workers from recomputing the same neighbour chunks while keeping
+/// every value immutable (`Arc<[...]>`, `Arc<str>`, `Arc<CarveMask>`, `i32`)
+/// and never holding a shard lock across computation.
+///
+/// All generators sharing an instance must come from the same data root, world
+/// seed, and dimension settings.
+///
+/// Memory budget across the 32 shards (worst-case 2x generation cap):
+/// - `chunk_density`: `2 * 192 = 384` chunks x `384 KiB` = `144 MiB`
+/// - `masks`: `2 * 256 = 512` chunks x `12 KiB` ≈ `6 MiB`
+/// - `chunk_biomes`: `2 * 512 = 1,024` chunks x `~3.5 KiB` ≈ `3.5 MiB`
+/// - `ocean_floor_maps`: `2 * 512 = 1,024` chunks x `1 KiB` = `1 MiB`
+/// - `surface_height_maps`: `2 * 512 = 1,024` chunks x `1 KiB` = `1 MiB`
+/// - `biomes`: `2 * 8,192 = 16,384` quart cells x `~32 B` ≈ `512 KiB`
+/// - `ocean_floor_cols`: `2 * 16,384 = 32,768` columns x `~16 B` ≈ `512 KiB`
+/// - `surface_heights`: `2 * 16,384 = 32,768` columns x `~16 B` ≈ `512 KiB`
+///
+/// Total upper bound: roughly `157 MiB`, bounded regardless of world size.
+pub struct SharedChunkCaches {
+    chunk_density: ShardedBoundedCache<(i32, i32), ChunkDensities>,
+    chunk_biomes: ShardedBoundedCache<(i32, i32), Arc<ChunkBiomes>>,
+    biomes: ShardedBoundedCache<(i32, i32, i32), Option<Arc<str>>>,
+    masks: ShardedBoundedCache<(i32, i32), Arc<CarveMask>>,
+    ocean_floor_maps: ShardedBoundedCache<(i32, i32), Arc<[i32; 256]>>,
+    ocean_floor_cols: ShardedBoundedCache<(i32, i32), i32>,
+    surface_height_maps: ShardedBoundedCache<(i32, i32), Arc<[i32; 256]>>,
+    surface_heights: ShardedBoundedCache<(i32, i32), i32>,
+}
+
+impl SharedChunkCaches {
+    /// Target active-window capacity for shared chunk `final_density` grids
+    /// (max `384` entries across two generations, `144 MiB` at Overworld height).
+    pub const CHUNK_DENSITY_CAPACITY: usize = 192;
+    /// Target active-window capacity for shared chunk biome grids and regions
+    /// (max `1,024` entries, `~3.5 MiB`).
+    pub const CHUNK_BIOMES_CAPACITY: usize = 512;
+    /// Target active-window capacity for shared point biome lookups such as
+    /// carver source chunks (max `16,384` entries, `~512 KiB`).
+    pub const BIOME_POINT_CAPACITY: usize = 8_192;
+    /// Target active-window capacity for shared per-chunk carve masks (max
+    /// `512` entries, `~6 MiB`).
+    pub const MASK_CAPACITY: usize = 256;
+    /// Target active-window capacity for completed chunk ocean-floor heightmaps
+    /// (max `1,024` entries, `1 MiB`).
+    pub const OCEAN_FLOOR_MAP_CAPACITY: usize = 512;
+    /// Target active-window capacity for individual halo ocean-floor columns
+    /// (max `32,768` entries, `~512 KiB`).
+    pub const OCEAN_FLOOR_COL_CAPACITY: usize = 16_384;
+    /// Target active-window capacity for completed chunk surface heightmaps
+    /// (max `1,024` entries, `1 MiB`).
+    pub const SURFACE_HEIGHT_MAP_CAPACITY: usize = 512;
+    /// Target active-window capacity for individual halo surface-top columns
+    /// (max `32,768` entries, `~512 KiB`).
+    pub const SURFACE_HEIGHT_COL_CAPACITY: usize = 16_384;
+
+    /// Creates an empty shared cache set whose shards allocate lazily.
+    pub fn new() -> Self {
+        Self {
+            chunk_density: ShardedBoundedCache::new(Self::CHUNK_DENSITY_CAPACITY),
+            chunk_biomes: ShardedBoundedCache::new(Self::CHUNK_BIOMES_CAPACITY),
+            biomes: ShardedBoundedCache::new(Self::BIOME_POINT_CAPACITY),
+            masks: ShardedBoundedCache::new(Self::MASK_CAPACITY),
+            ocean_floor_maps: ShardedBoundedCache::new(Self::OCEAN_FLOOR_MAP_CAPACITY),
+            ocean_floor_cols: ShardedBoundedCache::new(Self::OCEAN_FLOOR_COL_CAPACITY),
+            surface_height_maps: ShardedBoundedCache::new(Self::SURFACE_HEIGHT_MAP_CAPACITY),
+            surface_heights: ShardedBoundedCache::new(Self::SURFACE_HEIGHT_COL_CAPACITY),
+        }
+    }
+}
+
+impl Default for SharedChunkCaches {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -244,6 +403,7 @@ struct ColumnRunScratch {
     search: ColumnSearchScratch,
     depths: Vec<i64>,
     keys: Vec<(i32, i32, i32)>,
+    slots: Vec<usize>,
     rows: Vec<usize>,
 }
 
@@ -271,7 +431,7 @@ pub struct VanillaGenerator {
     /// biome or placed-feature documents to decorate with.
     features: Option<FeatureData>,
     /// Per-target-chunk carving masks, built lazily on first probe.
-    masks: RefCell<BoundedCache<(i32, i32), CarveMask>>,
+    masks: RefCell<BoundedCache<(i32, i32), Arc<CarveMask>>>,
     /// Per-source-chunk biome carver lists, built lazily during replay.
     chunk_carvers: RefCell<BoundedCache<(i32, i32), ChunkCarvers>>,
     /// Column-top memo: the descent's steep-gradient lookups re-read
@@ -283,10 +443,10 @@ pub struct VanillaGenerator {
     /// up. See `OceanFloorMap`.
     ocean_floor_maps: RefCell<BoundedCache<(i32, i32), OceanFloorMap>>,
     /// One immutable biome choice per quantized 4x4x4 world cell.
-    biomes: RefCell<BoundedCache<(i32, i32, i32), Option<String>>>,
+    biomes: RefCell<BiomePointCache>,
     /// Chunks whose whole biome volume has been enumerated, for the union a
-    /// decoration pass runs its ordinals over.
-    biome_regions: RefCell<BoundedCache<(i32, i32), Rc<BiomeRegion>>>,
+    /// decoration pass runs its ordinals over and O(1) per-cell lookup.
+    biome_regions: RefCell<BoundedCache<(i32, i32), Arc<ChunkBiomes>>>,
     /// Chunks whose columns have been decorated. The value is a pure
     /// function of the chunk position and the seed, so an eviction only
     /// costs a replay of the nine anchor chunks' placement passes.
@@ -294,6 +454,8 @@ pub struct VanillaGenerator {
     /// Raw `final_density` for one chunk, `16 x height x 16` block values in
     /// `DensityVolume::index` order, filled by one `sample_volume` pass.
     chunk_density: RefCell<BoundedCache<(i32, i32), ChunkDensities>>,
+    /// Cross-worker shared cache of immutable chunk/column products.
+    shared: Arc<SharedChunkCaches>,
     /// Reusable buffer for `chunk_density` volume fills.
     density_scratch: RefCell<Vec<f32>>,
     /// Reusable buffers for `chunk_biomes` climate volume fills and column searches.
@@ -371,11 +533,28 @@ impl VanillaGenerator {
     pub const CHUNK_DENSITY_CACHE_CAPACITY: usize = 16;
 
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
-    /// the noise engine to `world_seed`.
+    /// the noise engine to `world_seed` using a private [`SharedChunkCaches`]
+    /// instance.
     pub fn new(
         data_root: &Path,
         world_seed: i64,
         settings_id: &str,
+    ) -> Result<Self, WorldgenError> {
+        Self::with_shared_caches(
+            data_root,
+            world_seed,
+            settings_id,
+            Arc::new(SharedChunkCaches::new()),
+        )
+    }
+
+    /// Loads `data_root`, compiles the `settings_id` dimension, binds the
+    /// noise engine to `world_seed`, and attaches a shared cross-worker cache.
+    pub fn with_shared_caches(
+        data_root: &Path,
+        world_seed: i64,
+        settings_id: &str,
+        shared: Arc<SharedChunkCaches>,
     ) -> Result<Self, WorldgenError> {
         let data = WorldgenData::load(data_root)?;
         let engine = data.engine(world_seed);
@@ -455,40 +634,82 @@ impl VanillaGenerator {
             biome_regions: RefCell::new(BoundedCache::new(Self::BIOME_REGION_CACHE_CAPACITY)),
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
             chunk_density: RefCell::new(BoundedCache::new(Self::CHUNK_DENSITY_CACHE_CAPACITY)),
+            shared,
             density_scratch: RefCell::new(Vec::new()),
             climate_scratch: RefCell::new(ClimateScratch::default()),
         })
+    }
+
+    fn can_serve_chunk_biomes(&self) -> bool {
+        self.placement.is_some() && (self.router.min_y & 3) == 0 && (self.router.height & 3) == 0
+    }
+
+    fn biome_arc(&self, x: i32, z: i32, surface_y: i32) -> Option<Arc<str>> {
+        let placement = self.placement.as_ref()?;
+        if self.can_serve_chunk_biomes()
+            && surface_y >= self.router.min_y
+            && surface_y <= self.max_y
+        {
+            let chunk_key = (x >> 4, z >> 4);
+            let local_qx = ((x >> 2) & 3) as usize;
+            let local_qz = ((z >> 2) & 3) as usize;
+            let local_qy = ((surface_y >> 2) - (self.router.min_y >> 2)) as usize;
+            if let Some(chunk) = self.biome_regions.borrow_mut().get_mut(&chunk_key) {
+                return chunk.at_local(local_qx, local_qy, local_qz);
+            }
+            if let Some(chunk) = self.shared.chunk_biomes.get(&chunk_key) {
+                let found = chunk.at_local(local_qx, local_qy, local_qz);
+                self.biome_regions.borrow_mut().insert(chunk_key, chunk);
+                return found;
+            }
+        }
+        let key = (x >> 2, surface_y >> 2, z >> 2);
+        if let Some(value) = self.biomes.borrow_mut().get_mut(&key) {
+            return value.clone();
+        }
+        if let Some(value) = self.shared.biomes.get(&key) {
+            self.biomes.borrow_mut().insert(key, value.clone());
+            return value;
+        }
+        let value = self
+            .climate
+            .biome(placement, x, surface_y, z)
+            .map(Arc::<str>::from);
+        self.shared.biomes.insert(key, value.clone());
+        self.biomes.borrow_mut().insert(key, value.clone());
+        value
     }
 
     /// Biome identifier for the column at `(x, z)`, resolved from the
     /// climate target at the surface cell. `None` when the operator has
     /// not provisioned a placement table for this preset.
     pub fn biome(&self, x: i32, z: i32, surface_y: i32) -> Option<String> {
-        let placement = self.placement.as_ref()?;
-        let key = (x >> 2, surface_y >> 2, z >> 2);
-        if let Some(value) = self.biomes.borrow_mut().get_mut(&key) {
-            return value.clone();
-        }
-        let value = self.climate.biome(placement, x, surface_y, z);
-        self.biomes.borrow_mut().insert(key, value.clone());
-        value
+        self.biome_arc(x, z, surface_y)
+            .map(|name| name.as_ref().to_owned())
     }
 
-    /// The distinct biomes anywhere in one chunk's 4x4x4-cell volume,
-    /// ascending and deduplicated. The reference runtime collects the biome
-    /// palette of every section of the chunk, so the walk covers the whole
-    /// build height rather than only the surface band; one chunk is
-    /// 4x4x(height/4) quart cells, 1,536 in an overworld-sized dimension.
-    fn chunk_biomes(&self, chunk_x: i32, chunk_z: i32) -> Rc<BiomeRegion> {
-        if let Some(region) = self.biome_regions.borrow_mut().get_mut(&(chunk_x, chunk_z)) {
-            return Rc::clone(region);
+    /// The distinct biomes and full `4 x (height/4) x 4` quart grid of one
+    /// chunk, consulted from local L1 then shared L2 before computing.
+    fn chunk_biomes(&self, chunk_x: i32, chunk_z: i32) -> Arc<ChunkBiomes> {
+        let chunk_key = (chunk_x, chunk_z);
+        if let Some(region) = self.biome_regions.borrow_mut().get_mut(&chunk_key) {
+            return Arc::clone(region);
         }
-        let Some(placement) = self.placement.as_ref() else {
-            let region = Rc::new(Vec::new());
+        if let Some(shared) = self.shared.chunk_biomes.get(&chunk_key) {
             self.biome_regions
                 .borrow_mut()
-                .insert((chunk_x, chunk_z), Rc::clone(&region));
-            return region;
+                .insert(chunk_key, Arc::clone(&shared));
+            return shared;
+        }
+        let Some(placement) = self.placement.as_ref() else {
+            let empty = Arc::new(ChunkBiomes::empty());
+            self.shared
+                .chunk_biomes
+                .insert(chunk_key, Arc::clone(&empty));
+            self.biome_regions
+                .borrow_mut()
+                .insert(chunk_key, Arc::clone(&empty));
+            return empty;
         };
         let min_y = self.router.min_y;
         let quart_height = self.router.height / 4;
@@ -497,7 +718,7 @@ impl VanillaGenerator {
             [chunk_x * 16, min_y, chunk_z * 16],
             [4, 4, 4],
         ) else {
-            return Rc::new(Vec::new());
+            return Arc::new(ChunkBiomes::empty());
         };
         let mut scratch_guard = self.climate_scratch.borrow_mut();
         let ClimateScratch {
@@ -506,7 +727,10 @@ impl VanillaGenerator {
             column,
         } = &mut *scratch_guard;
         self.climate.targets_for_volume(&volume, density, targets);
-        let mut names = BTreeSet::new();
+        let mut built_grid = ChunkBiomeBuild {
+            palette: Vec::new(),
+            cells: vec![u16::MAX; volume.slot_count()],
+        };
         let mut biomes = self.biomes.borrow_mut();
         // Iterate column by column with y innermost, grouping runs whose five
         // non-depth targets are identical so placement searches sort once per run.
@@ -521,31 +745,34 @@ impl VanillaGenerator {
                 Self::resolve_biome_column(
                     placement,
                     col_targets,
-                    (qx, qz, min_y),
+                    (qx, qz, min_y, base_slot),
                     column,
                     &mut biomes,
-                    &mut names,
+                    &mut built_grid,
                 );
             }
         }
         drop(biomes);
         drop(scratch_guard);
-        let region = Rc::new(names.into_iter().collect::<BiomeRegion>());
+        let built = Arc::new(built_grid.finish(quart_height as usize));
+        self.shared
+            .chunk_biomes
+            .insert(chunk_key, Arc::clone(&built));
         self.biome_regions
             .borrow_mut()
-            .insert((chunk_x, chunk_z), Rc::clone(&region));
-        region
+            .insert(chunk_key, Arc::clone(&built));
+        built
     }
 
     /// Resolves one quart column's biome cells by grouping runs of equal
-    /// non-depth targets and populating `biomes` and `names` on cache misses.
+    /// non-depth targets and populating `biomes` and `built_grid` on misses.
     fn resolve_biome_column(
         placement: &BiomePlacement,
         col_targets: &[[i64; 6]],
-        (qx, qz, min_y): (i32, i32, i32),
+        (qx, qz, min_y, base_slot): (i32, i32, i32, usize),
         scratch: &mut ColumnRunScratch,
-        biomes: &mut BoundedCache<(i32, i32, i32), Option<String>>,
-        names: &mut BTreeSet<String>,
+        biomes: &mut BiomePointCache,
+        built_grid: &mut ChunkBiomeBuild,
     ) {
         let mut offset = 0usize;
         while offset < col_targets.len() {
@@ -553,18 +780,20 @@ impl VanillaGenerator {
             let fixed = fixed_climate_coords(&col_targets[offset]);
             scratch.depths.clear();
             scratch.keys.clear();
+            scratch.slots.clear();
             for (in_run, target) in col_targets[offset..offset + run_len].iter().enumerate() {
                 let qy = (min_y + (offset + in_run) as i32 * 4) >> 2;
                 let key = (qx, qy, qz);
+                let cell_slot = base_slot + offset + in_run;
                 if let Some(cached) = biomes.get_mut(&key) {
-                    if let Some(name) = cached
-                        && !names.contains(name.as_str())
-                    {
-                        names.insert(name.clone());
+                    if let Some(name) = cached {
+                        let (slot, _) = built_grid.intern(name.as_ref());
+                        built_grid.cells[cell_slot] = slot;
                     }
                 } else {
                     scratch.depths.push(target[4]);
                     scratch.keys.push(key);
+                    scratch.slots.push(cell_slot);
                 }
             }
             if !scratch.depths.is_empty() {
@@ -574,13 +803,19 @@ impl VanillaGenerator {
                     &mut scratch.search,
                     &mut scratch.rows,
                 );
-                for (&key, &row_idx) in scratch.keys.iter().zip(scratch.rows.iter()) {
+                for ((&key, &cell_slot), &row_idx) in scratch
+                    .keys
+                    .iter()
+                    .zip(scratch.slots.iter())
+                    .zip(scratch.rows.iter())
+                {
                     let found = placement.entry_id(row_idx);
-                    biomes.insert(key, found.map(str::to_owned));
-                    if let Some(name) = found
-                        && !names.contains(name)
-                    {
-                        names.insert(name.to_owned());
+                    if let Some(name) = found {
+                        let (slot, arc_name) = built_grid.intern(name);
+                        built_grid.cells[cell_slot] = slot;
+                        biomes.insert(key, Some(arc_name));
+                    } else {
+                        biomes.insert(key, None);
                     }
                 }
             }
@@ -593,11 +828,11 @@ impl VanillaGenerator {
     /// biome source's possible biomes from that union, and every identifier
     /// the placement table can return is in its own possible set, so the
     /// retention is a no-op here.
-    fn region_biomes(&self, chunk_x: i32, chunk_z: i32) -> Vec<String> {
+    fn region_biomes(&self, chunk_x: i32, chunk_z: i32) -> Vec<Arc<str>> {
         let mut names = Vec::new();
         for anchor_z in chunk_z - 1..=chunk_z + 1 {
             for anchor_x in chunk_x - 1..=chunk_x + 1 {
-                names.extend(self.chunk_biomes(anchor_x, anchor_z).iter().cloned());
+                names.extend(self.chunk_biomes(anchor_x, anchor_z).region.iter().cloned());
             }
         }
         names.sort_unstable();
@@ -704,13 +939,21 @@ impl VanillaGenerator {
     /// two veins compete for one position the winner can differ; `docs/
     /// PROVENANCE.md` records that as a deviation rather than a parity claim.
     fn build_decorated_chunk(&self, chunk_x: i32, chunk_z: i32) -> DecoratedChunk {
+        if self.can_serve_chunk_biomes() {
+            let _ = self.chunk_biomes(chunk_x, chunk_z);
+        }
         let height = self.router.height as usize;
         let mut chunk = DecoratedChunk::new(height);
+        let mut surface_map = [self.router.min_y; 256];
+        let mut floor_map = [self.router.min_y; 256];
         for local_x in 0..16 {
             for local_z in 0..16 {
                 let x = chunk_x * 16 + local_x;
                 let z = chunk_z * 16 + local_z;
-                let ids = self.base_column_ids(x, z);
+                let (ids, top_y, floor_y) = self.base_column_ids_with_heights(x, z);
+                let map_slot = OceanFloorMap::slot(x, z);
+                surface_map[map_slot] = top_y;
+                floor_map[map_slot] = floor_y;
                 for (row, name) in ids.into_iter().enumerate() {
                     let at = chunk.index(local_x, row, local_z);
                     let slot = chunk.intern(name);
@@ -718,6 +961,13 @@ impl VanillaGenerator {
                 }
             }
         }
+        let chunk_key = (chunk_x, chunk_z);
+        self.shared
+            .surface_height_maps
+            .insert(chunk_key, Arc::new(surface_map));
+        self.shared
+            .ocean_floor_maps
+            .insert(chunk_key, Arc::new(floor_map));
         let Some(features) = self.features.as_ref() else {
             return chunk;
         };
@@ -751,6 +1001,10 @@ impl VanillaGenerator {
         chunk
     }
 
+    fn base_column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+        self.base_column_ids_with_heights(x, z).0
+    }
+
     /// The full material-rule descent of one column, the documented
     /// `buildSurface` pass (`PROVENANCE.md` session 7): from the highest
     /// non-air row walk down, reset the stone-above counter and the water
@@ -763,8 +1017,9 @@ impl VanillaGenerator {
     ///
     /// Index 0 of the result is the dimension's minimum build Y. Rows
     /// above the column top and pre-carve air rows are `None`; solid rows
-    /// with no matching rule keep the filler `default_block`.
-    fn base_column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
+    /// with no matching rule keep the filler `default_block`. Also returns
+    /// `(surface_height, ocean_floor_height)` for chunk-level map publishing.
+    fn base_column_ids_with_heights(&self, x: i32, z: i32) -> (Vec<Option<String>>, i32, i32) {
         let min_y = self.router.min_y;
         let mut ids: Vec<Option<String>> = vec![None; self.router.height as usize];
         // The column as the surface pass sees it: the registry carvers
@@ -787,7 +1042,7 @@ impl VanillaGenerator {
         }
         let Some(top) = top else {
             self.record_ocean_floor(x, z, min_y);
-            return ids;
+            return (ids, min_y, min_y);
         };
         filled.reverse();
         self.heights.borrow_mut().insert((x, z), top);
@@ -888,7 +1143,7 @@ impl VanillaGenerator {
             floor -= 1;
         }
         self.record_ocean_floor(x, z, floor);
-        ids
+        (ids, top, floor)
     }
 
     /// Absolute Y of the top written block: terrain, or the aquifer/sea
@@ -898,7 +1153,18 @@ impl VanillaGenerator {
         if let Some(y) = self.heights.borrow_mut().get_mut(&(x, z)) {
             return *y;
         }
+        let chunk_key = (x >> 4, z >> 4);
+        if let Some(map) = self.shared.surface_height_maps.get(&chunk_key) {
+            let y = map[OceanFloorMap::slot(x, z)];
+            self.heights.borrow_mut().insert((x, z), y);
+            return y;
+        }
+        if let Some(y) = self.shared.surface_heights.get(&(x, z)) {
+            self.heights.borrow_mut().insert((x, z), y);
+            return y;
+        }
         let y = self.surface(x, z).map_or(self.router.min_y, |(y, _)| y);
+        self.shared.surface_heights.insert((x, z), y);
         self.heights.borrow_mut().insert((x, z), y);
         y
     }
@@ -930,7 +1196,19 @@ impl VanillaGenerator {
         if let Some(y) = served {
             return y;
         }
+        if let Some(full) = self.shared.ocean_floor_maps.get(&key) {
+            let y = full[slot];
+            self.ocean_floor_maps
+                .borrow_mut()
+                .insert(key, OceanFloorMap { entries: *full });
+            return y;
+        }
+        if let Some(y) = self.shared.ocean_floor_cols.get(&(x, z)) {
+            self.record_ocean_floor(x, z, y);
+            return y;
+        }
         let y = self.ocean_floor_by_descent(x, z);
+        self.shared.ocean_floor_cols.insert((x, z), y);
         self.record_ocean_floor(x, z, y);
         y
     }
@@ -976,28 +1254,35 @@ impl VanillaGenerator {
 
     /// Raw `final_density` values for one chunk (`16 x height x 16` floats in
     /// `DensityVolume::index` order), filled once by `sample_volume` and
-    /// cached.
+    /// cached across workers.
     fn chunk_density(&self, chunk_x: i32, chunk_z: i32) -> ChunkDensities {
         let key = (chunk_x, chunk_z);
         if let Some(existing) = self.chunk_density.borrow_mut().get_mut(&key) {
-            return Rc::clone(existing);
+            return Arc::clone(existing);
+        }
+        if let Some(existing) = self.shared.chunk_density.get(&key) {
+            self.chunk_density
+                .borrow_mut()
+                .insert(key, Arc::clone(&existing));
+            return existing;
         }
         let Some(volume) = DensityVolume::new(
             [16, self.router.height, 16],
             [chunk_x * 16, self.router.min_y, chunk_z * 16],
             [1, 1, 1],
         ) else {
-            return Rc::from([]);
+            return Arc::from([]);
         };
         let mut scratch = self.density_scratch.borrow_mut();
         scratch.resize(volume.slot_count(), 0.0);
         self.router
             .final_density
             .sample_volume(&volume, &mut scratch);
-        let filled: Rc<[f32]> = Rc::from(scratch.as_slice());
+        let filled: ChunkDensities = Arc::from(scratch.as_slice());
+        self.shared.chunk_density.insert(key, Arc::clone(&filled));
         self.chunk_density
             .borrow_mut()
-            .insert(key, Rc::clone(&filled));
+            .insert(key, Arc::clone(&filled));
         filled
     }
 
@@ -1068,8 +1353,14 @@ impl VanillaGenerator {
                 return mask.contains(relative_x, y, relative_z);
             }
         }
-        let mask = self.build_carve_mask(target);
+        if let Some(mask) = self.shared.masks.get(&target) {
+            let hit = mask.contains(relative_x, y, relative_z);
+            self.masks.borrow_mut().insert(target, mask);
+            return hit;
+        }
+        let mask = Arc::new(self.build_carve_mask(target));
         let hit = mask.contains(relative_x, y, relative_z);
+        self.shared.masks.insert(target, Arc::clone(&mask));
         self.masks.borrow_mut().insert(target, mask);
         hit
     }
@@ -1126,7 +1417,7 @@ impl VanillaGenerator {
             }
         }
         let data = self.carvers.as_ref()?;
-        let biome = self.biome(chunk.0 << 4, chunk.1 << 4, 0)?;
+        let biome = self.biome_arc(chunk.0 << 4, chunk.1 << 4, 0)?;
         let carvers = data.carvers_for_biome(&biome)?;
         self.chunk_carvers
             .borrow_mut()
@@ -2632,16 +2923,22 @@ mod tests {
     #[test]
     fn the_decoration_region_covers_the_chunk_volume_and_the_nine_window() {
         let (root, generator) = region_generator("region");
-        let low = "testns:low".to_string();
-        let peak = "testns:peak".to_string();
+        let low: Arc<str> = Arc::from("testns:low");
+        let peak: Arc<str> = Arc::from("testns:peak");
         // One chunk's enumeration visits every 4x4x4 cell of its volume: 4x4
         // quart columns over height/4 rows, all distinct sampler keys.
         let cells = 4 * 4 * (generator.router.height / 4) as usize;
-        assert_eq!(*generator.chunk_biomes(1, 0), vec![low.clone()]);
+        assert_eq!(
+            generator.chunk_biomes(1, 0).region.as_ref(),
+            &[Arc::clone(&low)]
+        );
         let occupancy = generator.cache_occupancy();
         assert_eq!(occupancy.biomes, cells, "the quart scan came up short");
         assert_eq!(occupancy.biome_regions, 1);
-        assert_eq!(*generator.chunk_biomes(3, 0), vec![peak.clone()]);
+        assert_eq!(
+            generator.chunk_biomes(3, 0).region.as_ref(),
+            &[Arc::clone(&peak)]
+        );
         let occupancy = generator.cache_occupancy();
         assert_eq!(occupancy.biomes, 2 * cells);
         assert_eq!(occupancy.biome_regions, 2);
@@ -2655,10 +2952,10 @@ mod tests {
         // once, in identifier order.
         assert_eq!(
             generator.region_biomes(2, 0),
-            vec![low.clone(), peak.clone()]
+            vec![Arc::clone(&low), Arc::clone(&peak)]
         );
-        assert_eq!(generator.region_biomes(0, 0), vec![low.clone()]);
-        assert_eq!(generator.region_biomes(8, 0), vec![peak.clone()]);
+        assert_eq!(generator.region_biomes(0, 0), vec![Arc::clone(&low)]);
+        assert_eq!(generator.region_biomes(8, 0), vec![Arc::clone(&peak)]);
 
         // The volume cache is bounded like the others: a sweep along a row
         // touches far more chunk volumes than it may hold.
@@ -3042,6 +3339,84 @@ mod tests {
                 "mismatch at ({x},{y},{z})"
             );
         }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn shared_caches_match_private_generator_across_threads() {
+        let (root, private) = decorating_generator("shared-caches");
+        let shared = Arc::new(SharedChunkCaches::new());
+        let coords: Vec<(i32, i32)> = (-1..=1)
+            .flat_map(|cx| (-1..=1).map(move |cz| (cx, cz)))
+            .collect();
+        let expected: Vec<_> = coords
+            .iter()
+            .map(|&(cx, cz)| chunk_columns(&private, cx, cz))
+            .collect();
+        let queue = std::sync::Mutex::new(coords.iter().copied().enumerate());
+        let results = std::sync::Mutex::new(vec![Vec::new(); coords.len()]);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let (root, shared, queue, results) = (&root, &shared, &queue, &results);
+                scope.spawn(move || {
+                    let worker = VanillaGenerator::with_shared_caches(
+                        root,
+                        2026,
+                        "testns:bounded",
+                        Arc::clone(shared),
+                    )
+                    .expect("shared worker");
+                    loop {
+                        let next = queue.lock().expect("queue").next();
+                        let Some((idx, (cx, cz))) = next else {
+                            break;
+                        };
+                        let cols = chunk_columns(&worker, cx, cz);
+                        results.lock().expect("results")[idx] = cols;
+                    }
+                });
+            }
+        });
+        let got = results.into_inner().expect("results");
+        assert_eq!(got, expected);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn chunk_biomes_at_local_preserves_xz_axes() {
+        let (root, generator) = region_generator("chunk-biomes-axes");
+        // In `region_generator`, temperature varies only along x (`0..64`),
+        // splitting at x = 32 (chunk 2). Chunk (1, 0) vs (2, 0): probe chunk
+        // straddling x = 32 by testing a x-varying pack inside one chunk (0, 0).
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("density_function/slope.json"),
+            r#"{"type": "gradient", "axis": "x", "from_coordinate": 0,
+                "to_coordinate": 16, "from_value": -1.0, "to_value": 1.0}"#,
+        );
+        let split = VanillaGenerator::new(&root, 2026, "testns:split").expect("split generator");
+        let placement = split.placement.as_ref().expect("placement");
+        let _ = split.chunk_biomes(0, 0);
+        // After populating `chunk_biomes(0, 0)`, every asymmetric (x, z) quart
+        // cell in chunk (0, 0) must still match the uncached point sampler.
+        let mut saw_low = false;
+        let mut saw_peak = false;
+        for local_qz in 0..4 {
+            for local_qx in 0..4 {
+                let x = local_qx * 4;
+                let z = local_qz * 4;
+                let expected = split.climate.biome(placement, x, 8, z);
+                let served = split.biome(x, z, 8);
+                assert_eq!(served, expected, "mismatch at ({x}, 8, {z})");
+                if served.as_deref() == Some("testns:low") {
+                    saw_low = true;
+                } else if served.as_deref() == Some("testns:peak") {
+                    saw_peak = true;
+                }
+            }
+        }
+        assert!(saw_low && saw_peak, "chunk must contain both x halves");
+        drop(generator);
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
