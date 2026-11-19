@@ -73,8 +73,10 @@ pub use events::{
 pub mod anvil;
 pub mod brewing;
 pub mod container_data;
+pub mod enchanting;
 pub mod enchantment;
 pub mod furnace;
+pub mod grindstone;
 pub mod loot;
 pub mod recipe_data;
 pub mod vanilla_rules;
@@ -91,7 +93,7 @@ pub use furnace::{
 };
 pub use recipe_data::{
     CRAFTING_REPAIR_BONUS_DIVISOR, CookingKind, CookingRecipe, RecipeData, RecipeDataError,
-    RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe,
+    RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe, repair_combined_damage,
 };
 pub use vanilla_rules::{
     CookingSummary, RecipeSummary, TagSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,
