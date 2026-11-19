@@ -771,4 +771,56 @@ mod tests {
         }
         println!("smoke OK: router compiled from {}", root.display());
     }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn final_density_volume_matches_point_samples_bit_for_bit() {
+        use crate::vanilla::density::DensityVolume;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = WorldgenData::load(&root).expect("operator data loads");
+        let engine = data.engine(2026);
+        let registry = data.registry(&engine);
+        let router = data
+            .router(&registry, "minecraft:overworld")
+            .expect("overworld router");
+
+        let mut mismatches = 0usize;
+        let mut first_mismatch = None;
+        for (cx, cz) in [(0, 0), (-3, 2), (17, -9), (40, 40)] {
+            let min_x = cx * 16;
+            let min_z = cz * 16;
+            let volume = DensityVolume::new(
+                [16, router.height, 16],
+                [min_x, router.min_y, min_z],
+                [1, 1, 1],
+            )
+            .expect("chunk volume");
+            let mut buffer = vec![0.0f32; volume.slot_count()];
+            router.final_density.sample_volume(&volume, &mut buffer);
+            for z in 0..16 {
+                for x in 0..16 {
+                    for y in 0..router.height {
+                        let wx = min_x + x;
+                        let wy = router.min_y + y;
+                        let wz = min_z + z;
+                        let got = buffer[volume.index(x as usize, y as usize, z as usize)];
+                        let want = router.final_density.sample(wx, wy, wz);
+                        if got.to_bits() != want.to_bits() {
+                            mismatches += 1;
+                            if first_mismatch.is_none() {
+                                first_mismatch = Some((wx, wy, wz, got, want));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "volume != point ({mismatches} mismatches), first: {first_mismatch:?}"
+        );
+    }
 }

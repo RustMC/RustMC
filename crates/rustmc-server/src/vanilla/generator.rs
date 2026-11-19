@@ -33,6 +33,7 @@ use crate::vanilla::aquifer::{
 use crate::vanilla::biome::{BiomePlacement, ClimateSampler};
 use crate::vanilla::cache::BoundedCache;
 use crate::vanilla::carver::{CarveMask, Carver, CarverContext, CarverData};
+use crate::vanilla::density::DensityVolume;
 use crate::vanilla::feature::{DecorationTarget, FeatureData};
 use crate::vanilla::random::LegacyRandom;
 use crate::vanilla::surface::{SurfaceContext, SurfaceRules};
@@ -45,6 +46,9 @@ const WAY_BELOW_MIN_Y: i32 = -32512;
 /// A biome's resolved carver list, shared between the registry and the
 /// per-source-chunk cache.
 type ChunkCarvers = Rc<Vec<Option<Rc<Carver>>>>;
+
+/// Cached `final_density` volume fill for one chunk (`16 x height x 16`).
+type ChunkDensities = Rc<[f32]>;
 
 /// One chunk after the decoration pass: the material-rule columns with
 /// every vein that landed in them painted over.
@@ -201,6 +205,8 @@ pub struct CacheOccupancy {
     pub aquifer_skip_bounds: usize,
     /// Chunks with a decorated grid.
     pub decorated_chunks: usize,
+    /// Chunks with a cached volume-filled `final_density` grid.
+    pub chunk_densities: usize,
 }
 
 impl CacheOccupancy {
@@ -217,6 +223,7 @@ impl CacheOccupancy {
             + self.aquifer_surface_levels
             + self.aquifer_skip_bounds
             + self.decorated_chunks
+            + self.chunk_densities
     }
 }
 
@@ -264,6 +271,11 @@ pub struct VanillaGenerator {
     /// function of the chunk position and the seed, so an eviction only
     /// costs a replay of the nine anchor chunks' placement passes.
     chunks: RefCell<BoundedCache<(i32, i32), Rc<DecoratedChunk>>>,
+    /// Raw `final_density` for one chunk, `16 x height x 16` block values in
+    /// `DensityVolume::index` order, filled by one `sample_volume` pass.
+    chunk_density: RefCell<BoundedCache<(i32, i32), ChunkDensities>>,
+    /// Reusable buffer for `chunk_density` volume fills.
+    density_scratch: RefCell<Vec<f32>>,
 }
 
 impl VanillaGenerator {
@@ -328,6 +340,13 @@ impl VanillaGenerator {
     /// tens of KiB instead of pinning one volume per chunk a radius-32 view
     /// touches (1,089 chunks).
     pub const BIOME_REGION_CACHE_CAPACITY: usize = 64;
+    /// Chunks with a volume-filled `final_density` array (`16 x height x 16`
+    /// floats). Sixteen chunks per generation cover the 3x3 decoration
+    /// neighbourhood plus a streaming margin (at most 32 chunks across the
+    /// two-generation cache). At 384 blocks high, one entry is
+    /// `16 * 384 * 16 * 4` = 384 KiB, so 32 entries cap at 12 MiB per
+    /// generator.
+    pub const CHUNK_DENSITY_CACHE_CAPACITY: usize = 16;
 
     /// Loads `data_root`, compiles the `settings_id` dimension, and binds
     /// the noise engine to `world_seed`.
@@ -413,6 +432,8 @@ impl VanillaGenerator {
             biomes: RefCell::new(BoundedCache::new(Self::BIOME_CACHE_CAPACITY)),
             biome_regions: RefCell::new(BoundedCache::new(Self::BIOME_REGION_CACHE_CAPACITY)),
             chunks: RefCell::new(BoundedCache::new(Self::DECORATED_CHUNK_CACHE_CAPACITY)),
+            chunk_density: RefCell::new(BoundedCache::new(Self::CHUNK_DENSITY_CACHE_CAPACITY)),
+            density_scratch: RefCell::new(Vec::new()),
         })
     }
 
@@ -491,12 +512,12 @@ impl VanillaGenerator {
                 // The documented descent reaches the top solid with a
                 // stone depth of one, no water column above, and the
                 // below-depth from the first non-solid position down.
-                let density = &self.router.final_density;
+                let chunk = self.chunk_density(x >> 4, z >> 4);
+                let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
                 let mut ceiling = WAY_BELOW_MIN_Y;
                 for lookahead in (self.router.min_y..top_y).rev() {
-                    let below =
-                        self.aquifer
-                            .substance(x, lookahead, z, density.sample(x, lookahead, z));
+                    let value = self.column_density_value(col, x, lookahead, z);
+                    let below = self.aquifer.substance(x, lookahead, z, value);
                     if below != Substance::Solid {
                         ceiling = lookahead + 1;
                         break;
@@ -642,11 +663,13 @@ impl VanillaGenerator {
         // have not stamped it yet. Keep the first non-air row found by the
         // top-down scan and retain the rest; this avoids sampling the first
         // non-air row a second time.
-        let density = &self.router.final_density;
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
         let mut top = None;
         let mut filled = Vec::with_capacity(self.router.height as usize);
         for y in (min_y..=self.max_y).rev() {
-            let substance = self.aquifer.substance(x, y, z, density.sample(x, y, z));
+            let value = self.column_density_value(col, x, y, z);
+            let substance = self.aquifer.substance(x, y, z, value);
             if top.is_none() && substance != Substance::Air {
                 top = Some(y);
             }
@@ -843,6 +866,72 @@ impl VanillaGenerator {
         self.router.final_density.sample(x, y, z)
     }
 
+    /// Raw `final_density` values for one chunk (`16 x height x 16` floats in
+    /// `DensityVolume::index` order), filled once by `sample_volume` and
+    /// cached.
+    fn chunk_density(&self, chunk_x: i32, chunk_z: i32) -> ChunkDensities {
+        let key = (chunk_x, chunk_z);
+        if let Some(existing) = self.chunk_density.borrow_mut().get_mut(&key) {
+            return Rc::clone(existing);
+        }
+        let Some(volume) = DensityVolume::new(
+            [16, self.router.height, 16],
+            [chunk_x * 16, self.router.min_y, chunk_z * 16],
+            [1, 1, 1],
+        ) else {
+            return Rc::from([]);
+        };
+        let mut scratch = self.density_scratch.borrow_mut();
+        scratch.resize(volume.slot_count(), 0.0);
+        self.router
+            .final_density
+            .sample_volume(&volume, &mut scratch);
+        let filled: Rc<[f32]> = Rc::from(scratch.as_slice());
+        self.chunk_density
+            .borrow_mut()
+            .insert(key, Rc::clone(&filled));
+        filled
+    }
+
+    /// Slice range inside a chunk's density array for the column at `(x, z)`.
+    fn column_density_range(&self, x: i32, z: i32) -> std::ops::Range<usize> {
+        let height = self.router.height as usize;
+        let local_x = (x & 15) as usize;
+        let local_z = (z & 15) as usize;
+        let start = (local_x + local_z * 16) * height;
+        start..start + height
+    }
+
+    /// Indexes a column slice from [`Self::chunk_density`] for in-range `y`
+    /// and falls back to point evaluation outside `[min_y, max_y]`.
+    fn column_density_value(&self, col: &[f32], x: i32, y: i32, z: i32) -> f32 {
+        if y >= self.router.min_y
+            && let Some(&value) = col.get((y - self.router.min_y) as usize)
+        {
+            return value;
+        }
+        self.router.final_density.sample(x, y, z)
+    }
+
+    /// Cached `final_density` at `(x, y, z)`, indexing the per-chunk volume
+    /// fill inside `[min_y, max_y]` and falling back to point evaluation
+    /// outside the dimension build height.
+    fn density_at(&self, x: i32, y: i32, z: i32) -> f32 {
+        if y < self.router.min_y || y > self.max_y {
+            return self.router.final_density.sample(x, y, z);
+        }
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let height = self.router.height as usize;
+        let local_x = (x & 15) as usize;
+        let local_y = (y - self.router.min_y) as usize;
+        let local_z = (z & 15) as usize;
+        let index = local_y + (local_x + local_z * 16) * height;
+        chunk
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| self.router.final_density.sample(x, y, z))
+    }
+
     /// The filler substance at one absolute block position: the raw
     /// `final_density` sample through the runtime aquifer, replaced by
     /// the aquifer's answer at density `0.0` where a registry carver
@@ -852,7 +941,7 @@ impl VanillaGenerator {
         if self.carved(x, y, z) {
             return self.aquifer.substance(x, y, z, 0.0);
         }
-        let density = self.raw_density(x, y, z);
+        let density = self.density_at(x, y, z);
         self.aquifer.substance(x, y, z, density)
     }
 
@@ -939,9 +1028,11 @@ impl VanillaGenerator {
 
     /// The highest non-air position in the column and what fills it.
     pub fn surface(&self, x: i32, z: i32) -> Option<(i32, Substance)> {
-        let density = &self.router.final_density;
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
         for y in (self.router.min_y..=self.max_y).rev() {
-            let substance = self.aquifer.substance(x, y, z, density.sample(x, y, z));
+            let value = self.column_density_value(col, x, y, z);
+            let substance = self.aquifer.substance(x, y, z, value);
             if substance != Substance::Air {
                 return Some((y, substance));
             }
@@ -952,9 +1043,10 @@ impl VanillaGenerator {
     /// Absolute Y of the top *terrain* (solid) block, ignoring fluids:
     /// the density-only scan kept for diagnostics.
     pub fn terrain_top_exhaustive(&self, x: i32, z: i32) -> i32 {
-        let density = &self.router.final_density;
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
         for y in (self.router.min_y..=self.max_y).rev() {
-            if density.sample(x, y, z) > 0.0 {
+            if self.column_density_value(col, x, y, z) > 0.0 {
                 return y;
             }
         }
@@ -994,6 +1086,7 @@ impl VanillaGenerator {
             aquifer_surface_levels: aquifer.surface_levels,
             aquifer_skip_bounds: aquifer.skip_bounds,
             decorated_chunks: self.chunks.borrow().entries(),
+            chunk_densities: self.chunk_density.borrow().entries(),
         }
     }
 
@@ -1001,15 +1094,16 @@ impl VanillaGenerator {
     /// that is value-exact only for graphs whose top-level `min` operands
     /// are also interpolated at the same y cell).
     pub fn terrain_top(&self, x: i32, z: i32) -> i32 {
-        let density = &self.router.final_density;
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
         let bottom_grid = self.router.min_y.div_euclid(8) * 8;
         let mut grid_y = self.max_y.div_euclid(8) * 8;
         while grid_y >= bottom_grid {
-            if density.sample(x, grid_y, z) > 0.0 {
+            if self.column_density_value(col, x, grid_y, z) > 0.0 {
                 // Refine the cell above the first positive grid sample.
                 let mut probe = (grid_y + 7).min(self.max_y);
                 while probe > grid_y {
-                    if density.sample(x, probe, z) > 0.0 {
+                    if self.column_density_value(col, x, probe, z) > 0.0 {
                         return probe;
                     }
                     probe -= 1;
@@ -2815,5 +2909,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chunk_density_cache_stays_bounded_and_matches_raw_density() {
+        let (root, generator) = bounded_generator("cache-density");
+        for chunk_x in 0..40i32 {
+            let chunk = generator.chunk_density(chunk_x, 0);
+            assert_eq!(chunk.len(), 16 * generator.height() as usize * 16);
+        }
+        let occupancy = generator.cache_occupancy();
+        assert!(occupancy.chunk_densities <= 2 * VanillaGenerator::CHUNK_DENSITY_CACHE_CAPACITY);
+        assert!(occupancy.chunk_densities < 40);
+        for (x, y, z) in [
+            (-1, 0, -1),
+            (0, 22, 15),
+            (17, 127, -3),
+            (5, -10, 5),
+            (5, 200, 5),
+        ] {
+            assert_eq!(
+                generator.density_at(x, y, z).to_bits(),
+                generator.raw_density(x, y, z).to_bits(),
+                "mismatch at ({x},{y},{z})"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
