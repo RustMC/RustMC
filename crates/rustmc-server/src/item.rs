@@ -82,7 +82,7 @@ pub fn items_equal(a: &str, b: &str) -> bool {
 pub fn default_max_stack(item: &str) -> u16 {
     match normalize_item_id(item) {
         "lava_bucket" | "water_bucket" | "milk_bucket" | "potion" | "splash_potion"
-        | "lingering_potion" => 1,
+        | "lingering_potion" | "enchanted_book" => 1,
         "bucket" | "snowball" | "ender_pearl" | "egg" => 16,
         _ => DEFAULT_MAX_STACK,
     }
@@ -1932,6 +1932,7 @@ mod tests {
             "minecraft:potion",
             "splash_potion",
             "minecraft:lingering_potion",
+            "minecraft:enchanted_book",
         ] {
             assert_eq!(default_max_stack(single), 1, "{single}");
         }
