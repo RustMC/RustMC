@@ -30,6 +30,29 @@ use crate::world::furnace::default_max_stack;
 ///   the smallest of x or y."
 pub const CRAFTING_REPAIR_BONUS_DIVISOR: u32 = 20;
 
+/// Computes the combined `minecraft:damage` (uses consumed) when repairing two
+/// items of the same damageable kind via the vanilla item-repair formula.
+///
+/// Uses `min(Item A uses + Item B uses + floor(Max uses / 20), Max uses)`
+/// (minecraft.wiki `Item repair` revision 3791643, shared by the crafting
+/// `minecraft:crafting_special_repairitem` recipe and the grindstone).
+/// Returns `None` when `max_damage == 0`, or `Some(result_damage)` where `0`
+/// means full remaining durability.
+#[must_use]
+pub fn repair_combined_damage(max_damage: u32, damage_a: u32, damage_b: u32) -> Option<u32> {
+    if max_damage == 0 {
+        return None;
+    }
+    let uses_a = max_damage.saturating_sub(damage_a);
+    let uses_b = max_damage.saturating_sub(damage_b);
+    let bonus = max_damage / CRAFTING_REPAIR_BONUS_DIVISOR;
+    let repaired_uses = uses_a
+        .saturating_add(uses_b)
+        .saturating_add(bonus)
+        .min(max_damage);
+    Some(max_damage.saturating_sub(repaired_uses))
+}
+
 /// Output stack count produced by combining two damaged items in a crafting grid.
 ///
 /// Source: minecraft.wiki `Item repair` (revision 3791643):
@@ -582,21 +605,9 @@ impl RepairItemRecipe {
         }
         let norm_id = normalize_item_id(first.item());
         let info = self.damageable_items.get(norm_id)?;
-        let max_damage = info.max_damage;
-        if max_damage == 0 {
-            return None;
-        }
-
         let damage_a = first.components().damage().unwrap_or(0);
         let damage_b = second.components().damage().unwrap_or(0);
-        let uses_a = max_damage.saturating_sub(damage_a);
-        let uses_b = max_damage.saturating_sub(damage_b);
-        let bonus = max_damage / CRAFTING_REPAIR_BONUS_DIVISOR;
-        let repaired_uses = uses_a
-            .saturating_add(uses_b)
-            .saturating_add(bonus)
-            .min(max_damage);
-        let result_damage = max_damage.saturating_sub(repaired_uses);
+        let result_damage = repair_combined_damage(info.max_damage, damage_a, damage_b)?;
 
         let mut result =
             ItemStack::try_new(first.item(), CRAFTING_REPAIR_RESULT_COUNT, info.max_stack).ok()?;
