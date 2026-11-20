@@ -68,10 +68,16 @@ struct DecoratedChunk {
     /// Interned block names; index 0 is the air slot a `None` column entry
     /// maps to.
     palette: Vec<Option<String>>,
+    /// Whether each palette slot is a non-air block, kept so `top_non_air`
+    /// maintenance and heightmap scans avoid repeated string lookups.
+    palette_non_air: Vec<bool>,
     /// Which palette entry each position holds, laid out y-outer so that one
     /// absolute Y row of the chunk is 256 contiguous entries: `row * 256 +
     /// local_x * 16 + local_z`, with `row` relative to `min_y`.
     blocks: Vec<u16>,
+    /// Highest non-air relative row index (`0..height`), or `-1` when a column
+    /// is completely empty. Maintained on populate and `set`.
+    top_non_air: [i16; 256],
     /// Name to palette index, kept so interning is O(1) per write.
     ids: HashMap<String, u16>,
 }
@@ -80,7 +86,9 @@ impl DecoratedChunk {
     fn new(height: usize) -> Self {
         Self {
             palette: vec![None],
+            palette_non_air: vec![false],
             blocks: vec![0; height * 256],
+            top_non_air: [-1; 256],
             ids: HashMap::new(),
         }
     }
@@ -96,6 +104,7 @@ impl DecoratedChunk {
             return slot;
         }
         let slot = self.palette.len() as u16;
+        self.palette_non_air.push(!AIR_IDS.contains(&name.as_str()));
         self.palette.push(Some(name.clone()));
         self.ids.insert(name, slot);
         slot
@@ -109,6 +118,22 @@ impl DecoratedChunk {
         let at = self.index(local_x, row, local_z);
         let slot = self.intern(Some(name.to_owned()));
         self.blocks[at] = slot;
+        let col = (local_x as usize) * 16 + local_z as usize;
+        if self.palette_non_air[slot as usize] {
+            if (row as i16) > self.top_non_air[col] {
+                self.top_non_air[col] = row as i16;
+            }
+        } else if (row as i16) == self.top_non_air[col] {
+            let mut scan = row as i16 - 1;
+            while scan >= 0 {
+                let idx = (scan as usize) * 256 + col;
+                if self.palette_non_air[self.blocks[idx] as usize] {
+                    break;
+                }
+                scan -= 1;
+            }
+            self.top_non_air[col] = scan;
+        }
     }
 
     /// One absolute column of the chunk, dimension-relative from index 0.
@@ -139,7 +164,7 @@ struct ChunkView<'a> {
 /// fill and carve, and the next candidate usually asks for the same column.
 /// Emptied at [`HALO_COLUMN_LIMIT`] so a pack of wide offsets cannot grow it
 /// past a fixed size.
-type HaloColumns = HashMap<(i32, i32), Rc<Vec<Option<String>>>>;
+type HaloColumns = HashMap<(i32, i32, i32), Rc<str>>;
 
 /// The most neighbour columns one pass keeps, about a chunk's perimeter four
 /// rows deep.
@@ -983,11 +1008,16 @@ impl VanillaGenerator {
                 let map_slot = OceanFloorMap::slot(x, z);
                 surface_map[map_slot] = top_y;
                 floor_map[map_slot] = floor_y;
+                let mut col_top = -1i16;
                 for (row, name) in ids.into_iter().enumerate() {
                     let at = chunk.index(local_x, row, local_z);
                     let slot = chunk.intern(name);
                     chunk.blocks[at] = slot;
+                    if chunk.palette_non_air[slot as usize] {
+                        col_top = row as i16;
+                    }
                 }
+                chunk.top_non_air[(local_x as usize) * 16 + local_z as usize] = col_top;
             }
         }
         let chunk_key = (chunk_x, chunk_z);
@@ -1030,8 +1060,67 @@ impl VanillaGenerator {
         chunk
     }
 
+    #[cfg(test)]
     fn base_column_ids(&self, x: i32, z: i32) -> Vec<Option<String>> {
         self.base_column_ids_with_heights(x, z).0
+    }
+
+    /// Resolves one solid pre-decoration block id at `(x, y, z)` using the
+    /// same top-down descent counters (`stone_above`, `stone_below`, `water_height`)
+    /// as [`Self::base_column_ids_with_heights`], without evaluating surface rules
+    /// on lower rows or allocating a full column vector.
+    fn base_solid_block_at(&self, x: i32, y: i32, z: i32) -> String {
+        let Some(rules) = self.surface.as_ref() else {
+            return self.router.default_block.clone();
+        };
+        let min_y = self.router.min_y;
+        let top = self.surface_height(x, z);
+        if y > top {
+            return self.router.default_block.clone();
+        }
+        let chunk = self.chunk_density(x >> 4, z >> 4);
+        let col = chunk.get(self.column_density_range(x, z)).unwrap_or(&[]);
+        let mut stone_above = 0i32;
+        let mut water_height: Option<i32> = None;
+        for cy in (y..=top).rev() {
+            let value = self.column_density_value(col, x, cy, z);
+            match self.aquifer.substance(x, cy, z, value) {
+                Substance::Air => {
+                    stone_above = 0;
+                    water_height = None;
+                }
+                Substance::Fluid(_) => {
+                    if water_height.is_none() {
+                        water_height = Some(cy + 1);
+                    }
+                }
+                Substance::Solid => {
+                    stone_above += 1;
+                }
+            }
+        }
+        let mut run_bottom = WAY_BELOW_MIN_Y;
+        let mut lookahead = y - 1;
+        while lookahead >= min_y {
+            let value = self.column_density_value(col, x, lookahead, z);
+            if self.aquifer.substance(x, lookahead, z, value) != Substance::Solid {
+                run_bottom = lookahead + 1;
+                break;
+            }
+            lookahead -= 1;
+        }
+        let mut ctx = SurfaceContext::new(
+            rules,
+            self.router.chunk_surface_level.as_ref(),
+            x,
+            z,
+            |hx, hz| self.surface_height(hx, hz),
+            |bx, by, bz| self.biome(bx, bz, by),
+        );
+        ctx.set_y(stone_above, y - run_bottom + 1, water_height, y);
+        rules
+            .apply(&mut ctx)
+            .unwrap_or_else(|| self.router.default_block.clone())
     }
 
     /// The full material-rule descent of one column, the documented
@@ -1583,16 +1672,30 @@ impl DecorationTarget for ChunkView<'_> {
             let named = self.block_at(x, y, z).unwrap_or("minecraft:air");
             return Some(Cow::Borrowed(named));
         }
-        let mut halo = self.halo.borrow_mut();
-        if halo.len() >= HALO_COLUMN_LIMIT && !halo.contains_key(&(x, z)) {
-            halo.clear();
+        if let Some(cached) = self.halo.borrow().get(&(x, y, z)) {
+            return Some(Cow::Owned(cached.as_ref().to_owned()));
         }
-        let column = halo
-            .entry((x, z))
-            .or_insert_with(|| Rc::new(self.generator.base_column_ids(x, z)));
-        let row = (y - self.generator.router.min_y) as usize;
-        let named = column[row].as_deref().unwrap_or("minecraft:air");
-        Some(Cow::Owned(named.to_string()))
+        match self.generator.substance(x, y, z) {
+            Substance::Air => {
+                let named = if self.generator.carved(x, y, z) {
+                    "minecraft:cave_air"
+                } else {
+                    "minecraft:air"
+                };
+                Some(Cow::Borrowed(named))
+            }
+            Substance::Fluid(fluid) => Some(Cow::Borrowed(VanillaGenerator::fluid_name(fluid))),
+            Substance::Solid => {
+                let mut halo = self.halo.borrow_mut();
+                if halo.len() >= HALO_COLUMN_LIMIT && !halo.contains_key(&(x, y, z)) {
+                    halo.clear();
+                }
+                let entry = halo.entry((x, y, z)).or_insert_with(|| {
+                    Rc::<str>::from(self.generator.base_solid_block_at(x, y, z))
+                });
+                Some(Cow::Owned(entry.as_ref().to_owned()))
+            }
+        }
     }
 
     fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
@@ -1614,18 +1717,90 @@ impl DecorationTarget for ChunkView<'_> {
         self.chunk.set(x & 15, row, z & 15, name);
     }
 
+    fn writable_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let min_x = self.chunk_x << 4;
+        let min_z = self.chunk_z << 4;
+        Some((min_x, min_x + 15, min_z, min_z + 15))
+    }
+
     fn biome_at(&self, _x: i32, y: i32, z: i32) -> Option<String> {
         self.generator.biome(_x, z, y)
     }
 
+    fn has_biome(&self, x: i32, y: i32, z: i32, allowed: &dyn Fn(&str) -> bool) -> bool {
+        self.generator
+            .biome_arc(x, z, y)
+            .is_some_and(|biome| allowed(biome.as_ref()))
+    }
+
     fn ocean_floor_height(&self, x: i32, z: i32) -> i32 {
         self.generator.ocean_floor_height(x, z)
+    }
+
+    fn heightmap_height(
+        &self,
+        kind: crate::vanilla::feature::HeightmapKind,
+        x: i32,
+        z: i32,
+        tags: &crate::vanilla::feature::BlockTags,
+    ) -> i32 {
+        use crate::vanilla::feature::HeightmapKind;
+        let min_y = self.generator.router.min_y;
+        if (x >> 4, z >> 4) == (self.chunk_x, self.chunk_z) {
+            let col = ((x & 15) as usize) * 16 + (z & 15) as usize;
+            let top_row = self.chunk.top_non_air[col];
+            if top_row < 0 {
+                return min_y;
+            }
+            if matches!(
+                kind,
+                HeightmapKind::WorldSurface | HeightmapKind::WorldSurfaceWg
+            ) {
+                return min_y + i32::from(top_row) + 1;
+            }
+            for row in (0..=top_row as usize).rev() {
+                let slot = self.chunk.blocks[row * 256 + col];
+                if slot == 0 {
+                    continue;
+                }
+                if let Some(name) = self.chunk.name(slot)
+                    && kind.matches_block(name, tags)
+                {
+                    return min_y + row as i32 + 1;
+                }
+            }
+            return min_y;
+        }
+        // Neighbour columns outside this chunk hold only pre-decoration terrain
+        // and fluids, so heightmaps resolve directly from cached floor heights
+        // and substance descent without building surface-rule string columns.
+        match kind {
+            HeightmapKind::OceanFloor | HeightmapKind::OceanFloorWg => {
+                let floor = self.generator.ocean_floor_height(x, z);
+                if floor > min_y || self.generator.substance(x, min_y, z) == Substance::Solid {
+                    floor + 1
+                } else {
+                    min_y
+                }
+            }
+            HeightmapKind::WorldSurface
+            | HeightmapKind::WorldSurfaceWg
+            | HeightmapKind::MotionBlocking
+            | HeightmapKind::MotionBlockingNoLeaves => {
+                let mut y = self.generator.surface_height(x, z);
+                while y >= min_y && self.generator.substance(x, y, z) == Substance::Air {
+                    y -= 1;
+                }
+                if y >= min_y { y + 1 } else { min_y }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3509,30 +3684,22 @@ mod tests {
                 false,
                 Some("minecraft:multiface_growth"),
             ),
-            (
-                "minecraft:forest_flowers",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
+            ("minecraft:forest_flowers", true, None),
             (
                 "minecraft:trees_birch_and_oak_leaf_litter",
                 false,
-                Some("range:minecraft:weighted_list"),
+                Some("placement:minecraft:surface_water_depth_filter"),
             ),
             (
                 "minecraft:patch_tall_grass_2",
                 false,
                 Some("placement:minecraft:noise_threshold_count"),
             ),
-            (
-                "minecraft:patch_bush",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
+            ("minecraft:patch_bush", true, None),
             (
                 "minecraft:trees_plains",
                 false,
-                Some("range:minecraft:weighted_list"),
+                Some("placement:minecraft:surface_water_depth_filter"),
             ),
             (
                 "minecraft:flower_plains",
@@ -3544,41 +3711,21 @@ mod tests {
                 false,
                 Some("placement:minecraft:noise_threshold_count"),
             ),
-            (
-                "minecraft:flower_default",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
-            (
-                "minecraft:patch_grass_forest",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
+            ("minecraft:flower_default", true, None),
+            ("minecraft:patch_grass_forest", true, None),
             (
                 "minecraft:brown_mushroom_normal",
                 false,
-                Some("placement:minecraft:heightmap"),
+                Some("state:minecraft:brown_mushroom"),
             ),
             (
                 "minecraft:red_mushroom_normal",
                 false,
-                Some("placement:minecraft:heightmap"),
+                Some("state:minecraft:red_mushroom"),
             ),
-            (
-                "minecraft:patch_pumpkin",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
-            (
-                "minecraft:patch_sugar_cane",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
-            (
-                "minecraft:patch_firefly_bush_near_water",
-                false,
-                Some("placement:minecraft:heightmap"),
-            ),
+            ("minecraft:patch_pumpkin", true, None),
+            ("minecraft:patch_sugar_cane", true, None),
+            ("minecraft:patch_firefly_bush_near_water", true, None),
         ];
 
         for (row, (expected_id, expected_runs, expected_first)) in
@@ -3598,28 +3745,95 @@ mod tests {
             first_pieces,
             BTreeSet::from([
                 "minecraft:multiface_growth".to_string(),
-                "placement:minecraft:heightmap".to_string(),
                 "placement:minecraft:noise_threshold_count".to_string(),
-                "range:minecraft:weighted_list".to_string(),
+                "placement:minecraft:surface_water_depth_filter".to_string(),
+                "state:minecraft:brown_mushroom".to_string(),
+                "state:minecraft:red_mushroom".to_string(),
             ])
         );
         assert_eq!(
             all_pieces,
             BTreeSet::from([
-                "minecraft:block_column".to_string(),
+                "minecraft:fallen_tree".to_string(),
                 "minecraft:multiface_growth".to_string(),
-                "minecraft:random_selector".to_string(),
-                "placement:minecraft:heightmap".to_string(),
+                "minecraft:tree".to_string(),
                 "placement:minecraft:noise_threshold_count".to_string(),
-                "placement:minecraft:offset".to_string(),
                 "placement:minecraft:surface_water_depth_filter".to_string(),
                 "predicate:minecraft:would_survive".to_string(),
-                "provider:minecraft:block_state_provider_reference".to_string(),
-                "range:minecraft:clamped".to_string(),
-                "range:minecraft:weighted_list".to_string(),
+                "provider:minecraft:noise_threshold".to_string(),
                 "state:minecraft:brown_mushroom".to_string(),
                 "state:minecraft:red_mushroom".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn chunk_view_heightmap_and_halo_solid_match_base_columns() {
+        use crate::vanilla::feature::{BlockTags, HeightmapKind};
+        let (root, generator) = decorating_generator("heightmap-halo");
+        let tags = BlockTags::default();
+        let mut chunk = DecoratedChunk::new(generator.router.height as usize);
+        for lx in 0..16 {
+            for lz in 0..16 {
+                let ids = generator.base_column_ids(lx, lz);
+                let mut top = -1i16;
+                for (row, name) in ids.into_iter().enumerate() {
+                    let at = chunk.index(lx, row, lz);
+                    let slot = chunk.intern(name);
+                    chunk.blocks[at] = slot;
+                    if chunk.palette_non_air[slot as usize] {
+                        top = row as i16;
+                    }
+                }
+                chunk.top_non_air[(lx as usize) * 16 + lz as usize] = top;
+            }
+        }
+        let top_row = generator.height() as usize - 1;
+        let top_y = generator.min_y() + top_row as i32;
+        chunk.set(2, top_row - 1, 2, "minecraft:stone");
+        chunk.set(2, top_row, 2, "minecraft:oak_leaves");
+        chunk.set(3, top_row - 1, 3, "minecraft:stone");
+        chunk.set(3, top_row, 3, "minecraft:short_grass");
+        let halo = RefCell::new(HaloColumns::new());
+        let view = ChunkView {
+            generator: &generator,
+            chunk_x: 0,
+            chunk_z: 0,
+            chunk: &mut chunk,
+            halo: &halo,
+        };
+        assert_eq!(
+            view.heightmap_height(HeightmapKind::WorldSurface, 2, 2, &tags),
+            top_y + 1
+        );
+        assert_eq!(
+            view.heightmap_height(HeightmapKind::MotionBlocking, 2, 2, &tags),
+            top_y + 1
+        );
+        assert_eq!(
+            view.heightmap_height(HeightmapKind::MotionBlockingNoLeaves, 2, 2, &tags),
+            top_y
+        );
+        assert_eq!(
+            view.heightmap_height(HeightmapKind::WorldSurface, 3, 3, &tags),
+            top_y + 1
+        );
+        assert_eq!(
+            view.heightmap_height(HeightmapKind::MotionBlocking, 3, 3, &tags),
+            top_y,
+            "short_grass does not block motion"
+        );
+        let expected_halo = generator.base_column_ids(17, 5);
+        for (row, expected_name) in expected_halo.iter().enumerate() {
+            let y = generator.min_y() + row as i32;
+            let got = view.read_block(17, y, 5);
+            let want = expected_name.as_deref().unwrap_or("minecraft:air");
+            assert_eq!(got.as_deref(), Some(want), "halo mismatch at y={y}");
+        }
+        assert!(
+            view.heightmap_height(HeightmapKind::OceanFloorWg, 17, 5, &tags)
+                <= view.heightmap_height(HeightmapKind::WorldSurfaceWg, 17, 5, &tags)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
