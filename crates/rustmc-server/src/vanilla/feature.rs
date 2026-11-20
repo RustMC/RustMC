@@ -1484,12 +1484,12 @@ impl FeatureData {
     /// lists at that step, then sorts them ascending; a biome the dimension
     /// cannot produce contributes nothing, which is its `retainAll` over the
     /// source's possible biomes.
-    pub fn region_ordinals(&self, step: usize, biomes: &[String]) -> Vec<usize> {
+    pub fn region_ordinals<S: AsRef<str>>(&self, step: usize, biomes: &[S]) -> Vec<usize> {
         let mut ordinals = Vec::new();
         for biome in biomes {
             if let Some(indices) = self
                 .biome_ordinals
-                .get(biome)
+                .get(biome.as_ref())
                 .and_then(|per_step| per_step.get(step))
             {
                 ordinals.extend_from_slice(indices);
@@ -3261,14 +3261,14 @@ impl FeatureData {
     /// its ordinal and step, so a feature with no runtime here contributes
     /// nothing without moving the seeds of the features around it — which is
     /// also why the ordinals are kept for unmodeled features.
-    pub fn decorate_step(
+    pub fn decorate_step<S: AsRef<str>>(
         &self,
         target: &mut dyn DecorationTarget,
         step: usize,
         chunk_x: i32,
         chunk_z: i32,
         world_seed: i64,
-        region_biomes: &[String],
+        region_biomes: &[S],
     ) -> usize {
         let mut written = 0usize;
         for ordinal in self.region_ordinals(step, region_biomes) {

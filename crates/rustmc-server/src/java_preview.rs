@@ -72,14 +72,17 @@ impl VanillaWorker {
         let (tx, results) = mpsc::sync_channel(capacity);
         let rx = Arc::new(Mutex::new(rx));
         let current_center = Arc::new(AtomicU64::new(packed_center((0, 0))));
+        let shared_caches = Arc::new(crate::vanilla::generator::SharedChunkCaches::new());
         let handles = (0..capacity)
             .map(|_| {
                 let rx = Arc::clone(&rx);
                 let tx = tx.clone();
                 let source = source.clone();
                 let current_center = Arc::clone(&current_center);
+                let shared_caches = Arc::clone(&shared_caches);
                 thread::spawn(move || {
-                    let Some((generator, tables)) = load_worker_inputs(&source) else {
+                    let Some((generator, tables)) = load_worker_inputs(&source, shared_caches)
+                    else {
                         // Dropping this worker's senders lets the preview observe
                         // a disconnected pool and close the session explicitly.
                         return;
@@ -199,14 +202,16 @@ impl VanillaWorker {
 /// validated these inputs, so a failure here means they changed on disk.
 fn load_worker_inputs(
     source: &VanillaSource,
+    shared_caches: Arc<crate::vanilla::generator::SharedChunkCaches>,
 ) -> Option<(
     crate::vanilla::generator::VanillaGenerator,
     crate::chunk_adapter::registry::RegistryTables,
 )> {
-    let loaded = crate::vanilla::generator::VanillaGenerator::new(
+    let loaded = crate::vanilla::generator::VanillaGenerator::with_shared_caches(
         &source.data_root,
         source.seed,
         "minecraft:overworld",
+        shared_caches,
     )
     .map_err(|error| error.to_string())
     .and_then(|generator| {
@@ -738,7 +743,10 @@ fn cache_center((x, z): (i32, i32)) -> Vec<u8> {
 }
 
 /// Square shells from the player, with each shell's forward edge first.
-fn ordered_view((cx, cz): (i32, i32), radius: i32, (dx, dz): (i32, i32)) -> Vec<(i32, i32)> {
+///
+/// This is the order the preview requests chunks in; a join at spawn uses
+/// direction `(0, 0)`. Public so the generation benchmarks can replay it.
+pub fn ordered_view((cx, cz): (i32, i32), radius: i32, (dx, dz): (i32, i32)) -> Vec<(i32, i32)> {
     let mut positions: Vec<_> = (-radius..=radius)
         .flat_map(|z| (-radius..=radius).map(move |x| (cx + x, cz + z)))
         .collect();

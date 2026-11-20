@@ -18,13 +18,21 @@
 //! explored world.
 //!
 //! This is deliberately not a general-purpose crate dependency: the caches
-//! need no TTL, no statistics, no concurrent access (each generator is used
-//! from one thread behind its own `RefCell`), and the whole policy is the
-//! six lines above. See the capacity comments on `VanillaGenerator` and
-//! `NoiseBasedAquifer` for the per-cache reasoning.
+//! need no TTL, no statistics, and no complex eviction policy, and the whole
+//! mechanism is the two-generation rotation below. Each generator owns private
+//! `RefCell` L1 caches for lock-free local hits, while `ShardedBoundedCache`
+//! shares immutable chunk products across workers behind sharded mutexes that
+//! are never held while computing. See the capacity comments on
+//! `VanillaGenerator`, `SharedChunkCaches`, and `NoiseBasedAquifer` for the
+//! per-cache reasoning.
 
-use rustc_hash::FxHashMap;
-use std::hash::Hash;
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::hash::{BuildHasher, Hash};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Number of independent shards in [`ShardedBoundedCache`], a power of two so
+/// shard selection is a single mask over the upper mixed hash bits.
+pub(crate) const CACHE_SHARDS: usize = 32;
 
 /// A hash map bounded to `2 * capacity` entries by two-generation FIFO
 /// eviction with promotion on old-generation hits.
@@ -44,6 +52,17 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
             capacity,
             young: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
             old: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+        }
+    }
+
+    /// Creates an empty cache with the same `2 * capacity` entry bound,
+    /// deferring hash-table allocation until entries are inserted.
+    pub fn new_lazy(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            young: FxHashMap::default(),
+            old: FxHashMap::default(),
         }
     }
 
@@ -95,6 +114,65 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
 fn rotate<K, V>(young: &mut FxHashMap<K, V>, old: &mut FxHashMap<K, V>) {
     std::mem::swap(young, old);
     young.clear();
+}
+
+/// A sharded, thread-safe, bounded cache holding immutable values shared across
+/// generation workers.
+///
+/// Each shard holds a [`BoundedCache`] behind its own `Mutex` and is never locked
+/// across value computation. Total entries never exceed
+/// `2 * CACHE_SHARDS * per_shard_capacity` (equal to `2 * capacity` when
+/// `capacity` is a non-zero multiple of [`CACHE_SHARDS`]).
+pub(crate) struct ShardedBoundedCache<K, V> {
+    shards: [Mutex<BoundedCache<K, V>>; CACHE_SHARDS],
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> ShardedBoundedCache<K, V> {
+    /// Creates an empty sharded cache whose shards lazily allocate on first use.
+    pub fn new(capacity: usize) -> Self {
+        let per_shard = capacity.div_ceil(CACHE_SHARDS).max(1);
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(BoundedCache::new_lazy(per_shard))),
+        }
+    }
+
+    fn shard_index(key: &K) -> usize {
+        let hash = FxBuildHasher.hash_one(key);
+        ((hash >> 59) as usize) & (CACHE_SHARDS - 1)
+    }
+
+    fn lock_shard(&self, key: &K) -> MutexGuard<'_, BoundedCache<K, V>> {
+        self.shards[Self::shard_index(key)]
+            .lock()
+            // Shard entries are immutable values inserted by complete map ops; a panic elsewhere leaves the cache valid.
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns a cloned immutable value for `key` if present, promoting hits
+    /// from the older generation into the young one.
+    pub fn get(&self, key: &K) -> Option<V> {
+        self.lock_shard(key).get_mut(key).cloned()
+    }
+
+    /// Inserts an immutable value for `key`, rotating the shard when full.
+    pub fn insert(&self, key: K, value: V) {
+        self.lock_shard(&key).insert(key, value);
+    }
+
+    /// Total entries currently held across every shard.
+    #[cfg(test)]
+    pub fn entries(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    // Shard entries are immutable values inserted by complete map ops; a panic elsewhere leaves the cache valid.
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entries()
+            })
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +245,32 @@ mod tests {
             Some(2),
             "the newest entry survives"
         );
+    }
+
+    #[test]
+    fn sharded_cache_stays_bounded_under_concurrent_writes() {
+        use std::sync::Arc;
+
+        let capacity = 64usize;
+        let cache = Arc::new(ShardedBoundedCache::<(i32, i32), Arc<[i32]>>::new(capacity));
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    for step in 0..500 {
+                        let key = ((worker * 17 + step) % 400, step / 10);
+                        if let Some(existing) = cache.get(&key) {
+                            assert_eq!(existing[0], key.0);
+                            assert_eq!(existing[1], key.1);
+                        } else {
+                            let val: Arc<[i32]> = Arc::from([key.0, key.1]);
+                            cache.insert(key, val);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(cache.entries() <= 2 * capacity);
+        assert!(cache.entries() > 0);
     }
 }

@@ -1257,3 +1257,74 @@ fn smoke_encodes_a_provisioned_overworld_column() {
         "operator data must exercise biome changes with height"
     );
 }
+
+#[test]
+#[ignore = "requires operator-provisioned local data"]
+fn shared_worker_caches_encode_identically_to_private_generator() {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::vanilla::generator::SharedChunkCaches;
+
+    let root = std::env::var("RUSTMC_VANILLA_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+    let registry_path = std::env::var("RUSTMC_CHUNK_REGISTRY")
+        .or_else(|_| std::env::var("RUSTMC_REGISTRY_TABLE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".rustmc-local/chunk-registry-26.3.json"));
+    let text = std::fs::read_to_string(&registry_path).expect("provisioned chunk registry reads");
+    let tables = RegistryTables::from_provisioned(&text).expect("provisioned table loads");
+
+    let coords: Vec<(i32, i32)> = (-2..=2)
+        .flat_map(|cx| (-2..=2).map(move |cz| (cx, cz)))
+        .collect();
+    let private =
+        VanillaGenerator::new(&root, 2026, "minecraft:overworld").expect("private generator loads");
+    let expected: Vec<Vec<u8>> = coords
+        .iter()
+        .map(|&(cx, cz)| {
+            let chunk =
+                chunk_from_generator(&private, cx, cz, &tables).expect("private chunk builds");
+            encode_chunk(&chunk, &tables).expect("private chunk encodes")
+        })
+        .collect();
+
+    let shared = Arc::new(SharedChunkCaches::new());
+    let queue = Mutex::new(coords.iter().copied().enumerate());
+    let actual = Mutex::new(vec![Vec::new(); coords.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let (root, text, shared, queue, actual) = (&root, &text, &shared, &queue, &actual);
+            scope.spawn(move || {
+                let worker = VanillaGenerator::with_shared_caches(
+                    root,
+                    2026,
+                    "minecraft:overworld",
+                    Arc::clone(shared),
+                )
+                .expect("shared generator loads");
+                let worker_tables =
+                    RegistryTables::from_provisioned(text).expect("worker tables load");
+                loop {
+                    let next = queue.lock().expect("queue").next();
+                    let Some((idx, (cx, cz))) = next else {
+                        break;
+                    };
+                    let chunk = chunk_from_generator(&worker, cx, cz, &worker_tables)
+                        .expect("shared chunk builds");
+                    let packet =
+                        encode_chunk(&chunk, &worker_tables).expect("shared chunk encodes");
+                    actual.lock().expect("actual")[idx] = packet;
+                }
+            });
+        }
+    });
+    let actual = actual.into_inner().expect("actual");
+    for (idx, &(cx, cz)) in coords.iter().enumerate() {
+        assert_eq!(
+            actual[idx], expected[idx],
+            "packet mismatch for chunk ({cx}, {cz})"
+        );
+    }
+}
