@@ -387,7 +387,13 @@ enum Node {
         functions: Rc<[Density]>,
     },
     Spline(Spline),
-    Cache(Density),
+    /// `minecraft:cache`: the input's values are memoised. When the input is
+    /// provably independent of `y` (see [`Density::is_y_independent`]) the
+    /// memo is per column; otherwise the node evaluates its input directly.
+    Cache {
+        input: Density,
+        columns: Option<RefCell<BoundedCache<ColumnKey, f32>>>,
+    },
     Interpolated {
         input: Density,
         cell_size_xz: i32,
@@ -451,6 +457,115 @@ impl Density {
         match &*self.0 {
             Node::Constant(value) => Some(*value),
             _ => None,
+        }
+    }
+
+    /// Whether the value provably does not depend on `y` beyond its sign
+    /// (see [`ColumnKey`]). Conservative: anything not proven independent
+    /// counts as dependent, which only costs a missed memo.
+    fn is_y_independent(&self) -> bool {
+        match &*self.0 {
+            // `find_top_surface` samples its bounds at y = 0 and its density at
+            // fixed probe heights: it never reads the queried y.
+            Node::Constant(_)
+            | Node::BlendAlpha
+            | Node::BlendOffset
+            | Node::Beardifier
+            | Node::FindTopSurface { .. } => true,
+            Node::Noise {
+                y_scale,
+                shift_x,
+                shift_y,
+                shift_z,
+                ..
+            } => {
+                *y_scale == 0.0
+                    && shift_x.is_y_independent()
+                    && shift_y.is_y_independent()
+                    && shift_z.is_y_independent()
+            }
+            Node::ShiftNoise { kind, .. } => *kind != ShiftKind::X,
+            Node::Axial { axis, .. } => *axis != Axis::Y,
+            Node::Unary(_, input)
+            | Node::BlendDensity(input)
+            | Node::PowConstExponent { input, .. }
+            | Node::Clamp { input, .. } => input.is_y_independent(),
+            Node::PowConstBase { exponent, .. } => exponent.is_y_independent(),
+            Node::Binary(_, left, right) | Node::Pow(left, right) => {
+                left.is_y_independent() && right.is_y_independent()
+            }
+            Node::Round {
+                input, multiple, ..
+            } => input.is_y_independent() && multiple.is_y_independent(),
+            Node::Lerp {
+                alpha,
+                first,
+                second,
+            } => alpha.is_y_independent() && first.is_y_independent() && second.is_y_independent(),
+            Node::RangeChoice {
+                input,
+                when_in_range,
+                when_out_of_range,
+                ..
+            } => {
+                input.is_y_independent()
+                    && when_in_range.is_y_independent()
+                    && when_out_of_range.is_y_independent()
+            }
+            Node::IntervalSelect {
+                input, functions, ..
+            } => input.is_y_independent() && functions.iter().all(Density::is_y_independent),
+            Node::Spline(spline) => spline_is_y_independent(spline),
+            Node::Cache { input, .. } => input.is_y_independent(),
+            Node::Slice { axis, input, .. } => *axis == Axis::Y || input.is_y_independent(),
+            Node::Interpolated { .. } | Node::DistanceToPoint { .. } | Node::Blended(_) => false,
+        }
+    }
+
+    /// Whether any descendant node is `Node::Interpolated`, used to decide
+    /// when a branch of `range_choice` benefits from a volume pass over a
+    /// sparse per-block sample.
+    fn contains_interpolated(&self) -> bool {
+        match &*self.0 {
+            Node::Interpolated { .. } => true,
+            Node::Unary(_, input)
+            | Node::PowConstExponent { input, .. }
+            | Node::PowConstBase {
+                exponent: input, ..
+            }
+            | Node::Clamp { input, .. }
+            | Node::Cache { input, .. }
+            | Node::Slice { input, .. }
+            | Node::BlendDensity(input) => input.contains_interpolated(),
+            Node::Binary(_, left, right) | Node::Pow(left, right) => {
+                left.contains_interpolated() || right.contains_interpolated()
+            }
+            Node::Round {
+                input, multiple, ..
+            } => input.contains_interpolated() || multiple.contains_interpolated(),
+            Node::Lerp {
+                alpha,
+                first,
+                second,
+            } => {
+                alpha.contains_interpolated()
+                    || first.contains_interpolated()
+                    || second.contains_interpolated()
+            }
+            Node::RangeChoice {
+                input,
+                when_in_range,
+                when_out_of_range,
+                ..
+            } => {
+                input.contains_interpolated()
+                    || when_in_range.contains_interpolated()
+                    || when_out_of_range.contains_interpolated()
+            }
+            Node::IntervalSelect {
+                input, functions, ..
+            } => input.contains_interpolated() || functions.iter().any(Self::contains_interpolated),
+            _ => false,
         }
     }
 
@@ -616,7 +731,18 @@ impl Density {
                 functions[index].sample(x, y, z)
             }
             Node::Spline(spline) => sample_spline(spline, x, y, z),
-            Node::Cache(input) => input.sample(x, y, z),
+            Node::Cache { input, columns } => match columns {
+                Some(columns) => {
+                    let key = column_key(x, y, z);
+                    if let Some(value) = columns.borrow_mut().get_mut(&key) {
+                        return *value;
+                    }
+                    let value = input.sample(x, y, z);
+                    columns.borrow_mut().insert(key, value);
+                    value
+                }
+                None => input.sample(x, y, z),
+            },
             Node::Interpolated {
                 input,
                 cell_size_xz,
@@ -745,6 +871,22 @@ impl Density {
     pub fn sample_volume(&self, volume: &DensityVolume, out: &mut [f32]) {
         debug_assert_eq!(out.len(), volume.slot_count());
         match &*self.0 {
+            Node::Constant(value) => out.fill(*value),
+            Node::BlendAlpha => out.fill(1.0),
+            Node::BlendOffset | Node::Beardifier => out.fill(0.0),
+            Node::BlendDensity(input) => input.sample_volume(volume, out),
+            Node::Unary(kind, input) => {
+                input.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot = kind.apply(*slot);
+                }
+            }
+            Node::Clamp { input, min, max } => {
+                input.sample_volume(volume, out);
+                for slot in out.iter_mut() {
+                    *slot = clamp(*slot, *min, *max);
+                }
+            }
             Node::Binary(kind, left, right) => {
                 sample_binary_volume(*kind, left, right, volume, out)
             }
@@ -754,6 +896,44 @@ impl Density {
                 cell_size_y,
                 ..
             } => sample_interpolated_volume(input, *cell_size_xz, *cell_size_y, volume, out),
+            Node::RangeChoice {
+                input,
+                min_inclusive,
+                max_exclusive,
+                when_in_range,
+                when_out_of_range,
+            } => sample_range_choice_volume(
+                input,
+                *min_inclusive,
+                *max_exclusive,
+                when_in_range,
+                when_out_of_range,
+                volume,
+                out,
+            ),
+            _ if self.is_y_independent() => {
+                let first_slot = |x: usize, z: usize| volume.index(x, 0, z);
+                let height = volume.size[1] as usize;
+                let neg_count = (0..volume.size[1])
+                    .take_while(|&y| volume.block(1, y) < 0)
+                    .count();
+                for z in 0..volume.size[2] {
+                    let block_z = volume.block(2, z);
+                    for x in 0..volume.size[0] {
+                        let block_x = volume.block(0, x);
+                        let start = first_slot(x as usize, z as usize);
+                        if neg_count > 0 {
+                            let val = self.sample(block_x, volume.block(1, 0), block_z);
+                            out[start..start + neg_count].fill(val);
+                        }
+                        if neg_count < height {
+                            let val =
+                                self.sample(block_x, volume.block(1, neg_count as i32), block_z);
+                            out[start + neg_count..start + height].fill(val);
+                        }
+                    }
+                }
+            }
             _ => {
                 for z in 0..volume.size[2] {
                     for x in 0..volume.size[0] {
@@ -984,6 +1164,77 @@ fn sample_binary_volume(
     }
 }
 
+fn sample_range_choice_volume(
+    input: &Density,
+    min_inclusive: f32,
+    max_exclusive: f32,
+    when_in_range: &Density,
+    when_out_of_range: &Density,
+    volume: &DensityVolume,
+    out: &mut [f32],
+) {
+    input.sample_volume(volume, out);
+    let mut any_in = false;
+    let mut any_out = false;
+    for &value in out.iter() {
+        if value >= min_inclusive && value < max_exclusive {
+            any_in = true;
+        } else {
+            any_out = true;
+        }
+        if any_in && any_out {
+            break;
+        }
+    }
+    if !any_out {
+        when_in_range.sample_volume(volume, out);
+        return;
+    }
+    if !any_in {
+        when_out_of_range.sample_volume(volume, out);
+        return;
+    }
+    let prepare_branch = |branch: &Density| -> (Option<f32>, Option<Vec<f32>>) {
+        if let Some(c) = branch.as_constant() {
+            return (Some(c), None);
+        }
+        let buf = branch.contains_interpolated().then(|| {
+            let mut buf = volume_scratch(volume);
+            branch.sample_volume(volume, &mut buf);
+            buf
+        });
+        (None, buf)
+    };
+    let (in_const, in_scratch) = prepare_branch(when_in_range);
+    let (out_const, out_scratch) = prepare_branch(when_out_of_range);
+    for z in 0..volume.size[2] {
+        let block_z = volume.block(2, z);
+        for x in 0..volume.size[0] {
+            let block_x = volume.block(0, x);
+            for y in 0..volume.size[1] {
+                let index = volume.index(x as usize, y as usize, z as usize);
+                let v = out[index];
+                let branch_value = if v >= min_inclusive && v < max_exclusive {
+                    if let Some(c) = in_const {
+                        c
+                    } else if let Some(buf) = in_scratch.as_deref() {
+                        buf[index]
+                    } else {
+                        when_in_range.sample(block_x, volume.block(1, y), block_z)
+                    }
+                } else if let Some(c) = out_const {
+                    c
+                } else if let Some(buf) = out_scratch.as_deref() {
+                    buf[index]
+                } else {
+                    when_out_of_range.sample(block_x, volume.block(1, y), block_z)
+                };
+                out[index] = branch_value;
+            }
+        }
+    }
+}
+
 /// `InterpolatedFunction.Sampler.sampleVolume`: aligned cell-stepped
 /// volumes pass straight through to the input; block-stepped volumes
 /// fill cell corner grids and interpolate each cell; volumes with a
@@ -1208,20 +1459,18 @@ fn fill_interpolated_cell(
     let y1 = cell_size_y.min(volume.size[1] - cell_output_y) - 1;
     let z1 = cell_size_xz.min(volume.size[2] - cell_output_z) - 1;
 
+    let xz_f = cell_size_xz as f32;
+    let y_f = cell_size_y as f32;
     for z in z0..=z1 {
         let output_z = cell_output_z + z;
-        let alpha_z = z as f32 * xz_inv;
-        let v00 = lerp(alpha_z, v000, v001);
-        let v01 = lerp(alpha_z, v010, v011);
-        let v10 = lerp(alpha_z, v100, v101);
-        let v11 = lerp(alpha_z, v110, v111);
-
+        let alpha_z = z as f32 / xz_f;
         for x in x0..=x1 {
             let output_x = cell_output_x + x;
-            let alpha_x = x as f32 * xz_inv;
-            let v_0 = lerp(alpha_x, v00, v10);
-            let v_1 = lerp(alpha_x, v01, v11);
-            let value_step = (v_1 - v_0) * y_inv;
+            let alpha_x = x as f32 / xz_f;
+            let lx00 = lerp(alpha_x, v000, v100);
+            let lx01 = lerp(alpha_x, v010, v110);
+            let lx10 = lerp(alpha_x, v001, v101);
+            let lx11 = lerp(alpha_x, v011, v111);
             // The volume layout is y-fastest, so the cell's vertical run
             // is a contiguous slot range.
             let first_slot = volume.index(
@@ -1229,13 +1478,20 @@ fn fill_interpolated_cell(
                 (cell_output_y + y0) as usize,
                 output_z as usize,
             );
-            let mut value = v_0 + value_step * y0 as f32;
-            for slot in &mut out[first_slot..first_slot + (y1 - y0 + 1) as usize] {
-                *slot = value;
-                value += value_step;
+            for (offset, slot) in out[first_slot..first_slot + (y1 - y0 + 1) as usize]
+                .iter_mut()
+                .enumerate()
+            {
+                let alpha_y = (y0 + offset as i32) as f32 / y_f;
+                *slot = lerp(
+                    alpha_z,
+                    lerp(alpha_y, lx00, lx01),
+                    lerp(alpha_y, lx10, lx11),
+                );
             }
         }
     }
+    let _ = (xz_inv, y_inv);
 }
 
 /// `Mth.clamp(float, min, max)`: comparison-chain form, so NaN passes
@@ -1359,6 +1615,39 @@ fn linear_extend(
         value
     } else {
         value + derivative * (input - locations[index])
+    }
+}
+
+/// Memo key for a `y`-independent cached node: the column plus the sign of
+/// `y`. A zero-`y_scale` noise multiplies `y` by `0.0`, which is `-0.0` for
+/// negative `y`; keeping the sign in the key returns exactly the bits the
+/// direct evaluation would produce.
+type ColumnKey = (i32, i32, bool);
+
+/// Columns each cached node remembers per generation of its two-generation
+/// [`BoundedCache`]: a chunk plus a one-cell interpolation margin
+/// (`(16 + 2 * 4)^2` = 576) rounded up.
+const CACHE_NODE_COLUMNS: usize = 1024;
+
+fn column_key(x: i32, y: i32, z: i32) -> ColumnKey {
+    (x, z, y < 0)
+}
+
+/// Builds a `minecraft:cache` node, giving it a per-column memo when its
+/// input cannot depend on `y`.
+fn cache_node(input: Density) -> Node {
+    let columns = input
+        .is_y_independent()
+        .then(|| RefCell::new(BoundedCache::new(CACHE_NODE_COLUMNS)));
+    Node::Cache { input, columns }
+}
+
+fn spline_is_y_independent(spline: &Spline) -> bool {
+    match spline {
+        Spline::Constant(_) => true,
+        Spline::Multipoint {
+            coordinate, values, ..
+        } => coordinate.is_y_independent() && values.iter().all(spline_is_y_independent),
     }
 }
 
@@ -1537,12 +1826,12 @@ impl<'e> DensityRegistry<'e> {
                 from_value: BUILTIN_Y_FROM as f32,
                 coordinate_factor: 1.0,
             },
-            "minecraft:shift_x" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
+            "minecraft:shift_x" => cache_node(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Xy,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
                 horizontal: RefCell::new(BoundedCache::new(512)),
             }))),
-            "minecraft:shift_z" => Node::Cache(Density(Rc::new(Node::ShiftNoise {
+            "minecraft:shift_z" => cache_node(Density(Rc::new(Node::ShiftNoise {
                 kind: ShiftKind::Z,
                 stack: self.engine.stack(&"minecraft:shift".to_owned())?,
                 horizontal: RefCell::new(BoundedCache::new(512)),
@@ -1663,7 +1952,7 @@ impl<'e> DensityRegistry<'e> {
         object: &'v serde_json::Map<String, Value>,
     ) -> Result<Node, DensityError> {
         let node = match kind {
-            "cache" => Node::Cache(self.child(get("input")?)?),
+            "cache" => cache_node(self.child(get("input")?)?),
             "interpolated" => {
                 let cell_size_xz = positive_int(get("cell_size_xz")?)?;
                 let cell_size_y = positive_int(get("cell_size_y")?)?;
@@ -1992,7 +2281,7 @@ fn fold_pow(base: Density, exponent: Density) -> Node {
             UnaryKind::Sqrt
         } else if absolute == 1.0 {
             if value > 0.0 {
-                return Node::Cache(base);
+                return cache_node(base);
             }
             UnaryKind::Reciprocal
         } else if absolute == 2.0 {
@@ -2707,5 +2996,69 @@ mod tests {
             mismatches.len(),
             mismatches.join("\n")
         );
+    }
+
+    #[test]
+    fn volume_matches_point_sample_bit_for_bit_on_synthetic_graph() {
+        let engine = engine_with_noise();
+        let reg = registry(&engine);
+        let graph = reg
+            .compile_value(&json!({
+                "type": "minecraft:min",
+                "left": {
+                    "type": "minecraft:max",
+                    "left": {
+                        "type": "minecraft:add",
+                        "left": {
+                            "type": "minecraft:interpolated",
+                            "cell_size_xz": 4,
+                            "cell_size_y": 8,
+                            "input": {
+                                "type": "minecraft:mul",
+                                "left": {
+                                    "type": "minecraft:cache",
+                                    "input": {
+                                        "type": "minecraft:noise",
+                                        "noise": "minecraft:shift",
+                                        "xz_scale": 0.25,
+                                        "y_scale": 0.0
+                                    }
+                                },
+                                "right": {
+                                    "type": "minecraft:noise",
+                                    "noise": "minecraft:shift",
+                                    "xz_scale": 0.5,
+                                    "y_scale": 0.125
+                                }
+                            }
+                        },
+                        "right": 0.25
+                    },
+                    "right": -0.5
+                },
+                "right": 0.75
+            }))
+            .unwrap();
+        let volume = DensityVolume::new([16, 32, 16], [-16, -16, 16], [1, 1, 1]).unwrap();
+        let mut buffer = vec![0.0f32; volume.slot_count()];
+        graph.sample_volume(&volume, &mut buffer);
+        for z in 0..16 {
+            for x in 0..16 {
+                for y in 0..32 {
+                    let wx = -16 + x;
+                    let wy = -16 + y;
+                    let wz = 16 + z;
+                    let got = buffer[volume.index(x as usize, y as usize, z as usize)];
+                    let want = graph.sample(wx, wy, wz);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "mismatch at ({wx},{wy},{wz}): volume={got} ({:08x}) point={want} ({:08x})",
+                        got.to_bits(),
+                        want.to_bits()
+                    );
+                }
+            }
+        }
     }
 }

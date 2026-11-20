@@ -771,4 +771,108 @@ mod tests {
         }
         println!("smoke OK: router compiled from {}", root.display());
     }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn final_density_volume_matches_point_samples_bit_for_bit() {
+        use crate::vanilla::density::DensityVolume;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = WorldgenData::load(&root).expect("operator data loads");
+        let engine = data.engine(2026);
+        let registry = data.registry(&engine);
+        let router = data
+            .router(&registry, "minecraft:overworld")
+            .expect("overworld router");
+
+        let mut mismatches = 0usize;
+        let mut first_mismatch = None;
+        for (cx, cz) in [(0, 0), (-3, 2), (17, -9), (40, 40)] {
+            let min_x = cx * 16;
+            let min_z = cz * 16;
+            let volume = DensityVolume::new(
+                [16, router.height, 16],
+                [min_x, router.min_y, min_z],
+                [1, 1, 1],
+            )
+            .expect("chunk volume");
+            let mut buffer = vec![0.0f32; volume.slot_count()];
+            router.final_density.sample_volume(&volume, &mut buffer);
+            for z in 0..16 {
+                for x in 0..16 {
+                    for y in 0..router.height {
+                        let wx = min_x + x;
+                        let wy = router.min_y + y;
+                        let wz = min_z + z;
+                        let got = buffer[volume.index(x as usize, y as usize, z as usize)];
+                        let want = router.final_density.sample(wx, wy, wz);
+                        if got.to_bits() != want.to_bits() {
+                            mismatches += 1;
+                            if first_mismatch.is_none() {
+                                first_mismatch = Some((wx, wy, wz, got, want));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "volume != point ({mismatches} mismatches), first: {first_mismatch:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn climate_volume_targets_match_point_targets_bit_for_bit() {
+        use crate::vanilla::biome::ClimateSampler;
+        use crate::vanilla::density::DensityVolume;
+
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = WorldgenData::load(&root).expect("operator data loads");
+        let engine = data.engine(2026);
+        let registry = data.registry(&engine);
+        let router = data
+            .router(&registry, "minecraft:overworld")
+            .expect("overworld router");
+        let climate = ClimateSampler {
+            temperature: router.temperature.clone(),
+            vegetation: router.vegetation.clone(),
+            continents: router.continents.clone(),
+            erosion: router.erosion.clone(),
+            depth: router.depth.clone(),
+            ridges: router.ridges.clone(),
+        };
+
+        let mut scratch = Vec::new();
+        let mut targets = Vec::new();
+        let quart_height = router.height / 4;
+        for (cx, cz) in [(0, 0), (-3, 2), (17, -9), (40, 40)] {
+            let min_x = cx * 16;
+            let min_z = cz * 16;
+            let volume = DensityVolume::new(
+                [4, quart_height, 4],
+                [min_x, router.min_y, min_z],
+                [4, 4, 4],
+            )
+            .expect("quart volume");
+            climate.targets_for_volume(&volume, &mut scratch, &mut targets);
+            for lz in 0..4 {
+                for lx in 0..4 {
+                    for ly in 0..quart_height {
+                        let wx = min_x + lx * 4;
+                        let wy = router.min_y + ly * 4;
+                        let wz = min_z + lz * 4;
+                        let got = targets[volume.index(lx as usize, ly as usize, lz as usize)];
+                        let want = climate.target_at_block(wx, wy, wz);
+                        assert_eq!(got, want, "target mismatch at ({wx},{wy},{wz})");
+                    }
+                }
+            }
+        }
+    }
 }

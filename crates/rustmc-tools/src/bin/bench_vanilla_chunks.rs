@@ -1,10 +1,11 @@
 //! Release-build measurement of `VanillaGenerator` chunk and column work.
 //!
 //! ```text
-//! bench_vanilla_chunks [--mode columns|heights|carve|substance|all ...]
+//! bench_vanilla_chunks [--mode columns|heights|carve|substance|throughput|all ...]
 //!                      [--data-root PATH] [--seed N] [--settings ID]
 //!                      [--origin-x N] [--origin-z N]
 //!                      [--side N] [--repeat N] [--view-radius N]
+//!                      [--workers N] [--radius N] [--registry PATH]
 //! ```
 //!
 //! Defaults measure the overworld the oracle gates run against: seed 2026, a
@@ -31,14 +32,30 @@
 //! is the eviction-is-recomputation check). This binary measures the
 //! bounded state only.
 //!
+//! `--mode throughput` measures the preview server's shape instead of one
+//! generator: `--workers` threads (default 16), each with its own generator,
+//! pull chunk positions from one shared queue in the order the preview
+//! requests a fresh view at spawn (`java_preview::ordered_view` with no
+//! travel direction), around the chunk holding `--origin-x`/`--origin-z`,
+//! for the radius-`--radius` square (default 8: 289 chunks). Each chunk is
+//! built and encoded exactly as a preview worker does it, cold, with no
+//! packet cache, so `--registry` (default `RUSTMC_CHUNK_REGISTRY`) must name
+//! the provisioned chunk registry table. Generators are built before the
+//! clock starts; the mode reports chunks per second over the whole square
+//! and the per-chunk p50/p95/max. It runs once whatever `--repeat` says and
+//! is not part of `all`.
+//!
 //! The data root is operator-provisioned worldgen data and is never
 //! committed; this binary prints aggregate numbers only.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier, Mutex, PoisonError};
 use std::time::Instant;
 
+use rustmc_server::chunk_adapter::{chunk_from_generator, encode_chunk, registry::RegistryTables};
+use rustmc_server::java_preview::ordered_view;
 use rustmc_server::vanilla::aquifer::{NoiseBasedAquifer, Substance};
-use rustmc_server::vanilla::generator::{CacheOccupancy, VanillaGenerator};
+use rustmc_server::vanilla::generator::{CacheOccupancy, SharedChunkCaches, VanillaGenerator};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,12 +74,21 @@ struct Config {
     repeat: usize,
     view_radius: i32,
     modes: Vec<String>,
+    workers: usize,
+    radius: i32,
+    registry: PathBuf,
 }
 
 fn default_data_root() -> PathBuf {
     std::env::var("RUSTMC_VANILLA_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"))
+}
+
+fn default_registry() -> PathBuf {
+    std::env::var("RUSTMC_CHUNK_REGISTRY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".rustmc-local/chunk-registry-26.3.json"))
 }
 
 fn integer(field: &str, value: &str) -> Result<i64, String> {
@@ -81,6 +107,9 @@ fn parse(args: &[String]) -> Result<Config, String> {
         repeat: 2,
         view_radius: 32,
         modes: vec!["columns".to_owned()],
+        workers: 16,
+        radius: 8,
+        registry: default_registry(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -114,6 +143,13 @@ fn parse(args: &[String]) -> Result<Config, String> {
                         .ok_or("missing value for --data-root".to_owned())?,
                 );
             }
+            "--registry" => {
+                index += 1;
+                config.registry = PathBuf::from(
+                    args.get(index)
+                        .ok_or("missing value for --registry".to_owned())?,
+                );
+            }
             "--settings" => {
                 index += 1;
                 config.settings = args
@@ -127,12 +163,17 @@ fn parse(args: &[String]) -> Result<Config, String> {
             "--side" => config.side = take_number("--side")? as usize,
             "--repeat" => config.repeat = take_number("--repeat")? as usize,
             "--view-radius" => config.view_radius = take_number("--view-radius")? as i32,
+            "--workers" => config.workers = take_number("--workers")? as usize,
+            "--radius" => config.radius = take_number("--radius")? as i32,
             other => return Err(format!("unknown argument {other}")),
         }
         index += 1;
     }
-    if config.side == 0 || config.repeat == 0 {
-        return Err("--side and --repeat must be positive".to_owned());
+    if config.side == 0 || config.repeat == 0 || config.workers == 0 {
+        return Err("--side, --repeat and --workers must be positive".to_owned());
+    }
+    if config.radius < 0 {
+        return Err("--radius must not be negative".to_owned());
     }
     if config.modes.iter().any(|mode| mode == "all") {
         config.modes = ["columns", "heights", "carve", "substance"]
@@ -177,6 +218,10 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("mode,pass,total_ms,ms_per_chunk,ms_per_column,units,units_per_ms");
     let mut mask_bytes = 0;
     for mode in &config.modes {
+        if mode == "throughput" {
+            measure_throughput(&config)?;
+            continue;
+        }
         // A fresh generator per mode: the coordinate caches persist across
         // calls, so sharing one generator between modes would measure cache
         // hits rather than generation.
@@ -222,16 +267,112 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The preview server's streaming shape, cold: every worker owns a generator
+/// and takes the next chunk of the spawn view from one shared queue, then
+/// builds and encodes it as `java_preview`'s workers do. Prints the load
+/// time, the square's chunks per second, and per-chunk percentiles.
+fn measure_throughput(config: &Config) -> Result<(), String> {
+    let text = std::fs::read_to_string(&config.registry)
+        .map_err(|error| format!("registry {}: {error}", config.registry.display()))?;
+    let center = (config.origin.0 >> 4, config.origin.1 >> 4);
+    let order = ordered_view(center, config.radius, (0, 0));
+    let total = order.len();
+    let queue = Mutex::new(order.into_iter());
+    let ready = Barrier::new(config.workers + 1);
+    let shared = Arc::new(SharedChunkCaches::new());
+    let load_started = Instant::now();
+    let (load_ms, elapsed_ms, mut chunk_ms) = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..config.workers)
+            .map(|_| {
+                let (queue, ready, text, shared) = (&queue, &ready, &text, Arc::clone(&shared));
+                scope.spawn(move || -> Result<Vec<f64>, String> {
+                    let loaded = VanillaGenerator::with_shared_caches(
+                        &config.data_root,
+                        config.seed,
+                        &config.settings,
+                        shared,
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|generator| {
+                        RegistryTables::from_provisioned(text)
+                            .map(|tables| (generator, tables))
+                            .map_err(|error| error.to_string())
+                    });
+                    // Every worker reaches the barrier, loaded or not, so a
+                    // failed load cannot leave the others waiting forever.
+                    ready.wait();
+                    let (generator, tables) = loaded?;
+                    let mut times = Vec::new();
+                    loop {
+                        let next = queue
+                            .lock()
+                            // The iterator only advances under this lock; a panic elsewhere leaves it valid.
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .next();
+                        let Some((chunk_x, chunk_z)) = next else {
+                            break;
+                        };
+                        let started = Instant::now();
+                        let chunk = chunk_from_generator(&generator, chunk_x, chunk_z, &tables)
+                            .map_err(|error| error.to_string())?;
+                        encode_chunk(&chunk, &tables).map_err(|error| error.to_string())?;
+                        times.push(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    Ok(times)
+                })
+            })
+            .collect();
+        ready.wait();
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let mut chunk_ms = Vec::with_capacity(total);
+        for handle in handles {
+            let times = handle
+                .join()
+                .map_err(|_| "throughput worker panicked".to_owned())??;
+            chunk_ms.extend(times);
+        }
+        Ok::<_, String>((load_ms, started.elapsed().as_secs_f64() * 1000.0, chunk_ms))
+    })?;
+    chunk_ms.sort_by(f64::total_cmp);
+    println!(
+        "phase,throughput,workers,{},load_and_compile_ms,{load_ms:.1}",
+        config.workers
+    );
+    println!(
+        "throughput,workers,{},radius,{},center,{},{},chunks,{total},elapsed_ms,{elapsed_ms:.1},chunks_per_s,{:.2},p50_ms,{:.1},p95_ms,{:.1},max_ms,{:.1}",
+        config.workers,
+        config.radius,
+        center.0,
+        center.1,
+        total as f64 * 1000.0 / elapsed_ms,
+        percentile(&chunk_ms, 50),
+        percentile(&chunk_ms, 95),
+        chunk_ms.last().copied().unwrap_or(0.0)
+    );
+    Ok(())
+}
+
+/// Nearest-rank percentile of an ascending slice; zero when it is empty.
+fn percentile(sorted: &[f64], percent: usize) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (percent * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
+}
+
 /// Entries held by every coordinate-keyed cache after one mode's sweep.
 fn report_occupancy(mode: &str, occupancy: &CacheOccupancy) {
     println!(
-        "occupancy,{mode},masks,{},heights,{},ocean_floor_maps,{},biomes,{},biome_regions,{},chunk_carvers,{}",
+        "occupancy,{mode},masks,{},heights,{},ocean_floor_maps,{},biomes,{},biome_regions,{},chunk_carvers,{},chunk_densities,{}",
         occupancy.masks,
         occupancy.heights,
         occupancy.ocean_floor_maps,
         occupancy.biomes,
         occupancy.biome_regions,
-        occupancy.chunk_carvers
+        occupancy.chunk_carvers,
+        occupancy.chunk_densities
     );
     println!(
         "occupancy,{mode},aquifer_centers,{},aquifer_statuses,{},aquifer_surface_levels,{},aquifer_skip_bounds,{},total,{}",
@@ -278,6 +419,10 @@ fn report_budget(mask_bytes: usize) {
     let statuses = entries(NoiseBasedAquifer::STATUS_CACHE_CAPACITY, 24);
     let surfaces = entries(NoiseBasedAquifer::SURFACE_CACHE_CAPACITY, 12);
     let skips = entries(NoiseBasedAquifer::SKIP_CACHE_CAPACITY, 12);
+    let chunk_densities = entries(
+        VanillaGenerator::CHUNK_DENSITY_CACHE_CAPACITY,
+        16 * 384 * 16 * 4,
+    );
     println!(
         "budget_kib,carve_masks,{},chunk_carvers,{},heights,{},ocean_floor_maps,{},biomes,{},aquifer_centers,{}",
         masks / 1024,
@@ -288,11 +433,21 @@ fn report_budget(mask_bytes: usize) {
         centers / 1024
     );
     println!(
-        "budget_kib,aquifer_statuses,{},aquifer_surfaces,{},aquifer_skips,{},total,{}",
+        "budget_kib,aquifer_statuses,{},aquifer_surfaces,{},aquifer_skips,{},chunk_densities,{},total,{}",
         statuses / 1024,
         surfaces / 1024,
         skips / 1024,
-        (masks + carvers + heights + floors + biomes + centers + statuses + surfaces + skips)
+        chunk_densities / 1024,
+        (masks
+            + carvers
+            + heights
+            + floors
+            + biomes
+            + centers
+            + statuses
+            + surfaces
+            + skips
+            + chunk_densities)
             / 1024
     );
 }
