@@ -370,6 +370,74 @@ mod runtime_cli {
     }
 
     #[test]
+    fn local_java_preview_with_compression_negotiates_set_compression() {
+        use rustmc_server::java_wire::{frame_compressed, read_compressed_frame};
+
+        let dir = TempDir::new();
+        let path = dir.file(&config(0).replace(
+            "max_bytes_per_connection = 4",
+            "max_bytes_per_connection = 4096\nlocal_java_preview = true\npreview_compression_threshold = 256",
+        ));
+        let server = Running::start(&path);
+        let bound = server.wait_for("event=listener_bound");
+        let address = bound
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("listen_addr="))
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap();
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .write_all(&[8, 0, 0x89, 0x06, 1, b'x', 0x63, 0xdd, 2])
+            .unwrap();
+        let mut hello = vec![22, 0, 4];
+        hello.extend_from_slice(b"Test");
+        hello.extend_from_slice(&[7; 16]);
+        socket.write_all(&hello).unwrap();
+
+        let mut reply = vec![0u8; 256];
+        let mut collected = Vec::new();
+        while collected.len() < 45 {
+            let count = socket.read(&mut reply).unwrap();
+            assert!(count > 0);
+            collected.extend_from_slice(&reply[..count]);
+        }
+        // First packet: uncompressed Set Compression (0x03, threshold 256).
+        assert_eq!(&collected[..4], &[0x03, 0x03, 0x80, 0x02]);
+        // Second packet: Login Success in compressed format (Data Length = 0).
+        let (login_id, login_body, rest) =
+            read_compressed_frame(&collected[4..], 256, 4096).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(login_id, 2);
+        assert_eq!(&login_body[..16], &[7; 16]);
+
+        let mut ack = Vec::new();
+        frame_compressed(3, &[], 256, &mut ack).unwrap();
+        socket.write_all(&ack).unwrap();
+
+        collected.clear();
+        while collected.len() < 24 {
+            let count = socket.read(&mut reply).unwrap();
+            assert!(count > 0);
+            collected.extend_from_slice(&reply[..count]);
+        }
+        let (kp_id, kp_body, rest) = read_compressed_frame(&collected, 256, 4096).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(kp_id, 15);
+        assert!(String::from_utf8_lossy(&kp_body).contains("minecraft"));
+
+        // Invalid compressed packet below threshold closes the socket.
+        let mut bad = Vec::new();
+        frame_compressed(0, &[], 0, &mut bad).unwrap();
+        socket.write_all(&bad).unwrap();
+        assert_eq!(socket.read(&mut reply).unwrap(), 0);
+        server.stop();
+    }
+
+    #[test]
     fn discovery_only_login_receives_a_reason_and_closes() {
         let dir = TempDir::new();
         let path = dir.file(&config(0).replace(

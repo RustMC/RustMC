@@ -2,7 +2,7 @@
 //! IDs and field layouts: official 26.3 packet/block reports and codec metadata.
 
 use crate::{
-    java_wire::{frame, put_string, put_varint},
+    java_wire::{frame, frame_compressed, put_string, put_varint, reframe_compressed},
     preview_data::RegistryManifest,
     world::{Biome, Block, Chunk, Generator},
 };
@@ -326,6 +326,7 @@ pub struct Preview {
     pub pending_keepalive: Option<u64>,
     vanilla: Option<VanillaWorker>,
     vanilla_spawn_y: Option<i32>,
+    compression_threshold: Option<usize>,
     pub failed: bool,
 }
 
@@ -363,8 +364,31 @@ impl Preview {
             pending_keepalive: None,
             vanilla: None,
             vanilla_spawn_y: None,
+            compression_threshold: None,
             failed: false,
         })
+    }
+
+    pub fn with_compression_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.compression_threshold = threshold;
+        self
+    }
+
+    fn frame_packet(&self, id: u32, body: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        push_wire_frame(self.compression_threshold, id, body, &mut out)?;
+        Some(out)
+    }
+
+    fn push_frame(&self, id: u32, body: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        push_wire_frame(self.compression_threshold, id, body, out)
+    }
+
+    fn cache_center_frame(&self, (x, z): (i32, i32)) -> Option<Vec<u8>> {
+        let mut body = Vec::new();
+        put_varint(x as u32, &mut body);
+        put_varint(z as u32, &mut body);
+        self.frame_packet(CACHE_CENTER, &body)
     }
 
     pub fn new_vanilla(
@@ -438,12 +462,12 @@ impl Preview {
         let mut start_chunks = vec![13]; // LEVEL_CHUNKS_LOAD_START.
         start_chunks.extend(0f32.to_be_bytes());
         Some(vec![
-            frame(LOGIN, &login),
-            frame(ABILITIES, &abilities),
-            frame(TIME, &time),
-            cache_center(self.center),
-            frame(GAME_EVENT, &start_chunks),
-            frame(POSITION, &position),
+            self.frame_packet(LOGIN, &login)?,
+            self.frame_packet(ABILITIES, &abilities)?,
+            self.frame_packet(TIME, &time)?,
+            self.cache_center_frame(self.center)?,
+            self.frame_packet(GAME_EVENT, &start_chunks)?,
+            self.frame_packet(POSITION, &position)?,
         ])
     }
 
@@ -491,7 +515,7 @@ impl Preview {
         self.keepalive_id += 1;
         self.pending_keepalive = Some(self.keepalive_id);
         self.keepalive_at = std::time::Instant::now();
-        Some(frame(KEEP_ALIVE, &self.keepalive_id.to_be_bytes()))
+        self.frame_packet(KEEP_ALIVE, &self.keepalive_id.to_be_bytes())
     }
 
     pub fn next_chunk(&mut self) -> Option<(Vec<u8>, u128, u128)> {
@@ -509,7 +533,7 @@ impl Preview {
         {
             return None;
         }
-        let mut output = cache_center(self.center);
+        let mut output = self.cache_center_frame(self.center)?;
         let mut had_forgets = false;
         let (cx, cz) = self.center;
         let radius = self.radius;
@@ -523,7 +547,7 @@ impl Preview {
             had_forgets = !expired.is_empty();
             for (x, z) in expired {
                 let packed = ((z as u32 as u64) << 32) | x as u32 as u64;
-                output.extend(frame(FORGET_CHUNK, &packed.to_be_bytes()));
+                self.push_frame(FORGET_CHUNK, &packed.to_be_bytes(), &mut output)?;
                 self.sent.remove(&(x, z));
             }
             self.forget_dirty = false;
@@ -540,7 +564,7 @@ impl Preview {
         if candidates.is_empty() {
             return had_forgets.then_some((output, 0, 0));
         }
-        output.extend(frame(BATCH_START, &[]));
+        self.push_frame(BATCH_START, &[], &mut output)?;
         let mut generation_us = 0;
         let mut encoding_us = 0;
         let mut count = 0;
@@ -550,17 +574,28 @@ impl Preview {
             generation_us += started.elapsed().as_micros();
             let started = std::time::Instant::now();
             let encoded = encode_chunk(&chunk, self.generator, &self.biomes);
+            let wire = match self.compression_threshold {
+                None => encoded,
+                Some(threshold) => {
+                    let mut out = Vec::new();
+                    if reframe_compressed(&encoded, threshold, &mut out).is_err() {
+                        self.failed = true;
+                        return None;
+                    }
+                    out
+                }
+            };
             encoding_us += started.elapsed().as_micros();
-            if count > 0 && output.len() + encoded.len() > MAX_BATCH_BYTES {
+            if count > 0 && output.len() + wire.len() > MAX_BATCH_BYTES {
                 break;
             }
-            output.extend(encoded);
+            output.extend(wire);
             self.sent.insert((x, z));
             count += 1;
         }
         let mut count_data = Vec::new();
         put_varint(count as u32, &mut count_data);
-        output.extend(frame(BATCH_END, &count_data));
+        self.push_frame(BATCH_END, &count_data, &mut output)?;
         self.awaiting_batch = true;
         Some((output, generation_us, encoding_us))
     }
@@ -578,6 +613,7 @@ impl Preview {
             })
             .filter(|position| !self.sent.contains(position))
             .count();
+        let compression = self.compression_threshold;
         let worker = self.vanilla.as_mut()?;
         let moving = self.last_center_change.elapsed() < MOVING_PRIORITY_WINDOW;
         while let Some(&position) = self.view_order.get(self.next_view_position) {
@@ -689,8 +725,26 @@ impl Preview {
                 self.next_view_position = 0;
                 continue;
             }
-            let size = match &built.packet {
-                Ok(Some(packet)) if packet.len() < MAX_BATCH_BYTES => packet.len(),
+            let wire_packet = match (&built.packet, self.compression_threshold) {
+                (Ok(Some(packet)), None) if packet.len() < MAX_BATCH_BYTES => None,
+                (Ok(Some(packet)), Some(threshold)) => {
+                    let mut out = Vec::new();
+                    if reframe_compressed(packet, threshold, &mut out).is_err()
+                        || out.len() >= MAX_BATCH_BYTES
+                    {
+                        self.failed = true;
+                        return None;
+                    }
+                    Some(out)
+                }
+                _ => {
+                    self.failed = true;
+                    return None;
+                }
+            };
+            let size = match (&wire_packet, &built.packet) {
+                (Some(wire), _) => wire.len(),
+                (None, Ok(Some(packet))) => packet.len(),
                 _ => {
                     self.failed = true;
                     return None;
@@ -707,12 +761,16 @@ impl Preview {
             {
                 continue;
             }
-            let Ok(Some(packet)) = built.packet else {
-                self.failed = true;
-                return None;
+            let packet = match (wire_packet, built.packet) {
+                (Some(wire), _) => wire,
+                (None, Ok(Some(packet))) => packet,
+                _ => {
+                    self.failed = true;
+                    return None;
+                }
             };
             if count == 0 {
-                output.extend(frame(BATCH_START, &[]));
+                push_wire_frame(compression, BATCH_START, &[], &mut output)?;
             }
             output.extend(packet);
             self.sent.insert(built.position);
@@ -729,17 +787,25 @@ impl Preview {
         }
         let mut count_data = Vec::new();
         put_varint(count as u32, &mut count_data);
-        output.extend(frame(BATCH_END, &count_data));
+        push_wire_frame(compression, BATCH_END, &count_data, &mut output)?;
         self.awaiting_batch = true;
         Some((output, generation_us, encoding_us))
     }
 }
 
-fn cache_center((x, z): (i32, i32)) -> Vec<u8> {
-    let mut body = Vec::new();
-    put_varint(x as u32, &mut body);
-    put_varint(z as u32, &mut body);
-    frame(CACHE_CENTER, &body)
+fn push_wire_frame(
+    compression_threshold: Option<usize>,
+    id: u32,
+    body: &[u8],
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    match compression_threshold {
+        None => {
+            out.extend(frame(id, body));
+            Some(())
+        }
+        Some(threshold) => frame_compressed(id, body, threshold, out).ok(),
+    }
 }
 
 /// Square shells from the player, with each shell's forward edge first.
@@ -1516,5 +1582,120 @@ mod tests {
     #[test]
     fn obsidian_block_state_id_matches_26_3_default() {
         assert_eq!(block_state(Block::Obsidian as u16), 4925);
+    }
+
+    #[test]
+    fn vanilla_worker_chunk_over_threshold_is_compressed_at_send_time() {
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest())
+            .unwrap()
+            .with_compression_threshold(Some(256));
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(4);
+        let raw_chunk_body = vec![0x5a; 4096];
+        let cached_uncompressed = frame(CHUNK, &raw_chunk_body);
+        tx.send(BuiltChunk {
+            position: (0, 0),
+            packet: Ok(Some(cached_uncompressed)),
+            generation_us: 3,
+            encoding_us: 1,
+        })
+        .unwrap();
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: [(0, 0)].into_iter().collect(),
+            pending: None,
+            capacity: 4,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: None,
+        });
+
+        let (stream, generation_us, encoding_us) = preview.next_chunk().unwrap();
+        assert_eq!((generation_us, encoding_us), (3, 1));
+        let mut cursor = stream.as_slice();
+        let mut ids = Vec::new();
+        let mut saw_compressed_chunk = false;
+        while !cursor.is_empty() {
+            let (pkt_len, pkt_prefix) = read_varint(cursor);
+            let (data_len, _) = read_varint(&cursor[pkt_prefix..]);
+            let (id, body, rest) =
+                crate::java_wire::read_compressed_frame(cursor, 256, 1_048_576).unwrap();
+            if id == CHUNK {
+                assert!(data_len > 0);
+                assert!((pkt_len as usize) < data_len as usize);
+                assert_eq!(body, raw_chunk_body);
+                saw_compressed_chunk = true;
+            } else {
+                assert_eq!(data_len, 0);
+            }
+            ids.push(id);
+            cursor = rest;
+        }
+        assert!(saw_compressed_chunk);
+        assert_eq!(ids, vec![CACHE_CENTER, BATCH_START, CHUNK, BATCH_END]);
+    }
+
+    #[test]
+    fn cached_uncompressed_chunk_packet_compresses_at_send_time_without_changing_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "rustmc-java-preview-cache-comp-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        std::fs::create_dir_all(data.join("data/minecraft/worldgen")).unwrap();
+        let registry = root.join("registry.json");
+        std::fs::write(&registry, b"{}").unwrap();
+        let cache =
+            crate::preview_cache::PreviewCache::open(&root.join("cache"), &data, &registry, 2026)
+                .unwrap();
+
+        let raw_chunk_body = vec![0x3c; 2048];
+        let cached_frame = frame(CHUNK, &raw_chunk_body);
+        cache.write(0, 0, &cached_frame).unwrap();
+        let read_back = cache.read(0, 0).unwrap().unwrap();
+        assert_eq!(read_back, cached_frame);
+
+        let mut preview = Preview::new(2026, 2, Terrain::Preview, &manifest())
+            .unwrap()
+            .with_compression_threshold(Some(256));
+        preview.teleport_acknowledged = true;
+        let (tx, rx) = mpsc::sync_channel(2);
+        tx.send(BuiltChunk {
+            position: (0, 0),
+            packet: Ok(Some(read_back)),
+            generation_us: 0,
+            encoding_us: 0,
+        })
+        .unwrap();
+        preview.vanilla = Some(VanillaWorker {
+            requests: None,
+            results: rx,
+            handles: Vec::new(),
+            in_flight: [(0, 0)].into_iter().collect(),
+            pending: None,
+            capacity: 2,
+            current_center: Arc::new(AtomicU64::new(packed_center((0, 0)))),
+            cache: Some(cache.clone()),
+        });
+
+        let (stream, _, _) = preview.next_chunk().unwrap();
+        let mut cursor = stream.as_slice();
+        let mut decoded_chunk = None;
+        while !cursor.is_empty() {
+            let (_, prefix) = read_varint(cursor);
+            let (data_len, _) = read_varint(&cursor[prefix..]);
+            let (id, body, rest) =
+                crate::java_wire::read_compressed_frame(cursor, 256, 1_048_576).unwrap();
+            if id == CHUNK {
+                assert!(data_len > 0);
+                decoded_chunk = Some(body);
+            }
+            cursor = rest;
+        }
+        assert_eq!(decoded_chunk.as_deref(), Some(raw_chunk_body.as_slice()));
+        assert_eq!(cache.read(0, 0).unwrap(), Some(cached_frame));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

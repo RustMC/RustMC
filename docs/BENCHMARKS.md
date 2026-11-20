@@ -239,3 +239,23 @@ What changed:
 - `ChunkBiomes` stores the `4 × (height/4) × 4` `u16` quart palette slots alongside the sorted `region` slice (`Arc<[Arc<str>]>`) so `VanillaGenerator::biome` serves in-range chunk queries in `O(1)`, and `build_decorated_chunk` populates `chunk_biomes` before `base_column_ids_with_heights` and publishes completed `256`-column `surface_height_maps` and `ocean_floor_maps` once the base columns finish.
 
 Evidence and remaining profile: `81/81` chunk packets around spawn (`prepare_preview_cache`, seed `2026`, radius `4`) are byte-identical to the `upstream/main` golden set; the ignored `shared_worker_caches_encode_identically_to_private_generator` test confirms `8` shared-cache workers produce byte-identical packets across a `5 × 5` square (`25` chunks) compared with a private `VanillaGenerator::new`; all `978` non-ignored workspace tests pass (`65` ignored), and all `64` ignored data-root tests pass in release mode (the one remaining ignored test requires the operator's local 26.3 save). Before this change, a CPU profile of the 16-worker throughput run (`218B` cycles) showed `44.78 %` in `chunk_density` (driven by neighbour `ocean_floor_height` -> `surface` lookups at `53.67 %` inclusive), `19.16 %` in `BiomePlacement::search`, `14.23 %` in `BiomePlacement::find_column`, `7.32 %` in `NoiseBasedAquifer::substance`, and `3.62 %` in `VanillaGenerator::carved`. After sharing (`52.5B` cycles), the remaining time is spread across `chunk_density` (`31.16 %`, mainly outer halo chunks and startup races on `ocean_floor_height`), `FeatureData::run_chain` (`20.76 %`), `base_column_ids_with_heights` (`16.38 %`, split across `eval_rule` `9.53 %` and `NoiseBasedAquifer::substance` `7.82 %`), `chunk_biomes` (`8.48 %`), and `chunk_adapter` state lookup and packet encoding (`RegistryTables::state` `6.61 %`, `encode_chunk` `6.12 %`).
+
+## Java preview packet compression (19 November 2026)
+
+Method: release build encoding 81 pre-cached data-driven Java 26.3 Overworld
+chunk packets (`seed 2026`, radius `4` around `(0, 0)`, operator-provisioned
+26.3 worldgen data and chunk registry table) at send time using zlib with
+threshold `256` bytes (the vanilla default). Packets were read into memory from
+a temporary uncompressed packet cache before timing, then compressed sequentially
+and verified to decode back to the exact original packet payloads.
+
+| Metric (81 chunks, threshold 256) | Value |
+| --- | ---: |
+| Uncompressed total bytes | 6,307,688 (`72,991`–`80,170` per chunk, mean `77,873`) |
+| Compressed total bytes | 376,675 (`3,144`–`6,394` per chunk, mean `4,650`) |
+| Compressed / uncompressed ratio | 0.0597× (`94.03%` size reduction) |
+| Initial pass compression time (fresh buffer per chunk) | 127.862 ms total (`1.579 ms/chunk`) |
+| Repeat pass compression time (5 passes, reused buffer) | 78.33–95.95 ms total, mean 82.170 ms (`1.014 ms/chunk`) |
+
+This measures local send-time CPU compression and wire byte sizes only; it does
+not measure socket I/O, network transport, or real-client decoding latency.

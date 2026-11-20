@@ -1119,6 +1119,15 @@ pub fn read_string(input: &[u8], max_chars: usize) -> Result<(String, usize), Pr
             max: max_chars,
         },
         WireError::InvalidText => ProtocolError::InvalidUtf8,
+        WireError::BelowCompressionThreshold { length, threshold } => {
+            ProtocolError::InvalidPacketLength {
+                expected: threshold,
+                received: length,
+            }
+        }
+        WireError::InvalidCompression | WireError::DecompressedSizeMismatch { .. } => {
+            ProtocolError::MalformedVarInt
+        }
     })?;
     check_chars(s, max_chars)?;
     Ok((s.to_owned(), input.len() - rest.len()))

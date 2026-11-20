@@ -398,12 +398,16 @@ fn read_slot_varint(input: &[u8]) -> Result<(u32, usize), SlotError> {
         Err(WireError::VarIntTooLong | WireError::NonCanonicalVarInt) => {
             Err(SlotError::InvalidVarInt)
         }
-        Err(WireError::TooLong { .. } | WireError::InvalidText) => {
-            Err(SlotError::InvalidTextComponent {
-                component: "slot",
-                reason: "invalid wire text",
-            })
-        }
+        Err(
+            WireError::TooLong { .. }
+            | WireError::InvalidText
+            | WireError::BelowCompressionThreshold { .. }
+            | WireError::InvalidCompression
+            | WireError::DecompressedSizeMismatch { .. },
+        ) => Err(SlotError::InvalidTextComponent {
+            component: "slot",
+            reason: "invalid wire text",
+        }),
     }
 }
 

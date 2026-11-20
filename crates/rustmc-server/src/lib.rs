@@ -14,7 +14,7 @@ pub mod entity;
 pub mod item;
 pub mod java_packets;
 pub mod java_preview;
-mod java_wire;
+pub mod java_wire;
 pub mod preview_cache;
 pub mod preview_data;
 pub mod protocol;
@@ -78,6 +78,16 @@ pub struct ListenerConfig {
     /// Client bytes read per second during play; excess input waits in the
     /// socket (TCP backpressure) instead of closing the session.
     pub preview_read_bytes_per_second: usize,
+    /// Optional zlib compression threshold in bytes for the local Java preview.
+    ///
+    /// Absent or negative values (`-1`) disable compression per
+    /// `https://minecraft.wiki/w/Java_Edition_protocol/Packets` (revision
+    /// 3868170: "Negative values will disable compression, meaning the packet
+    /// format should remain in the uncompressed packet format.") and
+    /// `https://minecraft.wiki/w/Server.properties` (revision 3904780,
+    /// `network-compression-threshold`: default `256`, `-1` disables
+    /// compression, `0` compresses every packet).
+    pub preview_compression_threshold: Option<usize>,
 }
 
 /// Allowed `listener.preview_session_lifetime_ms` values.
@@ -105,6 +115,7 @@ impl Default for ListenerConfig {
             preview_terrain: world::Terrain::Preview,
             preview_session_lifetime_ms: 600_000,
             preview_read_bytes_per_second: 65_536,
+            preview_compression_threshold: None,
         }
     }
 }
@@ -158,6 +169,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
                 | "vanilla_generation_workers"
                 | "preview_session_lifetime_ms"
                 | "preview_read_bytes_per_second"
+                | "preview_compression_threshold"
         ) {
             return Err(format!("unknown `listener` field `{key}`"));
         }
@@ -246,6 +258,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             "preview_terrain",
             "preview_session_lifetime_ms",
             "preview_read_bytes_per_second",
+            "preview_compression_threshold",
             "vanilla_data_root",
             "vanilla_registry_table",
         ]
@@ -337,7 +350,25 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             *PREVIEW_READ_BYTES_PER_SECOND.start() as u64,
             *PREVIEW_READ_BYTES_PER_SECOND.end() as u64,
         )? as usize,
+        preview_compression_threshold: compression_threshold(table)?,
     })
+}
+
+/// Parses `listener.preview_compression_threshold`: absent or negative disables
+/// compression (`None`); non-negative values enable zlib compression at that
+/// byte threshold (up to `i32::MAX`, the protocol `VarInt` range).
+fn compression_threshold(
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<Option<usize>, String> {
+    let Some(value) = table.get("preview_compression_threshold") else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_integer().and_then(|n| i32::try_from(n).ok()) else {
+        return Err(
+            "`listener.preview_compression_threshold` must be a signed 32-bit integer".to_owned(),
+        );
+    };
+    Ok((number >= 0).then_some(number as usize))
 }
 
 /// World seeds use the full signed 64-bit range, like vanilla seeds. The value
@@ -622,5 +653,46 @@ mod tests {
             parse_config(&complete.replace("max_connections = 1", "max_connections = 2")).is_err()
         );
         assert!(parse_config(&format!("{complete}preview_terrain = 'experimental'\n")).is_err());
+    }
+
+    #[test]
+    fn preview_compression_threshold_validates_signed_varint_and_requires_preview() {
+        let base =
+            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
+        assert_eq!(
+            parse_config(base)
+                .unwrap()
+                .listener
+                .preview_compression_threshold,
+            None
+        );
+        for off in [-1, -2, i32::MIN] {
+            let config =
+                parse_config(&format!("{base}preview_compression_threshold = {off}\n")).unwrap();
+            assert_eq!(config.listener.preview_compression_threshold, None);
+        }
+        for on in [0, 256, i32::MAX] {
+            let config =
+                parse_config(&format!("{base}preview_compression_threshold = {on}\n")).unwrap();
+            assert_eq!(
+                config.listener.preview_compression_threshold,
+                Some(on as usize)
+            );
+        }
+        for bad in ["'256'", "true", "2147483648", "-2147483649"] {
+            let err = parse_config(&format!("{base}preview_compression_threshold = {bad}\n"))
+                .unwrap_err();
+            assert!(
+                err.contains("preview_compression_threshold"),
+                "{bad}: {err}"
+            );
+        }
+        let err = parse_config(
+            "schema_version = 1\nlog_level = 'info'\n[listener]\npreview_compression_threshold = 256\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("preview_compression_threshold") && err.contains("local_java_preview")
+        );
     }
 }

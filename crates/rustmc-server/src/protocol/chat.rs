@@ -113,6 +113,12 @@ fn map_wire_error(err: WireError) -> ProtocolError {
             actual: length,
         },
         WireError::InvalidText => ProtocolError::InvalidUtf8,
+        WireError::BelowCompressionThreshold { length, threshold } => ProtocolError::Malformed(
+            format!("Compressed length {length} below threshold {threshold}"),
+        ),
+        WireError::InvalidCompression | WireError::DecompressedSizeMismatch { .. } => {
+            ProtocolError::Malformed("Invalid compressed frame".into())
+        }
     }
 }
 
