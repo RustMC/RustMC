@@ -2374,7 +2374,9 @@ mod tests {
     /// `deepslate_ore_replaceables`, `height_specific_ore_replaceables`) is a
     /// subset of `base_stone_overworld`, so that one tag answers for the whole
     /// placement stage: a row the pass changed must have held one of its
-    /// members before, and no row may appear or disappear.
+    /// members before, and no row may appear or disappear. Both checks cover
+    /// the rows under each column's highest solid base block, because the
+    /// vegetation step legitimately places plants on and above the terrain.
     ///
     /// The four 16×16 squares sit at fixed origins on a power-of-two grid,
     /// with one off-grid pair so at least one square straddles chunk borders
@@ -2406,7 +2408,19 @@ mod tests {
                 for z in origin_z..origin_z + 16 {
                     let base = generator.base_column_ids(x, z);
                     let ids = generator.column_ids(x, z);
-                    for (index, id) in ids.iter().enumerate() {
+                    // The vegetation step places plants on and above the
+                    // terrain (grass on air, seagrass and kelp in water), so
+                    // the invariants below hold under the column's highest
+                    // solid base row only.
+                    let solid_rows = base
+                        .iter()
+                        .rposition(|id| {
+                            id.as_deref().is_some_and(|id| {
+                                !matches!(id, "minecraft:cave_air" | SPRING_WATER | SPRING_LAVA)
+                            })
+                        })
+                        .map_or(0, |row| row + 1);
+                    for (index, id) in ids.iter().enumerate().take(solid_rows) {
                         let y = min_y + index as i32;
                         let before = base[index].as_deref();
                         if let Some(id) = id {
@@ -2453,6 +2467,7 @@ mod tests {
                     assert_eq!(
                         ids.iter()
                             .zip(base.iter())
+                            .take(solid_rows)
                             .filter(|(after, before)| {
                                 after.is_some() != before.is_some()
                                     && !(before.is_none()
