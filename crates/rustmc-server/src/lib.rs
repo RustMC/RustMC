@@ -14,7 +14,7 @@ pub mod entity;
 pub mod item;
 pub mod java_packets;
 pub mod java_preview;
-mod java_wire;
+pub mod java_wire;
 pub mod preview_cache;
 pub mod preview_data;
 pub mod protocol;

@@ -41,6 +41,7 @@ pub mod login {
     pub mod clientbound {
         pub const LOGIN_DISCONNECT: u32 = 0;
         pub const LOGIN_FINISHED: u32 = 2;
+        pub const SET_COMPRESSION: u32 = 3;
     }
 }
 

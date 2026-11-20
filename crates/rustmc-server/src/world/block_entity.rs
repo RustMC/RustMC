@@ -976,6 +976,11 @@ fn map_wire_error(err: WireError) -> BlockEntityError {
         WireError::NonCanonicalVarInt => BlockEntityError::Malformed("non-canonical VarInt"),
         WireError::TooLong { length, .. } => BlockEntityError::LineTooLong(length),
         WireError::InvalidText => BlockEntityError::Malformed("invalid text encoding"),
+        WireError::BelowCompressionThreshold { .. }
+        | WireError::InvalidCompression
+        | WireError::DecompressedSizeMismatch { .. } => {
+            BlockEntityError::Malformed("invalid compressed framing")
+        }
     }
 }
 

@@ -220,7 +220,12 @@ pub fn read_string(input: &[u8]) -> Result<(&str, usize), EntityProtocolError> {
         Ok((s, rest)) => Ok((s, input.len() - rest.len())),
         Err(WireError::Truncated) => Err(EntityProtocolError::UnexpectedEof),
         Err(
-            WireError::VarIntTooLong | WireError::NonCanonicalVarInt | WireError::TooLong { .. },
+            WireError::VarIntTooLong
+            | WireError::NonCanonicalVarInt
+            | WireError::TooLong { .. }
+            | WireError::BelowCompressionThreshold { .. }
+            | WireError::InvalidCompression
+            | WireError::DecompressedSizeMismatch { .. },
         ) => Err(EntityProtocolError::MalformedVarInt),
         Err(WireError::InvalidText) => Err(EntityProtocolError::InvalidUtf8),
     }
