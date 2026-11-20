@@ -10,3 +10,7 @@ max_connections = 8
 max_bytes_per_connection = 4096
 idle_timeout_ms = 1000
 max_connection_lifetime_ms = 10000
+# Opt-in Java 26.3 preview zlib packet compression threshold in bytes
+# (requires `local_java_preview = true`; absent or negative `-1` disables
+# compression, `0` compresses all packets, vanilla default is `256`).
+# preview_compression_threshold = 256

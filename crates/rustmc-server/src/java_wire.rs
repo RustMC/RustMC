@@ -221,6 +221,25 @@ pub fn frame_compressed(
     frame_compressed_parts([&id_bytes[..id_len], body], threshold, out)
 }
 
+/// Re-frame an uncompressed-framed packet (`[VarInt(len), VarInt(id), body...]`)
+/// into `out` using the post-`Set Compression` format (`threshold`).
+///
+/// Leaves `out` unmodified on error.
+pub fn reframe_compressed(
+    uncompressed_frame: &[u8],
+    threshold: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), WireError> {
+    let Some((len, prefix)) = read_varint(uncompressed_frame)? else {
+        return Err(WireError::Truncated);
+    };
+    let len = len as usize;
+    if len == 0 || prefix + len != uncompressed_frame.len() {
+        return Err(WireError::InvalidCompression);
+    }
+    frame_compressed_parts([&uncompressed_frame[prefix..], &[]], threshold, out)
+}
+
 /// Encode the login-phase `Set Compression` clientbound packet (`0x03`).
 ///
 /// Sent in the uncompressed packet format before `Login Success`; compression

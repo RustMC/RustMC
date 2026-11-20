@@ -248,6 +248,10 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
     }
     if !(2..=32).contains(&config.preview_view_distance)
         || (config.preview_registry_manifest.is_some() && !config.local_java_preview)
+        || (config.preview_compression_threshold.is_some() && !config.local_java_preview)
+        || config
+            .preview_compression_threshold
+            .is_some_and(|threshold| threshold > i32::MAX as usize)
         || config.max_connections == 0
         || config.max_connections > 64
         || config.max_bytes_per_connection == 0
@@ -518,7 +522,8 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
                             config.preview_seed,
                             config.preview_view_distance,
                             config.preview_terrain,
-                        );
+                        )
+                        .with_compression_threshold(config.preview_compression_threshold);
                     if let Some(source) = &vanilla_source {
                         discovery = discovery.with_vanilla_source(source.clone());
                     }
@@ -876,6 +881,15 @@ mod tests {
             },
             ListenerConfig {
                 preview_read_bytes_per_second: usize::MAX,
+                ..ListenerConfig::default()
+            },
+            ListenerConfig {
+                preview_compression_threshold: Some(256),
+                ..ListenerConfig::default()
+            },
+            ListenerConfig {
+                local_java_preview: true,
+                preview_compression_threshold: Some(usize::MAX),
                 ..ListenerConfig::default()
             },
         ] {

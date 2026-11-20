@@ -8,8 +8,9 @@ mod tests_keepalive;
 use crate::java_packets::{configuration, handshake, intent, login, play, status};
 use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
 use crate::java_wire::{
-    WireError, frame, pack_block_position, put_string, put_varint, read_f32_be, read_f64_be,
-    read_i16_be, read_i64_be, read_string, read_u64_be, read_varint, unpack_block_position,
+    WireError, encode_set_compression, frame, frame_compressed, pack_block_position, put_string,
+    put_varint, read_compressed_frame, read_f32_be, read_f64_be, read_i16_be, read_i64_be,
+    read_string, read_u64_be, read_varint, reframe_compressed, unpack_block_position,
 };
 use crate::preview_data::RegistryManifest;
 use crate::protocol::{
@@ -516,6 +517,8 @@ pub struct Session {
     player_name: String,
     dispatcher: crate::commands::CommandDispatcher,
     broadcasts: Vec<Vec<u8>>,
+    compression_threshold: Option<usize>,
+    compression_active: bool,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -537,6 +540,8 @@ impl Default for Session {
             player_name: "Player".to_string(),
             dispatcher: crate::commands::CommandDispatcher::read_only_preview(0),
             broadcasts: Vec::new(),
+            compression_threshold: None,
+            compression_active: false,
         }
     }
 }
@@ -565,6 +570,37 @@ impl Session {
     pub fn with_protocol_ids(mut self, protocol_ids: Arc<ProtocolIds>) -> Self {
         self.protocol_ids = Some(protocol_ids);
         self
+    }
+    pub fn with_compression_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.compression_threshold = threshold;
+        self
+    }
+    fn active_compression_threshold(&self) -> Option<usize> {
+        self.compression_active
+            .then_some(self.compression_threshold)
+            .flatten()
+    }
+    fn encode_frame(&self, id: u32, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let Some(threshold) = self.active_compression_threshold() else {
+            return Ok(frame(id, body));
+        };
+        let mut out = Vec::new();
+        frame_compressed(id, body, threshold, &mut out).map_err(|err| match err {
+            WireError::TooLong { .. } => Error::Oversized,
+            _ => Error::Malformed,
+        })?;
+        Ok(out)
+    }
+    fn reframe_packet(&self, uncompressed: Vec<u8>) -> Result<Vec<u8>, Error> {
+        let Some(threshold) = self.active_compression_threshold() else {
+            return Ok(uncompressed);
+        };
+        let mut out = Vec::new();
+        reframe_compressed(&uncompressed, threshold, &mut out).map_err(|err| match err {
+            WireError::TooLong { .. } => Error::Oversized,
+            _ => Error::Malformed,
+        })?;
+        Ok(out)
     }
     pub fn state(&self) -> State {
         self.state
@@ -622,12 +658,35 @@ impl Session {
             if self.input.len() < prefix + size {
                 break;
             }
-            let packet = self.input[prefix..prefix + size].to_vec();
-            self.input.drain(..prefix + size);
-            let Some((id, id_len)) = read_varint(&packet)? else {
-                return Err(Error::Malformed);
+            let (id, body_owned);
+            let body: &[u8] = if let Some(threshold) = self.active_compression_threshold() {
+                let max_uncompressed = MAX_FRAME.min(limit);
+                let (decoded_id, decoded_body, rest) = read_compressed_frame(
+                    &self.input[..prefix + size],
+                    threshold,
+                    max_uncompressed,
+                )
+                .map_err(|err| match err {
+                    WireError::TooLong { .. } => Error::Oversized,
+                    _ => Error::Malformed,
+                })?;
+                if !rest.is_empty() {
+                    return Err(Error::Malformed);
+                }
+                self.input.drain(..prefix + size);
+                id = decoded_id;
+                body_owned = decoded_body;
+                &body_owned
+            } else {
+                let packet = self.input[prefix..prefix + size].to_vec();
+                self.input.drain(..prefix + size);
+                let Some((decoded_id, id_len)) = read_varint(&packet)? else {
+                    return Err(Error::Malformed);
+                };
+                id = decoded_id;
+                body_owned = packet;
+                &body_owned[id_len..]
             };
-            let body = &packet[id_len..];
             match (self.state, id) {
                 (State::Handshake, handshake::serverbound::INTENTION) => {
                     let Some((version, n)) = read_varint(body)? else {
@@ -679,6 +738,17 @@ impl Session {
                 (State::Login, login::serverbound::HELLO) => {
                     let (name, client_uuid) = read_hello(body)?;
                     self.player_name = String::from_utf8_lossy(name).to_string();
+                    if let Some(threshold) = self.compression_threshold {
+                        let threshold_i32 =
+                            i32::try_from(threshold).map_err(|_| Error::Oversized)?;
+                        // Quote from `https://minecraft.wiki/w/Java_Edition_protocol/Packets`
+                        // (revision 3868170, Login flow):
+                        // "Set Compression, if present, must be sent before Login Success.
+                        // Note that anything sent after Set Compression must use the
+                        // Post Compression packet format."
+                        responses.push(encode_set_compression(threshold_i32));
+                        self.compression_active = true;
+                    }
                     // The client UUID is an opaque, unverified local-session value.
                     let mut success = client_uuid.to_vec();
                     put_varint(name.len() as u32, &mut success);
@@ -687,14 +757,15 @@ impl Session {
                     // 26.3 appends a separate connection-scoped session UUID. This is
                     // only a local identifier; it grants no authenticated identity.
                     success.extend_from_slice(&self.session_id);
-                    responses.push(frame(login::clientbound::LOGIN_FINISHED, &success));
+                    responses
+                        .push(self.encode_frame(login::clientbound::LOGIN_FINISHED, &success)?);
                     self.state = State::LoginAcknowledgement;
                 }
                 (State::LoginAcknowledgement, login::serverbound::LOGIN_ACKNOWLEDGED)
                     if body.is_empty() =>
                 {
                     self.state = State::Configuration;
-                    responses.push(known_packs());
+                    responses.push(self.reframe_packet(known_packs())?);
                 }
                 (
                     State::Configuration,
@@ -707,7 +778,9 @@ impl Session {
                     }
                     self.state = State::ConfigurationData;
                     if self.registry_manifest.is_some() {
-                        responses.extend(initial_configuration(self.registry_manifest.as_deref()));
+                        for packet in initial_configuration(self.registry_manifest.as_deref()) {
+                            responses.push(self.reframe_packet(packet)?);
+                        }
                     }
                 }
                 (State::ConfigurationData, configuration::serverbound::FINISH_CONFIGURATION)
@@ -728,6 +801,7 @@ impl Session {
                             manifest,
                         )
                     }
+                    .map(|p| p.with_compression_threshold(self.compression_threshold))
                     .ok_or(Error::Malformed)?;
                     responses.extend(preview.initial(manifest).ok_or(Error::Malformed)?);
                     self.dispatcher.set_seed(self.preview_seed as i64);
@@ -837,11 +911,15 @@ impl Session {
                         }
                         PLAYER_ACTION_ID => {
                             let action = decode_player_action(body)?;
-                            responses.push(acknowledge_block_change(action.sequence));
+                            responses.push(
+                                self.reframe_packet(acknowledge_block_change(action.sequence))?,
+                            );
                         }
                         USE_ITEM_ON_ID => {
                             let action = decode_use_item_on(body)?;
-                            responses.push(acknowledge_block_change(action.sequence));
+                            responses.push(
+                                self.reframe_packet(acknowledge_block_change(action.sequence))?,
+                            );
                         }
                         sb::SET_CREATIVE_MODE_SLOT => {
                             // `Set Creative Mode Slot` (0x39 / 57, `Java Edition protocol/Packets`
@@ -941,9 +1019,11 @@ impl Session {
                             // not verified and the text is relayed as system chat.
                             let packet = chat::ChatPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
-                            let frame = chat::broadcast_chat(&self.player_name, &packet.message)
-                                .map_err(|_| Error::Malformed)?
-                                .to_frame();
+                            let raw_frame =
+                                chat::broadcast_chat(&self.player_name, &packet.message)
+                                    .map_err(|_| Error::Malformed)?
+                                    .to_frame();
+                            let frame = self.reframe_packet(raw_frame)?;
                             if self.broadcasts.len() >= MAX_QUEUED_BROADCASTS {
                                 return Err(Error::Oversized);
                             }
@@ -953,12 +1033,14 @@ impl Session {
                         sb::CHAT_COMMAND => {
                             let packet = chat::ChatCommandPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
-                            responses.push(self.run_command(&packet.command)?);
+                            let reply = self.run_command(&packet.command)?;
+                            responses.push(self.reframe_packet(reply)?);
                         }
                         sb::CHAT_COMMAND_SIGNED => {
                             let packet = chat::SignedChatCommandPacket::decode_payload(body)
                                 .map_err(|_| Error::Malformed)?;
-                            responses.push(self.run_command(&packet.command)?);
+                            let reply = self.run_command(&packet.command)?;
+                            responses.push(self.reframe_packet(reply)?);
                         }
                         // Only system chat is sent, so there is nothing to acknowledge.
                         sb::CHAT_ACK => {
@@ -2688,5 +2770,276 @@ mod tests {
             );
         }
         assert_eq!(s.inventory().total_item_count(), 0);
+    }
+
+    #[test]
+    fn compressed_session_completes_login_configuration_and_play_round_trip() {
+        let mut manifest_val = (*test_manifest()).clone();
+        // Add enough registry entries so `REGISTRY_DATA` exceeds threshold=256 and compresses.
+        manifest_val.registries.push((
+            "minecraft:painting_variant".into(),
+            (0..20)
+                .map(|i| format!("minecraft:variant_{i:02}"))
+                .collect(),
+        ));
+        let manifest = Arc::new(manifest_val);
+
+        let mut hs = handshake(777);
+        *hs.last_mut().unwrap() = intent::LOGIN as u8;
+        let mut login_body = vec![4];
+        login_body.extend_from_slice(b"Test");
+        login_body.extend_from_slice(&[7; 16]);
+        let hello_pkt = frame(login::serverbound::HELLO, &login_body);
+
+        let mut s = Session::new(true)
+            .with_registry_manifest(Arc::clone(&manifest))
+            .with_compression_threshold(Some(256));
+        assert!(s.receive(&hs, 4096).unwrap().is_empty());
+        let login_replies = s.receive(&hello_pkt, 4096).unwrap();
+        assert_eq!(login_replies.len(), 2);
+        // Set Compression is sent uncompressed before Login Success.
+        assert_eq!(login_replies[0], [0x03, 0x03, 0x80, 0x02]);
+        // Login Success immediately follows in the compressed format.
+        let (login_id, login_success_body, rest) =
+            read_compressed_frame(&login_replies[1], 256, 4096).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(login_id, login::clientbound::LOGIN_FINISHED);
+        assert!(login_success_body.starts_with(&[7; 16]));
+
+        let mut ack_buf = Vec::new();
+        frame_compressed(
+            login::serverbound::LOGIN_ACKNOWLEDGED,
+            &[],
+            256,
+            &mut ack_buf,
+        )
+        .unwrap();
+        let cfg_replies = s.receive(&ack_buf, 4096).unwrap();
+        assert_eq!(cfg_replies.len(), 1);
+        let (kp_id, kp_body, rest) = read_compressed_frame(&cfg_replies[0], 256, 4096).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(kp_id, configuration::clientbound::SELECT_KNOWN_PACKS);
+        assert!(String::from_utf8_lossy(&kp_body).contains("minecraft"));
+
+        let mut known_body = vec![1];
+        for text in ["minecraft", "core", VERSION] {
+            put_string(text, &mut known_body);
+        }
+        let mut known_buf = Vec::new();
+        frame_compressed(
+            configuration::serverbound::SELECT_KNOWN_PACKS,
+            &known_body,
+            256,
+            &mut known_buf,
+        )
+        .unwrap();
+        let cfg_data_replies = s.receive(&known_buf, 4096).unwrap();
+        assert!(cfg_data_replies.len() >= 3);
+        let mut saw_compressed_cfg = false;
+        for reply in &cfg_data_replies {
+            let (_, prefix) = read_varint(reply).unwrap().unwrap();
+            let (dl, _) = read_varint(&reply[prefix..]).unwrap().unwrap();
+            if dl > 0 {
+                saw_compressed_cfg = true;
+            }
+            let (_, _, rest) = read_compressed_frame(reply, 256, 65_536).unwrap();
+            assert!(rest.is_empty());
+        }
+        assert!(saw_compressed_cfg);
+
+        let mut finish_buf = Vec::new();
+        frame_compressed(
+            configuration::serverbound::FINISH_CONFIGURATION,
+            &[],
+            256,
+            &mut finish_buf,
+        )
+        .unwrap();
+        let play_initial = s.receive(&finish_buf, 4096).unwrap();
+        assert_eq!(s.state(), State::Play);
+        assert_eq!(play_initial.len(), 6);
+        for reply in &play_initial {
+            let (_, _, rest) = read_compressed_frame(reply, 256, 4096).unwrap();
+            assert!(rest.is_empty());
+        }
+
+        // Compressed teleport confirmation and play chunk delivery.
+        let mut tp_buf = Vec::new();
+        frame_compressed(
+            play::serverbound::ACCEPT_TELEPORTATION,
+            &teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0),
+            256,
+            &mut tp_buf,
+        )
+        .unwrap();
+        assert!(s.receive(&tp_buf, 4096).unwrap().is_empty());
+
+        // Compare compressed chunk batch against an uncompressed session's chunk batch.
+        let mut uncomp_s = Session::new(true).with_registry_manifest(manifest);
+        uncomp_s.receive(&hs, 4096).unwrap();
+        uncomp_s.receive(&hello_pkt, 4096).unwrap();
+        uncomp_s
+            .receive(&frame(login::serverbound::LOGIN_ACKNOWLEDGED, &[]), 4096)
+            .unwrap();
+        uncomp_s
+            .receive(
+                &frame(configuration::serverbound::SELECT_KNOWN_PACKS, &known_body),
+                4096,
+            )
+            .unwrap();
+        uncomp_s
+            .receive(
+                &frame(configuration::serverbound::FINISH_CONFIGURATION, &[]),
+                4096,
+            )
+            .unwrap();
+        uncomp_s
+            .receive(
+                &frame(
+                    play::serverbound::ACCEPT_TELEPORTATION,
+                    &teleport_confirm(0.0, 64.0, 0.0, 0.0, 0.0),
+                ),
+                4096,
+            )
+            .unwrap();
+
+        let mut comp_chunks = Vec::new();
+        while let Some((comp_batch, _, _)) = s.preview.as_mut().unwrap().next_chunk() {
+            let mut comp_cursor = comp_batch.as_slice();
+            while !comp_cursor.is_empty() {
+                let (pkt_len, prefix) = read_varint(comp_cursor).unwrap().unwrap();
+                let (data_len, _) = read_varint(&comp_cursor[prefix..]).unwrap().unwrap();
+                let (id, body, rest) = read_compressed_frame(comp_cursor, 256, 1_048_576).unwrap();
+                if id == play::clientbound::LEVEL_CHUNK_WITH_LIGHT {
+                    assert!(data_len > 0, "chunk packet must be zlib-compressed");
+                    assert!(
+                        (pkt_len as usize) < data_len as usize,
+                        "compressed chunk should be smaller than uncompressed"
+                    );
+                    comp_chunks.push(body);
+                }
+                comp_cursor = rest;
+            }
+            s.preview.as_mut().unwrap().awaiting_batch = false;
+        }
+        assert_eq!(comp_chunks.len(), 25);
+
+        let mut uncomp_chunks = Vec::new();
+        while let Some((uncomp_batch, _, _)) = uncomp_s.preview.as_mut().unwrap().next_chunk() {
+            let mut uncomp_cursor = uncomp_batch.as_slice();
+            while !uncomp_cursor.is_empty() {
+                let (pkt_len, prefix) = read_varint(uncomp_cursor).unwrap().unwrap();
+                let packet = &uncomp_cursor[prefix..prefix + pkt_len as usize];
+                let (id, id_len) = read_varint(packet).unwrap().unwrap();
+                if id == play::clientbound::LEVEL_CHUNK_WITH_LIGHT {
+                    uncomp_chunks.push(packet[id_len..].to_vec());
+                }
+                uncomp_cursor = &uncomp_cursor[prefix + pkt_len as usize..];
+            }
+            uncomp_s.preview.as_mut().unwrap().awaiting_batch = false;
+        }
+        assert_eq!(comp_chunks, uncomp_chunks);
+
+        // Compressed play action -> compressed AcknowledgeBlockChange reply.
+        let action = PlayerAction {
+            status: PlayerActionStatus::StartedDigging,
+            pos: (10, 64, -20),
+            face: 1,
+            sequence: 42,
+        };
+        let mut act_buf = Vec::new();
+        frame_compressed(
+            PLAYER_ACTION_ID,
+            &encode_player_action(&action),
+            256,
+            &mut act_buf,
+        )
+        .unwrap();
+        let act_replies = s.receive(&act_buf, 4096).unwrap();
+        assert_eq!(act_replies.len(), 1);
+        let (ack_id, ack_body, rest) = read_compressed_frame(&act_replies[0], 256, 4096).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(ack_id, BLOCK_CHANGED_ACK_ID);
+        assert_eq!(ack_body, [42]);
+
+        // Compressed chat -> compressed SystemChat reply + broadcast.
+        let mut chat_body = Vec::new();
+        put_string("hi compressed", &mut chat_body);
+        chat_body.extend([0; 16]);
+        chat_body.extend([0; 6]);
+        let mut chat_buf = Vec::new();
+        frame_compressed(play::serverbound::CHAT, &chat_body, 256, &mut chat_buf).unwrap();
+        let chat_replies = s.receive(&chat_buf, 4096).unwrap();
+        assert_eq!(chat_replies.len(), 1);
+        let (sys_id, _, _) = read_compressed_frame(&chat_replies[0], 256, 4096).unwrap();
+        assert_eq!(sys_id, play::clientbound::SYSTEM_CHAT);
+        assert_eq!(s.take_broadcasts(), chat_replies);
+    }
+
+    #[test]
+    fn compressed_session_rejects_bad_client_frames_and_supports_pipelining() {
+        let mut hs = handshake(777);
+        *hs.last_mut().unwrap() = intent::LOGIN as u8;
+        let mut login_body = vec![4];
+        login_body.extend_from_slice(b"Test");
+        login_body.extend_from_slice(&[7; 16]);
+        let hello_pkt = frame(login::serverbound::HELLO, &login_body);
+
+        // Pipeline Hello (uncompressed) and Login Acknowledged (compressed) in one buffer.
+        let mut pipelined = Vec::new();
+        pipelined.extend_from_slice(&hs);
+        pipelined.extend_from_slice(&hello_pkt);
+        frame_compressed(
+            login::serverbound::LOGIN_ACKNOWLEDGED,
+            &[],
+            256,
+            &mut pipelined,
+        )
+        .unwrap();
+
+        let mut s = Session::new(true)
+            .with_registry_manifest(test_manifest())
+            .with_compression_threshold(Some(256));
+        let replies = s.receive(&pipelined, 4096).unwrap();
+        assert_eq!(s.state(), State::Configuration);
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0], encode_set_compression(256));
+        assert_eq!(
+            read_compressed_frame(&replies[1], 256, 4096).unwrap().0,
+            login::clientbound::LOGIN_FINISHED
+        );
+        assert_eq!(
+            read_compressed_frame(&replies[2], 256, 4096).unwrap().0,
+            configuration::clientbound::SELECT_KNOWN_PACKS
+        );
+
+        // Reject an invalid compressed frame whose declared length is below threshold (256).
+        let mut bad_below = Session::new(true).with_compression_threshold(Some(256));
+        bad_below.receive(&hs, 4096).unwrap();
+        bad_below.receive(&hello_pkt, 4096).unwrap();
+        let mut tiny_compressed = Vec::new();
+        frame_compressed(
+            login::serverbound::LOGIN_ACKNOWLEDGED,
+            &[],
+            0,
+            &mut tiny_compressed,
+        )
+        .unwrap();
+        assert_eq!(
+            bad_below.receive(&tiny_compressed, 4096),
+            Err(Error::Malformed)
+        );
+
+        // Reject a compressed frame whose declared Data Length exceeds MAX_FRAME (4096).
+        let mut bad_oversized = Session::new(true).with_compression_threshold(Some(256));
+        bad_oversized.receive(&hs, 4096).unwrap();
+        bad_oversized.receive(&hello_pkt, 4096).unwrap();
+        let mut forged = Vec::new();
+        let mut inner = Vec::new();
+        put_varint((MAX_FRAME + 1) as u32, &mut inner);
+        inner.extend_from_slice(&[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        put_varint(inner.len() as u32, &mut forged);
+        forged.extend_from_slice(&inner);
+        assert_eq!(bad_oversized.receive(&forged, 4096), Err(Error::Oversized));
     }
 }
