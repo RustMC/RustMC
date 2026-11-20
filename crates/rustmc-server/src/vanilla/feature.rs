@@ -251,6 +251,17 @@ fn tag_members<'a>(entries: &'a HashMap<String, Vec<String>>, tag: &str) -> Opti
 #[derive(Debug, Default, Clone)]
 pub struct BlockTags {
     entries: HashMap<String, Vec<String>>,
+    /// Precomputed set membership for O(1) lookup when loaded from pack data.
+    membership: HashMap<String, HashSet<String>>,
+}
+
+fn build_tag_membership(
+    entries: &HashMap<String, Vec<String>>,
+) -> HashMap<String, HashSet<String>> {
+    entries
+        .iter()
+        .map(|(tag, members)| (tag.clone(), members.iter().cloned().collect()))
+        .collect()
 }
 
 impl BlockTags {
@@ -258,15 +269,21 @@ impl BlockTags {
     /// A missing directory yields an empty registry, which makes every tag
     /// test fail rather than assuming membership.
     pub fn load(root: &Path) -> Result<Self, WorldgenError> {
+        let entries = load_registry(root, "block")?;
+        let membership = build_tag_membership(&entries);
         Ok(Self {
-            entries: load_registry(root, "block")?,
+            entries,
+            membership,
         })
     }
 
     /// Loads `data/<namespace>/tags/block/**/*.json` across ordered pack roots.
     pub fn load_from_roots(roots: &[&Path]) -> Result<Self, WorldgenError> {
+        let entries = load_registry_from_roots(roots, "block")?;
+        let membership = build_tag_membership(&entries);
         Ok(Self {
-            entries: load_registry_from_roots(roots, "block")?,
+            entries,
+            membership,
         })
     }
 
@@ -277,7 +294,11 @@ impl BlockTags {
 
     /// Whether `block` is a member of `tag`.
     pub fn contains(&self, tag: &str, block: &str) -> bool {
-        tag_contains(&self.entries, tag, block)
+        if let Some(set) = self.membership.get(tag) {
+            set.contains(block)
+        } else {
+            tag_contains(&self.entries, tag, block)
+        }
     }
 
     /// Number of tags read from the pack.
@@ -409,6 +430,19 @@ pub enum StateProvider {
         property: String,
         values: RangeProvider,
     },
+    /// `minecraft:rotated` — sets or randomly rotates `axis` (`x`, `y`, `z`) or
+    /// `facing` (`north`, `east`, `south`, `west`) on a block state.
+    ///
+    /// Source: minecraft.wiki `Block state provider` (revision 3828513):
+    /// "Randomly rotates any block with `axis` or `facing` properties."
+    Rotated {
+        state: Box<StateProvider>,
+        direction: Option<Direction>,
+    },
+    /// Named reference into `worldgen/block_state_provider/*.json`. Resolved
+    /// during [`FeatureData::load`] when the document exists in the pack;
+    /// unresolved references remain named gaps.
+    Reference { id: String },
     /// A provider shape without a runtime here. Named so the gap report can
     /// tell an unmodeled state apart from a feature that placed nothing.
     Unsupported { kind: String },
@@ -438,7 +472,19 @@ impl StateProvider {
                 property,
                 values,
             } => !property.is_empty() && source.is_modelable() && values.is_modelable(),
-            Self::Unsupported { .. } => false,
+            Self::Rotated { state, .. } => state.is_modelable(),
+            Self::Reference { .. } | Self::Unsupported { .. } => false,
+        }
+    }
+
+    /// Whether sampling this provider consumes no decoration RNG draws.
+    fn costs_no_draws(&self) -> bool {
+        match self {
+            Self::Constant { .. } => true,
+            Self::RuleBased { fallback, rules } => {
+                fallback.costs_no_draws() && rules.iter().all(|rule| rule.then.costs_no_draws())
+            }
+            _ => false,
         }
     }
 
@@ -455,8 +501,10 @@ impl StateProvider {
                 .flat_map(|rule| rule.then.states())
                 .chain(fallback.states())
                 .collect(),
-            Self::RandomizedInt { source, .. } => source.states(),
-            Self::Unsupported { .. } => Vec::new(),
+            Self::RandomizedInt { source, .. } | Self::Rotated { state: source, .. } => {
+                source.states()
+            }
+            Self::Reference { .. } | Self::Unsupported { .. } => Vec::new(),
         }
     }
 
@@ -502,8 +550,40 @@ impl StateProvider {
                 let value = values.sample(target.min_y(), target.height(), random);
                 Some(Cow::Owned(set_state_property(&base, property, value)))
             }
+            Self::Rotated { state, direction } => {
+                let base = state.sample(target, pos, tags, random)?;
+                if block_state_property(&base, "axis").is_some() {
+                    let axis = match direction {
+                        Some(Direction::East | Direction::West) => "x",
+                        Some(Direction::Up | Direction::Down) => "y",
+                        Some(Direction::North | Direction::South) => "z",
+                        None => match random.next_int_bounded(3) {
+                            0 => "x",
+                            1 => "y",
+                            _ => "z",
+                        },
+                    };
+                    Some(Cow::Owned(set_state_property_str(&base, "axis", axis)))
+                } else if block_state_property(&base, "facing").is_some() {
+                    let facing = match direction {
+                        Some(Direction::North) => "north",
+                        Some(Direction::East) => "east",
+                        Some(Direction::South) => "south",
+                        Some(Direction::West) => "west",
+                        Some(_) | None => match random.next_int_bounded(4) {
+                            0 => "north",
+                            1 => "east",
+                            2 => "south",
+                            _ => "west",
+                        },
+                    };
+                    Some(Cow::Owned(set_state_property_str(&base, "facing", facing)))
+                } else {
+                    Some(base)
+                }
+            }
             // `is_modelable` gates this out before the feature runs.
-            Self::Unsupported { .. } => None,
+            Self::Reference { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -535,6 +615,21 @@ pub enum BlockPredicate {
     /// `minecraft:inside_world_bounds` — tests whether `pos + offset` lies within
     /// the buildable vertical range `[min_y, min_y + height)`.
     InsideWorldBounds { offset: (i32, i32, i32) },
+    /// `minecraft:replaceable` — checks whether the block at `pos + offset`
+    /// belongs to `#minecraft:replaceable`.
+    ///
+    /// Source: minecraft.wiki `Block predicate` (revision 3840614):
+    /// "Checks if the block at the specified offset can be replaced by placing blocks."
+    Replaceable { offset: (i32, i32, i32) },
+    /// `minecraft:would_survive` — checks whether `state` is a valid placement
+    /// at `pos + offset`.
+    ///
+    /// Source: minecraft.wiki `Block predicate` (revision 3840614):
+    /// "Checks if a specified block state is a valid placement at the given offset."
+    WouldSurvive {
+        offset: (i32, i32, i32),
+        state: String,
+    },
     /// `minecraft:true` — always succeeds.
     True,
     /// `minecraft:any_of` — at least one nested test passes.
@@ -554,6 +649,7 @@ impl BlockPredicate {
     pub fn is_modelable(&self) -> bool {
         match self {
             Self::Unsupported { .. } => false,
+            Self::WouldSurvive { state, .. } => plant_support::supports_survival_state(state),
             Self::AnyOf(rules) | Self::AllOf(rules) => rules.iter().all(Self::is_modelable),
             Self::Not(rule) => rule.is_modelable(),
             _ => true,
@@ -572,9 +668,24 @@ impl BlockPredicate {
         tags: &BlockTags,
     ) -> bool {
         match self {
-            Self::BlockTag { tag, offset } => target
-                .read_block(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
-                .is_some_and(|block| tags.contains(tag, base_block_id(&block))),
+            Self::BlockTag { tag, offset } => {
+                let px = pos.x + offset.0;
+                let py = pos.y + offset.1;
+                let pz = pos.z + offset.2;
+                if tag == "minecraft:air"
+                    && tags.contains("minecraft:air", "minecraft:air")
+                    && tags.contains("minecraft:air", "minecraft:cave_air")
+                    && tags.contains("minecraft:air", "minecraft:void_air")
+                {
+                    py >= target.min_y()
+                        && py < target.min_y() + target.height()
+                        && target.is_air(px, py, pz)
+                } else {
+                    target
+                        .read_block(px, py, pz)
+                        .is_some_and(|block| tags.contains(tag, base_block_id(&block)))
+                }
+            }
             Self::Blocks { blocks, offset } => target
                 .read_block(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
                 .is_some_and(|block| {
@@ -599,6 +710,17 @@ impl BlockPredicate {
             Self::InsideWorldBounds { offset } => {
                 let ty = pos.y + offset.1;
                 ty >= target.min_y() && ty < target.min_y() + target.height()
+            }
+            Self::Replaceable { offset } => target
+                .read_block(pos.x + offset.0, pos.y + offset.1, pos.z + offset.2)
+                .is_some_and(|block| is_replaceable_block(base_block_id(&block), tags)),
+            Self::WouldSurvive { offset, state } => {
+                let checked = DecorationPos {
+                    x: pos.x + offset.0,
+                    y: pos.y + offset.1,
+                    z: pos.z + offset.2,
+                };
+                plant_support::would_survive(target, tags, state, checked)
             }
             Self::True => true,
             Self::AnyOf(rules) => rules.iter().any(|rule| rule.test(target, pos, tags)),
@@ -643,7 +765,7 @@ const ALWAYS_WATER_SOURCE_BLOCKS: &[&str] = &[
 /// Derives the fluid identifier (`minecraft:fluid` registry) carried by a block
 /// state from its `waterlogged` / `level` state properties (from 26.3 `blocks.json`),
 /// always-waterlogged vanilla blocks, and fluid block identity (`minecraft:water` / `minecraft:lava`).
-fn fluid_from_block_state(state: &str) -> &'static str {
+pub(crate) fn fluid_from_block_state(state: &str) -> &'static str {
     if block_state_property(state, "waterlogged") == Some("true") {
         return "minecraft:water";
     }
@@ -668,6 +790,190 @@ fn fluid_from_block_state(state: &str) -> &'static str {
         }
         _ => "minecraft:empty",
     }
+}
+
+/// Blocks marked legacy solid despite thin/empty collision bounds (`Block properties/Solid (legacy)`,
+/// rev 3717400).
+const LEGACY_SOLID_OVERRIDES: &[&str] = &[
+    "minecraft:cobweb",
+    "minecraft:moving_piston",
+    "minecraft:cake",
+    "minecraft:bamboo_sapling",
+    "minecraft:bamboo",
+    "minecraft:amethyst_cluster",
+    "minecraft:sculk_vein",
+    "minecraft:pointed_dripstone",
+    "minecraft:firefly_bush",
+    "minecraft:conduit",
+    "minecraft:turtle_egg",
+    "minecraft:dried_ghast",
+    "minecraft:bell",
+    "minecraft:lantern",
+    "minecraft:soul_lantern",
+    "minecraft:lightning_rod",
+];
+
+/// Blocks excluded from legacy solid (`Block properties/Solid (legacy)`, rev 3717400).
+const LEGACY_NON_SOLID_OVERRIDES: &[&str] = &[
+    "minecraft:ladder",
+    "minecraft:snow",
+    "minecraft:end_rod",
+    "minecraft:chorus_plant",
+    "minecraft:chorus_flower",
+    "minecraft:azalea",
+    "minecraft:flowering_azalea",
+    "minecraft:big_dripleaf",
+];
+
+/// Whether `base_id` has the legacy solid property (`Block properties/Solid (legacy)` rev 3717400),
+/// using `#minecraft:blocks_motion` when loaded or a non-fluid/non-plant fallback in synthetic tests.
+pub(crate) fn is_legacy_solid(base_id: &str, tags: &BlockTags) -> bool {
+    if is_air_block(Some(base_id)) || LEGACY_NON_SOLID_OVERRIDES.contains(&base_id) {
+        return false;
+    }
+    if LEGACY_SOLID_OVERRIDES.contains(&base_id) {
+        return true;
+    }
+    if tags.members("minecraft:blocks_motion").is_some() {
+        return tags.contains("minecraft:blocks_motion", base_id);
+    }
+    !matches!(
+        base_id,
+        "minecraft:water"
+            | "minecraft:flowing_water"
+            | "minecraft:lava"
+            | "minecraft:flowing_lava"
+            | "minecraft:short_grass"
+            | "minecraft:tall_grass"
+            | "minecraft:fern"
+            | "minecraft:large_fern"
+            | "minecraft:dead_bush"
+            | "minecraft:bush"
+            | "minecraft:short_dry_grass"
+            | "minecraft:tall_dry_grass"
+            | "minecraft:sugar_cane"
+            | "minecraft:dandelion"
+            | "minecraft:poppy"
+            | "minecraft:blue_orchid"
+            | "minecraft:allium"
+            | "minecraft:azure_bluet"
+            | "minecraft:red_tulip"
+            | "minecraft:orange_tulip"
+            | "minecraft:white_tulip"
+            | "minecraft:pink_tulip"
+            | "minecraft:oxeye_daisy"
+            | "minecraft:cornflower"
+            | "minecraft:lily_of_the_valley"
+            | "minecraft:sunflower"
+            | "minecraft:lilac"
+            | "minecraft:rose_bush"
+            | "minecraft:peony"
+            | "minecraft:wildflowers"
+            | "minecraft:pink_petals"
+            | "minecraft:leaf_litter"
+            | "minecraft:small_dripleaf"
+            | "minecraft:moss_carpet"
+            | "minecraft:pale_moss_carpet"
+            | "minecraft:lily_pad"
+            | "minecraft:vine"
+            | "minecraft:glow_lichen"
+            | "minecraft:seagrass"
+            | "minecraft:tall_seagrass"
+            | "minecraft:kelp"
+            | "minecraft:kelp_plant"
+    )
+}
+
+fn is_replaceable_block(base_id: &str, tags: &BlockTags) -> bool {
+    if tags.members("minecraft:replaceable").is_some() {
+        tags.contains("minecraft:replaceable", base_id)
+    } else {
+        matches!(
+            base_id,
+            "minecraft:air"
+                | "minecraft:cave_air"
+                | "minecraft:void_air"
+                | "minecraft:water"
+                | "minecraft:lava"
+                | "minecraft:short_grass"
+                | "minecraft:fern"
+                | "minecraft:dead_bush"
+                | "minecraft:bush"
+                | "minecraft:short_dry_grass"
+                | "minecraft:tall_dry_grass"
+                | "minecraft:seagrass"
+                | "minecraft:tall_seagrass"
+                | "minecraft:tall_grass"
+                | "minecraft:large_fern"
+                | "minecraft:snow"
+                | "minecraft:vine"
+                | "minecraft:glow_lichen"
+                | "minecraft:leaf_litter"
+        )
+    }
+}
+
+/// Heightmap variants defined by `Placed feature` (rev 3816343) and
+/// `Heightmap` (rev 3806795).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeightmapKind {
+    WorldSurfaceWg,
+    WorldSurface,
+    OceanFloorWg,
+    OceanFloor,
+    MotionBlocking,
+    MotionBlockingNoLeaves,
+}
+
+impl HeightmapKind {
+    /// Parses a vanilla heightmap identifier.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "WORLD_SURFACE_WG" => Some(Self::WorldSurfaceWg),
+            "WORLD_SURFACE" => Some(Self::WorldSurface),
+            "OCEAN_FLOOR_WG" => Some(Self::OceanFloorWg),
+            "OCEAN_FLOOR" => Some(Self::OceanFloor),
+            "MOTION_BLOCKING" => Some(Self::MotionBlocking),
+            "MOTION_BLOCKING_NO_LEAVES" => Some(Self::MotionBlockingNoLeaves),
+            _ => None,
+        }
+    }
+
+    /// Returns whether `state` counts as a blocking/surface block under this heightmap
+    /// per `Heightmap` (rev 3806795) and 26.3 heightmap tags.
+    pub fn matches_block(self, state: &str, tags: &BlockTags) -> bool {
+        if is_air_block(Some(state)) {
+            return false;
+        }
+        match self {
+            Self::WorldSurfaceWg | Self::WorldSurface => true,
+            Self::OceanFloorWg | Self::OceanFloor => heightmap_blocks_motion(state, tags, false),
+            Self::MotionBlocking => {
+                heightmap_blocks_motion(state, tags, false)
+                    || fluid_from_block_state(state) != "minecraft:empty"
+            }
+            Self::MotionBlockingNoLeaves => {
+                heightmap_blocks_motion(state, tags, true)
+                    || fluid_from_block_state(state) != "minecraft:empty"
+            }
+        }
+    }
+}
+
+fn heightmap_blocks_motion(state: &str, tags: &BlockTags, exclude_leaves: bool) -> bool {
+    let base = base_block_id(state);
+    let tag = if exclude_leaves {
+        "minecraft:blocks_motion_in_heightmap_no_leaves"
+    } else {
+        "minecraft:blocks_motion_in_heightmap"
+    };
+    if tags.members(tag).is_some() {
+        return tags.contains(tag, base);
+    }
+    if exclude_leaves && base.ends_with("_leaves") {
+        return false;
+    }
+    is_legacy_solid(base, tags)
 }
 
 /// Strips a state's properties, leaving its block id.
@@ -745,9 +1051,51 @@ pub enum ConfiguredFeature {
     SimpleRandomSelector {
         features: Vec<Rc<PlacedFeature>>,
     },
+    /// `minecraft:random_selector` — checks each `(feature, chance)` entry in
+    /// order and runs `default` if none succeed.
+    ///
+    /// Source: minecraft.wiki `Random Selector` (revision 3818741).
+    RandomSelector {
+        features: Vec<(Rc<PlacedFeature>, f32)>,
+        default: Rc<PlacedFeature>,
+    },
+    /// `minecraft:weighted_random_selector` — selects one placed feature by weight.
+    ///
+    /// Source: minecraft.wiki `Java Edition 26.2` (revision 3880953):
+    /// "Randomly selects one of the given features to generate based on their weights."
+    WeightedRandomSelector {
+        features: Vec<(Rc<PlacedFeature>, i32)>,
+    },
+    /// `minecraft:random_boolean_selector` — chooses `feature_true` or
+    /// `feature_false` with equal probability.
+    ///
+    /// Source: minecraft.wiki `Random Boolean Selector` (revision 3818739).
+    RandomBooleanSelector {
+        feature_true: Rc<PlacedFeature>,
+        feature_false: Rc<PlacedFeature>,
+    },
+    /// `minecraft:block_column` — builds a contiguous column of layer blocks
+    /// along `direction` while `allowed_placement` holds.
+    ///
+    /// Source: minecraft.wiki `Cave Vines (feature)` (revision 3818484):
+    /// "`prioritize_tip`: Determines where to cut off blocks when space is restricted.
+    /// If `true`, starts removing layers from the start of the column."
+    BlockColumn {
+        direction: Direction,
+        allowed_placement: BlockPredicate,
+        prioritize_tip: bool,
+        layers: Vec<BlockColumnLayer>,
+    },
     Unsupported {
         kind: String,
     },
+}
+
+/// One height + block-state-provider layer of a `minecraft:block_column`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockColumnLayer {
+    pub height: RangeProvider,
+    pub provider: StateProvider,
 }
 
 impl ConfiguredFeature {
@@ -777,6 +1125,34 @@ impl ConfiguredFeature {
             Self::SimpleRandomSelector { features } => {
                 !features.is_empty() && features.iter().all(|feature| feature.is_modelable())
             }
+            Self::RandomSelector { features, default } => {
+                default.is_modelable()
+                    && features.iter().all(|(feature, chance)| {
+                        (0.0..=1.0).contains(chance) && feature.is_modelable()
+                    })
+            }
+            Self::WeightedRandomSelector { features } => {
+                !features.is_empty()
+                    && features
+                        .iter()
+                        .all(|(feature, weight)| *weight > 0 && feature.is_modelable())
+            }
+            Self::RandomBooleanSelector {
+                feature_true,
+                feature_false,
+            } => feature_true.is_modelable() && feature_false.is_modelable(),
+            Self::BlockColumn {
+                allowed_placement,
+                layers,
+                ..
+            } => {
+                allowed_placement.is_modelable()
+                    && layers.iter().all(|layer| {
+                        layer.height.is_modelable()
+                            && layer.provider.is_modelable()
+                            && layer.provider.is_placeable()
+                    })
+            }
             Self::Unsupported { .. } => false,
         }
     }
@@ -785,17 +1161,145 @@ impl ConfiguredFeature {
     /// the patch's origin.
     fn patch_reach(&self) -> i32 {
         match self {
+            Self::Disk { radius, .. } => radius.range(0, 0).map_or(0, |(_, max)| max.max(0)),
             Self::RandomPatch {
                 xz_spread, feature, ..
-            } => xz_spread.saturating_add(feature.feature.patch_reach()),
+            } => xz_spread.saturating_add(feature.patch_reach()),
             Self::SimpleRandomSelector { features } => features
                 .iter()
-                .map(|feature| feature.feature.patch_reach())
+                .map(|feature| feature.patch_reach())
                 .max()
                 .unwrap_or(0),
+            Self::RandomSelector { features, default } => features
+                .iter()
+                .map(|(feature, _)| feature.patch_reach())
+                .max()
+                .unwrap_or(0)
+                .max(default.patch_reach()),
+            Self::WeightedRandomSelector { features } => features
+                .iter()
+                .map(|(feature, _)| feature.patch_reach())
+                .max()
+                .unwrap_or(0),
+            Self::RandomBooleanSelector {
+                feature_true,
+                feature_false,
+            } => feature_true.patch_reach().max(feature_false.patch_reach()),
             _ => 0,
         }
     }
+
+    /// Whether executing this feature without placement modifiers draws zero RNG values.
+    fn costs_no_draws(&self) -> bool {
+        match self {
+            Self::SimpleBlock { to_place } => to_place.costs_no_draws(),
+            Self::Spring { .. } | Self::Unsupported { .. } => true,
+            Self::BlockColumn { layers, .. } => layers
+                .iter()
+                .all(|layer| layer.height.costs_no_draws() && layer.provider.costs_no_draws()),
+            Self::Disk {
+                state_provider,
+                radius,
+                ..
+            } => radius.costs_no_draws() && state_provider.costs_no_draws(),
+            Self::Ore { .. }
+            | Self::RandomPatch { .. }
+            | Self::SimpleRandomSelector { .. }
+            | Self::RandomSelector { .. }
+            | Self::WeightedRandomSelector { .. }
+            | Self::RandomBooleanSelector { .. } => false,
+        }
+    }
+
+    /// Conservative inclusive horizontal write offset `(min_dx, max_dx, min_dz, max_dz)`
+    /// relative to the feature origin, or `None` when unbounded (ores).
+    fn write_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        match self {
+            Self::SimpleBlock { .. } | Self::Spring { .. } | Self::Unsupported { .. } => {
+                Some((0, 0, 0, 0))
+            }
+            Self::Disk { radius, .. } => {
+                let (_, max_r) = radius.range(0, 0)?;
+                let r = max_r.max(0);
+                Some((-r, r, -r, r))
+            }
+            Self::BlockColumn {
+                direction, layers, ..
+            } => {
+                let (dx, _, dz) = direction.unit_vector();
+                if dx == 0 && dz == 0 {
+                    Some((0, 0, 0, 0))
+                } else {
+                    let mut total = 0i32;
+                    for layer in layers {
+                        let (_, max_h) = layer.height.range(0, 0)?;
+                        total = total.saturating_add(max_h.max(0));
+                    }
+                    let rx = dx.saturating_mul(total);
+                    let rz = dz.saturating_mul(total);
+                    Some((rx.min(0), rx.max(0), rz.min(0), rz.max(0)))
+                }
+            }
+            Self::RandomPatch {
+                xz_spread, feature, ..
+            } => {
+                let s = (*xz_spread).max(0);
+                let child = feature.remaining_write_bounds(0)?;
+                Some(add_horizontal_bounds((-s, s, -s, s), child))
+            }
+            Self::SimpleRandomSelector { features } => {
+                union_placed_bounds(features.iter().map(|f| f.as_ref()))
+            }
+            Self::RandomSelector { features, default } => union_placed_bounds(
+                features
+                    .iter()
+                    .map(|(f, _)| f.as_ref())
+                    .chain(std::iter::once(default.as_ref())),
+            ),
+            Self::WeightedRandomSelector { features } => {
+                union_placed_bounds(features.iter().map(|(f, _)| f.as_ref()))
+            }
+            Self::RandomBooleanSelector {
+                feature_true,
+                feature_false,
+            } => {
+                let a = feature_true.remaining_write_bounds(0)?;
+                let b = feature_false.remaining_write_bounds(0)?;
+                Some(union_horizontal_bounds(a, b))
+            }
+            Self::Ore { .. } => None,
+        }
+    }
+}
+
+fn add_horizontal_bounds(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (
+        a.0.saturating_add(b.0),
+        a.1.saturating_add(b.1),
+        a.2.saturating_add(b.2),
+        a.3.saturating_add(b.3),
+    )
+}
+
+fn union_horizontal_bounds(
+    a: (i32, i32, i32, i32),
+    b: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3))
+}
+
+fn union_placed_bounds<'a>(
+    features: impl IntoIterator<Item = &'a PlacedFeature>,
+) -> Option<(i32, i32, i32, i32)> {
+    let mut combined: Option<(i32, i32, i32, i32)> = None;
+    for feature in features {
+        let bounds = feature.remaining_write_bounds(0)?;
+        combined = Some(match combined {
+            Some(acc) => union_horizontal_bounds(acc, bounds),
+            None => bounds,
+        });
+    }
+    Some(combined.unwrap_or((0, 0, 0, 0)))
 }
 
 /// A `VerticalAnchor`: a row expressed against one of the world bounds.
@@ -863,6 +1367,29 @@ pub enum RangeProvider {
         min_inclusive: VerticalAnchor,
         max_inclusive: VerticalAnchor,
     },
+    /// `minecraft:trapezoid` with explicit non-zero plateau width (`Java Edition 26.1`
+    /// rev 3880954).
+    TrapezoidPlateau {
+        min_inclusive: VerticalAnchor,
+        max_inclusive: VerticalAnchor,
+        plateau: i32,
+    },
+    /// `minecraft:biased_to_bottom` (`Configured feature/int provider` rev 3267224;
+    /// `Sugar Cane` rev 3899892: `11/18`, `5/18`, `2/18` over `[2..4]`).
+    BiasedToBottom {
+        min_inclusive: i32,
+        max_inclusive: i32,
+    },
+    /// `minecraft:clamped` (`Configured feature/int provider` rev 3267224).
+    Clamped {
+        min_inclusive: i32,
+        max_inclusive: i32,
+        source: Box<RangeProvider>,
+    },
+    /// `minecraft:weighted_list` (`Configured feature/int provider` rev 3267224).
+    WeightedList {
+        distribution: Vec<(RangeProvider, i32)>,
+    },
     /// A provider shape without a runtime here.
     Unsupported { kind: String },
 }
@@ -883,10 +1410,20 @@ impl RangeProvider {
         let anchored = |kind: &str| -> Option<Self> {
             let min_val = object
                 .get("min_inclusive")
-                .or_else(|| object.get("value").and_then(|v| v.get("min_inclusive")))?;
+                .or_else(|| object.get("min"))
+                .or_else(|| {
+                    object
+                        .get("value")
+                        .and_then(|v| v.get("min_inclusive").or_else(|| v.get("min")))
+                })?;
             let max_val = object
                 .get("max_inclusive")
-                .or_else(|| object.get("value").and_then(|v| v.get("max_inclusive")))?;
+                .or_else(|| object.get("max"))
+                .or_else(|| {
+                    object
+                        .get("value")
+                        .and_then(|v| v.get("max_inclusive").or_else(|| v.get("max")))
+                })?;
             let min_inclusive = VerticalAnchor::from_value(min_val)?;
             let max_inclusive = VerticalAnchor::from_value(max_val)?;
             // A count provider is a plain numeric range; only the height
@@ -897,17 +1434,47 @@ impl RangeProvider {
             {
                 return None;
             }
-            Some(if kind == "minecraft:uniform" {
-                Self::Uniform {
+            if kind == "minecraft:uniform" {
+                Some(Self::Uniform {
                     min_inclusive,
                     max_inclusive,
-                }
+                })
             } else {
-                Self::Trapezoid {
-                    min_inclusive,
-                    max_inclusive,
+                let plateau = object
+                    .get("plateau")
+                    .or_else(|| object.get("value").and_then(|v| v.get("plateau")))
+                    .and_then(Value::as_i64)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .unwrap_or(0);
+                if plateau > 0 {
+                    Some(Self::TrapezoidPlateau {
+                        min_inclusive,
+                        max_inclusive,
+                        plateau,
+                    })
+                } else {
+                    Some(Self::Trapezoid {
+                        min_inclusive,
+                        max_inclusive,
+                    })
                 }
-            })
+            }
+        };
+        let plain_bounds = || -> Option<(i32, i32)> {
+            let min_i = object
+                .get("min_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("min_inclusive")))
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())?;
+            let max_i = object
+                .get("max_inclusive")
+                .or_else(|| object.get("value").and_then(|v| v.get("max_inclusive")))
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())?;
+            if max_i < min_i {
+                return None;
+            }
+            Some((min_i, max_i))
         };
         match object.get("type").and_then(Value::as_str) {
             Some("minecraft:constant") => {
@@ -927,6 +1494,47 @@ impl RangeProvider {
                 Some(Self::Constant(n))
             }
             Some(kind @ ("minecraft:uniform" | "minecraft:trapezoid")) => anchored(kind),
+            Some("minecraft:biased_to_bottom") if !anchors_allowed => {
+                let (min_inclusive, max_inclusive) = plain_bounds()?;
+                Some(Self::BiasedToBottom {
+                    min_inclusive,
+                    max_inclusive,
+                })
+            }
+            Some("minecraft:clamped") if !anchors_allowed => {
+                let (min_inclusive, max_inclusive) = plain_bounds()?;
+                let src_val = object
+                    .get("source")
+                    .or_else(|| object.get("value").and_then(|v| v.get("source")))?;
+                let source = Self::from_value(src_val, false)?;
+                Some(Self::Clamped {
+                    min_inclusive,
+                    max_inclusive,
+                    source: Box::new(source),
+                })
+            }
+            Some("minecraft:weighted_list") if !anchors_allowed => {
+                let dist_val = object
+                    .get("distribution")
+                    .or_else(|| object.get("value").and_then(|v| v.get("distribution")))?
+                    .as_array()?;
+                let mut distribution = Vec::with_capacity(dist_val.len());
+                for entry in dist_val {
+                    let weight = entry
+                        .get("weight")
+                        .and_then(Value::as_i64)
+                        .and_then(|w| i32::try_from(w).ok())?;
+                    if weight <= 0 {
+                        return None;
+                    }
+                    let data = Self::from_value(entry.get("data")?, false)?;
+                    distribution.push((data, weight));
+                }
+                if distribution.is_empty() {
+                    return None;
+                }
+                Some(Self::WeightedList { distribution })
+            }
             Some(other) => Some(Self::Unsupported {
                 kind: other.to_string(),
             }),
@@ -939,7 +1547,22 @@ impl RangeProvider {
 
     /// Whether a provider shape has a runtime here.
     pub fn is_modelable(&self) -> bool {
-        !matches!(self, Self::Unsupported { .. })
+        match self {
+            Self::Clamped { source, .. } => source.is_modelable(),
+            Self::WeightedList { distribution } => {
+                !distribution.is_empty()
+                    && distribution
+                        .iter()
+                        .all(|(provider, weight)| *weight > 0 && provider.is_modelable())
+            }
+            Self::Unsupported { .. } => false,
+            _ => true,
+        }
+    }
+
+    /// Whether sampling this range provider consumes zero RNG draws.
+    fn costs_no_draws(&self) -> bool {
+        matches!(self, Self::Constant(_))
     }
 }
 
@@ -950,8 +1573,27 @@ pub enum PlacementModifier {
     Count { count: RangeProvider },
     /// `minecraft:rarity_filter` — one attempt per `chance` on average.
     RarityFilter { chance: i64 },
+    /// `minecraft:random_chance` — keeps the candidate with probability `chance`.
+    ///
+    /// Source: minecraft.wiki `Placed feature` (revision 3816343):
+    /// "Gates the feature being placed behind a random chance."
+    RandomChance { chance: f32 },
     /// `minecraft:in_square` — a horizontal offset inside the chunk.
     InSquare,
+    /// `minecraft:heightmap` — snaps Y to one block above the named heightmap.
+    ///
+    /// Source: minecraft.wiki `Placed feature` (revision 3816343):
+    /// "Sets the Y coordinate to one block above the heightmap."
+    Heightmap { heightmap: HeightmapKind },
+    /// `minecraft:offset` — offsets `(x, y, z)` by per-axis int providers in `-16..=16`.
+    ///
+    /// Source: minecraft.wiki `Placed feature` (revision 3816343):
+    /// "Applies an offset to the current position."
+    Offset {
+        x: RangeProvider,
+        y: RangeProvider,
+        z: RangeProvider,
+    },
     /// `minecraft:height_range` — the vertical band of the attempt.
     HeightRange { height: RangeProvider },
     /// `minecraft:biome` — keep the position only if the biome at it lists
@@ -980,6 +1622,55 @@ pub enum PlacementModifier {
     Unsupported { kind: String },
 }
 
+impl PlacementModifier {
+    fn costs_no_draws(&self) -> bool {
+        matches!(
+            self,
+            Self::Heightmap { .. }
+                | Self::Biome
+                | Self::BlockPredicateFilter { .. }
+                | Self::SurfaceRelativeThresholdFilter { .. }
+                | Self::EnvironmentScan { .. }
+                | Self::Unsupported { .. }
+        )
+    }
+
+    fn horizontal_step(&self) -> Option<(i32, i32, i32, i32)> {
+        match self {
+            Self::InSquare => Some((0, 15, 0, 15)),
+            Self::Offset { x, z, .. } => {
+                let (xmin, xmax) = x.range(0, 0)?;
+                let (zmin, zmax) = z.range(0, 0)?;
+                Some((
+                    xmin.clamp(-16, 16),
+                    xmax.clamp(-16, 16),
+                    zmin.clamp(-16, 16),
+                    zmax.clamp(-16, 16),
+                ))
+            }
+            Self::EnvironmentScan {
+                direction_of_search,
+                max_steps,
+                ..
+            } => {
+                let (dx, _, dz) = direction_of_search.unit_vector();
+                let sx = dx.saturating_mul(*max_steps);
+                let sz = dz.saturating_mul(*max_steps);
+                Some((sx.min(0), sx.max(0), sz.min(0), sz.max(0)))
+            }
+            Self::Count { .. }
+            | Self::RarityFilter { .. }
+            | Self::RandomChance { .. }
+            | Self::Heightmap { .. }
+            | Self::HeightRange { .. }
+            | Self::Biome
+            | Self::BlockPredicateFilter { .. }
+            | Self::SurfaceRelativeThresholdFilter { .. }
+            | Self::Unsupported { .. } => Some((0, 0, 0, 0)),
+        }
+    }
+}
+
 /// A placed feature: one configured feature plus its ordered decorations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacedFeature {
@@ -995,9 +1686,23 @@ impl PlacedFeature {
     /// any nested placed feature attempts, ensuring total work per feature does not
     /// exceed 4,096 and nesting depth does not exceed 2.
     pub fn validate_attempt_budget(&self, depth: usize) -> Result<u32, WorldgenError> {
-        if depth > 2 {
+        self.validate_budget(depth, 0)
+    }
+
+    fn validate_budget(
+        &self,
+        patch_depth: usize,
+        selector_depth: usize,
+    ) -> Result<u32, WorldgenError> {
+        if patch_depth > 2 {
             return Err(WorldgenError::Invalid(format!(
                 "{}: random_patch nesting depth exceeds limit (maximum allowed depth is 2)",
+                self.id
+            )));
+        }
+        if selector_depth > 16 {
+            return Err(WorldgenError::Invalid(format!(
+                "{}: selector nesting depth exceeds limit",
                 self.id
             )));
         }
@@ -1028,7 +1733,7 @@ impl PlacedFeature {
                 feature: child,
                 ..
             } => {
-                let child_attempts = child.validate_attempt_budget(depth + 1)?;
+                let child_attempts = child.validate_budget(patch_depth + 1, selector_depth)?;
                 (*tries as u32).checked_mul(child_attempts).ok_or_else(|| {
                     WorldgenError::Invalid(format!(
                         "{}: random_patch tries overflow attempt budget",
@@ -1039,10 +1744,33 @@ impl PlacedFeature {
             ConfiguredFeature::SimpleRandomSelector { features } => {
                 let mut max_child = 1u32;
                 for child in features {
-                    max_child = max_child.max(child.validate_attempt_budget(depth + 1)?);
+                    max_child =
+                        max_child.max(child.validate_budget(patch_depth, selector_depth + 1)?);
                 }
                 max_child
             }
+            ConfiguredFeature::RandomSelector { features, default } => {
+                let mut max_child = default.validate_budget(patch_depth, selector_depth + 1)?;
+                for (child, _) in features {
+                    max_child =
+                        max_child.max(child.validate_budget(patch_depth, selector_depth + 1)?);
+                }
+                max_child
+            }
+            ConfiguredFeature::WeightedRandomSelector { features } => {
+                let mut max_child = 1u32;
+                for (child, _) in features {
+                    max_child =
+                        max_child.max(child.validate_budget(patch_depth, selector_depth + 1)?);
+                }
+                max_child
+            }
+            ConfiguredFeature::RandomBooleanSelector {
+                feature_true,
+                feature_false,
+            } => feature_true
+                .validate_budget(patch_depth, selector_depth + 1)?
+                .max(feature_false.validate_budget(patch_depth, selector_depth + 1)?),
             _ => 1,
         };
 
@@ -1063,6 +1791,38 @@ impl PlacedFeature {
         Ok(total)
     }
 
+    fn patch_reach(&self) -> i32 {
+        let modifier_reach: i32 = self.modifiers.iter().fold(0i32, |acc, modifier| {
+            if let PlacementModifier::Offset { x, z, .. } = modifier {
+                let max_abs = |r: &RangeProvider| {
+                    r.range(0, 0)
+                        .map_or(0, |(min, max)| min.abs().max(max.abs()))
+                };
+                acc.saturating_add(max_abs(x).max(max_abs(z)))
+            } else {
+                acc
+            }
+        });
+        modifier_reach.saturating_add(self.feature.patch_reach())
+    }
+
+    fn remaining_costs_no_draws(&self, index: usize) -> bool {
+        self.modifiers
+            .get(index..)
+            .is_some_and(|rest| rest.iter().all(PlacementModifier::costs_no_draws))
+            && self.feature.costs_no_draws()
+    }
+
+    fn remaining_write_bounds(&self, index: usize) -> Option<(i32, i32, i32, i32)> {
+        let mut bounds = self.feature.write_bounds()?;
+        if let Some(rest) = self.modifiers.get(index..) {
+            for modifier in rest {
+                bounds = add_horizontal_bounds(bounds, modifier.horizontal_step()?);
+            }
+        }
+        Some(bounds)
+    }
+
     /// Whether every decoration and the configured feature itself can be
     /// modeled here. A false answer means this runtime places nothing for
     /// this feature; the feature still holds its ordinal in its step, so
@@ -1070,9 +1830,14 @@ impl PlacedFeature {
     pub fn is_modelable(&self) -> bool {
         self.feature.is_supported()
             && self.validate_attempt_budget(0).is_ok()
+            && self.patch_reach() <= MAX_PATCH_REACH
             && self.modifiers.iter().all(|modifier| match modifier {
                 PlacementModifier::Unsupported { .. } => false,
                 PlacementModifier::Count { count } => count.is_modelable(),
+                PlacementModifier::Offset { x, y, z } => {
+                    x.is_modelable() && y.is_modelable() && z.is_modelable()
+                }
+                PlacementModifier::RandomChance { chance } => (0.0..=1.0).contains(chance),
                 PlacementModifier::HeightRange { height } => height.is_modelable(),
                 PlacementModifier::BlockPredicateFilter { predicate } => predicate.is_modelable(),
                 PlacementModifier::SurfaceRelativeThresholdFilter { heightmap, .. } => {
@@ -1091,6 +1856,58 @@ impl PlacedFeature {
                 _ => true,
             })
     }
+
+    /// Every unsupported piece of this placed feature in evaluation order:
+    /// placement modifiers first (in list order), then the configured feature,
+    /// its state providers, predicates, or child features, using the gap
+    /// report's prefixed naming (`placement:`, `range:`, `predicate:`,
+    /// `provider:`, `state:`, `target:`, or the configured feature type).
+    ///
+    /// Source: minecraft.wiki `Placed feature` (revision 3816343):
+    /// "Placed features are applied in order to determine where feature
+    /// placement attempt(s) should occur."
+    pub fn unmodeled_pieces(&self) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut seen = HashSet::new();
+        collect_unmodeled_placed_pieces(self, &mut pieces, &mut seen);
+        pieces
+    }
+
+    /// The first unsupported piece blocking placement of this feature in
+    /// evaluation order, or `None` when [`Self::is_modelable`] holds.
+    pub fn first_unmodeled_piece(&self) -> Option<String> {
+        self.unmodeled_pieces().into_iter().next()
+    }
+
+    /// Diagnostic summary for this placed feature.
+    pub fn diagnose(&self) -> PlacedFeatureDiagnosis {
+        let unsupported_pieces = self.unmodeled_pieces();
+        let first_unsupported = unsupported_pieces.first().cloned();
+        PlacedFeatureDiagnosis {
+            id: self.id.clone(),
+            modelable: self.is_modelable(),
+            first_unsupported,
+            unsupported_pieces,
+        }
+    }
+}
+
+/// Diagnostic summary for one placed feature in a generation step.
+///
+/// Source: minecraft.wiki `Placed feature` (revision 3816343):
+/// "Placed features are applied in order to determine where feature
+/// placement attempt(s) should occur."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFeatureDiagnosis {
+    /// Placed feature identifier.
+    pub id: String,
+    /// Whether RustMC currently models and runs this placed feature.
+    pub modelable: bool,
+    /// The first unsupported piece blocking placement in evaluation order,
+    /// or `None` when `modelable` is `true`.
+    pub first_unsupported: Option<String>,
+    /// Every unsupported piece encountered in evaluation order.
+    pub unsupported_pieces: Vec<String>,
 }
 
 /// The configured/placed feature registries plus the per-biome ordered
@@ -1130,6 +1947,7 @@ pub struct FeatureData {
     /// Nothing prints it from the server yet — the operator-data smoke is
     /// its only reader until a startup surface exists.
     pub(crate) unimplemented_features: HashMap<String, usize>,
+    state_providers: HashMap<String, StateProvider>,
 }
 
 /// One generation step's ordered features, plus the lookup that turns a
@@ -1184,6 +2002,14 @@ const MAX_CYCLE_ATTEMPTS: usize = 8;
 /// of the data contract.
 pub const GENERATION_STEPS: usize = 11;
 
+/// Index of the `VEGETAL_DECORATION` step in a biome's 11-entry `features`
+/// array.
+///
+/// Source: minecraft.wiki `Biome definition (Java Edition)` (revision 3862553):
+/// "VEGETAL_DECORATION: Used for trees, bamboo, cacti, kelp, and other ground
+/// and ocean vegetation in vanilla."
+pub const VEGETAL_DECORATION_STEP: usize = 9;
+
 impl FeatureData {
     /// Loads `worldgen/feature`, `worldgen/placed_feature`, `worldgen/biome`
     /// and `tags/block` documents under the data root and resolves every
@@ -1198,6 +2024,7 @@ impl FeatureData {
         let Some(namespaces) = read_dir_optional(&data_dir)? else {
             return Ok(data);
         };
+        let mut provider_docs: Vec<(String, Value)> = Vec::new();
         let mut configured_docs: Vec<(String, Value)> = Vec::new();
         let mut placed_docs: Vec<(String, Value)> = Vec::new();
         let mut biome_docs: Vec<(String, Value)> = Vec::new();
@@ -1216,6 +2043,9 @@ impl FeatureData {
                 continue;
             }
             let ns = namespace.file_name().to_string_lossy().into_owned();
+            for entry in walk_json(&worldgen.join("block_state_provider"))? {
+                provider_docs.push((format!("{ns}:{}", stem(&entry)), read_json(&entry)?));
+            }
             for entry in walk_json(&worldgen.join("feature"))? {
                 configured_docs.push((format!("{ns}:{}", stem(&entry)), read_json(&entry)?));
             }
@@ -1229,18 +2059,41 @@ impl FeatureData {
         // Directory order is the filesystem's, so the documents are sorted
         // by identifier before anything is parsed: the schedule a biome's
         // inline feature reference gets must not depend on that order.
+        provider_docs.sort_by(|left, right| left.0.cmp(&right.0));
         configured_docs.sort_by(|left, right| left.0.cmp(&right.0));
         placed_docs.sort_by(|left, right| left.0.cmp(&right.0));
         biome_docs.sort_by(|left, right| left.0.cmp(&right.0));
+        for (id, document) in provider_docs {
+            data.state_providers
+                .insert(id, parse_state_provider(Some(&document)));
+        }
+        let provider_snapshot = data.state_providers.clone();
+        for provider in data.state_providers.values_mut() {
+            resolve_state_provider_references(provider, &provider_snapshot, 0);
+        }
         for (id, document) in configured_docs {
-            let feature = parse_configured_feature(&document)?;
+            let mut feature = parse_configured_feature(&document)?;
+            resolve_configured_providers(&mut feature, &data.state_providers);
             data.configured.insert(id, Rc::new(feature));
         }
+        let mut placed_feature_targets: Vec<(String, String)> = Vec::new();
         for (id, document) in placed_docs {
+            if let Some(target_cf) = document.get("feature").and_then(Value::as_str) {
+                placed_feature_targets.push((id.clone(), target_cf.to_string()));
+            }
             let feature = parse_placed_feature(&id, &document, &data.configured)?;
             data.placed.insert(id, Rc::new(feature));
         }
-        resolve_selector_references(&mut data.configured, &data.placed);
+        for _ in 0..4 {
+            resolve_selector_references(&mut data.configured, &data.placed, &data.state_providers);
+            for (placed_id, cf_id) in &placed_feature_targets {
+                if let (Some(cf), Some(placed_rc)) =
+                    (data.configured.get(cf_id), data.placed.get_mut(placed_id))
+                {
+                    Rc::make_mut(placed_rc).feature = Rc::clone(cf);
+                }
+            }
+        }
         for feature in data.configured.values() {
             record_unmodeled_configured(&mut data.unimplemented_features, feature);
         }
@@ -1513,6 +2366,23 @@ impl FeatureData {
         self.biomes.get(biome_id)
     }
 
+    /// Diagnoses the placed features that `biomes` contribute to `step`, in the
+    /// step schedule's ordinal order (`self.region_ordinals(step, biomes)`).
+    pub fn diagnose_step_for_biomes(
+        &self,
+        step: usize,
+        biomes: &[String],
+    ) -> Vec<PlacedFeatureDiagnosis> {
+        let Some(schedule) = self.step(step) else {
+            return Vec::new();
+        };
+        self.region_ordinals(step, biomes)
+            .into_iter()
+            .filter_map(|ordinal| schedule.get(ordinal))
+            .map(|placed| placed.diagnose())
+            .collect()
+    }
+
     /// The step indices that carry at least one feature somewhere in the
     /// pack, ascending. Vanilla iterates its own fixed step list; here the
     /// list is derived from the data so an empty pack decorates nothing.
@@ -1576,7 +2446,12 @@ fn depth_first_visit(
 /// Inserts or overrides one integer property on a rendered block state string,
 /// keeping property keys in sorted order to match [`state_from_object`].
 fn set_state_property(state: &str, property: &str, value: i32) -> String {
-    let value_str = value.to_string();
+    set_state_property_str(state, property, &value.to_string())
+}
+
+/// Inserts or overrides one property on a rendered block state string, keeping
+/// property keys in sorted order to match [`state_from_object`].
+fn set_state_property_str(state: &str, property: &str, value_str: &str) -> String {
     let (id, rest) = state
         .split_once('[')
         .map_or((state, None), |(base, tail)| (base, Some(tail)));
@@ -1590,7 +2465,7 @@ fn set_state_property(state: &str, property: &str, value: i32) -> String {
             }
         }
     }
-    properties.insert(property, value_str);
+    properties.insert(property, value_str.to_string());
     let rendered: Vec<String> = properties
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -1598,26 +2473,210 @@ fn set_state_property(state: &str, property: &str, value: i32) -> String {
     format!("{id}[{}]", rendered.join(","))
 }
 
-/// Resolves named child feature references inside `minecraft:simple_random_selector`
-/// against loaded placed and configured features.
+fn resolve_state_provider_references(
+    provider: &mut StateProvider,
+    registry: &HashMap<String, StateProvider>,
+    depth: usize,
+) {
+    if depth >= 16 {
+        return;
+    }
+    match provider {
+        StateProvider::Reference { id } => {
+            if let Some(resolved) = registry.get(id.as_str()) {
+                *provider = resolved.clone();
+                resolve_state_provider_references(provider, registry, depth + 1);
+            }
+        }
+        StateProvider::RuleBased { fallback, rules } => {
+            resolve_state_provider_references(fallback, registry, depth + 1);
+            for rule in rules {
+                resolve_state_provider_references(&mut rule.then, registry, depth + 1);
+            }
+        }
+        StateProvider::RandomizedInt { source, .. }
+        | StateProvider::Rotated { state: source, .. } => {
+            resolve_state_provider_references(source, registry, depth + 1);
+        }
+        StateProvider::Constant { .. }
+        | StateProvider::Weighted { .. }
+        | StateProvider::Unsupported { .. } => {}
+    }
+}
+
+fn resolve_configured_providers(
+    feature: &mut ConfiguredFeature,
+    registry: &HashMap<String, StateProvider>,
+) {
+    match feature {
+        ConfiguredFeature::SimpleBlock { to_place } => {
+            resolve_state_provider_references(to_place, registry, 0);
+        }
+        ConfiguredFeature::Disk { state_provider, .. } => {
+            resolve_state_provider_references(state_provider, registry, 0);
+        }
+        ConfiguredFeature::BlockColumn { layers, .. } => {
+            for layer in layers {
+                resolve_state_provider_references(&mut layer.provider, registry, 0);
+            }
+        }
+        ConfiguredFeature::RandomPatch { feature: child, .. } => {
+            resolve_placed_providers(child, registry);
+        }
+        ConfiguredFeature::SimpleRandomSelector { features } => {
+            for child in features {
+                resolve_placed_providers(Rc::make_mut(child), registry);
+            }
+        }
+        ConfiguredFeature::RandomSelector { features, default } => {
+            for (child, _) in features {
+                resolve_placed_providers(Rc::make_mut(child), registry);
+            }
+            resolve_placed_providers(Rc::make_mut(default), registry);
+        }
+        ConfiguredFeature::WeightedRandomSelector { features } => {
+            for (child, _) in features {
+                resolve_placed_providers(Rc::make_mut(child), registry);
+            }
+        }
+        ConfiguredFeature::RandomBooleanSelector {
+            feature_true,
+            feature_false,
+        } => {
+            resolve_placed_providers(Rc::make_mut(feature_true), registry);
+            resolve_placed_providers(Rc::make_mut(feature_false), registry);
+        }
+        ConfiguredFeature::Ore { .. }
+        | ConfiguredFeature::Spring { .. }
+        | ConfiguredFeature::Unsupported { .. } => {}
+    }
+}
+
+fn resolve_placed_providers(placed: &mut PlacedFeature, registry: &HashMap<String, StateProvider>) {
+    resolve_configured_providers(Rc::make_mut(&mut placed.feature), registry);
+}
+
+fn resolve_child_placed_feature(
+    child: &mut Rc<PlacedFeature>,
+    configured: &HashMap<String, Rc<ConfiguredFeature>>,
+    placed: &HashMap<String, Rc<PlacedFeature>>,
+    providers: &HashMap<String, StateProvider>,
+    depth: usize,
+) {
+    if depth >= 8 {
+        return;
+    }
+    if let ConfiguredFeature::Unsupported { kind } = child.feature.as_ref() {
+        if child.id == *kind
+            && let Some(resolved_placed) = placed.get(&child.id)
+        {
+            *child = Rc::clone(resolved_placed);
+            return;
+        }
+        if let Some(resolved_configured) = configured.get(kind) {
+            Rc::make_mut(child).feature = Rc::clone(resolved_configured);
+        }
+    }
+    resolve_placed_providers(Rc::make_mut(child), providers);
+    resolve_nested_placed(
+        Rc::make_mut(child),
+        configured,
+        placed,
+        providers,
+        depth + 1,
+    );
+}
+
+fn resolve_nested_placed(
+    pf: &mut PlacedFeature,
+    configured: &HashMap<String, Rc<ConfiguredFeature>>,
+    placed: &HashMap<String, Rc<PlacedFeature>>,
+    providers: &HashMap<String, StateProvider>,
+    depth: usize,
+) {
+    match Rc::make_mut(&mut pf.feature) {
+        ConfiguredFeature::RandomPatch { feature: child, .. } => {
+            if let ConfiguredFeature::Unsupported { kind } = child.feature.as_ref()
+                && child.id == *kind
+                && let Some(resolved) = placed.get(&child.id)
+            {
+                **child = resolved.as_ref().clone();
+            }
+            resolve_placed_providers(child, providers);
+        }
+        ConfiguredFeature::SimpleRandomSelector { features } => {
+            for child in features {
+                resolve_child_placed_feature(child, configured, placed, providers, depth);
+            }
+        }
+        ConfiguredFeature::RandomSelector { features, default } => {
+            for (child, _) in features {
+                resolve_child_placed_feature(child, configured, placed, providers, depth);
+            }
+            resolve_child_placed_feature(default, configured, placed, providers, depth);
+        }
+        ConfiguredFeature::WeightedRandomSelector { features } => {
+            for (child, _) in features {
+                resolve_child_placed_feature(child, configured, placed, providers, depth);
+            }
+        }
+        ConfiguredFeature::RandomBooleanSelector {
+            feature_true,
+            feature_false,
+        } => {
+            resolve_child_placed_feature(feature_true, configured, placed, providers, depth);
+            resolve_child_placed_feature(feature_false, configured, placed, providers, depth);
+        }
+        _ => {}
+    }
+}
+
+/// Resolves named child feature references inside selector configured features
+/// against loaded placed, configured, and state-provider registries.
 fn resolve_selector_references(
     configured: &mut HashMap<String, Rc<ConfiguredFeature>>,
     placed: &HashMap<String, Rc<PlacedFeature>>,
+    providers: &HashMap<String, StateProvider>,
 ) {
     let configured_snapshot = configured.clone();
     for feature in configured.values_mut() {
-        if let ConfiguredFeature::SimpleRandomSelector { features } = Rc::make_mut(feature) {
-            for child in features.iter_mut() {
-                if let ConfiguredFeature::Unsupported { kind } = child.feature.as_ref() {
-                    if child.id == *kind
-                        && let Some(resolved_placed) = placed.get(&child.id)
-                    {
-                        *child = Rc::clone(resolved_placed);
-                    } else if let Some(resolved_configured) = configured_snapshot.get(kind) {
-                        Rc::make_mut(child).feature = Rc::clone(resolved_configured);
-                    }
+        match Rc::make_mut(feature) {
+            ConfiguredFeature::SimpleRandomSelector { features } => {
+                for child in features.iter_mut() {
+                    resolve_child_placed_feature(child, &configured_snapshot, placed, providers, 0);
                 }
             }
+            ConfiguredFeature::RandomSelector { features, default } => {
+                for (child, _) in features.iter_mut() {
+                    resolve_child_placed_feature(child, &configured_snapshot, placed, providers, 0);
+                }
+                resolve_child_placed_feature(default, &configured_snapshot, placed, providers, 0);
+            }
+            ConfiguredFeature::WeightedRandomSelector { features } => {
+                for (child, _) in features.iter_mut() {
+                    resolve_child_placed_feature(child, &configured_snapshot, placed, providers, 0);
+                }
+            }
+            ConfiguredFeature::RandomBooleanSelector {
+                feature_true,
+                feature_false,
+            } => {
+                resolve_child_placed_feature(
+                    feature_true,
+                    &configured_snapshot,
+                    placed,
+                    providers,
+                    0,
+                );
+                resolve_child_placed_feature(
+                    feature_false,
+                    &configured_snapshot,
+                    placed,
+                    providers,
+                    0,
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -1670,16 +2729,7 @@ fn parse_state_provider(value: Option<&Value>) -> StateProvider {
             // placement; no runtime here reads that back.
             unsupported("minecraft:block_tag")
         }
-        // The 26.3 pack puts a *reference into its own
-        // `block_state_provider` registry* at this position, not a block
-        // name: every bare string it writes here
-        // (`minecraft:flower_plain`, `minecraft:flower_meadow`,
-        // `minecraft:flower_flower_forest`) is the id of a document under
-        // `worldgen/block_state_provider`, and none of them is a block.
-        // Reading one as a state would write a block that does not exist, so
-        // it stays a named gap. A string inside a `weighted` entry is the
-        // other codec field — a block state — and is a constant there.
-        Some(Value::String(_)) => unsupported("minecraft:block_state_provider_reference"),
+        Some(Value::String(id)) => StateProvider::Reference { id: id.clone() },
         Some(Value::Object(object)) => {
             match object.get("type").and_then(Value::as_str) {
                 Some("minecraft:weighted") => {
@@ -1766,6 +2816,30 @@ fn parse_state_provider(value: Option<&Value>) -> StateProvider {
                         source,
                         property: property.to_string(),
                         values,
+                    }
+                }
+                Some("minecraft:rotated" | "minecraft:rotated_block_provider") => {
+                    let Some(state_val) = object.get("state") else {
+                        return unsupported("minecraft:rotated");
+                    };
+                    let state = if state_val.is_string() {
+                        parse_direct_state(state_val).map_or_else(
+                            || parse_state_provider(Some(state_val)),
+                            |s| StateProvider::Constant { state: s },
+                        )
+                    } else {
+                        parse_state_provider(Some(state_val))
+                    };
+                    let direction = match object.get("direction").and_then(Value::as_str) {
+                        Some(name) => match parse_direction_name(name) {
+                            Some(dir) => Some(dir),
+                            None => return unsupported("minecraft:rotated"),
+                        },
+                        None => None,
+                    };
+                    StateProvider::Rotated {
+                        state: Box::new(state),
+                        direction,
                     }
                 }
                 Some(other) => unsupported(other),
@@ -1890,6 +2964,19 @@ fn parse_block_predicate(value: Option<&Value>) -> BlockPredicate {
             Some(offset) => BlockPredicate::InsideWorldBounds { offset },
             None => unsupported(kind),
         },
+        "minecraft:replaceable" => match parse_block_offset(object) {
+            Some(offset) => BlockPredicate::Replaceable { offset },
+            None => unsupported(kind),
+        },
+        "minecraft:would_survive" => {
+            let Some(offset) = parse_block_offset(object) else {
+                return unsupported(kind);
+            };
+            let Some(state) = object.get("state").and_then(parse_direct_state) else {
+                return unsupported(kind);
+            };
+            BlockPredicate::WouldSurvive { offset, state }
+        }
         "minecraft:true" => BlockPredicate::True,
         // An empty conjunction would accept every position and an empty
         // disjunction is a no-op, so neither is read as a filter at all.
@@ -2058,6 +3145,10 @@ pub(crate) fn parse_configured_feature(
         "minecraft:disk" => parse_disk(body),
         "minecraft:spring_feature" => parse_spring(body),
         "minecraft:simple_random_selector" => parse_simple_random_selector(body),
+        "minecraft:random_selector" => parse_random_selector(body),
+        "minecraft:weighted_random_selector" => parse_weighted_random_selector(body),
+        "minecraft:random_boolean_selector" => parse_random_boolean_selector(body),
+        "minecraft:block_column" => parse_block_column(body),
         _ => Ok(ConfiguredFeature::Unsupported { kind }),
     }
 }
@@ -2210,6 +3301,136 @@ fn parse_simple_random_selector(body: &Value) -> Result<ConfiguredFeature, World
     Ok(ConfiguredFeature::SimpleRandomSelector { features })
 }
 
+/// Parses a `minecraft:random_selector` configuration (`Random Selector` rev 3818741).
+fn parse_random_selector(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let default_val = body.get("default").ok_or_else(|| {
+        WorldgenError::Invalid("random_selector feature without default".to_string())
+    })?;
+    let default = Rc::new(parse_inline_placed_feature(default_val)?);
+    let entries = body
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            WorldgenError::Invalid("random_selector feature without features".to_string())
+        })?;
+    let mut features = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let chance = entry.get("chance").and_then(Value::as_f64).ok_or_else(|| {
+            WorldgenError::Invalid("random_selector entry without chance".to_string())
+        })? as f32;
+        if !(0.0..=1.0).contains(&chance) {
+            return Err(WorldgenError::Invalid(format!(
+                "random_selector chance must be in 0.0..=1.0, got {chance}"
+            )));
+        }
+        let child_val = entry.get("feature").ok_or_else(|| {
+            WorldgenError::Invalid("random_selector entry without feature".to_string())
+        })?;
+        features.push((Rc::new(parse_inline_placed_feature(child_val)?), chance));
+    }
+    Ok(ConfiguredFeature::RandomSelector { features, default })
+}
+
+/// Parses a `minecraft:weighted_random_selector` configuration (`Java Edition 26.2` rev 3880953).
+fn parse_weighted_random_selector(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let entries = body
+        .get("features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            WorldgenError::Invalid("weighted_random_selector feature without features".to_string())
+        })?;
+    let mut features = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let weight = entry
+            .get("weight")
+            .and_then(Value::as_i64)
+            .and_then(|w| i32::try_from(w).ok())
+            .ok_or_else(|| {
+                WorldgenError::Invalid("weighted_random_selector entry without weight".to_string())
+            })?;
+        if weight <= 0 {
+            return Err(WorldgenError::Invalid(format!(
+                "weighted_random_selector weight must be positive, got {weight}"
+            )));
+        }
+        let data = entry.get("data").ok_or_else(|| {
+            WorldgenError::Invalid("weighted_random_selector entry without data".to_string())
+        })?;
+        features.push((Rc::new(parse_inline_placed_feature(data)?), weight));
+    }
+    Ok(ConfiguredFeature::WeightedRandomSelector { features })
+}
+
+/// Parses a `minecraft:random_boolean_selector` configuration (`Random Boolean Selector` rev 3818739).
+fn parse_random_boolean_selector(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let feature_true = Rc::new(parse_inline_placed_feature(
+        body.get("feature_true").ok_or_else(|| {
+            WorldgenError::Invalid("random_boolean_selector without feature_true".to_string())
+        })?,
+    )?);
+    let feature_false = Rc::new(parse_inline_placed_feature(
+        body.get("feature_false").ok_or_else(|| {
+            WorldgenError::Invalid("random_boolean_selector without feature_false".to_string())
+        })?,
+    )?);
+    Ok(ConfiguredFeature::RandomBooleanSelector {
+        feature_true,
+        feature_false,
+    })
+}
+
+/// Parses a `minecraft:block_column` configuration (`Cave Vines (feature)` rev 3818484).
+fn parse_block_column(body: &Value) -> Result<ConfiguredFeature, WorldgenError> {
+    let dir_str = body
+        .get("direction")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorldgenError::Invalid("block_column without direction".to_string()))?;
+    let direction = parse_direction_name(dir_str).ok_or_else(|| {
+        WorldgenError::Invalid(format!("block_column invalid direction {dir_str}"))
+    })?;
+    let allowed_placement = parse_block_predicate(body.get("allowed_placement"));
+    let prioritize_tip = body
+        .get("prioritize_tip")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| WorldgenError::Invalid("block_column without prioritize_tip".to_string()))?;
+    let layer_entries = body
+        .get("layers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorldgenError::Invalid("block_column without layers".to_string()))?;
+    let mut layers = Vec::with_capacity(layer_entries.len());
+    for entry in layer_entries {
+        let height_val = entry.get("height").ok_or_else(|| {
+            WorldgenError::Invalid("block_column layer without height".to_string())
+        })?;
+        let height = RangeProvider::from_value(height_val, false).ok_or_else(|| {
+            WorldgenError::Invalid("block_column layer height is not an int provider".to_string())
+        })?;
+        let provider = parse_state_provider(entry.get("provider"));
+        layers.push(BlockColumnLayer { height, provider });
+    }
+    Ok(ConfiguredFeature::BlockColumn {
+        direction,
+        allowed_placement,
+        prioritize_tip,
+        layers,
+    })
+}
+
+fn record_unmodeled_range(counts: &mut HashMap<String, usize>, range: &RangeProvider) {
+    match range {
+        RangeProvider::Unsupported { kind } => {
+            *counts.entry(format!("range:{kind}")).or_insert(0) += 1;
+        }
+        RangeProvider::Clamped { source, .. } => record_unmodeled_range(counts, source),
+        RangeProvider::WeightedList { distribution } => {
+            for (entry, _) in distribution {
+                record_unmodeled_range(counts, entry);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Counts unmodeled configured features and their inner components for the startup gap report.
 fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &ConfiguredFeature) {
     match feature {
@@ -2229,9 +3450,7 @@ fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &Co
         } => {
             record_unmodeled_provider(counts, state_provider);
             record_unmodeled_predicates(counts, target_predicate);
-            if let RangeProvider::Unsupported { kind } = radius {
-                *counts.entry(format!("range:{kind}")).or_insert(0) += 1;
-            }
+            record_unmodeled_range(counts, radius);
         }
         ConfiguredFeature::Spring { .. } => {}
         ConfiguredFeature::RandomPatch { feature: child, .. } => {
@@ -2256,6 +3475,46 @@ fn record_unmodeled_configured(counts: &mut HashMap<String, usize>, feature: &Co
             for child in features {
                 record_unmodeled_modifiers(counts, child);
                 record_unmodeled_configured(counts, &child.feature);
+            }
+        }
+        ConfiguredFeature::RandomSelector { features, default } => {
+            for (child, _) in features {
+                record_unmodeled_modifiers(counts, child);
+                record_unmodeled_configured(counts, &child.feature);
+            }
+            record_unmodeled_modifiers(counts, default);
+            record_unmodeled_configured(counts, &default.feature);
+        }
+        ConfiguredFeature::WeightedRandomSelector { features } => {
+            if features.is_empty() {
+                *counts
+                    .entry("minecraft:weighted_random_selector:empty".to_string())
+                    .or_insert(0) += 1;
+            }
+            for (child, _) in features {
+                record_unmodeled_modifiers(counts, child);
+                record_unmodeled_configured(counts, &child.feature);
+            }
+        }
+        ConfiguredFeature::RandomBooleanSelector {
+            feature_true,
+            feature_false,
+        } => {
+            record_unmodeled_modifiers(counts, feature_true);
+            record_unmodeled_configured(counts, &feature_true.feature);
+            record_unmodeled_modifiers(counts, feature_false);
+            record_unmodeled_configured(counts, &feature_false.feature);
+        }
+        ConfiguredFeature::BlockColumn {
+            allowed_placement,
+            layers,
+            ..
+        } => {
+            record_unmodeled_predicates(counts, allowed_placement);
+            for layer in layers {
+                record_unmodeled_range(counts, &layer.height);
+                record_unmodeled_provider(counts, &layer.provider);
+                record_unplaceable_states(counts, &layer.provider);
             }
         }
     }
@@ -2354,6 +3613,11 @@ fn unmodeled_predicates(predicate: &BlockPredicate) -> Vec<&str> {
     let mut kinds = Vec::new();
     match predicate {
         BlockPredicate::Unsupported { kind } => kinds.push(kind.as_str()),
+        BlockPredicate::WouldSurvive { state, .. }
+            if !plant_support::supports_survival_state(state) =>
+        {
+            kinds.push("minecraft:would_survive");
+        }
         BlockPredicate::AnyOf(rules) | BlockPredicate::AllOf(rules) => {
             for nested in rules {
                 kinds.extend(unmodeled_predicates(nested));
@@ -2377,6 +3641,11 @@ fn record_unmodeled_provider(counts: &mut HashMap<String, usize>, provider: &Sta
         StateProvider::Unsupported { kind } => {
             *counts.entry(format!("provider:{kind}")).or_insert(0) += 1;
         }
+        StateProvider::Reference { .. } => {
+            *counts
+                .entry("provider:minecraft:block_state_provider_reference".to_string())
+                .or_insert(0) += 1;
+        }
         StateProvider::RuleBased { fallback, rules } => {
             for rule in rules {
                 record_unmodeled_predicates(counts, &rule.if_true);
@@ -2386,10 +3655,9 @@ fn record_unmodeled_provider(counts: &mut HashMap<String, usize>, provider: &Sta
         }
         StateProvider::RandomizedInt { source, values, .. } => {
             record_unmodeled_provider(counts, source);
-            if let RangeProvider::Unsupported { kind } = values {
-                *counts.entry(format!("range:{kind}")).or_insert(0) += 1;
-            }
+            record_unmodeled_range(counts, values);
         }
+        StateProvider::Rotated { state, .. } => record_unmodeled_provider(counts, state),
         StateProvider::Constant { .. } | StateProvider::Weighted { .. } => {}
     }
 }
@@ -2411,6 +3679,264 @@ fn record_unplaceable_states(counts: &mut HashMap<String, usize>, provider: &Sta
                 .entry(format!("state:{}", base_block_id(state)))
                 .or_insert(0) += 1;
         }
+    }
+}
+
+fn push_unique_piece(pieces: &mut Vec<String>, seen: &mut HashSet<String>, key: String) {
+    if seen.insert(key.clone()) {
+        pieces.push(key);
+    }
+}
+
+fn collect_unmodeled_range_pieces(
+    range: &RangeProvider,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match range {
+        RangeProvider::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, format!("range:{kind}"));
+        }
+        RangeProvider::Clamped { source, .. } => {
+            collect_unmodeled_range_pieces(source, pieces, seen);
+        }
+        RangeProvider::WeightedList { distribution } => {
+            for (entry, _) in distribution {
+                collect_unmodeled_range_pieces(entry, pieces, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects every unsupported piece of one placed feature in evaluation order:
+/// placement modifiers in list order, then the configured feature and its
+/// nested components.
+fn collect_unmodeled_placed_pieces(
+    placed: &PlacedFeature,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for modifier in &placed.modifiers {
+        match modifier {
+            PlacementModifier::Unsupported { kind } => {
+                push_unique_piece(pieces, seen, format!("placement:{kind}"));
+            }
+            PlacementModifier::Count { count } => {
+                collect_unmodeled_range_pieces(count, pieces, seen);
+            }
+            PlacementModifier::HeightRange { height } => {
+                collect_unmodeled_range_pieces(height, pieces, seen);
+            }
+            PlacementModifier::Offset { x, y, z } => {
+                collect_unmodeled_range_pieces(x, pieces, seen);
+                collect_unmodeled_range_pieces(y, pieces, seen);
+                collect_unmodeled_range_pieces(z, pieces, seen);
+            }
+            PlacementModifier::BlockPredicateFilter { predicate } => {
+                for kind in unmodeled_predicates(predicate) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+            }
+            PlacementModifier::SurfaceRelativeThresholdFilter { heightmap, .. }
+                if heightmap != "OCEAN_FLOOR_WG" =>
+            {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    format!("placement:minecraft:surface_relative_threshold_filter:{heightmap}"),
+                );
+            }
+            PlacementModifier::EnvironmentScan {
+                target_condition,
+                allowed_search_condition,
+                ..
+            } => {
+                for kind in unmodeled_predicates(target_condition) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+                if let Some(allowed) = allowed_search_condition {
+                    for kind in unmodeled_predicates(allowed) {
+                        push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if placed.patch_reach() > MAX_PATCH_REACH
+        && !matches!(*placed.feature, ConfiguredFeature::RandomPatch { .. })
+    {
+        push_unique_piece(pieces, seen, "placement:minecraft:offset:reach".to_string());
+    }
+    collect_unmodeled_configured_pieces(&placed.feature, pieces, seen);
+    if placed.validate_attempt_budget(0).is_err() {
+        push_unique_piece(pieces, seen, "placement:attempt_budget".to_string());
+    }
+}
+
+fn collect_unmodeled_configured_pieces(
+    feature: &ConfiguredFeature,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match feature {
+        ConfiguredFeature::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, kind.clone());
+        }
+        ConfiguredFeature::Ore { targets, .. } => {
+            for target in targets {
+                collect_unmodeled_rule_pieces(&target.predicate, pieces, seen);
+            }
+        }
+        ConfiguredFeature::Disk {
+            state_provider,
+            target_predicate,
+            radius,
+            ..
+        } => {
+            collect_unmodeled_provider_pieces(state_provider, pieces, seen);
+            for kind in unmodeled_predicates(target_predicate) {
+                push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+            }
+            collect_unmodeled_range_pieces(radius, pieces, seen);
+        }
+        ConfiguredFeature::Spring { .. } => {}
+        ConfiguredFeature::RandomPatch { feature: child, .. } => {
+            if feature.patch_reach() > MAX_PATCH_REACH {
+                push_unique_piece(pieces, seen, "minecraft:random_patch:reach".to_string());
+            }
+            collect_unmodeled_placed_pieces(child, pieces, seen);
+        }
+        ConfiguredFeature::SimpleBlock { to_place } => {
+            collect_unmodeled_provider_pieces(to_place, pieces, seen);
+            for state in to_place.states() {
+                if !plant_support::is_placeable(state) {
+                    push_unique_piece(pieces, seen, format!("state:{}", base_block_id(state)));
+                }
+            }
+        }
+        ConfiguredFeature::SimpleRandomSelector { features } => {
+            if features.is_empty() {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    "minecraft:simple_random_selector:empty".to_string(),
+                );
+            }
+            for child in features {
+                collect_unmodeled_placed_pieces(child, pieces, seen);
+            }
+        }
+        ConfiguredFeature::RandomSelector { features, default } => {
+            for (child, _) in features {
+                collect_unmodeled_placed_pieces(child, pieces, seen);
+            }
+            collect_unmodeled_placed_pieces(default, pieces, seen);
+        }
+        ConfiguredFeature::WeightedRandomSelector { features } => {
+            if features.is_empty() {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    "minecraft:weighted_random_selector:empty".to_string(),
+                );
+            }
+            for (child, _) in features {
+                collect_unmodeled_placed_pieces(child, pieces, seen);
+            }
+        }
+        ConfiguredFeature::RandomBooleanSelector {
+            feature_true,
+            feature_false,
+        } => {
+            collect_unmodeled_placed_pieces(feature_true, pieces, seen);
+            collect_unmodeled_placed_pieces(feature_false, pieces, seen);
+        }
+        ConfiguredFeature::BlockColumn {
+            allowed_placement,
+            layers,
+            ..
+        } => {
+            for kind in unmodeled_predicates(allowed_placement) {
+                push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+            }
+            for layer in layers {
+                collect_unmodeled_range_pieces(&layer.height, pieces, seen);
+                collect_unmodeled_provider_pieces(&layer.provider, pieces, seen);
+                for state in layer.provider.states() {
+                    if !plant_support::is_placeable(state) {
+                        push_unique_piece(pieces, seen, format!("state:{}", base_block_id(state)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_unmodeled_rule_pieces(
+    rule: &RuleTest,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match rule {
+        RuleTest::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, format!("target:{kind}"));
+        }
+        RuleTest::AnyOf(rules) | RuleTest::AllOf(rules) => {
+            for nested in rules {
+                collect_unmodeled_rule_pieces(nested, pieces, seen);
+            }
+        }
+        RuleTest::Not(nested) => collect_unmodeled_rule_pieces(nested, pieces, seen),
+        _ => {}
+    }
+}
+
+fn collect_unmodeled_provider_pieces(
+    provider: &StateProvider,
+    pieces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match provider {
+        StateProvider::Unsupported { kind } => {
+            push_unique_piece(pieces, seen, format!("provider:{kind}"));
+        }
+        StateProvider::Reference { .. } => {
+            push_unique_piece(
+                pieces,
+                seen,
+                "provider:minecraft:block_state_provider_reference".to_string(),
+            );
+        }
+        StateProvider::RuleBased { fallback, rules } => {
+            for rule in rules {
+                for kind in unmodeled_predicates(&rule.if_true) {
+                    push_unique_piece(pieces, seen, format!("predicate:{kind}"));
+                }
+                collect_unmodeled_provider_pieces(&rule.then, pieces, seen);
+            }
+            collect_unmodeled_provider_pieces(fallback, pieces, seen);
+        }
+        StateProvider::RandomizedInt {
+            source,
+            property,
+            values,
+        } => {
+            if property.is_empty() {
+                push_unique_piece(
+                    pieces,
+                    seen,
+                    "provider:minecraft:randomized_int".to_string(),
+                );
+            }
+            collect_unmodeled_provider_pieces(source, pieces, seen);
+            collect_unmodeled_range_pieces(values, pieces, seen);
+        }
+        StateProvider::Rotated { state, .. } => {
+            collect_unmodeled_provider_pieces(state, pieces, seen);
+        }
+        StateProvider::Constant { .. } | StateProvider::Weighted { .. } => {}
     }
 }
 
@@ -2731,7 +4257,51 @@ fn parse_placement_modifier(
             }
             Ok(PlacementModifier::RarityFilter { chance })
         }
+        "minecraft:random_chance" => {
+            let chance = entry.get("chance").and_then(Value::as_f64).ok_or_else(|| {
+                WorldgenError::Invalid(format!("{id}: random_chance without a chance"))
+            })? as f32;
+            if !(0.0..=1.0).contains(&chance) {
+                return Err(WorldgenError::Invalid(format!(
+                    "{id}: random_chance must be in 0.0..=1.0, got {chance}"
+                )));
+            }
+            Ok(PlacementModifier::RandomChance { chance })
+        }
         "minecraft:in_square" => Ok(PlacementModifier::InSquare),
+        "minecraft:heightmap" => {
+            let name = entry
+                .get("heightmap")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{id}: heightmap modifier without heightmap"))
+                })?;
+            let heightmap = HeightmapKind::parse(name)
+                .ok_or_else(|| WorldgenError::Invalid(format!("{id}: unknown heightmap {name}")))?;
+            Ok(PlacementModifier::Heightmap { heightmap })
+        }
+        "minecraft:offset" => {
+            let axis = |key: &str| -> Result<RangeProvider, WorldgenError> {
+                let raw = entry.get(key).ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{id}: offset modifier without {key}"))
+                })?;
+                let rp = RangeProvider::from_value(raw, false).ok_or_else(|| {
+                    WorldgenError::Invalid(format!("{id}: offset {key} is not an int provider"))
+                })?;
+                if matches!(rp.range(0, 0), Some((min, max)) if !(-16..=16).contains(&min) || !(-16..=16).contains(&max))
+                {
+                    return Err(WorldgenError::Invalid(format!(
+                        "{id}: offset {key} must be in -16..=16"
+                    )));
+                }
+                Ok(rp)
+            };
+            Ok(PlacementModifier::Offset {
+                x: axis("x")?,
+                y: axis("y")?,
+                z: axis("z")?,
+            })
+        }
         "minecraft:height_range" => {
             let height = entry.get("height").ok_or_else(|| {
                 WorldgenError::Invalid(format!("{id}: height_range without a height"))
@@ -2907,10 +4477,40 @@ impl RangeProvider {
             | Self::Trapezoid {
                 min_inclusive,
                 max_inclusive,
+            }
+            | Self::TrapezoidPlateau {
+                min_inclusive,
+                max_inclusive,
+                ..
             } => Some((
                 min_inclusive.resolve(min_y, height),
                 max_inclusive.resolve(min_y, height),
             )),
+            Self::BiasedToBottom {
+                min_inclusive,
+                max_inclusive,
+            } => Some((*min_inclusive, *max_inclusive)),
+            Self::Clamped {
+                min_inclusive,
+                max_inclusive,
+                source,
+            } => {
+                let (s_min, s_max) = source.range(min_y, height)?;
+                Some((
+                    s_min.clamp(*min_inclusive, *max_inclusive),
+                    s_max.clamp(*min_inclusive, *max_inclusive),
+                ))
+            }
+            Self::WeightedList { distribution } => {
+                let mut low: Option<i32> = None;
+                let mut high: Option<i32> = None;
+                for (entry, _) in distribution {
+                    let (a, b) = entry.range(min_y, height)?;
+                    low = Some(low.map_or(a, |prev| prev.min(a)));
+                    high = Some(high.map_or(b, |prev| prev.max(b)));
+                }
+                low.zip(high)
+            }
             Self::Unsupported { .. } => None,
         }
     }
@@ -2942,6 +4542,41 @@ impl RangeProvider {
                 let low = span / 2;
                 let high = span - low;
                 min + random.next_int_bounded(high + 1) + random.next_int_bounded(low + 1)
+            }
+            Self::TrapezoidPlateau { plateau, .. } => {
+                let span = max - min;
+                if span <= 0 || *plateau >= span {
+                    return min + random.next_int_bounded(span.max(0) + 1);
+                }
+                let low = (span - *plateau) / 2;
+                let high = span - low;
+                min + random.next_int_bounded(high + 1) + random.next_int_bounded(low + 1)
+            }
+            Self::BiasedToBottom { .. } => {
+                let span = max - min;
+                let bound = random.next_int_bounded(span + 1) + 1;
+                min + random.next_int_bounded(bound)
+            }
+            Self::Clamped {
+                min_inclusive,
+                max_inclusive,
+                source,
+            } => source
+                .sample(min_y, height, random)
+                .clamp(*min_inclusive, *max_inclusive),
+            Self::WeightedList { distribution } => {
+                let total: i32 = distribution.iter().map(|(_, weight)| *weight).sum();
+                if total <= 0 {
+                    return 0;
+                }
+                let mut pick = random.next_int_bounded(total);
+                for (entry, weight) in distribution {
+                    if pick < *weight {
+                        return entry.sample(min_y, height, random);
+                    }
+                    pick -= *weight;
+                }
+                0
             }
             _ => min + random.next_int_bounded(max - min + 1),
         }
@@ -2975,6 +4610,11 @@ pub trait DecorationTarget {
     /// evaluated, so they cost no draws either; the neighbour chunk's own
     /// pass paints its half of a vein that straddles the border.
     fn writable(&self, x: i32, y: i32, z: i32) -> bool;
+    /// Optional inclusive horizontal chunk bounds `(min_x, max_x, min_z, max_z)`
+    /// of writable positions, used to skip halo anchors that cannot reach.
+    fn writable_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
     /// The block name currently at the position, `None` where the world
     /// holds air. Earlier decorations in this pass have already painted
     /// here: a later vein may replace stone a blob turned to granite.
@@ -2995,11 +4635,48 @@ pub trait DecorationTarget {
     fn set_block(&mut self, x: i32, y: i32, z: i32, name: &str);
     /// The biome at a position, which the `minecraft:biome` filter asks for.
     fn biome_at(&self, x: i32, y: i32, z: i32) -> Option<String>;
+    /// Allocation-free biome predicate check for the `minecraft:biome` filter.
+    fn has_biome(&self, x: i32, y: i32, z: i32, allowed: &dyn Fn(&str) -> bool) -> bool {
+        self.biome_at(x, y, z).is_some_and(|biome| allowed(&biome))
+    }
     /// The absolute Y of the highest terrain row of the column, as the
     /// world-gen ocean-floor heightmap reports it: fluid and air above a sea
     /// floor do not count. The ore anchor gate reads it for every column of
     /// its box's footprint, including the halo over the neighbour chunks.
     fn ocean_floor_height(&self, x: i32, z: i32) -> i32;
+    /// One block above the highest matching block at `(x, z)` for `kind`, or
+    /// `min_y()` when the column contains no matching block.
+    fn heightmap_height(&self, kind: HeightmapKind, x: i32, z: i32, tags: &BlockTags) -> i32 {
+        default_heightmap_height(self, kind, x, z, tags)
+    }
+}
+
+fn default_heightmap_height<T: DecorationTarget + ?Sized>(
+    target: &T,
+    kind: HeightmapKind,
+    x: i32,
+    z: i32,
+    tags: &BlockTags,
+) -> i32 {
+    let min_y = target.min_y();
+    let max_y = min_y + target.height() - 1;
+    for y in (min_y..=max_y).rev() {
+        if let Some(block) = target.read_block(x, y, z)
+            && kind.matches_block(block.as_ref(), tags)
+        {
+            return y + 1;
+        }
+    }
+    if matches!(
+        kind,
+        HeightmapKind::OceanFloor | HeightmapKind::OceanFloorWg
+    ) {
+        let fallback = target.ocean_floor_height(x, z);
+        if fallback > min_y {
+            return fallback;
+        }
+    }
+    min_y
 }
 
 /// Java `Mth.SIN`: a 65536-entry table indexed by a fixed-point multiple of
@@ -3230,7 +4907,7 @@ fn place_ore(
 /// Places one `minecraft:simple_block`. The state is drawn first: two chunks
 /// replaying one anchor must consume the same stream whether or not this
 /// candidate lands in the chunk being decorated. The block then only replaces
-/// air, and only where the plant's ground holds.
+/// air/water/replaceable, and only where the plant's ground holds.
 fn place_simple_block(
     target: &mut dyn DecorationTarget,
     random: &mut DecorationRandom,
@@ -3241,10 +4918,81 @@ fn place_simple_block(
     let Some(state) = to_place.sample(target, pos, tags, random) else {
         return 0;
     };
-    if !target.writable(pos.x, pos.y, pos.z) || !target.is_air(pos.x, pos.y, pos.z) {
+    plant_support::place_plant(target, tags, state.as_ref(), pos)
+}
+
+struct BlockColumnFeature<'a> {
+    direction: Direction,
+    allowed_placement: &'a BlockPredicate,
+    prioritize_tip: bool,
+    layers: &'a [BlockColumnLayer],
+}
+
+/// Places a `minecraft:block_column` along `direction`, trimming from the start
+/// when `prioritize_tip` is `true` and from the tip otherwise (`Cave Vines (feature)`
+/// rev 3818484).
+fn place_block_column(
+    target: &mut dyn DecorationTarget,
+    random: &mut DecorationRandom,
+    tags: &BlockTags,
+    column: BlockColumnFeature<'_>,
+    pos: DecorationPos,
+) -> usize {
+    let BlockColumnFeature {
+        direction,
+        allowed_placement,
+        prioritize_tip,
+        layers,
+    } = column;
+    let min_y = target.min_y();
+    let max_y = min_y + target.height();
+    let heights: Vec<usize> = layers
+        .iter()
+        .map(|layer| layer.height.sample(min_y, target.height(), random).max(0) as usize)
+        .collect();
+    let total: usize = heights.iter().sum();
+    if total == 0 {
         return 0;
     }
-    plant_support::place_plant(target, tags, state.as_ref(), pos)
+    let (dx, dy, dz) = direction.unit_vector();
+    let mut avail = 0usize;
+    let mut scan = pos;
+    while avail < total {
+        if scan.y < min_y
+            || scan.y >= max_y
+            || !target.writable(scan.x, scan.y, scan.z)
+            || !allowed_placement.test(target, scan, tags)
+        {
+            break;
+        }
+        avail += 1;
+        scan.x += dx;
+        scan.y += dy;
+        scan.z += dz;
+    }
+    if avail == 0 {
+        return 0;
+    }
+    let mut trim_from_start = if prioritize_tip { total - avail } else { 0 };
+    let mut remaining = avail;
+    let mut cur = pos;
+    let mut written = 0usize;
+    for (layer, height) in layers.iter().zip(heights) {
+        let skip = trim_from_start.min(height);
+        trim_from_start -= skip;
+        let take = (height - skip).min(remaining);
+        remaining -= take;
+        for _ in 0..take {
+            if let Some(state) = layer.provider.sample(target, cur, tags, random) {
+                target.set_block(cur.x, cur.y, cur.z, state.as_ref());
+                written += 1;
+            }
+            cur.x += dx;
+            cur.y += dy;
+            cur.z += dz;
+        }
+    }
+    written
 }
 
 impl FeatureData {
@@ -3324,6 +5072,32 @@ impl FeatureData {
         pos: DecorationPos,
         random: &mut DecorationRandom,
     ) -> usize {
+        let mut ctx = PlacementContext {
+            writable_bounds: target.writable_bounds(),
+            target,
+            random,
+        };
+        self.run_chain_step(&mut ctx, placed, index, pos, false)
+    }
+
+    fn run_chain_step(
+        &self,
+        ctx: &mut PlacementContext<'_>,
+        placed: &PlacedFeature,
+        index: usize,
+        pos: DecorationPos,
+        in_loop: bool,
+    ) -> usize {
+        if !in_loop
+            && !matches!(placed.feature.as_ref(), ConfiguredFeature::Ore { .. })
+            && !bounds_overlap(
+                pos,
+                placed.remaining_write_bounds(index),
+                ctx.writable_bounds,
+            )
+        {
+            return 0;
+        }
         let Some(modifier) = placed.modifiers.get(index) else {
             let feature = &*placed.feature;
             return match feature {
@@ -3332,8 +5106,8 @@ impl FeatureData {
                     targets,
                     discard_chance_on_air_exposure,
                 } => place_ore(
-                    target,
-                    random,
+                    ctx.target,
+                    ctx.random,
                     &self.tags,
                     *size,
                     targets,
@@ -3346,14 +5120,16 @@ impl FeatureData {
                     y_spread,
                     feature: child,
                 } => {
+                    let child_no_draws = child.remaining_costs_no_draws(0);
+                    let child_bounds = child.remaining_write_bounds(0);
                     let mut written = 0;
-                    for _ in 0..*tries {
+                    for try_idx in 0..*tries {
                         // The pack's own vegetation states this scatter as an
                         // `offset` of three plateau-free trapezoids, x then y
                         // then z. Two draws per axis, a spread of zero included.
                         let mut axis = |spread: i32| {
-                            random.next_int_bounded(spread + 1)
-                                + random.next_int_bounded(spread + 1)
+                            ctx.random.next_int_bounded(spread + 1)
+                                + ctx.random.next_int_bounded(spread + 1)
                                 - spread
                         };
                         let dx = axis(*xz_spread);
@@ -3364,12 +5140,18 @@ impl FeatureData {
                             y: pos.y + dy,
                             z: pos.z + dz,
                         };
-                        written += self.run_chain(target, child, 0, next, random);
+                        let try_in_loop = in_loop || try_idx + 1 < *tries;
+                        if (!try_in_loop || child_no_draws)
+                            && !bounds_overlap(next, child_bounds, ctx.writable_bounds)
+                        {
+                            continue;
+                        }
+                        written += self.run_chain_step(ctx, child, 0, next, try_in_loop);
                     }
                     written
                 }
                 ConfiguredFeature::SimpleBlock { to_place } => {
-                    place_simple_block(target, random, &self.tags, to_place, pos)
+                    place_simple_block(ctx.target, ctx.random, &self.tags, to_place, pos)
                 }
                 ConfiguredFeature::Disk {
                     state_provider,
@@ -3377,8 +5159,8 @@ impl FeatureData {
                     radius,
                     half_height,
                 } => place_disk(
-                    target,
-                    random,
+                    ctx.target,
+                    ctx.random,
                     &self.tags,
                     DiskFeature {
                         state_provider,
@@ -3395,7 +5177,7 @@ impl FeatureData {
                     requires_block_below,
                     valid_blocks,
                 } => place_spring(
-                    target,
+                    ctx.target,
                     &self.tags,
                     SpringFeature {
                         state,
@@ -3410,48 +5192,139 @@ impl FeatureData {
                     if features.is_empty() {
                         0
                     } else {
-                        let chosen = random.next_int_bounded(features.len() as i32) as usize;
-                        self.run_chain(target, &features[chosen], 0, pos, random)
+                        let chosen = ctx.random.next_int_bounded(features.len() as i32) as usize;
+                        self.run_chain_step(ctx, &features[chosen], 0, pos, in_loop)
                     }
                 }
+                ConfiguredFeature::RandomSelector { features, default } => {
+                    for (child, chance) in features {
+                        if ctx.random.next_float() < *chance {
+                            return self.run_chain_step(ctx, child, 0, pos, in_loop);
+                        }
+                    }
+                    self.run_chain_step(ctx, default, 0, pos, in_loop)
+                }
+                ConfiguredFeature::WeightedRandomSelector { features } => {
+                    let total: i32 = features.iter().map(|(_, weight)| *weight).sum();
+                    if total <= 0 {
+                        0
+                    } else {
+                        let mut pick = ctx.random.next_int_bounded(total);
+                        let mut chosen = None;
+                        for (child, weight) in features {
+                            if pick < *weight {
+                                chosen = Some(child);
+                                break;
+                            }
+                            pick -= *weight;
+                        }
+                        chosen.map_or(0, |child| self.run_chain_step(ctx, child, 0, pos, in_loop))
+                    }
+                }
+                ConfiguredFeature::RandomBooleanSelector {
+                    feature_true,
+                    feature_false,
+                } => {
+                    let chosen = if ctx.random.next_bool() {
+                        feature_true
+                    } else {
+                        feature_false
+                    };
+                    self.run_chain_step(ctx, chosen, 0, pos, in_loop)
+                }
+                ConfiguredFeature::BlockColumn {
+                    direction,
+                    allowed_placement,
+                    prioritize_tip,
+                    layers,
+                } => place_block_column(
+                    ctx.target,
+                    ctx.random,
+                    &self.tags,
+                    BlockColumnFeature {
+                        direction: *direction,
+                        allowed_placement,
+                        prioritize_tip: *prioritize_tip,
+                        layers,
+                    },
+                    pos,
+                ),
                 ConfiguredFeature::Unsupported { .. } => 0,
             };
         };
         match modifier {
             PlacementModifier::Count { count } => {
-                let attempts = count.sample(target.min_y(), target.height(), random);
+                let attempts = count.sample(ctx.target.min_y(), ctx.target.height(), ctx.random);
+                let total = attempts.max(0);
                 let mut written = 0;
-                for _ in 0..attempts.max(0) {
-                    written += self.run_chain(target, placed, index + 1, pos, random);
+                for attempt in 0..total {
+                    written += self.run_chain_step(
+                        ctx,
+                        placed,
+                        index + 1,
+                        pos,
+                        in_loop || attempt + 1 < total,
+                    );
                 }
                 written
             }
             PlacementModifier::RarityFilter { chance } => {
-                if random.next_float() < 1.0f32 / (*chance as f32) {
-                    self.run_chain(target, placed, index + 1, pos, random)
+                if ctx.random.next_float() < 1.0f32 / (*chance as f32) {
+                    self.run_chain_step(ctx, placed, index + 1, pos, in_loop)
+                } else {
+                    0
+                }
+            }
+            PlacementModifier::RandomChance { chance } => {
+                if ctx.random.next_float() < *chance {
+                    self.run_chain_step(ctx, placed, index + 1, pos, in_loop)
                 } else {
                     0
                 }
             }
             PlacementModifier::InSquare => {
                 let mut next = pos;
-                next.x += random.next_int_bounded(16);
-                next.z += random.next_int_bounded(16);
-                self.run_chain(target, placed, index + 1, next, random)
+                next.x += ctx.random.next_int_bounded(16);
+                next.z += ctx.random.next_int_bounded(16);
+                self.run_chain_step(ctx, placed, index + 1, next, in_loop)
+            }
+            PlacementModifier::Heightmap { heightmap } => {
+                let mut next = pos;
+                next.y = ctx
+                    .target
+                    .heightmap_height(*heightmap, pos.x, pos.z, &self.tags);
+                self.run_chain_step(ctx, placed, index + 1, next, in_loop)
+            }
+            PlacementModifier::Offset { x, y, z } => {
+                let dx = x
+                    .sample(ctx.target.min_y(), ctx.target.height(), ctx.random)
+                    .clamp(-16, 16);
+                let dy = y
+                    .sample(ctx.target.min_y(), ctx.target.height(), ctx.random)
+                    .clamp(-16, 16);
+                let dz = z
+                    .sample(ctx.target.min_y(), ctx.target.height(), ctx.random)
+                    .clamp(-16, 16);
+                let next = DecorationPos {
+                    x: pos.x + dx,
+                    y: pos.y + dy,
+                    z: pos.z + dz,
+                };
+                self.run_chain_step(ctx, placed, index + 1, next, in_loop)
             }
             PlacementModifier::HeightRange { height: provider } => {
                 let mut next = pos;
-                next.y = provider.sample(target.min_y(), target.height(), random);
-                self.run_chain(target, placed, index + 1, next, random)
+                next.y = provider.sample(ctx.target.min_y(), ctx.target.height(), ctx.random);
+                self.run_chain_step(ctx, placed, index + 1, next, in_loop)
             }
             PlacementModifier::Biome => {
                 // The filter asks the biome at the candidate position, not at
                 // the chunk origin, and it costs no draws.
-                let allowed = target
-                    .biome_at(pos.x, pos.y, pos.z)
-                    .is_some_and(|biome| self.biome_lists(&biome, &placed.id));
+                let allowed = ctx.target.has_biome(pos.x, pos.y, pos.z, &|biome| {
+                    self.biome_lists(biome, &placed.id)
+                });
                 if allowed {
-                    self.run_chain(target, placed, index + 1, pos, random)
+                    self.run_chain_step(ctx, placed, index + 1, pos, in_loop)
                 } else {
                     0
                 }
@@ -3460,8 +5333,8 @@ impl FeatureData {
                 // The predicate reads the terrain around the candidate and
                 // costs no draws; an unmodeled shape inside it is gated out by
                 // `is_modelable` long before this point.
-                if predicate.test(target, pos, &self.tags) {
-                    self.run_chain(target, placed, index + 1, pos, random)
+                if predicate.test(ctx.target, pos, &self.tags) {
+                    self.run_chain_step(ctx, placed, index + 1, pos, in_loop)
                 } else {
                     0
                 }
@@ -3474,10 +5347,10 @@ impl FeatureData {
                 if heightmap != "OCEAN_FLOOR_WG" {
                     return 0;
                 }
-                let surface_y = target.ocean_floor_height(pos.x, pos.z);
+                let surface_y = ctx.target.ocean_floor_height(pos.x, pos.z);
                 let delta = i64::from(pos.y) - i64::from(surface_y);
                 if delta >= i64::from(*min_inclusive) && delta <= i64::from(*max_inclusive) {
-                    self.run_chain(target, placed, index + 1, pos, random)
+                    self.run_chain_step(ctx, placed, index + 1, pos, in_loop)
                 } else {
                     0
                 }
@@ -3489,7 +5362,7 @@ impl FeatureData {
                 allowed_search_condition,
             } => {
                 if let Some(allowed) = allowed_search_condition
-                    && !allowed.test(target, pos, &self.tags)
+                    && !allowed.test(ctx.target, pos, &self.tags)
                 {
                     return 0;
                 }
@@ -3497,24 +5370,26 @@ impl FeatureData {
                 let mut cur = pos;
                 let mut step = 0;
                 while step < *max_steps {
-                    if target_condition.test(target, cur, &self.tags) {
-                        return self.run_chain(target, placed, index + 1, cur, random);
+                    if target_condition.test(ctx.target, cur, &self.tags) {
+                        return self.run_chain_step(ctx, placed, index + 1, cur, in_loop);
                     }
                     cur.x += dx;
                     cur.y += dy;
                     cur.z += dz;
-                    if cur.y < target.min_y() || cur.y >= target.min_y() + target.height() {
+                    if cur.y < ctx.target.min_y()
+                        || cur.y >= ctx.target.min_y() + ctx.target.height()
+                    {
                         return 0;
                     }
                     if let Some(allowed) = allowed_search_condition
-                        && !allowed.test(target, cur, &self.tags)
+                        && !allowed.test(ctx.target, cur, &self.tags)
                     {
                         break;
                     }
                     step += 1;
                 }
-                if target_condition.test(target, cur, &self.tags) {
-                    self.run_chain(target, placed, index + 1, cur, random)
+                if target_condition.test(ctx.target, cur, &self.tags) {
+                    self.run_chain_step(ctx, placed, index + 1, cur, in_loop)
                 } else {
                     0
                 }
@@ -3523,6 +5398,28 @@ impl FeatureData {
             PlacementModifier::Unsupported { .. } => 0,
         }
     }
+}
+
+struct PlacementContext<'a> {
+    target: &'a mut dyn DecorationTarget,
+    random: &'a mut DecorationRandom,
+    writable_bounds: Option<(i32, i32, i32, i32)>,
+}
+
+fn bounds_overlap(
+    pos: DecorationPos,
+    bounds: Option<(i32, i32, i32, i32)>,
+    writable: Option<(i32, i32, i32, i32)>,
+) -> bool {
+    let (Some((min_dx, max_dx, min_dz, max_dz)), Some((min_wx, max_wx, min_wz, max_wz))) =
+        (bounds, writable)
+    else {
+        return true;
+    };
+    pos.x + max_dx >= min_wx
+        && pos.x + min_dx <= max_wx
+        && pos.z + max_dz >= min_wz
+        && pos.z + min_dz <= max_wz
 }
 
 #[cfg(test)]
@@ -3845,7 +5742,7 @@ mod tests {
             "report-dedup",
             r#"[{"type": "minecraft:random_offset", "xz_spread": 7, "y_spread": 3},
                 {"type": "minecraft:random_offset", "xz_spread": 2, "y_spread": 1},
-                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:count_on_every_layer", "count": 1},
                 {"type": "minecraft:biome"}]"#,
         );
         let data = FeatureData::load(&root).expect("loads");
@@ -3858,7 +5755,7 @@ mod tests {
         );
         assert_eq!(
             data.unimplemented_features
-                .get("placement:minecraft:heightmap"),
+                .get("placement:minecraft:count_on_every_layer"),
             Some(&1),
             "a second unmodeled kind in the same document gets its own key"
         );
@@ -3889,7 +5786,7 @@ mod tests {
         write(
             &worldgen.join("placed_feature/one.json"),
             r#"{"feature": "testns:diorite", "placement": [
-                {"type": "minecraft:offset", "location": {"positive": true}}
+                {"type": "minecraft:count_on_every_layer", "count": 1}
             ]}"#,
         );
         write(
@@ -3910,7 +5807,7 @@ mod tests {
         );
         assert_eq!(
             data.unimplemented_features
-                .get("placement:minecraft:offset"),
+                .get("placement:minecraft:count_on_every_layer"),
             Some(&1)
         );
         assert_eq!(
@@ -5446,6 +7343,7 @@ mod tests {
                     vec!["minecraft:air".to_string()],
                 ),
             ]),
+            membership: HashMap::new(),
         }
     }
 
@@ -6419,9 +8317,8 @@ mod tests {
     }
 
     /// Requires the operator-provisioned data pack. `spring_water` reaches the
-    /// runtime through modifiers this branch has. The disks parse, but their
-    /// placements still need `minecraft:heightmap` and
-    /// `minecraft:block_predicate_filter`, so they stay gated and report that.
+    /// runtime through modifiers this branch has, and the disks now also model
+    /// `minecraft:heightmap`, `minecraft:matching_fluids`, and `minecraft:rule_based`.
     #[test]
     #[ignore = "requires operator-provisioned local data"]
     fn the_real_pack_reaches_springs_and_gates_disks() {
@@ -6441,8 +8338,8 @@ mod tests {
             let name = format!("minecraft:{id}");
             assert!(data.configured[&name].is_supported(), "{id} is modeled");
             assert!(
-                !data.placed[&name].is_modelable(),
-                "{id} needs placement modifiers from the ground-cover work"
+                data.placed[&name].is_modelable(),
+                "{id} is modelable now that heightmap and rule_based predicates are modeled"
             );
         }
     }
@@ -6840,5 +8737,621 @@ mod tests {
         let mut gaps = HashMap::new();
         record_unmodeled_configured(&mut gaps, &with_gap);
         assert_eq!(gaps.get("minecraft:coral_tree"), Some(&1));
+    }
+
+    #[test]
+    fn diagnose_reports_first_and_all_unsupported_pieces_in_evaluation_order() {
+        let root = scratch_root("diagnose-step");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("feature/grass.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:short_grass"}}"#,
+        );
+        write(
+            &worldgen.join("feature/cane.json"),
+            r#"{"type": "minecraft:block_column", "direction": "up", "allowed_placement": {"type": "minecraft:true"}, "prioritize_tip": false, "layers": []}"#,
+        );
+        write(
+            &worldgen.join("feature/blocked_patch.json"),
+            r#"{"type": "minecraft:vegetation_patch"}"#,
+        );
+        write(
+            &worldgen.join("feature/plain_flower.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": "minecraft:flower_plain"}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/ready_grass.json"),
+            r#"{"feature": "testns:grass", "placement": [
+                {"type": "minecraft:count", "count": 2},
+                {"type": "minecraft:in_square"},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/ready_cane.json"),
+            r#"{"feature": "testns:cane", "placement": [
+                {"type": "minecraft:heightmap", "heightmap": "MOTION_BLOCKING"},
+                {"type": "minecraft:offset", "x": 1, "y": 0, "z": 1},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:would_survive", "state": "minecraft:sugar_cane"}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/blocked_patch.json"),
+            r#"{"feature": "testns:blocked_patch", "placement": [
+                {"type": "minecraft:noise_threshold_count", "noise_level": -0.8, "below_noise": 5, "above_noise": 10},
+                {"type": "minecraft:block_predicate_filter",
+                    "predicate": {"type": "minecraft:has_sturdy_face", "direction": "up"}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/blocked_provider.json"),
+            r#"{"feature": "testns:plain_flower", "placement": [
+                {"type": "minecraft:count", "count": {"type": "minecraft:clamped", "min_inclusive": 0, "max_inclusive": 1, "source": 1}}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/forest.json"),
+            r#"{"features": [[], [], [], [], [], [], [], [], [], [
+                "testns:ready_grass",
+                "testns:ready_cane",
+                "testns:blocked_patch",
+                "testns:blocked_provider"
+            ], []]}"#,
+        );
+
+        let data = FeatureData::load(&root).expect("loads synthetic pack");
+        let report =
+            data.diagnose_step_for_biomes(VEGETAL_DECORATION_STEP, &["testns:forest".to_string()]);
+        assert_eq!(report.len(), 4);
+
+        assert_eq!(
+            report[0],
+            PlacedFeatureDiagnosis {
+                id: "testns:ready_grass".to_string(),
+                modelable: true,
+                first_unsupported: None,
+                unsupported_pieces: Vec::new(),
+            }
+        );
+        assert_eq!(
+            report[1],
+            PlacedFeatureDiagnosis {
+                id: "testns:ready_cane".to_string(),
+                modelable: true,
+                first_unsupported: None,
+                unsupported_pieces: Vec::new(),
+            }
+        );
+        assert_eq!(
+            report[2],
+            PlacedFeatureDiagnosis {
+                id: "testns:blocked_patch".to_string(),
+                modelable: false,
+                first_unsupported: Some("placement:minecraft:noise_threshold_count".to_string()),
+                unsupported_pieces: vec![
+                    "placement:minecraft:noise_threshold_count".to_string(),
+                    "predicate:minecraft:has_sturdy_face".to_string(),
+                    "minecraft:vegetation_patch".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            report[3],
+            PlacedFeatureDiagnosis {
+                id: "testns:blocked_provider".to_string(),
+                modelable: false,
+                first_unsupported: Some(
+                    "provider:minecraft:block_state_provider_reference".to_string()
+                ),
+                unsupported_pieces: vec![
+                    "provider:minecraft:block_state_provider_reference".to_string(),
+                ],
+            }
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn heightmap_modifier_distinguishes_all_six_heightmaps() {
+        let mut target = TestTarget::new().with_ground(60).write_anywhere();
+        target.base = "minecraft:air".to_string();
+        target.set_block(4, 60, 4, "minecraft:stone");
+        target.set_block(4, 61, 4, "minecraft:water");
+        target.set_block(4, 62, 4, "minecraft:water");
+        target.set_block(4, 63, 4, "minecraft:oak_leaves");
+        target.set_block(4, 64, 4, "minecraft:short_grass");
+
+        target.set_block(5, 60, 5, "minecraft:stone");
+        target.set_block(5, 61, 5, "minecraft:water");
+        target.set_block(5, 62, 5, "minecraft:water");
+        target.set_block(5, 63, 5, "minecraft:seagrass");
+
+        let mut tags = BlockTags::default();
+        tags.entries.insert(
+            "minecraft:blocks_motion_in_heightmap".to_string(),
+            vec![
+                "minecraft:stone".to_string(),
+                "minecraft:oak_leaves".to_string(),
+            ],
+        );
+        tags.entries.insert(
+            "minecraft:blocks_motion_in_heightmap_no_leaves".to_string(),
+            vec!["minecraft:stone".to_string()],
+        );
+        tags.membership = build_tag_membership(&tags.entries);
+
+        let check = |kind_str: &str, x: i32, z: i32| {
+            let kind = HeightmapKind::parse(kind_str).expect("valid heightmap");
+            target.heightmap_height(kind, x, z, &tags)
+        };
+        assert_eq!(check("WORLD_SURFACE_WG", 4, 4), 65);
+        assert_eq!(check("WORLD_SURFACE", 4, 4), 65);
+        assert_eq!(check("MOTION_BLOCKING", 4, 4), 64);
+        assert_eq!(check("MOTION_BLOCKING_NO_LEAVES", 4, 4), 63);
+        assert_eq!(check("OCEAN_FLOOR_WG", 4, 4), 64);
+        assert_eq!(check("OCEAN_FLOOR", 5, 5), 61);
+    }
+
+    #[test]
+    fn range_providers_cover_26_1_fields_plateau_biased_clamped_and_weighted_list() {
+        let trap_26_1 = RangeProvider::from_value(
+            &json!({"type": "minecraft:trapezoid", "min": 2, "max": 6, "plateau": 2}),
+            false,
+        )
+        .expect("parses 26.1 trapezoid");
+        assert_eq!(trap_26_1.range(0, 0), Some((2, 6)));
+
+        let uni_26_1 = RangeProvider::from_value(
+            &json!({"type": "minecraft:uniform", "min": 1, "max": 4}),
+            false,
+        )
+        .expect("parses 26.1 uniform");
+        assert_eq!(uni_26_1.range(0, 0), Some((1, 4)));
+
+        let biased = RangeProvider::from_value(
+            &json!({"type": "minecraft:biased_to_bottom", "min_inclusive": 0, "max_inclusive": 2}),
+            false,
+        )
+        .expect("parses biased_to_bottom");
+        let clamped = RangeProvider::from_value(
+            &json!({
+                "type": "minecraft:clamped",
+                "min_inclusive": 1,
+                "max_inclusive": 3,
+                "source": {"type": "minecraft:uniform", "min_inclusive": 0, "max_inclusive": 5}
+            }),
+            false,
+        )
+        .expect("parses clamped");
+        let weighted = RangeProvider::from_value(
+            &json!({
+                "type": "minecraft:weighted_list",
+                "distribution": [
+                    {"data": 2, "weight": 3},
+                    {"data": 5, "weight": 1}
+                ]
+            }),
+            false,
+        )
+        .expect("parses weighted_list");
+
+        let mut random = DecorationRandom::new(99);
+        let mut counts = [0usize; 3];
+        for _ in 0..9_000 {
+            let v = biased.sample(0, 128, &mut random);
+            assert!((0..=2).contains(&v));
+            counts[v as usize] += 1;
+            let cv = clamped.sample(0, 128, &mut random);
+            assert!((1..=3).contains(&cv));
+            let wv = weighted.sample(0, 128, &mut random);
+            assert!(wv == 2 || wv == 5);
+        }
+        // Sugar Cane rev 3899892: 11/18, 5/18, 2/18 over 0..=2 (here 9000 samples).
+        assert!(counts[0] > counts[1] && counts[1] > counts[2]);
+        assert!((counts[0] as f64 / 9000.0 - 11.0 / 18.0).abs() < 0.03);
+        assert!((counts[1] as f64 / 9000.0 - 5.0 / 18.0).abs() < 0.03);
+        assert!((counts[2] as f64 / 9000.0 - 2.0 / 18.0).abs() < 0.03);
+    }
+
+    #[test]
+    fn offset_random_chance_and_reach_gating_work_as_specified() {
+        let root = scratch_root("offset-chance");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &root.join("data/minecraft/tags/block/supports_vegetation.json"),
+            r#"{"values": ["minecraft:grass_block", "minecraft:dirt"]}"#,
+        );
+        write(
+            &worldgen.join("feature/grass.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:short_grass"}}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/near_patch.json"),
+            r#"{"feature": "testns:grass", "placement": [
+                {"type": "minecraft:random_chance", "chance": 1.0},
+                {"type": "minecraft:offset", "x": 2, "y": 0, "z": -1},
+                {"type": "minecraft:biome"}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/wide_patch.json"),
+            r#"{"feature": "testns:grass", "placement": [
+                {"type": "minecraft:offset", "x": 10, "y": 0, "z": 0},
+                {"type": "minecraft:offset", "x": 8, "y": 0, "z": 0}
+            ]}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [[], [], [], [], [], [], [], [], [], [
+                "testns:near_patch",
+                "testns:wide_patch"
+            ], []]}"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert!(data.placed["testns:near_patch"].is_modelable());
+        assert!(!data.placed["testns:wide_patch"].is_modelable());
+
+        let mut target = TestTarget::new()
+            .with_ground(60)
+            .in_biome(Some("testns:plains"))
+            .write_anywhere();
+        target.base = "minecraft:air".to_string();
+        target.set_block(6, 60, 3, "minecraft:grass_block");
+        let mut random = DecorationRandom::new(1);
+        let written = data.run_chain(
+            &mut target,
+            &data.placed["testns:near_patch"],
+            0,
+            DecorationPos { x: 4, y: 61, z: 4 },
+            &mut random,
+        );
+        assert_eq!(written, 1);
+        assert_eq!(target.block_at(6, 61, 3), Some("minecraft:short_grass"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn predicates_replaceable_and_would_survive_enforce_plant_rules() {
+        let mut tags = BlockTags::default();
+        tags.entries.insert(
+            "minecraft:replaceable".to_string(),
+            vec![
+                "minecraft:air".to_string(),
+                "minecraft:short_grass".to_string(),
+            ],
+        );
+        tags.entries.insert(
+            "minecraft:supports_vegetation".to_string(),
+            vec![
+                "minecraft:grass_block".to_string(),
+                "minecraft:dirt".to_string(),
+            ],
+        );
+        tags.entries.insert(
+            "minecraft:supports_sugar_cane".to_string(),
+            vec![
+                "minecraft:sand".to_string(),
+                "minecraft:grass_block".to_string(),
+            ],
+        );
+        tags.entries.insert(
+            "minecraft:supports_cactus".to_string(),
+            vec!["minecraft:sand".to_string()],
+        );
+        tags.entries.insert(
+            "minecraft:water".to_string(),
+            vec!["minecraft:water".to_string()],
+        );
+        tags.membership = build_tag_membership(&tags.entries);
+
+        let mut target = TestTarget::new().with_ground(60).write_anywhere();
+        target.base = "minecraft:air".to_string();
+        target.set_block(0, 60, 0, "minecraft:grass_block");
+        target.set_block(0, 61, 0, "minecraft:short_grass");
+        target.set_block(5, 60, 5, "minecraft:sand");
+        target.set_block(6, 60, 5, "minecraft:water");
+        target.set_block(10, 60, 10, "minecraft:sand");
+
+        let replaceable = BlockPredicate::Replaceable { offset: (0, 0, 0) };
+        assert!(replaceable.test(&target, DecorationPos { x: 0, y: 61, z: 0 }, &tags));
+        assert!(!replaceable.test(&target, DecorationPos { x: 0, y: 60, z: 0 }, &tags));
+
+        let grass_survives = BlockPredicate::WouldSurvive {
+            offset: (0, 0, 0),
+            state: "minecraft:short_grass".to_string(),
+        };
+        assert!(grass_survives.test(&target, DecorationPos { x: 0, y: 61, z: 0 }, &tags));
+        assert!(!grass_survives.test(&target, DecorationPos { x: 5, y: 61, z: 5 }, &tags));
+
+        let cane_survives = BlockPredicate::WouldSurvive {
+            offset: (0, 0, 0),
+            state: "minecraft:sugar_cane".to_string(),
+        };
+        assert!(cane_survives.test(&target, DecorationPos { x: 5, y: 61, z: 5 }, &tags));
+        assert!(!cane_survives.test(
+            &target,
+            DecorationPos {
+                x: 10,
+                y: 61,
+                z: 10
+            },
+            &tags
+        ));
+
+        let cactus_survives = BlockPredicate::WouldSurvive {
+            offset: (0, 0, 0),
+            state: "minecraft:cactus".to_string(),
+        };
+        assert!(cactus_survives.test(
+            &target,
+            DecorationPos {
+                x: 10,
+                y: 61,
+                z: 10
+            },
+            &tags
+        ));
+        target.set_block(11, 61, 10, "minecraft:stone");
+        assert!(!cactus_survives.test(
+            &target,
+            DecorationPos {
+                x: 10,
+                y: 61,
+                z: 10
+            },
+            &tags
+        ));
+
+        let sapling = BlockPredicate::WouldSurvive {
+            offset: (0, 0, 0),
+            state: "minecraft:oak_sapling".to_string(),
+        };
+        assert!(!sapling.is_modelable());
+    }
+
+    #[test]
+    fn state_provider_rotated_and_registry_reference_resolve_cleanly() {
+        let root = scratch_root("provider-registry");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &worldgen.join("block_state_provider/rotated_flower.json"),
+            r#"{"type": "minecraft:rotated", "state": {"id": "minecraft:wildflowers", "properties": {"facing": "north", "flower_amount": "1"}}}"#,
+        );
+        write(
+            &worldgen.join("feature/resolved.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": "testns:rotated_flower"}"#,
+        );
+        write(
+            &worldgen.join("feature/unresolved.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": "testns:missing_provider"}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/resolved.json"),
+            r#"{"feature": "testns:resolved", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/unresolved.json"),
+            r#"{"feature": "testns:unresolved", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("biome/plains.json"),
+            r#"{"features": [[], [], [], [], [], [], [], [], [], ["testns:resolved", "testns:unresolved"], []]}"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        assert!(data.placed["testns:resolved"].is_modelable());
+        assert!(!data.placed["testns:unresolved"].is_modelable());
+        assert_eq!(
+            data.unimplemented_features
+                .get("provider:minecraft:block_state_provider_reference"),
+            Some(&1)
+        );
+        if let ConfiguredFeature::SimpleBlock { to_place } = &*data.configured["testns:resolved"] {
+            let target = TestTarget::new();
+            let mut random = DecorationRandom::new(7);
+            let picked = to_place
+                .sample(
+                    &target,
+                    DecorationPos { x: 0, y: 64, z: 0 },
+                    &data.tags,
+                    &mut random,
+                )
+                .expect("sample");
+            assert!(picked.starts_with("minecraft:wildflowers[facing="));
+        } else {
+            panic!("expected resolved simple_block");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn block_column_prioritize_tip_and_selectors_place_expected_plants() {
+        let root = scratch_root("column-selectors");
+        let worldgen = root.join("data/testns/worldgen");
+        write(
+            &root.join("data/minecraft/tags/block/supports_vegetation.json"),
+            r#"{"values": ["minecraft:grass_block", "minecraft:sand"]}"#,
+        );
+        write(
+            &root.join("data/minecraft/tags/block/replaceable.json"),
+            r#"{"values": ["minecraft:air"]}"#,
+        );
+        write(
+            &worldgen.join("feature/col_no_tip.json"),
+            r#"{"type": "minecraft:block_column", "direction": "up", "prioritize_tip": false,
+                "allowed_placement": {"type": "minecraft:matching_blocks", "blocks": ["minecraft:air"]},
+                "layers": [
+                    {"height": 2, "provider": {"id": "minecraft:kelp_plant"}},
+                    {"height": 2, "provider": {"id": "minecraft:kelp"}}
+                ]}"#,
+        );
+        write(
+            &worldgen.join("feature/col_tip.json"),
+            r#"{"type": "minecraft:block_column", "direction": "up", "prioritize_tip": true,
+                "allowed_placement": {"type": "minecraft:matching_blocks", "blocks": ["minecraft:air"]},
+                "layers": [
+                    {"height": 2, "provider": {"id": "minecraft:kelp_plant"}},
+                    {"height": 2, "provider": {"id": "minecraft:kelp"}}
+                ]}"#,
+        );
+        write(
+            &worldgen.join("feature/short_grass.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:short_grass"}}"#,
+        );
+        write(
+            &worldgen.join("feature/fern.json"),
+            r#"{"type": "minecraft:simple_block", "to_place": {"id": "minecraft:fern"}}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/short_grass_inline.json"),
+            r#"{"feature": "testns:short_grass", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/fern_inline.json"),
+            r#"{"feature": "testns:fern", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("feature/bool_sel.json"),
+            r#"{"type": "minecraft:random_boolean_selector",
+                "feature_true": "testns:short_grass_inline",
+                "feature_false": "testns:fern_inline"}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/bool_sel_placed.json"),
+            r#"{"feature": "testns:bool_sel", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("feature/weight_sel.json"),
+            r#"{"type": "minecraft:weighted_random_selector",
+                "features": [{"data": "testns:bool_sel_placed", "weight": 3}]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/weight_sel_placed.json"),
+            r#"{"feature": "testns:weight_sel", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("feature/prob_sel.json"),
+            r#"{"type": "minecraft:random_selector",
+                "default": "testns:weight_sel_placed",
+                "features": [{"feature": "testns:fern_inline", "chance": 0.5}]}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/col_no_tip.json"),
+            r#"{"feature": "testns:col_no_tip", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/col_tip.json"),
+            r#"{"feature": "testns:col_tip", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("placed_feature/prob_sel.json"),
+            r#"{"feature": "testns:prob_sel", "placement": []}"#,
+        );
+        write(
+            &worldgen.join("biome/forest.json"),
+            r#"{"features": [[], [], [], [], [], [], [], [], [], [
+                "testns:col_no_tip",
+                "testns:col_tip",
+                "testns:prob_sel"
+            ], []]}"#,
+        );
+        let data = FeatureData::load(&root).expect("loads");
+        let mut target = TestTarget::new().with_ground(60).write_anywhere();
+        target.base = "minecraft:air".to_string();
+        target.set_block(2, 64, 2, "minecraft:stone");
+        target.set_block(6, 64, 6, "minecraft:stone");
+        let mut random = DecorationRandom::new(42);
+        assert_eq!(
+            data.run_chain(
+                &mut target,
+                &data.placed["testns:col_no_tip"],
+                0,
+                DecorationPos { x: 2, y: 61, z: 2 },
+                &mut random,
+            ),
+            3
+        );
+        assert_eq!(target.block_at(2, 61, 2), Some("minecraft:kelp_plant"));
+        assert_eq!(target.block_at(2, 62, 2), Some("minecraft:kelp_plant"));
+        assert_eq!(target.block_at(2, 63, 2), Some("minecraft:kelp"));
+
+        assert_eq!(
+            data.run_chain(
+                &mut target,
+                &data.placed["testns:col_tip"],
+                0,
+                DecorationPos { x: 6, y: 61, z: 6 },
+                &mut random,
+            ),
+            3
+        );
+        assert_eq!(target.block_at(6, 61, 6), Some("minecraft:kelp_plant"));
+        assert_eq!(target.block_at(6, 62, 6), Some("minecraft:kelp"));
+        assert_eq!(target.block_at(6, 63, 6), Some("minecraft:kelp"));
+
+        target.set_block(10, 60, 10, "minecraft:grass_block");
+        assert!(data.placed["testns:prob_sel"].is_modelable());
+        assert_eq!(
+            data.run_chain(
+                &mut target,
+                &data.placed["testns:prob_sel"],
+                0,
+                DecorationPos {
+                    x: 10,
+                    y: 61,
+                    z: 10
+                },
+                &mut random,
+            ),
+            1
+        );
+        let placed = target.block_at(10, 61, 10).expect("placed plant");
+        assert!(placed == "minecraft:short_grass" || placed == "minecraft:fern");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    #[ignore = "requires operator-provisioned local data"]
+    fn pack_simple_vegetation_features_are_modelable() {
+        let root = std::env::var("RUSTMC_VANILLA_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rustmc-local/vanilla-data"));
+        let data = FeatureData::load(&root).expect("the provisioned pack loads");
+        for id in [
+            "minecraft:patch_grass_forest",
+            "minecraft:flower_default",
+            "minecraft:forest_flowers",
+            "minecraft:patch_bush",
+            "minecraft:patch_pumpkin",
+            "minecraft:patch_sugar_cane",
+            "minecraft:patch_firefly_bush_near_water",
+            "minecraft:patch_cactus_desert",
+            "minecraft:patch_dead_bush",
+            "minecraft:patch_grass_taiga",
+            "minecraft:seagrass_normal",
+            "minecraft:sea_pickle",
+            "minecraft:patch_waterlily",
+        ] {
+            let placed = data
+                .placed
+                .get(id)
+                .unwrap_or_else(|| panic!("missing placed feature {id}"));
+            assert!(
+                placed.is_modelable(),
+                "expected {id} to be modelable, got diagnosis {:?}",
+                placed.diagnose()
+            );
+        }
+        for id in [
+            "minecraft:trees_birch_and_oak_leaf_litter",
+            "minecraft:patch_grass_plain",
+            "minecraft:kelp_cold",
+            "minecraft:brown_mushroom_normal",
+        ] {
+            assert!(
+                !data.placed[id].is_modelable(),
+                "{id} uses out-of-scope or unstated rules and must stay gated"
+            );
+        }
     }
 }
