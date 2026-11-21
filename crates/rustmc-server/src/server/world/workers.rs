@@ -1,26 +1,49 @@
-//! The chunk worker pool: generates and encodes columns off the game thread.
+//! The chunk worker pool: loads or generates and encodes columns off the game
+//! thread.
 //!
-//! Why: generation and encoding are the expensive part of streaming; the game
-//! loop only asks for positions and receives finished columns.
-//! Done: a fixed pool sized by configuration, a bounded request queue,
-//! results delivered to the game loop's inbox. Not done: loading saved
-//! columns (track C reads them before generating).
+//! Why: reading, generating and encoding are the expensive part of streaming;
+//! the game loop only asks for positions and receives finished columns.
+//! Done: a fixed pool sized by configuration, a bounded request queue, saved
+//! columns loaded before anything is generated (a damaged one is served as
+//! generated terrain and never saved), results delivered to the game loop's
+//! inbox. Not done: nothing known.
 
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
+use super::column::Column;
 use super::store::ReadyChunk;
 use super::terrain::{TerrainPalette, generate};
 use crate::chunk_adapter::{RegistryTables, encode_chunk_body};
 use crate::java_packets::play::clientbound::LEVEL_CHUNK_WITH_LIGHT;
 use crate::net::framing::Packet;
 use crate::server::connection::Event;
+use crate::server::log;
+use crate::storage::world_files::{StorageError, WorldFiles};
 use crate::world::Generator;
 
 /// Requests that may wait for a worker before `request` reports the queue
 /// full; the store retries those positions on a later tick.
 pub const REQUEST_QUEUE: usize = 1_024;
+
+/// Where columns come from: the world's saved chunks, else the generator.
+pub struct ColumnSource {
+    pub files: WorldFiles,
+    pub generator: Generator,
+    pub palette: TerrainPalette,
+    pub tables: Arc<RegistryTables>,
+}
+
+impl ColumnSource {
+    /// The saved column, or a freshly generated one if it was never saved.
+    pub fn column(&self, x: i32, z: i32) -> Result<Column, StorageError> {
+        match self.files.load_column(x, z, &self.tables)? {
+            Some(column) => Ok(column),
+            None => Ok(generate(self.generator, &self.palette, x, z)),
+        }
+    }
+}
 
 /// Handle to the worker pool.
 pub struct ChunkWorkers {
@@ -31,21 +54,18 @@ impl ChunkWorkers {
     /// Starts `count` workers that send finished columns to `results`.
     pub fn spawn(
         count: usize,
-        generator: Generator,
-        palette: Arc<TerrainPalette>,
-        tables: Arc<RegistryTables>,
+        source: Arc<ColumnSource>,
         results: SyncSender<Event>,
     ) -> std::io::Result<Self> {
         let (requests, queue) = sync_channel(REQUEST_QUEUE);
         let queue = Arc::new(Mutex::new(queue));
         for index in 0..count {
             let queue = Arc::clone(&queue);
-            let palette = Arc::clone(&palette);
-            let tables = Arc::clone(&tables);
+            let source = Arc::clone(&source);
             let results = results.clone();
             thread::Builder::new()
                 .name(format!("chunk-worker-{index}"))
-                .spawn(move || work(&queue, generator, &palette, &tables, &results))?;
+                .spawn(move || work(&queue, &source, &results))?;
         }
         Ok(Self { requests })
     }
@@ -59,22 +79,31 @@ impl ChunkWorkers {
     }
 }
 
-fn work(
-    queue: &Mutex<Receiver<(i32, i32)>>,
-    generator: Generator,
-    palette: &TerrainPalette,
-    tables: &RegistryTables,
-    results: &SyncSender<Event>,
-) {
+fn work(queue: &Mutex<Receiver<(i32, i32)>>, source: &ColumnSource, results: &SyncSender<Event>) {
     loop {
         // The receiver holds no invariant a panicking holder could break.
         let next = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
         let Ok((x, z)) = next else {
             return;
         };
-        let column = generate(generator, palette, x, z);
-        let packet = encode(&column, tables);
-        let ready = ReadyChunk { column, packet };
+        // A damaged saved chunk is served as generated terrain so players are
+        // not stuck, but marked so it is never saved over the damaged data.
+        let (column, damaged) = match source.column(x, z) {
+            Ok(column) => (column, false),
+            Err(error) => {
+                log::event(
+                    "chunk_load_failed",
+                    &[("x", &x), ("z", &z), ("error", &error)],
+                );
+                (generate(source.generator, &source.palette, x, z), true)
+            }
+        };
+        let packet = encode(&column, &source.tables);
+        let ready = ReadyChunk {
+            column,
+            packet,
+            damaged,
+        };
         if results.send(Event::ChunkReady(Box::new(ready))).is_err() {
             return;
         }
@@ -82,7 +111,7 @@ fn work(
 }
 
 /// Encodes a column as a Level Chunk With Light packet.
-pub fn encode(column: &super::column::Column, tables: &RegistryTables) -> Option<Arc<Packet>> {
+pub fn encode(column: &Column, tables: &RegistryTables) -> Option<Arc<Packet>> {
     let adapter = column.to_adapter().ok()?;
     let body = encode_chunk_body(&adapter, tables).ok()?;
     Some(Arc::new(Packet {

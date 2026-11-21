@@ -24,9 +24,11 @@ use config::ServerConfig;
 use game::Game;
 use world::store::ChunkStore;
 use world::terrain::TerrainPalette;
-use world::workers::ChunkWorkers;
+use world::workers::{ChunkWorkers, ColumnSource};
 
 use crate::chunk_adapter::RegistryTables;
+use crate::storage::journal::Journal;
+use crate::storage::world_files::{LevelData, StorageError, WorldFiles};
 use crate::world::Generator;
 
 use crate::net::crypto::ServerKey;
@@ -43,6 +45,8 @@ pub enum ServerError {
     Manifest(String),
     /// The registry table is missing, invalid or lacks a default-terrain name.
     Registry(String),
+    /// The world directory could not be read or written.
+    Storage(StorageError),
     Key(crate::net::crypto::CryptoError),
     Bind(std::io::Error),
     Accept(std::io::Error),
@@ -53,6 +57,7 @@ impl fmt::Display for ServerError {
         match self {
             Self::Manifest(error) => write!(f, "registry manifest: {error}"),
             Self::Registry(error) => write!(f, "registry table: {error}"),
+            Self::Storage(error) => write!(f, "world storage: {error}"),
             Self::Key(error) => write!(f, "server key: {error}"),
             Self::Bind(error) => write!(f, "cannot listen: {error}"),
             Self::Accept(error) => write!(f, "accept failed: {error}"),
@@ -79,12 +84,28 @@ pub fn run(
         RegistryTables::from_provisioned(&table)
             .map_err(|error| ServerError::Registry(error.to_string()))?,
     );
-    let palette = Arc::new(
-        TerrainPalette::resolve(&tables)
-            .map_err(|error| ServerError::Registry(error.to_string()))?,
-    );
-    // The configuration stores the signed seed; the generator hashes its bits.
-    let generator = Generator::new(config.seed as u64);
+    let palette = TerrainPalette::resolve(&tables)
+        .map_err(|error| ServerError::Registry(error.to_string()))?;
+    let files = WorldFiles::new(&config.world_dir);
+    // A saved world keeps its own seed; the configured one starts new worlds.
+    let level = files
+        .load_level()
+        .map_err(ServerError::Storage)?
+        .unwrap_or(LevelData {
+            seed: config.seed,
+            world_age: 0,
+            day_time: 0,
+        });
+    let (journal, replay) = Journal::open(&files.journal_path())
+        .map_err(|error| ServerError::Storage(StorageError::Io(files.journal_path(), error)))?;
+    // The generator hashes the signed seed's bits.
+    let generator = Generator::new(level.seed as u64);
+    let source = Arc::new(ColumnSource {
+        files,
+        generator,
+        palette,
+        tables: Arc::clone(&tables),
+    });
     let key = Arc::new(ServerKey::generate().map_err(ServerError::Key)?);
     let verifier =
         verifier.unwrap_or_else(|| Arc::new(HttpSessionServer::new(&config.session_server)));
@@ -121,16 +142,20 @@ pub fn run(
             .spawn(move || listener::accept_loop(listener, config, context, events, shutdown))
             .map_err(ServerError::Bind)?
     };
-    let workers = ChunkWorkers::spawn(
-        config.generation_workers,
-        generator,
-        palette,
-        tables.clone(),
-        results,
-    )
-    .map_err(ServerError::Bind)?;
+    let workers = ChunkWorkers::spawn(config.generation_workers, Arc::clone(&source), results)
+        .map_err(ServerError::Bind)?;
     let store = ChunkStore::new(workers, tables);
-    Game::new(Arc::clone(&config), manifest, online, generator, store).run(&queue, &shutdown);
+    let mut game = Game::new(
+        Arc::clone(&config),
+        manifest,
+        online,
+        source,
+        store,
+        journal,
+        level,
+    );
+    game.recover(&replay).map_err(ServerError::Storage)?;
+    game.run(&queue, &shutdown);
     let result = accept
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("accept thread panicked")));

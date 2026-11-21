@@ -6,7 +6,8 @@ use std::time::Duration;
 use super::*;
 use crate::server::connection::Event;
 use crate::server::world::terrain::TerrainPalette;
-use crate::server::world::workers::ChunkWorkers;
+use crate::server::world::workers::{ChunkWorkers, ColumnSource};
+use crate::storage::world_files::WorldFiles;
 use crate::world::Generator;
 
 fn ids(out: &[Outgoing]) -> Vec<u32> {
@@ -58,10 +59,16 @@ fn the_client_rate_sizes_later_batches_within_bounds() {
 #[test]
 fn batches_send_generated_chunks_nearest_first_one_batch_at_a_time() {
     let tables = Arc::new(crate::server::world::terrain::tests::tables());
-    let palette = Arc::new(TerrainPalette::resolve(&tables).expect("palette"));
+    let palette = TerrainPalette::resolve(&tables).expect("palette");
+    let world = std::env::temp_dir().join(format!("rustmc-view-test-{}", std::process::id()));
+    let source = Arc::new(ColumnSource {
+        files: WorldFiles::new(&world),
+        generator: Generator::new(1),
+        palette,
+        tables: Arc::clone(&tables),
+    });
     let (results, inbox) = sync_channel(64);
-    let workers = ChunkWorkers::spawn(2, Generator::new(1), palette, Arc::clone(&tables), results)
-        .expect("workers");
+    let workers = ChunkWorkers::spawn(2, source, results).expect("workers");
     let mut store = ChunkStore::new(workers, tables);
     let mut view = View::new((0, 0), 1);
     assert!(

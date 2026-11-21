@@ -55,7 +55,8 @@ struct TestServer {
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<Result<(), ServerError>>>,
-    _dir: TempDir,
+    /// Removed when the server is dropped, after it stopped.
+    dir: Option<TempDir>,
 }
 
 struct TempDir(std::path::PathBuf);
@@ -76,7 +77,7 @@ impl Drop for TestServer {
     }
 }
 
-fn start(online_mode: bool, verifier: Option<Arc<dyn SessionVerifier>>) -> TestServer {
+fn temp_dir() -> std::path::PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "rustmc-server-test-{}-{}",
@@ -84,12 +85,29 @@ fn start(online_mode: bool, verifier: Option<Arc<dyn SessionVerifier>>) -> TestS
         NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+fn start(online_mode: bool, verifier: Option<Arc<dyn SessionVerifier>>) -> TestServer {
+    let dir = temp_dir();
+    let mut server = start_in(&dir, online_mode, verifier);
+    server.dir = Some(TempDir(dir));
+    server
+}
+
+/// Starts a server whose world lives in `dir`; the caller owns `dir`.
+fn start_in(
+    dir: &std::path::Path,
+    online_mode: bool,
+    verifier: Option<Arc<dyn SessionVerifier>>,
+) -> TestServer {
     let manifest = dir.join("registries.toml");
     std::fs::write(&manifest, MANIFEST).expect("manifest");
     let table = dir.join("registry-table.json");
     std::fs::write(&table, registry_table()).expect("table");
     let mut config = ServerConfig::with_registries(manifest, table);
     config.generation_workers = 2;
+    config.world_dir = dir.join("world");
     config.address = "127.0.0.1:0".parse().expect("address");
     config.online_mode = online_mode;
     config.max_players = 2;
@@ -111,7 +129,7 @@ fn start(online_mode: bool, verifier: Option<Arc<dyn SessionVerifier>>) -> TestS
         address,
         shutdown,
         thread: Some(thread),
-        _dir: TempDir(dir),
+        dir: None,
     }
 }
 
@@ -120,6 +138,8 @@ struct Client {
     stream: TcpStream,
     encoder: FrameEncoder,
     decoder: FrameDecoder,
+    /// Body of the last Synchronize Player Position received.
+    last_teleport: Option<Vec<u8>>,
 }
 
 impl Client {
@@ -132,6 +152,7 @@ impl Client {
             stream,
             encoder: FrameEncoder::new(),
             decoder: FrameDecoder::new(1 << 21),
+            last_teleport: None,
         }
     }
 
@@ -194,6 +215,7 @@ impl Client {
             let packet = self.receive();
             ids.push(packet.id);
             if packet.id == play::clientbound::PLAYER_POSITION {
+                self.last_teleport = Some(packet.body);
                 break;
             }
         }
@@ -382,4 +404,81 @@ fn joined_players_receive_terrain_and_walking_moves_the_view() {
         }
     }
     assert!(saw_center && saw_forget, "moving recentres and forgets");
+}
+
+/// Reads the first Synchronize Player Position after joining.
+fn spawn_position(client: &mut Client) -> [f64; 3] {
+    // finish_login stops at the teleport; its body starts with the teleport
+    // id VarInt (1) and then x, y, z as doubles.
+    let teleport = client.last_teleport.clone().expect("teleport");
+    let mut position = [0.0; 3];
+    for (axis, value) in position.iter_mut().enumerate() {
+        let start = 1 + axis * 8;
+        *value = f64::from_be_bytes(teleport[start..start + 8].try_into().expect("double"));
+    }
+    position
+}
+
+#[test]
+fn players_and_journaled_edits_survive_a_restart() {
+    use crate::storage::journal::{BlockEdit, Journal};
+    use crate::storage::world_files::WorldFiles;
+    let dir = temp_dir();
+    let world = dir.join("world");
+    {
+        let server = start_in(&dir, false, None);
+        let mut client = Client::connect(server.address);
+        client.handshake(intent::LOGIN);
+        client.hello("Saver");
+        client.finish_login();
+        client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
+        let mut moved = Vec::new();
+        for value in [100.5f64, 90.0, -40.5] {
+            moved.extend(value.to_be_bytes());
+        }
+        moved.extend(45.0f32.to_be_bytes());
+        moved.extend(10.0f32.to_be_bytes());
+        moved.push(1);
+        client.send(play::serverbound::MOVE_PLAYER_POS_ROT, &moved);
+        // A status ping completes only after the game loop handled the move.
+        wait_for_online(server.address, 1);
+        drop(client);
+        wait_for_online(server.address, 0);
+    }
+    // Leave an edit in the journal, as a crash after a tick would.
+    let edit = BlockEdit {
+        x: 5,
+        y: 100,
+        z: 5,
+        state: crate::world::Block::Obsidian as u32,
+    };
+    {
+        let (mut journal, _) =
+            Journal::open(&WorldFiles::new(&world).journal_path()).expect("journal");
+        journal.append(edit).expect("append");
+        journal.sync().expect("sync");
+    }
+    {
+        let server = start_in(&dir, false, None);
+        let mut client = Client::connect(server.address);
+        client.handshake(intent::LOGIN);
+        client.hello("Saver");
+        client.finish_login();
+        assert_eq!(spawn_position(&mut client), [100.5, 90.0, -40.5]);
+    }
+    let files = WorldFiles::new(&world);
+    let tables =
+        crate::chunk_adapter::RegistryTables::from_provisioned(&registry_table()).expect("tables");
+    let column = files
+        .load_column(0, 0, &tables)
+        .expect("load")
+        .expect("saved");
+    assert_eq!(
+        column.get(5, 100, 5),
+        Some(edit.state),
+        "the journaled edit was saved"
+    );
+    let (_, replay) = Journal::open(&files.journal_path()).expect("journal");
+    assert!(replay.is_empty(), "the journal was emptied after the save");
+    drop(TempDir(dir));
 }
