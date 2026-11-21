@@ -19,7 +19,7 @@ pub mod runtime;
 pub mod vanilla;
 pub mod world;
 
-use std::{net::IpAddr, path::Path};
+use std::{net::IpAddr, ops::RangeInclusive, path::Path};
 
 /// Configuration schema supported by the bootstrap and development CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +88,97 @@ pub struct ListenerConfig {
 }
 
 /// Allowed `listener.preview_session_lifetime_ms` values.
-pub const PREVIEW_SESSION_LIFETIME_MS: std::ops::RangeInclusive<u64> = 10_000..=3_600_000;
+pub const PREVIEW_SESSION_LIFETIME_MS: RangeInclusive<u64> = 10_000..=3_600_000;
 /// Allowed `listener.preview_read_bytes_per_second` values.
-pub const PREVIEW_READ_BYTES_PER_SECOND: std::ops::RangeInclusive<usize> = 1_024..=1_048_576;
+pub const PREVIEW_READ_BYTES_PER_SECOND: RangeInclusive<usize> = 1_024..=1_048_576;
+/// Allowed `listener.max_connections`: each connection owns bounded buffers,
+/// so this caps the listener's memory.
+pub const MAX_CONNECTIONS: RangeInclusive<usize> = 1..=64;
+/// Allowed `listener.max_bytes_per_connection` (the read budget of one
+/// connection before it is closed).
+pub const MAX_BYTES_PER_CONNECTION: RangeInclusive<usize> = 1..=65_536;
+/// Allowed `listener.idle_timeout_ms`.
+pub const IDLE_TIMEOUT_MS: RangeInclusive<u64> = 10..=60_000;
+/// Allowed `listener.max_connection_lifetime_ms` when the preview is enabled.
+pub const CONNECTION_LIFETIME_MS: RangeInclusive<u64> = 10..=3_600_000;
+/// Longest connection a discovery-only listener keeps: status and ping
+/// exchanges finish in well under a minute.
+pub const DISCOVERY_CONNECTION_LIFETIME_MAX_MS: u64 = 60_000;
+/// Allowed `listener.vanilla_generation_workers` (generator threads).
+pub const VANILLA_GENERATION_WORKERS: RangeInclusive<usize> = 1..=20;
+/// Allowed `listener.preview_view_distance` in chunks, the client's own
+/// render-distance range.
+pub const PREVIEW_VIEW_DISTANCE: RangeInclusive<u8> = 2..=32;
+
+impl ListenerConfig {
+    /// Longest connection lifetime this listener accepts.
+    fn max_lifetime_ms(&self) -> u64 {
+        if self.local_java_preview {
+            *CONNECTION_LIFETIME_MS.end()
+        } else {
+            DISCOVERY_CONNECTION_LIFETIME_MAX_MS
+        }
+    }
+
+    /// Checks the numeric limits and preview-only options, whether the value
+    /// came from a file or was built in code.
+    pub fn validate(&self) -> Result<(), String> {
+        let lifetime = *CONNECTION_LIFETIME_MS.start()..=self.max_lifetime_ms();
+        let checks = [
+            (
+                MAX_CONNECTIONS.contains(&self.max_connections),
+                "`listener.max_connections` is out of range",
+            ),
+            (
+                MAX_BYTES_PER_CONNECTION.contains(&self.max_bytes_per_connection),
+                "`listener.max_bytes_per_connection` is out of range",
+            ),
+            (
+                IDLE_TIMEOUT_MS.contains(&self.idle_timeout_ms),
+                "`listener.idle_timeout_ms` is out of range",
+            ),
+            (
+                lifetime.contains(&self.max_connection_lifetime_ms),
+                "`listener.max_connection_lifetime_ms` is out of range",
+            ),
+            (
+                self.idle_timeout_ms <= self.max_connection_lifetime_ms,
+                "`listener.idle_timeout_ms` cannot exceed `listener.max_connection_lifetime_ms`",
+            ),
+            (
+                PREVIEW_VIEW_DISTANCE.contains(&self.preview_view_distance),
+                "`listener.preview_view_distance` is out of range",
+            ),
+            (
+                VANILLA_GENERATION_WORKERS.contains(&self.vanilla_generation_workers),
+                "`listener.vanilla_generation_workers` is out of range",
+            ),
+            (
+                PREVIEW_SESSION_LIFETIME_MS.contains(&self.preview_session_lifetime_ms),
+                "`listener.preview_session_lifetime_ms` is out of range",
+            ),
+            (
+                PREVIEW_READ_BYTES_PER_SECOND.contains(&self.preview_read_bytes_per_second),
+                "`listener.preview_read_bytes_per_second` is out of range",
+            ),
+            (
+                self.local_java_preview
+                    || (self.preview_registry_manifest.is_none()
+                        && self.preview_compression_threshold.is_none()),
+                "preview options require `listener.local_java_preview = true`",
+            ),
+            (
+                self.preview_compression_threshold
+                    .is_none_or(|threshold| i32::try_from(threshold).is_ok()),
+                "`listener.preview_compression_threshold` is out of range",
+            ),
+        ];
+        match checks.into_iter().find(|(ok, _)| !ok) {
+            Some((_, message)) => Err(message.to_owned()),
+            None => Ok(()),
+        }
+    }
+}
 
 impl Default for ListenerConfig {
     fn default() -> Self {
@@ -190,15 +278,15 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         table,
         "idle_timeout_ms",
         defaults.idle_timeout_ms,
-        10,
-        60000,
+        *IDLE_TIMEOUT_MS.start(),
+        *IDLE_TIMEOUT_MS.end(),
     )?;
     let max_connection_lifetime_ms = integer_field(
         table,
         "max_connection_lifetime_ms",
         defaults.max_connection_lifetime_ms,
-        10,
-        3_600_000,
+        *CONNECTION_LIFETIME_MS.start(),
+        *CONNECTION_LIFETIME_MS.end(),
     )?;
     if idle_timeout_ms > max_connection_lifetime_ms {
         return Err(
@@ -212,7 +300,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             .as_bool()
             .ok_or_else(|| "`listener.local_java_preview` must be true or false".to_owned())?,
     };
-    if !local_java_preview && max_connection_lifetime_ms > 60_000 {
+    if !local_java_preview && max_connection_lifetime_ms > DISCOVERY_CONNECTION_LIFETIME_MAX_MS {
         return Err(
             "`listener.max_connection_lifetime_ms` exceeds the discovery-only limit".to_owned(),
         );
@@ -273,7 +361,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         && table
             .get("max_connections")
             .and_then(toml::Value::as_integer)
-            .unwrap_or(8)
+            .unwrap_or(defaults.max_connections as i64)
             != 1
     {
         return Err("vanilla preview requires `listener.max_connections = 1`".to_owned());
@@ -295,20 +383,26 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     }
     Ok(ListenerConfig {
         bind_address,
-        port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
+        port: integer_field(
+            table,
+            "port",
+            u64::from(defaults.port),
+            0,
+            u64::from(u16::MAX),
+        )? as u16,
         max_connections: integer_field(
             table,
             "max_connections",
             defaults.max_connections as u64,
-            1,
-            64,
+            *MAX_CONNECTIONS.start() as u64,
+            *MAX_CONNECTIONS.end() as u64,
         )? as usize,
         max_bytes_per_connection: integer_field(
             table,
             "max_bytes_per_connection",
             defaults.max_bytes_per_connection as u64,
-            1,
-            65536,
+            *MAX_BYTES_PER_CONNECTION.start() as u64,
+            *MAX_BYTES_PER_CONNECTION.end() as u64,
         )? as usize,
         idle_timeout_ms,
         max_connection_lifetime_ms,
@@ -321,16 +415,16 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             table,
             "vanilla_generation_workers",
             defaults.vanilla_generation_workers as u64,
-            1,
-            20,
+            *VANILLA_GENERATION_WORKERS.start() as u64,
+            *VANILLA_GENERATION_WORKERS.end() as u64,
         )? as usize,
         preview_seed: preview_seed(table)?,
         preview_view_distance: integer_field(
             table,
             "preview_view_distance",
             defaults.preview_view_distance.into(),
-            2,
-            32,
+            (*PREVIEW_VIEW_DISTANCE.start()).into(),
+            (*PREVIEW_VIEW_DISTANCE.end()).into(),
         )? as u8,
         preview_terrain,
         preview_session_lifetime_ms: integer_field(

@@ -251,3 +251,34 @@ fn preview_compression_threshold_validates_signed_varint_and_requires_preview() 
     .unwrap_err();
     assert!(err.contains("preview_compression_threshold") && err.contains("local_java_preview"));
 }
+
+#[test]
+fn listener_validation_rejects_out_of_range_limits_built_in_code() {
+    assert_eq!(ListenerConfig::default().validate(), Ok(()));
+    let too_many = ListenerConfig {
+        max_connections: *MAX_CONNECTIONS.end() + 1,
+        ..ListenerConfig::default()
+    };
+    assert_eq!(
+        too_many.validate(),
+        Err("`listener.max_connections` is out of range".to_owned())
+    );
+    let long_discovery = ListenerConfig {
+        max_connection_lifetime_ms: DISCOVERY_CONNECTION_LIFETIME_MAX_MS + 1,
+        ..ListenerConfig::default()
+    };
+    assert!(long_discovery.validate().is_err());
+    let long_preview = ListenerConfig {
+        local_java_preview: true,
+        ..long_discovery
+    };
+    assert_eq!(long_preview.validate(), Ok(()));
+    let compression_without_preview = ListenerConfig {
+        preview_compression_threshold: Some(256),
+        ..ListenerConfig::default()
+    };
+    assert_eq!(
+        compression_without_preview.validate(),
+        Err("preview options require `listener.local_java_preview = true`".to_owned())
+    );
+}

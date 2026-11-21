@@ -1,9 +1,6 @@
 //! Bounded loopback discovery supervisor with an opt-in local Java terrain preview.
 
-use crate::{
-    ListenerConfig, PREVIEW_READ_BYTES_PER_SECOND, PREVIEW_SESSION_LIFETIME_MS, discovery_bedrock,
-    discovery_java, java_preview, preview_data,
-};
+use crate::{ListenerConfig, discovery_bedrock, discovery_java, java_preview, preview_data};
 use std::{
     fmt,
     io::{self, Read, Write},
@@ -246,27 +243,7 @@ pub fn run_listener<F: FnMut(RuntimeEvent)>(
         stop(None, Vec::new(), started, &mut observe);
         return Ok(());
     }
-    if !(2..=32).contains(&config.preview_view_distance)
-        || (config.preview_registry_manifest.is_some() && !config.local_java_preview)
-        || (config.preview_compression_threshold.is_some() && !config.local_java_preview)
-        || config
-            .preview_compression_threshold
-            .is_some_and(|threshold| threshold > i32::MAX as usize)
-        || config.max_connections == 0
-        || config.max_connections > 64
-        || config.max_bytes_per_connection == 0
-        || config.max_bytes_per_connection > 65536
-        || !(10..=60000).contains(&config.idle_timeout_ms)
-        || !(10..=if config.local_java_preview {
-            3_600_000
-        } else {
-            60_000
-        })
-            .contains(&config.max_connection_lifetime_ms)
-        || config.idle_timeout_ms > config.max_connection_lifetime_ms
-        || !PREVIEW_SESSION_LIFETIME_MS.contains(&config.preview_session_lifetime_ms)
-        || !PREVIEW_READ_BYTES_PER_SECOND.contains(&config.preview_read_bytes_per_second)
-    {
+    if config.validate().is_err() {
         observe(event(
             "failed",
             LifecycleState::Failed,
