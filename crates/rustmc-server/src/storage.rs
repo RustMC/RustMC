@@ -8,3 +8,4 @@
 pub mod chunk;
 pub mod nbt;
 pub mod region;
+pub mod region_file;
