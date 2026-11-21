@@ -8,9 +8,13 @@
 //! Not done: inventories (added with inventory play), other dimensions.
 //!
 //! Layout (observed in a 26.3 save, see docs/PROVENANCE.md):
-//! `dimensions/minecraft/overworld/region/r.X.Z.mca`,
-//! `players/data/<uuid>.dat` and `level.dat`, both gzip-compressed NBT.
-//! RustMC's own journal lives in `rustmc/journal.bin`.
+//! `dimensions/minecraft/overworld/region/r.X.Z.mca` and
+//! `players/data/<uuid>.dat` (gzip-compressed NBT). RustMC keeps its own
+//! level data and journal under `rustmc/`, so it never overwrites a vanilla
+//! save's `level.dat`. Opening a vanilla save reads its seed from
+//! `data/minecraft/world_gen_settings.dat` (`data.seed`) and its age from
+//! `level.dat` (`Data.Time`); its day clock is not read yet, so day time
+//! starts at 0 there.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -147,7 +151,33 @@ impl WorldFiles {
     }
 
     fn level_path(&self) -> PathBuf {
-        self.root.join("level.dat")
+        self.root.join("rustmc").join("level.dat")
+    }
+
+    /// Seed and age of a vanilla save in this directory, if it is one.
+    fn vanilla_level(&self) -> Result<Option<LevelData>, StorageError> {
+        let settings_path = self.root.join("data/minecraft/world_gen_settings.dat");
+        let Some(settings) = read_gzip_nbt(&settings_path)? else {
+            return Ok(None);
+        };
+        let seed = match settings.get("data").and_then(|data| data.get("seed")) {
+            Some(Tag::Long(seed)) => *seed,
+            _ => return Err(StorageError::Malformed(settings_path, "data.seed")),
+        };
+        let level_path = self.root.join("level.dat");
+        let world_age = match read_gzip_nbt(&level_path)?
+            .as_ref()
+            .and_then(|level| level.get("Data"))
+            .and_then(|data| data.get("Time"))
+        {
+            Some(Tag::Long(time)) => (*time).max(0) as u64,
+            _ => 0,
+        };
+        Ok(Some(LevelData {
+            seed,
+            world_age,
+            day_time: 0,
+        }))
     }
 
     /// The saved column at `(chunk_x, chunk_z)`, if one was saved.
@@ -269,11 +299,12 @@ impl WorldFiles {
         write_gzip_nbt(&self.player_path(uuid), &tag)
     }
 
-    /// The world's saved seed and clocks, if the world was saved before.
+    /// The world's saved seed and clocks: RustMC's own level data, else a
+    /// vanilla save's, else `None` for a new world.
     pub fn load_level(&self) -> Result<Option<LevelData>, StorageError> {
         let path = self.level_path();
         let Some(tag) = read_gzip_nbt(&path)? else {
-            return Ok(None);
+            return self.vanilla_level();
         };
         let data = tag
             .get("Data")
