@@ -1,3 +1,5 @@
+//! Checks that every dependency in Cargo.lock has a reviewed, compatible license; run by CI.
+
 use rustmc_tools::{REVIEWED, review_packages};
 use serde_json::Value;
 use std::{error::Error, process::Command};

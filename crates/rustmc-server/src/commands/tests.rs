@@ -1,3 +1,5 @@
+//! Unit tests for `commands`: parsing, selectors, permissions and each built-in handler.
+
 use super::*;
 
 #[test]

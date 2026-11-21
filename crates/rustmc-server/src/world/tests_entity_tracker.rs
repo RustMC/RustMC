@@ -1,3 +1,5 @@
+//! Unit tests for `world::entity_tracker`: spatial indexing and view-distance tracking events.
+
 use super::entity_tracker::{
     EntityId, EntityType, MAX_TRACKING_RANGE, SpatialEntityTracker, TrackingError, TrackingEvent,
     try_chunk_coords,

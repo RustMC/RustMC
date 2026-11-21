@@ -1,3 +1,5 @@
+//! Unit tests for `world::inventory`: slot transactions and stacking.
+
 use super::inventory::*;
 use crate::item::{DEFAULT_MAX_STACK, ItemStack};
 

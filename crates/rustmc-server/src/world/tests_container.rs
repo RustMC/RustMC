@@ -1,3 +1,5 @@
+//! Unit tests for `world::container`: window clicks and slot synchronization.
+
 use super::container::*;
 use crate::item::ItemStack;
 

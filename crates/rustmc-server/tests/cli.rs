@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Integration tests for the `rustmc-server` binary: CLI flags, config validation and exit codes.
+
 use std::{
     fs,
     path::PathBuf,
