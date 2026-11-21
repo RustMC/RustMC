@@ -251,7 +251,7 @@ impl Game {
                 _ => Err(reason::BAD_PACKET),
             },
             serverbound::CHUNK_BATCH_RECEIVED => match read_f32_be(body) {
-                Ok((rate, rest)) if rest.is_empty() => {
+                Ok((rate, [])) => {
                     player.view.batch_received(rate);
                     Ok(())
                 }
@@ -309,7 +309,7 @@ impl Game {
             self.players.remove(&id);
         }
         self.online.store(self.players.len(), Ordering::Relaxed);
-        if tick % UNLOAD_INTERVAL_TICKS == 0 {
+        if tick.is_multiple_of(UNLOAD_INTERVAL_TICKS) {
             let players = &self.players;
             self.store
                 .unload_unviewed(|position| players.values().any(|p| p.view.contains(position)));
