@@ -189,5 +189,16 @@ pub fn server_hash(parts: &[&[u8]]) -> String {
     }
 }
 
+/// A fresh random shared secret for tests, assembled from two random
+/// integers.
+#[cfg(test)]
+pub(crate) fn test_secret() -> [u8; SHARED_SECRET_BYTES] {
+    let high = getrandom::u64().expect("random").to_be_bytes();
+    let low = getrandom::u64().expect("random").to_be_bytes();
+    let mut secret = high.to_vec();
+    secret.extend_from_slice(&low);
+    secret.try_into().expect("sixteen bytes")
+}
+
 #[cfg(test)]
 mod tests;

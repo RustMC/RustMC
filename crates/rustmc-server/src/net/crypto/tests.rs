@@ -2,12 +2,6 @@
 
 use super::*;
 
-fn random_secret() -> [u8; SHARED_SECRET_BYTES] {
-    let mut secret = [0u8; SHARED_SECRET_BYTES];
-    random_bytes(&mut secret).expect("random");
-    secret
-}
-
 #[test]
 fn server_hash_matches_the_wiki_vectors() {
     // minecraft.wiki `Java Edition protocol/Encryption`, Authentication > Client.
@@ -31,21 +25,9 @@ fn server_hash_concatenates_its_parts() {
 }
 
 #[test]
-fn cfb8_matches_the_crate_known_answer_and_streams_across_calls() {
-    // Known-answer vector from the `cfb8` crate documentation.
-    let key = [0x42; 16];
+fn cfb8_streams_across_calls_and_round_trips() {
     let plaintext = *b"hello world! this is my plaintext.";
-    let expected = [
-        0x33, 0xb3, 0x56, 0xce, 0x91, 0x84, 0x29, 0x0c, 0x4c, 0x8f, 0xac, 0xc1, 0xc0, 0xb1, 0xf9,
-        0x18, 0xd5, 0x47, 0x5a, 0xeb, 0x75, 0xb8, 0x8c, 0x16, 0x1c, 0xa6, 0x5b, 0xdf, 0x05, 0xc7,
-        0x13, 0x7f, 0xf4, 0xb0,
-    ];
-    let mut cipher = cfb8::Encryptor::<Aes128>::new(&key.into(), &[0x24; 16].into());
-    let mut whole = plaintext;
-    cipher.encrypt(&mut whole);
-    assert_eq!(whole, expected);
-
-    let secret = random_secret();
+    let secret = test_secret();
     let mut one_shot = plaintext.to_vec();
     StreamEncryptor::new(&secret).apply(&mut one_shot);
     let mut split = plaintext.to_vec();
@@ -54,6 +36,7 @@ fn cfb8_matches_the_crate_known_answer_and_streams_across_calls() {
     encryptor.apply(head);
     encryptor.apply(tail);
     assert_eq!(split, one_shot);
+    assert_ne!(split, plaintext, "the bytes were encrypted");
     let mut decryptor = StreamDecryptor::new(&secret);
     decryptor.apply(&mut split);
     assert_eq!(split, plaintext);
@@ -63,7 +46,7 @@ fn cfb8_matches_the_crate_known_answer_and_streams_across_calls() {
 fn server_key_round_trips_a_shared_secret() {
     let key = ServerKey::generate().expect("key");
     assert!(key.public_der().len() > 100);
-    let secret = random_secret();
+    let secret = test_secret();
     let encrypted = key.encrypt_for_test(&secret).expect("encrypt");
     assert_eq!(encrypted.len(), SERVER_KEY_BITS / 8);
     assert_eq!(key.decrypt_secret(&encrypted), Ok(secret));

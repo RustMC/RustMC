@@ -2,12 +2,6 @@
 
 use super::*;
 
-fn random_secret() -> [u8; 16] {
-    let mut secret = [0u8; 16];
-    crate::net::crypto::random_bytes(&mut secret).expect("random");
-    secret
-}
-
 fn round_trip(encoder: &mut FrameEncoder, decoder: &mut FrameDecoder, id: u32, body: &[u8]) {
     let mut wire = Vec::new();
     encoder.encode(id, body, &mut wire).expect("encode");
@@ -30,7 +24,7 @@ fn round_trip(encoder: &mut FrameEncoder, decoder: &mut FrameDecoder, id: u32, b
 
 #[test]
 fn plain_compressed_and_encrypted_frames_round_trip() {
-    let secret = random_secret();
+    let secret = crate::net::crypto::test_secret();
     let mut encoder = FrameEncoder::new();
     let mut decoder = FrameDecoder::new(1 << 20);
     round_trip(&mut encoder, &mut decoder, 7, b"plain");
@@ -55,7 +49,7 @@ fn plain_frame_bytes_are_length_id_body() {
 
 #[test]
 fn bytes_received_with_the_enabling_frame_are_decrypted_retroactively() {
-    let secret = random_secret();
+    let secret = crate::net::crypto::test_secret();
     let mut first = Vec::new();
     FrameEncoder::new()
         .encode(1, b"key", &mut first)
