@@ -476,9 +476,9 @@ fn players_and_journaled_edits_survive_a_restart() {
         client.finish_login();
         client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
         let spawn = spawn_position(&mut client);
-        walk_to(&mut client, spawn, [100.5, 90.0, -40.5]);
+        walk_to(&mut client, spawn, [10.5, 70.0, -8.5]);
         let mut moved = Vec::new();
-        for value in [100.5f64, 90.0, -40.5] {
+        for value in [10.5f64, 70.0, -8.5] {
             moved.extend(value.to_be_bytes());
         }
         moved.extend(45.0f32.to_be_bytes());
@@ -514,7 +514,7 @@ fn players_and_journaled_edits_survive_a_restart() {
         client.handshake(intent::LOGIN);
         client.hello("Saver");
         client.finish_login();
-        assert_eq!(spawn_position(&mut client), [100.5, 90.0, -40.5]);
+        assert_eq!(spawn_position(&mut client), [10.5, 70.0, -8.5]);
     }
     let files = WorldFiles::new(&world);
     let saved = files
