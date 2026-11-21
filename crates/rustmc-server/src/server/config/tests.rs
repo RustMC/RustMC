@@ -8,7 +8,8 @@ fn parse(text: &str) -> Result<ServerConfig, String> {
 
 #[test]
 fn defaults_follow_vanilla_server_properties() {
-    let config = parse(r#"registry_manifest = "registries.toml""#).expect("config");
+    let config = parse("registry_manifest = \"registries.toml\"\nregistry_table = \"table.json\"")
+        .expect("config");
     assert_eq!(config.address.port(), 25565);
     assert!(config.online_mode);
     assert_eq!(config.max_players, 20);
@@ -23,6 +24,9 @@ fn every_key_parses() {
     let config = parse(
         r#"
         registry_manifest = "r.toml"
+        registry_table = "t.json"
+        seed = -5
+        generation_workers = 3
         bind_address = "127.0.0.1"
         port = 25570
         online_mode = false
@@ -44,30 +48,43 @@ fn every_key_parses() {
     assert_eq!(config.compression_threshold, None);
     assert_eq!(config.game_mode, GameMode::Creative);
     assert_eq!(config.outbound_queue_packets, 128);
+    assert_eq!(config.seed, -5);
+    assert_eq!(config.generation_workers, 3);
 }
 
 #[test]
 fn invalid_values_are_rejected_with_the_key_name() {
     for (text, key) in [
         ("", "registry_manifest"),
-        ("registry_manifest = \"r\"\nmax_players = 0", "max_players"),
+        ("registry_manifest = \"r\"", "registry_table"),
         (
-            "registry_manifest = \"r\"\nview_distance = 40",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\ngeneration_workers = 0",
+            "generation_workers",
+        ),
+        (
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nmax_players = 0",
+            "max_players",
+        ),
+        (
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nview_distance = 40",
             "view_distance",
         ),
         (
-            "registry_manifest = \"r\"\ngame_mode = \"god\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\ngame_mode = \"god\"",
             "game_mode",
         ),
         (
-            "registry_manifest = \"r\"\nbind_address = \"nowhere\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nbind_address = \"nowhere\"",
             "bind_address",
         ),
         (
-            "registry_manifest = \"r\"\nsession_server = \"ftp://x\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nsession_server = \"ftp://x\"",
             "session_server",
         ),
-        ("registry_manifest = \"r\"\nunknown = 1", "unknown"),
+        (
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nunknown = 1",
+            "unknown",
+        ),
     ] {
         let error = parse(text).expect_err(text);
         assert!(error.contains(key), "{error}");

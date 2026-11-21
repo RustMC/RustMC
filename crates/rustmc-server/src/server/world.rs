@@ -5,4 +5,7 @@
 //! Done: see submodules. Not done: persistence (track C).
 
 pub mod column;
+pub mod store;
 pub mod terrain;
+pub mod view;
+pub mod workers;

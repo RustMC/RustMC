@@ -26,6 +26,30 @@ const MANIFEST: &str = r#"version = "26.3"
 "minecraft:world_clock" = ["minecraft:overworld"]
 "#;
 
+/// A provisioned-format registry table with exactly the default-terrain
+/// block states and biomes.
+fn registry_table() -> String {
+    use crate::world::{Biome, Block};
+    let states: serde_json::Map<String, serde_json::Value> = Block::ALL
+        .iter()
+        .map(|b| (b.state_name().to_owned(), serde_json::json!(*b as u32)))
+        .collect();
+    let biomes: serde_json::Map<String, serde_json::Value> = Biome::ALL
+        .iter()
+        .enumerate()
+        .map(|(id, b)| (b.identifier().to_owned(), serde_json::json!(id)))
+        .collect();
+    serde_json::json!({
+        "version": crate::chunk_adapter::SUPPORTED_VERSION,
+        "protocol": crate::chunk_adapter::SUPPORTED_PROTOCOL,
+        "block_state_count": states.len(),
+        "block_states": states,
+        "biome_count": biomes.len(),
+        "biomes": biomes,
+    })
+    .to_string()
+}
+
 /// A started server and the means to stop it.
 struct TestServer {
     address: SocketAddr,
@@ -62,7 +86,10 @@ fn start(online_mode: bool, verifier: Option<Arc<dyn SessionVerifier>>) -> TestS
     std::fs::create_dir_all(&dir).expect("temp dir");
     let manifest = dir.join("registries.toml");
     std::fs::write(&manifest, MANIFEST).expect("manifest");
-    let mut config = ServerConfig::with_manifest(manifest);
+    let table = dir.join("registry-table.json");
+    std::fs::write(&table, registry_table()).expect("table");
+    let mut config = ServerConfig::with_registries(manifest, table);
+    config.generation_workers = 2;
     config.address = "127.0.0.1:0".parse().expect("address");
     config.online_mode = online_mode;
     config.max_players = 2;
@@ -298,4 +325,61 @@ fn a_full_server_refuses_further_logins() {
     third.handshake(intent::LOGIN);
     third.hello("Three");
     assert_eq!(third.receive().id, login::clientbound::LOGIN_DISCONNECT);
+}
+
+#[test]
+fn joined_players_receive_terrain_and_walking_moves_the_view() {
+    let server = start(false, None);
+    let mut client = Client::connect(server.address);
+    client.handshake(intent::LOGIN);
+    client.hello("Walker");
+    client.finish_login();
+    let mut chunks = Vec::new();
+    loop {
+        let packet = client.receive();
+        if packet.id == play::clientbound::LEVEL_CHUNK_WITH_LIGHT {
+            chunks.push((
+                i32::from_be_bytes(packet.body[0..4].try_into().expect("x")),
+                i32::from_be_bytes(packet.body[4..8].try_into().expect("z")),
+            ));
+        }
+        if packet.id == play::clientbound::CHUNK_BATCH_FINISHED {
+            break;
+        }
+    }
+    assert!(
+        chunks.contains(&(0, 0)),
+        "the spawn chunk comes first: {chunks:?}"
+    );
+    client.send(
+        play::serverbound::CHUNK_BATCH_RECEIVED,
+        &25.0f32.to_be_bytes(),
+    );
+    client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
+    let mut moved = Vec::new();
+    for value in [400.5f64, 120.0, 0.5] {
+        moved.extend(value.to_be_bytes());
+    }
+    moved.push(1);
+    client.send(play::serverbound::MOVE_PLAYER_POS, &moved);
+    let mut saw_center = false;
+    let mut saw_forget = false;
+    for _ in 0..2_000 {
+        let packet = client.receive();
+        match packet.id {
+            play::clientbound::SET_CHUNK_CACHE_CENTER => {
+                saw_center = true;
+            }
+            play::clientbound::FORGET_LEVEL_CHUNK => saw_forget = true,
+            play::clientbound::CHUNK_BATCH_FINISHED => client.send(
+                play::serverbound::CHUNK_BATCH_RECEIVED,
+                &25.0f32.to_be_bytes(),
+            ),
+            _ => {}
+        }
+        if saw_center && saw_forget {
+            break;
+        }
+    }
+    assert!(saw_center && saw_forget, "moving recentres and forgets");
 }

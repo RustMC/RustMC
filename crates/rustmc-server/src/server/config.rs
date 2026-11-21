@@ -48,6 +48,9 @@ pub const LOGIN_TIMEOUT_MS: RangeInclusive<u64> = 1_000..=120_000;
 /// Allowed `outbound_queue_packets`: packets waiting for one slow client
 /// before it is disconnected.
 pub const OUTBOUND_QUEUE_PACKETS: RangeInclusive<usize> = 64..=65_536;
+/// Allowed `generation_workers`: chunk generation threads.
+pub const GENERATION_WORKERS: RangeInclusive<usize> = 1..=64;
+
 /// Longest MOTD accepted, in bytes.
 pub const MAX_MOTD_BYTES: usize = 256;
 
@@ -64,6 +67,12 @@ pub struct ServerConfig {
     pub game_mode: GameMode,
     /// Operator-provisioned identifier manifest of the 26.3 registries.
     pub registry_manifest: PathBuf,
+    /// Operator-provisioned 26.3 block-state and biome id table.
+    pub registry_table: PathBuf,
+    /// World seed for the default terrain.
+    pub seed: i64,
+    /// Chunk generation threads.
+    pub generation_workers: usize,
     pub session_server: String,
     pub max_packet_bytes: usize,
     pub read_bytes_per_second: usize,
@@ -72,8 +81,8 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Defaults for everything but the registry manifest.
-    pub fn with_manifest(registry_manifest: PathBuf) -> Self {
+    /// Defaults for everything but the provisioned registry files.
+    pub fn with_registries(registry_manifest: PathBuf, registry_table: PathBuf) -> Self {
         Self {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
             online_mode: true,
@@ -83,6 +92,9 @@ impl ServerConfig {
             view_distance: DEFAULT_VIEW_DISTANCE,
             game_mode: GameMode::Survival,
             registry_manifest,
+            registry_table,
+            seed: 0,
+            generation_workers: default_workers(),
             session_server: MOJANG_SESSION_SERVER.to_owned(),
             max_packet_bytes: MAX_PACKET_WIRE_BYTES,
             read_bytes_per_second: DEFAULT_READ_BYTES_PER_SECOND,
@@ -92,7 +104,15 @@ impl ServerConfig {
     }
 }
 
-const KEYS: [&str; 14] = [
+/// One generation thread per core, leaving one core for the game loop and
+/// connections.
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get().saturating_sub(1))
+        .clamp(*GENERATION_WORKERS.start(), *GENERATION_WORKERS.end())
+}
+
+const KEYS: [&str; 17] = [
     "bind_address",
     "port",
     "online_mode",
@@ -102,6 +122,9 @@ const KEYS: [&str; 14] = [
     "view_distance",
     "game_mode",
     "registry_manifest",
+    "registry_table",
+    "seed",
+    "generation_workers",
     "session_server",
     "max_packet_bytes",
     "read_bytes_per_second",
@@ -153,10 +176,25 @@ pub fn parse_server(value: &toml::Value) -> Result<ServerConfig, String> {
     if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
         return Err(format!("unknown field `server.{key}`"));
     }
-    let manifest = text(table, "registry_manifest")?
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| "`server.registry_manifest` is required".to_owned())?;
-    let mut config = ServerConfig::with_manifest(PathBuf::from(manifest));
+    let required = |key: &str| -> Result<PathBuf, String> {
+        text(table, key)?
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("`server.{key}` is required"))
+    };
+    let mut config =
+        ServerConfig::with_registries(required("registry_manifest")?, required("registry_table")?);
+    if let Some(value) = table.get("seed") {
+        config.seed = value
+            .as_integer()
+            .ok_or_else(|| "`server.seed` must be a 64-bit integer".to_owned())?;
+    }
+    config.generation_workers = integer(
+        table,
+        "generation_workers",
+        config.generation_workers,
+        &GENERATION_WORKERS,
+    )?;
     if let Some(address) = text(table, "bind_address")? {
         let ip: IpAddr = address
             .parse()

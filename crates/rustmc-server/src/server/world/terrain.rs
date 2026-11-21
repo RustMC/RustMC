@@ -102,4 +102,4 @@ pub fn surface_y(generator: Generator, x: i64, z: i64) -> i32 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
