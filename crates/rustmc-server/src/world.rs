@@ -79,7 +79,6 @@ pub mod furnace;
 pub mod grindstone;
 pub mod loot;
 pub mod recipe_data;
-pub mod vanilla_rules;
 
 pub use brewing::{
     BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
@@ -94,10 +93,6 @@ pub use furnace::{
 pub use recipe_data::{
     CRAFTING_REPAIR_BONUS_DIVISOR, CookingKind, CookingRecipe, RecipeData, RecipeDataError,
     RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe, repair_combined_damage,
-};
-pub use vanilla_rules::{
-    CookingSummary, ItemComponentSummary, LootCategorySummary, ProtocolIdSummary, RecipeSummary,
-    TagSummary, UnsupportedLootSummary, VanillaRules, VanillaRulesError, VanillaRulesSummary,
 };
 pub mod inventory;
 pub use inventory::{

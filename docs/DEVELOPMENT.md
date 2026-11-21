@@ -224,16 +224,13 @@ unzip -q "$tmp_dir/server-26.3.jar" 'data/minecraft/*' -d "$data_root"
 (cd "$tmp_dir" && java -DbundlerMainClass=net.minecraft.data.Main -jar "$server_jar" --reports)
 mv "$tmp_dir/generated/reports" "$data_root/reports"
 rm -rf "$tmp_dir"
-
-# 3. Verify the provisioned data root and print its summary JSON.
-cargo run -p rustmc-tools --bin check_vanilla_data --locked -- "$data_root"
 ```
 
-You can also set `RUSTMC_VANILLA_DATA="$data_root"` instead of passing the path
-as an argument to `check_vanilla_data`, or run the opt-in data-root tests:
+The data root feeds the opt-in vanilla generator. Its ignored tests read it
+from `RUSTMC_VANILLA_DATA`:
 
 ```sh
-RUSTMC_VANILLA_DATA="$data_root" cargo test -p rustmc-server --lib -- --ignored pack_vanilla_rules_pin_26_3_summary
+RUSTMC_VANILLA_DATA="$data_root" cargo test -p rustmc-server --lib -- --ignored
 ```
 
 Keep the provisioned directory outside the repository: official game data and
