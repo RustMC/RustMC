@@ -77,6 +77,8 @@ pub struct ServerConfig {
     pub registry_manifest: PathBuf,
     /// Operator-provisioned 26.3 block-state and biome id table.
     pub registry_table: PathBuf,
+    /// The official 26.3 `reports/registries.json` (item and entity ids).
+    pub registries_report: PathBuf,
     /// World seed for the default terrain.
     pub seed: i64,
     /// Chunk generation threads.
@@ -93,7 +95,11 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Defaults for everything but the provisioned registry files.
-    pub fn with_registries(registry_manifest: PathBuf, registry_table: PathBuf) -> Self {
+    pub fn with_registries(
+        registry_manifest: PathBuf,
+        registry_table: PathBuf,
+        registries_report: PathBuf,
+    ) -> Self {
         Self {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
             online_mode: true,
@@ -104,6 +110,7 @@ impl ServerConfig {
             game_mode: GameMode::Survival,
             registry_manifest,
             registry_table,
+            registries_report,
             seed: 0,
             generation_workers: default_workers(),
             world_dir: PathBuf::from(DEFAULT_WORLD_DIR),
@@ -125,7 +132,7 @@ pub fn default_workers() -> usize {
         .clamp(*GENERATION_WORKERS.start(), *GENERATION_WORKERS.end())
 }
 
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 20] = [
     "bind_address",
     "port",
     "online_mode",
@@ -136,6 +143,7 @@ const KEYS: [&str; 19] = [
     "game_mode",
     "registry_manifest",
     "registry_table",
+    "registries_report",
     "seed",
     "generation_workers",
     "world_dir",
@@ -197,8 +205,11 @@ pub fn parse_server(value: &toml::Value) -> Result<ServerConfig, String> {
             .map(PathBuf::from)
             .ok_or_else(|| format!("`server.{key}` is required"))
     };
-    let mut config =
-        ServerConfig::with_registries(required("registry_manifest")?, required("registry_table")?);
+    let mut config = ServerConfig::with_registries(
+        required("registry_manifest")?,
+        required("registry_table")?,
+        required("registries_report")?,
+    );
     if let Some(value) = table.get("seed") {
         config.seed = value
             .as_integer()

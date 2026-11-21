@@ -27,6 +27,7 @@ use world::terrain::TerrainPalette;
 use world::workers::{ChunkWorkers, ColumnSource};
 
 use crate::chunk_adapter::RegistryTables;
+use crate::protocol::ids::ProtocolIds;
 use crate::storage::journal::Journal;
 use crate::storage::world_files::{LevelData, StorageError, WorldFiles};
 use crate::world::Generator;
@@ -106,6 +107,10 @@ pub fn run(
         palette,
         tables: Arc::clone(&tables),
     });
+    let ids = Arc::new(
+        ProtocolIds::load_file(&config.registries_report)
+            .map_err(|error| ServerError::Registry(error.to_string()))?,
+    );
     let key = Arc::new(ServerKey::generate().map_err(ServerError::Key)?);
     let verifier =
         verifier.unwrap_or_else(|| Arc::new(HttpSessionServer::new(&config.session_server)));
@@ -153,6 +158,7 @@ pub fn run(
         store,
         journal,
         level,
+        ids,
     );
     game.recover(&replay).map_err(ServerError::Storage)?;
     game.run(&queue, &shutdown);

@@ -9,6 +9,7 @@
 //! `persist`), clean disconnect and save on shutdown.
 //! Not done: movement validation and block play (D), chat and commands (E).
 
+mod blocks;
 mod persist;
 
 use std::collections::HashMap;
@@ -34,9 +35,11 @@ use crate::net::framing::Packet;
 use crate::net::identity::{GameProfile, uuid_text};
 use crate::net::login::JoinRequest;
 use crate::preview_data::RegistryManifest;
+use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
 use crate::protocol::movement::{ServerboundMovementPacket, decode_serverbound_movement_packet};
 use crate::storage::journal::Journal;
 use crate::storage::world_files::LevelData;
+use crate::world::inventory::PlayerInventory;
 
 /// Length of one game tick at 20 ticks per second.
 pub const TICK: Duration = Duration::from_millis(50);
@@ -72,6 +75,7 @@ struct Player {
     yaw: f32,
     pitch: f32,
     game_mode: GameMode,
+    inventory: PlayerInventory,
     view: View,
 }
 
@@ -83,6 +87,8 @@ pub struct Game {
     source: Arc<ColumnSource>,
     store: ChunkStore,
     journal: Journal,
+    ids: Arc<ProtocolIds>,
+    dynamic_ids: DynamicRegistryIds,
     players: HashMap<ConnectionId, Player>,
     next_entity_id: i32,
     seed: i64,
@@ -99,8 +105,12 @@ impl Game {
         store: ChunkStore,
         journal: Journal,
         level: LevelData,
+        ids: Arc<ProtocolIds>,
     ) -> Self {
+        let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
         Self {
+            ids,
+            dynamic_ids,
             config,
             manifest,
             online,
@@ -251,6 +261,7 @@ impl Game {
                 yaw,
                 pitch,
                 game_mode,
+                inventory: PlayerInventory::new(),
                 view: View::new(chunk_of(position[0], position[2]), view_distance),
             },
         );
@@ -258,6 +269,20 @@ impl Game {
     }
 
     fn packet(&mut self, id: ConnectionId, packet: Packet) {
+        let body = packet.body.as_slice();
+        let block_play = match packet.id {
+            serverbound::SET_CREATIVE_MODE_SLOT => Some(self.creative_slot(id, body)),
+            serverbound::SET_CARRIED_ITEM => Some(self.carried_item(id, body)),
+            serverbound::PLAYER_ACTION => Some(self.player_action(id, body)),
+            serverbound::USE_ITEM_ON => Some(self.use_item_on(id, body)),
+            _ => None,
+        };
+        if let Some(result) = block_play {
+            if let Err(text) = result {
+                self.remove_player(id, text);
+            }
+            return;
+        }
         let tick = self.tick;
         let Some(player) = self.players.get_mut(&id) else {
             return;

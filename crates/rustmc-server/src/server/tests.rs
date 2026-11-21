@@ -50,6 +50,28 @@ fn registry_table() -> String {
     .to_string()
 }
 
+/// A minimal `registries.json` report: the registries the server loads, with
+/// a few items whose names match default-terrain blocks.
+const REGISTRIES_REPORT: &str = r#"{
+    "minecraft:item": { "entries": {
+        "minecraft:air": { "protocol_id": 0 },
+        "minecraft:stone": { "protocol_id": 1 },
+        "minecraft:dirt": { "protocol_id": 28 }
+    } },
+    "minecraft:data_component_type": { "entries": {
+        "minecraft:max_stack_size": { "protocol_id": 1 }
+    } },
+    "minecraft:potion": { "entries": { "minecraft:water": { "protocol_id": 0 } } },
+    "minecraft:mob_effect": { "entries": { "minecraft:speed": { "protocol_id": 0 } } },
+    "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
+}"#;
+
+/// Players join test servers in Creative so they can place and break blocks
+/// without survival rules.
+fn game_mode_for_tests() -> crate::server::join::GameMode {
+    crate::server::join::GameMode::Creative
+}
+
 /// A started server and the means to stop it.
 struct TestServer {
     address: SocketAddr,
@@ -105,7 +127,10 @@ fn start_in(
     std::fs::write(&manifest, MANIFEST).expect("manifest");
     let table = dir.join("registry-table.json");
     std::fs::write(&table, registry_table()).expect("table");
-    let mut config = ServerConfig::with_registries(manifest, table);
+    let report = dir.join("registries.json");
+    std::fs::write(&report, REGISTRIES_REPORT).expect("report");
+    let mut config = ServerConfig::with_registries(manifest, table, report);
+    config.game_mode = game_mode_for_tests();
     config.generation_workers = 2;
     config.world_dir = dir.join("world");
     config.address = "127.0.0.1:0".parse().expect("address");
@@ -494,5 +519,129 @@ fn players_and_journaled_edits_survive_a_restart() {
     );
     let (_, replay) = Journal::open(&files.journal_path()).expect("journal");
     assert!(replay.is_empty(), "the journal was emptied after the save");
+    drop(TempDir(dir));
+}
+
+/// Joins `name` and confirms the first teleport.
+fn join_playing(address: SocketAddr, name: &str) -> Client {
+    let mut client = Client::connect(address);
+    client.handshake(intent::LOGIN);
+    client.hello(name);
+    client.finish_login();
+    client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
+    client
+}
+
+/// Reads packets until one with `id` arrives, answering keep-alives and
+/// chunk batches on the way. Bounded by time, not by count: keep-alives keep
+/// the socket busy, so a missing packet would otherwise never time out.
+fn receive_until(client: &mut Client, id: u32) -> Packet {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let packet = client.receive();
+        match packet.id {
+            play::clientbound::KEEP_ALIVE => {
+                client.send(play::serverbound::KEEP_ALIVE, &packet.body);
+            }
+            play::clientbound::CHUNK_BATCH_FINISHED => {
+                client.send(
+                    play::serverbound::CHUNK_BATCH_RECEIVED,
+                    &64.0f32.to_be_bytes(),
+                );
+            }
+            _ => {}
+        }
+        if packet.id == id {
+            return packet;
+        }
+    }
+    panic!("packet {id} never arrived");
+}
+
+/// The position and state of a Block Update body.
+fn block_update_of(packet: &Packet) -> ((i32, i32, i32), u32) {
+    let packed = i64::from_be_bytes(packet.body[..8].try_into().expect("position"));
+    let (state, _) = read_varint(&packet.body[8..]).unwrap().unwrap();
+    (
+        crate::discovery_java::actions::unpack_block_pos(packed),
+        state,
+    )
+}
+
+fn use_item_on(pos: (i32, i32, i32), face: u32, sequence: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_varint(0, &mut body); // main hand
+    body.extend(crate::java_wire::pack_block_position(pos.0, pos.1, pos.2).to_be_bytes());
+    put_varint(face, &mut body);
+    for cursor in [0.5f32, 1.0, 0.5] {
+        body.extend(cursor.to_be_bytes());
+    }
+    body.extend([0, 0]); // not inside a block, no world border hit
+    put_varint(sequence, &mut body);
+    body
+}
+
+#[test]
+fn placed_and_broken_blocks_reach_other_players_and_survive_a_restart() {
+    use crate::item::ItemStack;
+    use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
+    use crate::world::Block;
+    let dir = temp_dir();
+    let top;
+    {
+        let server = start_in(&dir, false, None);
+        let mut builder = join_playing(server.address, "Builder");
+        let mut watcher = join_playing(server.address, "Watcher");
+        receive_until(&mut builder, play::clientbound::CHUNK_BATCH_FINISHED);
+        receive_until(&mut watcher, play::clientbound::CHUNK_BATCH_FINISHED);
+        let surface = spawn_position(&mut builder)[1] as i32;
+        let ids = ProtocolIds::from_json_str(std::path::Path::new("r.json"), REGISTRIES_REPORT)
+            .expect("ids");
+        let dynamic = DynamicRegistryIds::default();
+        let mut slot = 36i16.to_be_bytes().to_vec(); // hotbar slot 0
+        let stone = ItemStack::try_new("minecraft:stone", 64, 64).expect("stack");
+        crate::protocol::slot::encode_slot(&Some(stone), &ids, &dynamic, &mut slot).expect("slot");
+        builder.send(play::serverbound::SET_CREATIVE_MODE_SLOT, &slot);
+        // Place on top of the ground two columns away from spawn; the test
+        // world uses the default seed, 0.
+        let generator = crate::world::Generator::new(0);
+        top = crate::server::world::terrain::surface_y(generator, 2, 0);
+        let ground = (2, top - 1, 0);
+        builder.send(play::serverbound::USE_ITEM_ON, &use_item_on(ground, 1, 7));
+        let ack = receive_until(&mut builder, play::clientbound::BLOCK_CHANGED_ACK);
+        assert_eq!(read_varint(&ack.body).unwrap().unwrap().0, 7);
+        let seen = receive_until(&mut watcher, play::clientbound::BLOCK_UPDATE);
+        assert_eq!(block_update_of(&seen), ((2, top, 0), Block::Stone as u32));
+        // Placing into a player's body is refused and corrected.
+        builder.send(
+            play::serverbound::USE_ITEM_ON,
+            &use_item_on((0, surface - 1, 0), 1, 8),
+        );
+        let corrected = receive_until(&mut builder, play::clientbound::BLOCK_UPDATE);
+        assert_eq!(
+            block_update_of(&corrected),
+            ((0, surface, 0), Block::Air as u32)
+        );
+        // Breaking in Creative is instant and reaches the watcher.
+        let mut dig = Vec::new();
+        put_varint(0, &mut dig); // started digging
+        dig.extend(crate::java_wire::pack_block_position(2, top, 0).to_be_bytes());
+        dig.push(1);
+        put_varint(9, &mut dig);
+        builder.send(play::serverbound::PLAYER_ACTION, &dig);
+        let broken = receive_until(&mut watcher, play::clientbound::BLOCK_UPDATE);
+        assert_eq!(block_update_of(&broken), ((2, top, 0), Block::Air as u32));
+        // Place again so a block is left for the restart.
+        builder.send(play::serverbound::USE_ITEM_ON, &use_item_on(ground, 1, 10));
+        let placed = receive_until(&mut watcher, play::clientbound::BLOCK_UPDATE);
+        assert_eq!(block_update_of(&placed).1, Block::Stone as u32);
+    }
+    let tables =
+        crate::chunk_adapter::RegistryTables::from_provisioned(&registry_table()).expect("tables");
+    let column = crate::storage::world_files::WorldFiles::new(&dir.join("world"))
+        .load_column(0, 0, &tables)
+        .expect("load")
+        .expect("saved");
+    assert_eq!(column.get(2, top, 0), Some(Block::Stone as u32));
     drop(TempDir(dir));
 }

@@ -700,7 +700,7 @@ impl Session {
     }
 }
 
-mod actions;
+pub(crate) mod actions;
 pub use actions::*;
 
 #[cfg(test)]
