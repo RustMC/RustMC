@@ -17,6 +17,8 @@ fn defaults_follow_vanilla_server_properties() {
     assert_eq!(config.view_distance, 10);
     assert_eq!(config.game_mode, GameMode::Survival);
     assert_eq!(config.motd, "A Minecraft Server");
+    assert_eq!(config.world_dir, PathBuf::from("world"));
+    assert_eq!(config.autosave_interval_seconds, 300);
 }
 
 #[test]
@@ -27,6 +29,8 @@ fn every_key_parses() {
         registry_table = "t.json"
         seed = -5
         generation_workers = 3
+        world_dir = "saves/main"
+        autosave_interval_seconds = 60
         bind_address = "127.0.0.1"
         port = 25570
         online_mode = false
@@ -50,6 +54,8 @@ fn every_key_parses() {
     assert_eq!(config.outbound_queue_packets, 128);
     assert_eq!(config.seed, -5);
     assert_eq!(config.generation_workers, 3);
+    assert_eq!(config.world_dir, PathBuf::from("saves/main"));
+    assert_eq!(config.autosave_interval_seconds, 60);
 }
 
 #[test]

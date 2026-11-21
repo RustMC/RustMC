@@ -3,9 +3,9 @@
 //!
 //! Why: every player near a column receives the same packet, so it is
 //! encoded once and shared; edits invalidate it.
-//! Done: request de-duplication, packet sharing, unloading of unchanged
-//! columns nobody views. Not done: saving edited columns (track C keeps
-//! them in memory until then).
+//! Done: request de-duplication, packet sharing, tracking which columns
+//! changed since they were last saved, unloading of saved columns nobody
+//! views. Not done: nothing known.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,13 +20,16 @@ use crate::net::framing::Packet;
 pub struct ReadyChunk {
     pub column: Column,
     pub packet: Option<Arc<Packet>>,
+    /// The saved copy could not be read; this column must never be saved.
+    pub damaged: bool,
 }
 
 struct Stored {
     column: Column,
     packet: Option<Arc<Packet>>,
-    /// Changed since generation: kept loaded so the change is not lost.
-    edited: bool,
+    /// Changed since it was last saved: kept loaded until it is saved.
+    dirty: bool,
+    damaged: bool,
 }
 
 /// Loaded columns and pending requests.
@@ -64,7 +67,8 @@ impl ChunkStore {
         self.columns.entry(position).or_insert(Stored {
             column: ready.column,
             packet: ready.packet,
-            edited: false,
+            dirty: false,
+            damaged: ready.damaged,
         });
     }
 
@@ -95,7 +99,7 @@ impl ChunkStore {
         )?;
         if previous != state {
             stored.packet = None;
-            stored.edited = true;
+            stored.dirty = !stored.damaged;
         }
         Some(previous)
     }
@@ -108,10 +112,32 @@ impl ChunkStore {
         )
     }
 
-    /// Unloads unedited columns for which `viewed` is false.
+    /// Unloads saved columns for which `viewed` is false.
     pub fn unload_unviewed(&mut self, viewed: impl Fn((i32, i32)) -> bool) {
         self.columns
-            .retain(|position, stored| stored.edited || viewed(*position));
+            .retain(|position, stored| stored.dirty || viewed(*position));
+    }
+
+    /// Whether a column is loaded or on its way.
+    pub fn is_known(&self, position: (i32, i32)) -> bool {
+        self.columns.contains_key(&position) || self.requested.contains(&position)
+    }
+
+    /// Columns changed since they were last saved.
+    pub fn dirty_columns(&self) -> impl Iterator<Item = &Column> {
+        self.columns
+            .values()
+            .filter(|stored| stored.dirty)
+            .map(|stored| &stored.column)
+    }
+
+    /// Records that these columns now match their saved copies.
+    pub fn mark_saved(&mut self, positions: &[(i32, i32)]) {
+        for position in positions {
+            if let Some(stored) = self.columns.get_mut(position) {
+                stored.dirty = false;
+            }
+        }
     }
 
     /// Loaded columns and their memory, for the load test and logs.

@@ -48,6 +48,14 @@ pub const LOGIN_TIMEOUT_MS: RangeInclusive<u64> = 1_000..=120_000;
 /// Allowed `outbound_queue_packets`: packets waiting for one slow client
 /// before it is disconnected.
 pub const OUTBOUND_QUEUE_PACKETS: RangeInclusive<usize> = 64..=65_536;
+/// Allowed `autosave_interval_seconds`. Vanilla saves every 6,000 ticks
+/// (five minutes); edits in between are kept safe by the journal.
+pub const AUTOSAVE_INTERVAL_SECONDS: RangeInclusive<u64> = 10..=3_600;
+/// Default `autosave_interval_seconds`, vanilla's five minutes.
+pub const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: u64 = 300;
+/// Default `world_dir`, relative to the working directory.
+pub const DEFAULT_WORLD_DIR: &str = "world";
+
 /// Allowed `generation_workers`: chunk generation threads.
 pub const GENERATION_WORKERS: RangeInclusive<usize> = 1..=64;
 
@@ -73,6 +81,9 @@ pub struct ServerConfig {
     pub seed: i64,
     /// Chunk generation threads.
     pub generation_workers: usize,
+    /// Directory holding the saved world.
+    pub world_dir: PathBuf,
+    pub autosave_interval_seconds: u64,
     pub session_server: String,
     pub max_packet_bytes: usize,
     pub read_bytes_per_second: usize,
@@ -95,6 +106,8 @@ impl ServerConfig {
             registry_table,
             seed: 0,
             generation_workers: default_workers(),
+            world_dir: PathBuf::from(DEFAULT_WORLD_DIR),
+            autosave_interval_seconds: DEFAULT_AUTOSAVE_INTERVAL_SECONDS,
             session_server: MOJANG_SESSION_SERVER.to_owned(),
             max_packet_bytes: MAX_PACKET_WIRE_BYTES,
             read_bytes_per_second: DEFAULT_READ_BYTES_PER_SECOND,
@@ -112,7 +125,7 @@ pub fn default_workers() -> usize {
         .clamp(*GENERATION_WORKERS.start(), *GENERATION_WORKERS.end())
 }
 
-const KEYS: [&str; 17] = [
+const KEYS: [&str; 19] = [
     "bind_address",
     "port",
     "online_mode",
@@ -125,6 +138,8 @@ const KEYS: [&str; 17] = [
     "registry_table",
     "seed",
     "generation_workers",
+    "world_dir",
+    "autosave_interval_seconds",
     "session_server",
     "max_packet_bytes",
     "read_bytes_per_second",
@@ -194,6 +209,18 @@ pub fn parse_server(value: &toml::Value) -> Result<ServerConfig, String> {
         "generation_workers",
         config.generation_workers,
         &GENERATION_WORKERS,
+    )?;
+    if let Some(dir) = text(table, "world_dir")? {
+        if dir.is_empty() {
+            return Err("`server.world_dir` must not be empty".to_owned());
+        }
+        config.world_dir = PathBuf::from(dir);
+    }
+    config.autosave_interval_seconds = integer(
+        table,
+        "autosave_interval_seconds",
+        config.autosave_interval_seconds,
+        &AUTOSAVE_INTERVAL_SECONDS,
     )?;
     if let Some(address) = text(table, "bind_address")? {
         let ip: IpAddr = address
