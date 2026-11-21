@@ -5,6 +5,7 @@
 //! per connection; the server needs shared, authenticated sessions.
 //! Done: see each submodule. Not done: proxy protocols, transfer packets.
 
+pub mod configuration;
 pub mod crypto;
 pub mod framing;
 pub mod identity;

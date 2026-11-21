@@ -10,8 +10,9 @@ use crate::java_preview::{MAX_HORIZONTAL_POSITION, MAX_VERTICAL_POSITION};
 use crate::java_wire::{
     WireError, encode_set_compression, frame, frame_compressed, pack_block_position, put_string,
     put_varint, read_compressed_frame, read_f32_be, read_f64_be, read_i16_be, read_i64_be,
-    read_string, read_u64_be, read_varint, reframe_compressed, unpack_block_position,
+    read_u64_be, read_varint, reframe_compressed, unpack_block_position,
 };
+use crate::net::configuration as configuration_packets;
 use crate::preview_data::RegistryManifest;
 use crate::protocol::{
     chat,
@@ -68,78 +69,25 @@ impl From<WireError> for Error {
 }
 
 fn known_packs() -> Vec<u8> {
-    let mut body = Vec::new();
-    put_varint(1, &mut body);
-    for text in ["minecraft", "core", VERSION] {
-        put_string(text, &mut body);
-    }
-    frame(configuration::clientbound::SELECT_KNOWN_PACKS, &body)
-}
-
-fn registry_data(registry: &str, entries: &[String]) -> Vec<u8> {
-    let mut body = Vec::new();
-    put_string(registry, &mut body);
-    put_varint(entries.len() as u32, &mut body);
-    for entry in entries {
-        put_string(entry, &mut body);
-        body.push(0); // Entry definition comes from the negotiated core pack.
-    }
-    frame(configuration::clientbound::REGISTRY_DATA, &body)
+    framed(configuration_packets::known_packs())
 }
 
 fn initial_configuration(manifest: Option<&RegistryManifest>) -> Vec<Vec<u8>> {
-    let mut features = Vec::new();
-    put_varint(1, &mut features);
-    put_string("minecraft:vanilla", &mut features);
-    let mut packets = vec![frame(
-        configuration::clientbound::UPDATE_ENABLED_FEATURES,
-        &features,
-    )];
-    if let Some(manifest) = manifest {
-        for (registry, entries) in &manifest.registries {
-            packets.push(registry_data(registry, entries));
-        }
-    }
-    let mut tags = Vec::new();
-    put_varint(manifest.map_or(0, |m| m.tags.len()) as u32, &mut tags);
-    if let Some(manifest) = manifest {
-        for registry in &manifest.tags {
-            put_string(&registry.registry, &mut tags);
-            put_varint(registry.tags.len() as u32, &mut tags);
-            for (name, ids) in &registry.tags {
-                put_string(name, &mut tags);
-                put_varint(ids.len() as u32, &mut tags);
-                for id in ids {
-                    put_varint(*id, &mut tags);
-                }
-            }
-        }
-    }
-    packets.push(frame(configuration::clientbound::UPDATE_TAGS, &tags));
-    packets.push(frame(configuration::clientbound::FINISH_CONFIGURATION, &[]));
-    packets
+    configuration_packets::initial_configuration(manifest)
+        .into_iter()
+        .map(framed)
+        .collect()
+}
+
+fn framed(packet: crate::net::framing::Packet) -> Vec<u8> {
+    frame(packet.id, &packet.body)
 }
 
 fn recognizes_core_pack(body: &[u8]) -> Result<bool, Error> {
-    let Some((count, prefix)) = read_varint(body)? else {
-        return Err(Error::Malformed);
-    };
-    if count > 16 {
-        return Err(Error::Oversized);
-    }
-    let mut remaining = &body[prefix..];
-    let mut recognized = false;
-    for _ in 0..count {
-        let (namespace, rest) = read_string(remaining, MAX_SHORT_STRING)?;
-        let (id, rest) = read_string(rest, MAX_SHORT_STRING)?;
-        let (version, rest) = read_string(rest, MAX_SHORT_STRING)?;
-        recognized |= namespace == "minecraft" && id == "core" && version == VERSION;
-        remaining = rest;
-    }
-    if !remaining.is_empty() {
-        return Err(Error::Malformed);
-    }
-    Ok(recognized)
+    configuration_packets::recognizes_core_pack(body).map_err(|error| match error {
+        configuration_packets::PackListError::TooMany => Error::Oversized,
+        configuration_packets::PackListError::Malformed => Error::Malformed,
+    })
 }
 
 fn status(local_preview: bool) -> Vec<u8> {
