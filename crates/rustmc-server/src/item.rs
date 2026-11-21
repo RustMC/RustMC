@@ -900,66 +900,7 @@ pub(crate) const fn valid_item_id(id: &str) -> bool {
     true
 }
 
-/// Compile-time validated namespaced item or potion identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StaticItemId(&'static str);
-
-impl StaticItemId {
-    /// Validates `id` in a `const` context.
-    pub(crate) const fn new(id: &'static str) -> Self {
-        assert!(valid_item_id(id), "static item ID must be valid");
-        Self(id)
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        self.0
-    }
-}
-
-/// Compile-time validated item stack parameters (`id`, `count`, `max_stack`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StaticStackSpec {
-    pub(crate) id: StaticItemId,
-    pub(crate) count: u16,
-    pub(crate) max_stack: u16,
-}
-
-impl StaticStackSpec {
-    /// Validates `id`, `count`, and `max_stack` in a `const` context.
-    pub(crate) const fn new(id: &'static str, count: u16, max_stack: u16) -> Self {
-        let id = StaticItemId::new(id);
-        assert!(
-            max_stack >= 1 && max_stack <= MAX_STACK_LIMIT,
-            "static max_stack must be in 1..=MAX_STACK_LIMIT"
-        );
-        assert!(
-            count >= 1 && count <= max_stack,
-            "static count must be in 1..=max_stack"
-        );
-        Self {
-            id,
-            count,
-            max_stack,
-        }
-    }
-}
-
 impl ItemStack {
-    /// Constructs a validated stack from compile-time checked static parameters.
-    pub(crate) fn from_static(spec: StaticStackSpec) -> Self {
-        Self {
-            item: spec.id.as_str().to_owned(),
-            count: spec.count,
-            max_stack: spec.max_stack,
-            components: None,
-        }
-    }
-
-    /// Sets `minecraft:potion_contents` base potion ID from a statically validated identifier.
-    pub(crate) fn with_static_potion(mut self, potion: StaticItemId) -> Self {
-        self.components_mut().potion = Some(potion.as_str().to_owned());
-        self
-    }
     /// Constructs a validated stack with empty components, checking the item id,
     /// max stack size, and count in order.
     pub fn try_new(

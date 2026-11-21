@@ -1,11 +1,5 @@
 //! Original coordinate-derived preview terrain; no vanilla generation parity.
 
-pub mod crafting;
-
-pub use crafting::{
-    CraftResult, CraftingError, CraftingGrid, GridBoundingBox, Ingredient, Recipe, RecipeRegistry,
-    ShapedRecipe, ShapelessRecipe, crafting_remainder,
-};
 pub mod container;
 
 #[cfg(test)]
@@ -70,26 +64,8 @@ pub use events::{
     apply_block_place, rollback_break, rollback_break_explicit, rollback_break_with_ack,
     rollback_place, rollback_place_explicit, rollback_place_with_ack,
 };
-pub mod brewing;
-pub mod container_data;
 pub mod enchantment;
-pub mod furnace;
-pub mod recipe_data;
 
-pub use brewing::{
-    BrewingError, BrewingRecipe, BrewingRecipeRegistry, BrewingSlotItem, BrewingStandBlockEntity,
-    BrewingStandProperty, Potion,
-};
-pub use container_data::{
-    SET_CONTAINER_DATA_PACKET_ID, SetContainerDataError, SetContainerDataPacket,
-};
-pub use furnace::{
-    FuelRegistry, FurnaceBlockEntity, FurnaceProperty, SmeltingRecipe, SmeltingRecipeRegistry,
-};
-pub use recipe_data::{
-    CRAFTING_REPAIR_BONUS_DIVISOR, CookingKind, CookingRecipe, RecipeData, RecipeDataError,
-    RepairItemRecipe, SkipReason, StonecuttingRecipe, TransmuteRecipe, repair_combined_damage,
-};
 pub mod inventory;
 pub use inventory::{
     HOTBAR_SLOT_COUNT, HOTBAR_SLOTS, InventoryError, MAIN_SLOT_COUNT, MAIN_SLOTS, PlayerInventory,
