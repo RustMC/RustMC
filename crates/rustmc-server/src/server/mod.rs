@@ -5,4 +5,5 @@
 //! players; this module is the server players actually share.
 //! Done: see submodules. Not done: see `docs/STATUS.md`.
 
+pub mod config;
 pub mod join;
