@@ -96,10 +96,22 @@ shared world, and other players are not visible.
 
 ## Deletions
 
-Filled in as each subsystem is removed.
+41,074 lines removed in total. To restore a subsystem, revert its commit
+(`git revert <commit>`) or read a file back with `git show <commit>^:<path>`.
 
-| Subsystem | Commit |
-| --- | --- |
+| Subsystem | Files | Commit |
+| --- | --- | --- |
+| Vanilla rule bundle and `check_vanilla_data` tool | `world/vanilla_rules.rs`, tool and its test | `4bae815` |
+| Loot tables (block, entity, chest, gameplay, archaeology) | `world/loot.rs` | `c3f1e62` |
+| Anvil, grindstone, enchanting table | `world/anvil.rs`, `world/grindstone.rs`, `world/enchanting.rs` | `cacf3fb` |
+| Crafting, recipe data, furnace, brewing, container data | `world/crafting.rs`, `world/recipe_data.rs`, `world/furnace.rs`, `world/brewing.rs`, `world/container_data.rs` | `4172655` |
+| Experience | `world/experience.rs` and tests | `13d8d13` |
+| Fluids | `world/fluid.rs` and tests | `79848c1` |
+| Projectiles | `world/projectile.rs` | `23bb1dd` |
+| Explosions | `world/explosion.rs` | `de0f525` |
+| Mob AI | `entity/ai.rs` | `12e397d` |
+| Bedrock session, chunk and batch codecs | `bedrock/`, `bedrock_chunk.rs`, `bedrock_framing.rs` | `53b3438` |
+| Item default components (tool, food, consumable rules) | part of `item.rs` | `425e2cc` |
 
 ## Owner decisions
 
