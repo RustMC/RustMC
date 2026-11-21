@@ -403,12 +403,8 @@ fn joined_players_receive_terrain_and_walking_moves_the_view() {
         &25.0f32.to_be_bytes(),
     );
     client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
-    let mut moved = Vec::new();
-    for value in [400.5f64, 120.0, 0.5] {
-        moved.extend(value.to_be_bytes());
-    }
-    moved.push(1);
-    client.send(play::serverbound::MOVE_PLAYER_POS, &moved);
+    let spawn = spawn_position(&mut client);
+    walk_to(&mut client, spawn, [400.5, 120.0, 0.5]);
     let mut saw_center = false;
     let mut saw_forget = false;
     for _ in 0..2_000 {
@@ -432,6 +428,28 @@ fn joined_players_receive_terrain_and_walking_moves_the_view() {
 }
 
 /// Reads the first Synchronize Player Position after joining.
+/// Moves the player from `from` to `to` in steps short enough to be
+/// accepted as walking.
+fn walk_to(client: &mut Client, from: [f64; 3], to: [f64; 3]) {
+    const STEP: f64 = 9.0;
+    let distance = from
+        .iter()
+        .zip(to)
+        .map(|(a, b)| (b - a) * (b - a))
+        .sum::<f64>()
+        .sqrt();
+    let steps = (distance / STEP).ceil().max(1.0) as u32;
+    for step in 1..=steps {
+        let t = f64::from(step) / f64::from(steps);
+        let mut body = Vec::new();
+        for (a, b) in from.iter().zip(to) {
+            body.extend((a + (b - a) * t).to_be_bytes());
+        }
+        body.push(1);
+        client.send(play::serverbound::MOVE_PLAYER_POS, &body);
+    }
+}
+
 fn spawn_position(client: &mut Client) -> [f64; 3] {
     // finish_login stops at the teleport; its body starts with the teleport
     // id VarInt (1) and then x, y, z as doubles.
@@ -457,6 +475,8 @@ fn players_and_journaled_edits_survive_a_restart() {
         client.hello("Saver");
         client.finish_login();
         client.send(play::serverbound::ACCEPT_TELEPORTATION, &[1]);
+        let spawn = spawn_position(&mut client);
+        walk_to(&mut client, spawn, [100.5, 90.0, -40.5]);
         let mut moved = Vec::new();
         for value in [100.5f64, 90.0, -40.5] {
             moved.extend(value.to_be_bytes());
@@ -671,8 +691,9 @@ fn two_players_see_each_other_join_move_and_leave() {
     assert_eq!(spawned.body[n..n + 16], offline_uuid("Builder"));
     receive_until(&mut builder, play::clientbound::ADD_ENTITY);
     // Movement reaches the watcher.
+    let builder_spawn = spawn_position(&mut builder);
     let mut moved = Vec::new();
-    for value in [3.5f64, 90.0, 4.5] {
+    for value in [3.5f64, builder_spawn[1], 4.5] {
         moved.extend(value.to_be_bytes());
     }
     moved.push(1);
@@ -695,4 +716,22 @@ fn two_players_see_each_other_join_move_and_leave() {
         read_varint(&removed.body[1..]).unwrap().unwrap().0,
         builder_entity
     );
+}
+
+#[test]
+fn a_move_of_more_than_ten_blocks_is_undone() {
+    let server = start(false, None);
+    let mut client = join_playing(server.address, "Jumper");
+    let spawn = spawn_position(&mut client);
+    let mut far = Vec::new();
+    for value in [spawn[0] + 50.0, spawn[1], spawn[2]] {
+        far.extend(value.to_be_bytes());
+    }
+    far.push(1);
+    client.send(play::serverbound::MOVE_PLAYER_POS, &far);
+    let back = receive_until(&mut client, play::clientbound::PLAYER_POSITION);
+    let (teleport, n) = read_varint(&back.body).unwrap().unwrap();
+    assert_eq!(teleport, 2, "a new teleport id");
+    let x = f64::from_be_bytes(back.body[n..n + 8].try_into().expect("x"));
+    assert_eq!(x, spawn[0], "back to the last accepted position");
 }

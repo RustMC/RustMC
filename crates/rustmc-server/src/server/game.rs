@@ -10,6 +10,7 @@
 //! Not done: movement validation and block play (D), chat and commands (E).
 
 mod blocks;
+mod movement;
 mod players;
 
 pub use players::PLAYER_ENTITY_TYPE;
@@ -39,7 +40,6 @@ use crate::net::identity::{GameProfile, uuid_text};
 use crate::net::login::JoinRequest;
 use crate::preview_data::RegistryManifest;
 use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
-use crate::protocol::movement::{ServerboundMovementPacket, decode_serverbound_movement_packet};
 use crate::storage::journal::Journal;
 use crate::storage::world_files::LevelData;
 use crate::world::inventory::PlayerInventory;
@@ -74,6 +74,8 @@ struct Player {
     keepalive: KeepAliveTracker,
     last_keepalive_tick: u64,
     awaiting_teleport: Option<u32>,
+    /// The id of the last teleport sent.
+    next_teleport_id: u32,
     position: [f64; 3],
     yaw: f32,
     pitch: f32,
@@ -284,6 +286,7 @@ impl Game {
                 keepalive: KeepAliveTracker::default(),
                 last_keepalive_tick: self.tick,
                 awaiting_teleport: Some(teleport_id),
+                next_teleport_id: teleport_id,
                 position,
                 yaw,
                 pitch,
@@ -302,14 +305,17 @@ impl Game {
 
     fn packet(&mut self, id: ConnectionId, packet: Packet) {
         let body = packet.body.as_slice();
-        let block_play = match packet.id {
+        let routed = match packet.id {
             serverbound::SET_CREATIVE_MODE_SLOT => Some(self.creative_slot(id, body)),
             serverbound::SET_CARRIED_ITEM => Some(self.carried_item(id, body)),
             serverbound::PLAYER_ACTION => Some(self.player_action(id, body)),
             serverbound::USE_ITEM_ON => Some(self.use_item_on(id, body)),
+            serverbound::MOVE_PLAYER_POS
+            | serverbound::MOVE_PLAYER_POS_ROT
+            | serverbound::MOVE_PLAYER_ROT => Some(self.move_player(id, packet.id, body)),
             _ => None,
         };
-        if let Some(result) = block_play {
+        if let Some(result) = routed {
             if let Err(text) = result {
                 self.remove_player(id, text);
             }
@@ -345,9 +351,6 @@ impl Game {
                 }
                 _ => Err(reason::BAD_PACKET),
             },
-            serverbound::MOVE_PLAYER_POS
-            | serverbound::MOVE_PLAYER_POS_ROT
-            | serverbound::MOVE_PLAYER_ROT => move_player(player, packet.id, body),
             _ => Ok(()),
         };
         if let Err(text) = kick {
@@ -417,38 +420,6 @@ impl Game {
     pub fn player_count(&self) -> usize {
         self.players.len()
     }
-}
-
-/// Applies a position update and moves the player's view with it.
-fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static str> {
-    let (position, rotation, on_ground) = match decode_serverbound_movement_packet(id, body) {
-        Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None, p.on_ground),
-        Ok(ServerboundMovementPacket::PosRot(p)) => {
-            ([p.x, p.y, p.z], Some((p.yaw, p.pitch)), p.on_ground)
-        }
-        Ok(ServerboundMovementPacket::Rot(p)) => {
-            (player.position, Some((p.yaw, p.pitch)), p.on_ground)
-        }
-        _ => return Err(reason::BAD_PACKET),
-    };
-    if player.awaiting_teleport.is_some() {
-        // Moves sent before the client confirmed the last teleport are
-        // stale; vanilla ignores them the same way.
-        return Ok(());
-    }
-    player.position = position;
-    player.on_ground = on_ground;
-    player.moved = true;
-    if let Some((yaw, pitch)) = rotation {
-        player.yaw = yaw;
-        player.pitch = pitch;
-    }
-    for out in player.view.recenter(chunk_of(position[0], position[2])) {
-        if !player.handle.send(out) {
-            return Err(reason::SLOW);
-        }
-    }
-    Ok(())
 }
 
 /// Sends a play-phase Disconnect and closes the connection.
