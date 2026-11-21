@@ -70,13 +70,10 @@ pub use events::{
     apply_block_place, rollback_break, rollback_break_explicit, rollback_break_with_ack,
     rollback_place, rollback_place_explicit, rollback_place_with_ack,
 };
-pub mod anvil;
 pub mod brewing;
 pub mod container_data;
-pub mod enchanting;
 pub mod enchantment;
 pub mod furnace;
-pub mod grindstone;
 pub mod recipe_data;
 
 pub use brewing::{
