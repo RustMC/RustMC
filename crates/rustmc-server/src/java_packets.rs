@@ -36,10 +36,14 @@ pub mod status {
 pub mod login {
     pub mod serverbound {
         pub const HELLO: u32 = 0;
+        /// `minecraft:key` (Encryption Response).
+        pub const KEY: u32 = 1;
         pub const LOGIN_ACKNOWLEDGED: u32 = 3;
     }
     pub mod clientbound {
         pub const LOGIN_DISCONNECT: u32 = 0;
+        /// `minecraft:hello` (Encryption Request).
+        pub const HELLO: u32 = 1;
         pub const LOGIN_FINISHED: u32 = 2;
         pub const SET_COMPRESSION: u32 = 3;
     }
