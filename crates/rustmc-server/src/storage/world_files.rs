@@ -199,6 +199,15 @@ impl WorldFiles {
             return Ok(None);
         };
         let tag = parse_root(&bytes).map_err(|_| StorageError::Malformed(path.clone(), "chunk"))?;
+        // A chunk filed under another slot is damaged: serving it would key
+        // it by its own coordinates and leave the requested one missing.
+        let stored = (
+            tag.get("xPos").and_then(Tag::as_i32),
+            tag.get("zPos").and_then(Tag::as_i32),
+        );
+        if stored != (Some(chunk_x), Some(chunk_z)) {
+            return Err(StorageError::Malformed(path, "chunk coordinates"));
+        }
         decode(&tag, tables)
             .map(Some)
             .map_err(|error| StorageError::Chunk(path, error))
@@ -217,8 +226,15 @@ impl WorldFiles {
         let mut count = 0;
         for column in columns {
             let path = self.region_path(column.x, column.z);
-            let tag = encode(column, tables, game_time as i64)
-                .map_err(|error| StorageError::Chunk(path.clone(), error))?;
+            let Tag::Compound(modelled) = encode(column, tables, game_time as i64)
+                .map_err(|error| StorageError::Chunk(path.clone(), error))?
+            else {
+                return Err(StorageError::Malformed(path, "chunk"));
+            };
+            let tag = Tag::Compound(merge_chunk(
+                self.stored_chunk_tags(&path, column.x, column.z)?,
+                modelled,
+            ));
             let mut nbt = Vec::new();
             write_root(&tag, &mut nbt);
             let stored = compress(&nbt).map_err(|error| StorageError::Io(path.clone(), error))?;
@@ -235,6 +251,29 @@ impl WorldFiles {
             save_chunks(&path, chunks, timestamp).map_err(|error| StorageError::Io(path, error))?;
         }
         Ok(count)
+    }
+
+    /// The tags of the chunk already saved in a slot, or none.
+    fn stored_chunk_tags(
+        &self,
+        path: &Path,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Result<BTreeMap<String, Tag>, StorageError> {
+        let side = REGION_SIDE as i32;
+        let bytes = read_chunk(
+            path,
+            chunk_x.rem_euclid(side) as usize,
+            chunk_z.rem_euclid(side) as usize,
+        )
+        .map_err(|error| StorageError::Io(path.to_path_buf(), error))?;
+        let Some(bytes) = bytes else {
+            return Ok(BTreeMap::new());
+        };
+        match parse_root(&bytes) {
+            Ok(Tag::Compound(tags)) => Ok(tags),
+            _ => Err(StorageError::Malformed(path.to_path_buf(), "chunk")),
+        }
     }
 
     /// A player's saved state, if they played here before.
@@ -281,9 +320,17 @@ impl WorldFiles {
         }))
     }
 
-    /// Saves a player's state.
+    /// Saves a player's state into their file. Tags RustMC does not model
+    /// (a vanilla save's `Inventory`, health, experience and so on) are kept;
+    /// a damaged existing file is an error rather than being overwritten.
     pub fn save_player(&self, uuid: &[u8; 16], player: &PlayerData) -> Result<(), StorageError> {
-        let tag = compound(&[
+        let path = self.player_path(uuid);
+        let mut tags = match read_gzip_nbt(&path)? {
+            Some(Tag::Compound(tags)) => tags,
+            Some(_) => return Err(StorageError::Malformed(path, "player")),
+            None => BTreeMap::new(),
+        };
+        let Tag::Compound(modelled) = compound(&[
             ("DataVersion", Tag::Int(DATA_VERSION)),
             (
                 "Pos",
@@ -295,8 +342,11 @@ impl WorldFiles {
             ),
             ("playerGameType", Tag::Int(player.game_mode as i32)),
             ("Dimension", Tag::String("minecraft:overworld".to_owned())),
-        ]);
-        write_gzip_nbt(&self.player_path(uuid), &tag)
+        ]) else {
+            return Err(StorageError::Malformed(path, "player"));
+        };
+        tags.extend(modelled);
+        write_gzip_nbt(&path, &Tag::Compound(tags))
     }
 
     /// The world's saved seed and clocks: RustMC's own level data, else a
@@ -335,3 +385,19 @@ impl WorldFiles {
 
 #[cfg(test)]
 mod tests;
+
+/// The chunk to write: the saved chunk's tags with RustMC's modelled ones
+/// replacing theirs. Block entities, ticks, structures and other tags RustMC
+/// does not model survive a rewrite; `Heightmaps` is dropped so vanilla
+/// recomputes it from the new blocks, and a saved `InhabitedTime` is kept.
+fn merge_chunk(
+    mut stored: BTreeMap<String, Tag>,
+    mut modelled: BTreeMap<String, Tag>,
+) -> BTreeMap<String, Tag> {
+    stored.remove("Heightmaps");
+    if stored.contains_key("InhabitedTime") {
+        modelled.remove("InhabitedTime");
+    }
+    stored.extend(modelled);
+    stored
+}

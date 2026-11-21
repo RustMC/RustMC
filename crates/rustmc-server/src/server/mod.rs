@@ -97,6 +97,9 @@ pub fn run(
             world_age: 0,
             day_time: 0,
         });
+    // Written before anyone joins, so player files never outlive the seed
+    // their positions were saved in.
+    files.save_level(&level).map_err(ServerError::Storage)?;
     let (journal, replay) = Journal::open(&files.journal_path())
         .map_err(|error| ServerError::Storage(StorageError::Io(files.journal_path(), error)))?;
     // The generator hashes the signed seed's bits.

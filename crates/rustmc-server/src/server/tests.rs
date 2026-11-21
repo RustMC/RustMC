@@ -735,3 +735,14 @@ fn a_move_of_more_than_ten_blocks_is_undone() {
     let x = f64::from_be_bytes(back.body[n..n + 8].try_into().expect("x"));
     assert_eq!(x, spawn[0], "back to the last accepted position");
 }
+
+#[test]
+fn a_new_world_records_its_seed_before_anyone_joins() {
+    let dir = temp_dir();
+    let server = start_in(&dir, false, None);
+    let level = crate::storage::world_files::WorldFiles::new(&dir.join("world"))
+        .load_level()
+        .expect("load");
+    assert_eq!(level.map(|l| l.seed), Some(0));
+    drop(server);
+}

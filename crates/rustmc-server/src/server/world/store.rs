@@ -30,6 +30,9 @@ struct Stored {
     /// Changed since it was last saved: kept loaded until it is saved.
     dirty: bool,
     damaged: bool,
+    /// Edited while damaged: never saved, so those edits live only in the
+    /// journal, which must be kept and the column kept loaded.
+    journal_only: bool,
 }
 
 /// Loaded columns and pending requests.
@@ -69,6 +72,7 @@ impl ChunkStore {
             packet: ready.packet,
             dirty: false,
             damaged: ready.damaged,
+            journal_only: false,
         });
     }
 
@@ -99,7 +103,11 @@ impl ChunkStore {
         )?;
         if previous != state {
             stored.packet = None;
-            stored.dirty = !stored.damaged;
+            if stored.damaged {
+                stored.journal_only = true;
+            } else {
+                stored.dirty = true;
+            }
         }
         Some(previous)
     }
@@ -115,7 +123,12 @@ impl ChunkStore {
     /// Unloads saved columns for which `viewed` is false.
     pub fn unload_unviewed(&mut self, viewed: impl Fn((i32, i32)) -> bool) {
         self.columns
-            .retain(|position, stored| stored.dirty || viewed(*position));
+            .retain(|position, stored| stored.dirty || stored.journal_only || viewed(*position));
+    }
+
+    /// Whether a damaged column holds edits that only the journal records.
+    pub fn has_journal_only_edits(&self) -> bool {
+        self.columns.values().any(|stored| stored.journal_only)
     }
 
     /// Whether a column is loaded or on its way.
