@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+//! The `rustmc-server` binary: parses CLI flags, validates the config file and
+//! runs the listener until SIGINT or SIGTERM.
+
 use std::{
     io::{self, Write},
     path::Path,

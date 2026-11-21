@@ -1,3 +1,5 @@
+//! Unit tests for `world::time_weather`: day cycle and weather transitions.
+
 use super::time_weather::*;
 
 #[test]

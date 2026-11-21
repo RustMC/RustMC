@@ -1,3 +1,5 @@
+//! Integration tests for the vanilla oracle tool's coverage accounting and exit codes.
+
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;

@@ -1,3 +1,5 @@
+//! Unit tests for `discovery_java::keepalive`: challenge timing, matching and timeout disconnects.
+
 use super::keepalive::*;
 
 #[test]

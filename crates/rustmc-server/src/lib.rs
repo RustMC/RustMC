@@ -3,9 +3,6 @@
 //! RustMC configuration, discovery, and opt-in local Java terrain preview.
 //! The preview is unauthenticated and has no authoritative gameplay world.
 
-pub mod bedrock;
-pub mod bedrock_chunk;
-pub mod bedrock_framing;
 pub mod chunk_adapter;
 pub mod commands;
 pub mod discovery_bedrock;
@@ -22,7 +19,7 @@ pub mod runtime;
 pub mod vanilla;
 pub mod world;
 
-use std::{net::IpAddr, path::Path};
+use std::{net::IpAddr, ops::RangeInclusive, path::Path};
 
 /// Configuration schema supported by the bootstrap and development CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,9 +88,97 @@ pub struct ListenerConfig {
 }
 
 /// Allowed `listener.preview_session_lifetime_ms` values.
-pub const PREVIEW_SESSION_LIFETIME_MS: std::ops::RangeInclusive<u64> = 10_000..=3_600_000;
+pub const PREVIEW_SESSION_LIFETIME_MS: RangeInclusive<u64> = 10_000..=3_600_000;
 /// Allowed `listener.preview_read_bytes_per_second` values.
-pub const PREVIEW_READ_BYTES_PER_SECOND: std::ops::RangeInclusive<usize> = 1_024..=1_048_576;
+pub const PREVIEW_READ_BYTES_PER_SECOND: RangeInclusive<usize> = 1_024..=1_048_576;
+/// Allowed `listener.max_connections`: each connection owns bounded buffers,
+/// so this caps the listener's memory.
+pub const MAX_CONNECTIONS: RangeInclusive<usize> = 1..=64;
+/// Allowed `listener.max_bytes_per_connection` (the read budget of one
+/// connection before it is closed).
+pub const MAX_BYTES_PER_CONNECTION: RangeInclusive<usize> = 1..=65_536;
+/// Allowed `listener.idle_timeout_ms`.
+pub const IDLE_TIMEOUT_MS: RangeInclusive<u64> = 10..=60_000;
+/// Allowed `listener.max_connection_lifetime_ms` when the preview is enabled.
+pub const CONNECTION_LIFETIME_MS: RangeInclusive<u64> = 10..=3_600_000;
+/// Longest connection a discovery-only listener keeps: status and ping
+/// exchanges finish in well under a minute.
+pub const DISCOVERY_CONNECTION_LIFETIME_MAX_MS: u64 = 60_000;
+/// Allowed `listener.vanilla_generation_workers` (generator threads).
+pub const VANILLA_GENERATION_WORKERS: RangeInclusive<usize> = 1..=20;
+/// Allowed `listener.preview_view_distance` in chunks, the client's own
+/// render-distance range.
+pub const PREVIEW_VIEW_DISTANCE: RangeInclusive<u8> = 2..=32;
+
+impl ListenerConfig {
+    /// Longest connection lifetime this listener accepts.
+    fn max_lifetime_ms(&self) -> u64 {
+        if self.local_java_preview {
+            *CONNECTION_LIFETIME_MS.end()
+        } else {
+            DISCOVERY_CONNECTION_LIFETIME_MAX_MS
+        }
+    }
+
+    /// Checks the numeric limits and preview-only options, whether the value
+    /// came from a file or was built in code.
+    pub fn validate(&self) -> Result<(), String> {
+        let lifetime = *CONNECTION_LIFETIME_MS.start()..=self.max_lifetime_ms();
+        let checks = [
+            (
+                MAX_CONNECTIONS.contains(&self.max_connections),
+                "`listener.max_connections` is out of range",
+            ),
+            (
+                MAX_BYTES_PER_CONNECTION.contains(&self.max_bytes_per_connection),
+                "`listener.max_bytes_per_connection` is out of range",
+            ),
+            (
+                IDLE_TIMEOUT_MS.contains(&self.idle_timeout_ms),
+                "`listener.idle_timeout_ms` is out of range",
+            ),
+            (
+                lifetime.contains(&self.max_connection_lifetime_ms),
+                "`listener.max_connection_lifetime_ms` is out of range",
+            ),
+            (
+                self.idle_timeout_ms <= self.max_connection_lifetime_ms,
+                "`listener.idle_timeout_ms` cannot exceed `listener.max_connection_lifetime_ms`",
+            ),
+            (
+                PREVIEW_VIEW_DISTANCE.contains(&self.preview_view_distance),
+                "`listener.preview_view_distance` is out of range",
+            ),
+            (
+                VANILLA_GENERATION_WORKERS.contains(&self.vanilla_generation_workers),
+                "`listener.vanilla_generation_workers` is out of range",
+            ),
+            (
+                PREVIEW_SESSION_LIFETIME_MS.contains(&self.preview_session_lifetime_ms),
+                "`listener.preview_session_lifetime_ms` is out of range",
+            ),
+            (
+                PREVIEW_READ_BYTES_PER_SECOND.contains(&self.preview_read_bytes_per_second),
+                "`listener.preview_read_bytes_per_second` is out of range",
+            ),
+            (
+                self.local_java_preview
+                    || (self.preview_registry_manifest.is_none()
+                        && self.preview_compression_threshold.is_none()),
+                "preview options require `listener.local_java_preview = true`",
+            ),
+            (
+                self.preview_compression_threshold
+                    .is_none_or(|threshold| i32::try_from(threshold).is_ok()),
+                "`listener.preview_compression_threshold` is out of range",
+            ),
+        ];
+        match checks.into_iter().find(|(ok, _)| !ok) {
+            Some((_, message)) => Err(message.to_owned()),
+            None => Ok(()),
+        }
+    }
+}
 
 impl Default for ListenerConfig {
     fn default() -> Self {
@@ -193,15 +278,15 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         table,
         "idle_timeout_ms",
         defaults.idle_timeout_ms,
-        10,
-        60000,
+        *IDLE_TIMEOUT_MS.start(),
+        *IDLE_TIMEOUT_MS.end(),
     )?;
     let max_connection_lifetime_ms = integer_field(
         table,
         "max_connection_lifetime_ms",
         defaults.max_connection_lifetime_ms,
-        10,
-        3_600_000,
+        *CONNECTION_LIFETIME_MS.start(),
+        *CONNECTION_LIFETIME_MS.end(),
     )?;
     if idle_timeout_ms > max_connection_lifetime_ms {
         return Err(
@@ -215,7 +300,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             .as_bool()
             .ok_or_else(|| "`listener.local_java_preview` must be true or false".to_owned())?,
     };
-    if !local_java_preview && max_connection_lifetime_ms > 60_000 {
+    if !local_java_preview && max_connection_lifetime_ms > DISCOVERY_CONNECTION_LIFETIME_MAX_MS {
         return Err(
             "`listener.max_connection_lifetime_ms` exceeds the discovery-only limit".to_owned(),
         );
@@ -276,7 +361,7 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
         && table
             .get("max_connections")
             .and_then(toml::Value::as_integer)
-            .unwrap_or(8)
+            .unwrap_or(defaults.max_connections as i64)
             != 1
     {
         return Err("vanilla preview requires `listener.max_connections = 1`".to_owned());
@@ -298,20 +383,26 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
     }
     Ok(ListenerConfig {
         bind_address,
-        port: integer_field(table, "port", u64::from(defaults.port), 0, 65535)? as u16,
+        port: integer_field(
+            table,
+            "port",
+            u64::from(defaults.port),
+            0,
+            u64::from(u16::MAX),
+        )? as u16,
         max_connections: integer_field(
             table,
             "max_connections",
             defaults.max_connections as u64,
-            1,
-            64,
+            *MAX_CONNECTIONS.start() as u64,
+            *MAX_CONNECTIONS.end() as u64,
         )? as usize,
         max_bytes_per_connection: integer_field(
             table,
             "max_bytes_per_connection",
             defaults.max_bytes_per_connection as u64,
-            1,
-            65536,
+            *MAX_BYTES_PER_CONNECTION.start() as u64,
+            *MAX_BYTES_PER_CONNECTION.end() as u64,
         )? as usize,
         idle_timeout_ms,
         max_connection_lifetime_ms,
@@ -324,16 +415,16 @@ fn parse_listener(value: Option<&toml::Value>) -> Result<ListenerConfig, String>
             table,
             "vanilla_generation_workers",
             defaults.vanilla_generation_workers as u64,
-            1,
-            20,
+            *VANILLA_GENERATION_WORKERS.start() as u64,
+            *VANILLA_GENERATION_WORKERS.end() as u64,
         )? as usize,
         preview_seed: preview_seed(table)?,
         preview_view_distance: integer_field(
             table,
             "preview_view_distance",
             defaults.preview_view_distance.into(),
-            2,
-            32,
+            (*PREVIEW_VIEW_DISTANCE.start()).into(),
+            (*PREVIEW_VIEW_DISTANCE.end()).into(),
         )? as u8,
         preview_terrain,
         preview_session_lifetime_ms: integer_field(
@@ -437,262 +528,4 @@ pub fn check_config(path: &Path) -> Result<Config, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_supported_values_and_loopback_defaults() {
-        let parsed = parse_config("schema_version = 1\nlog_level = 'trace'\n").unwrap();
-        assert_eq!(parsed.log_level, LogLevel::Trace);
-        assert!(parsed.listener.bind_address.is_loopback());
-        assert_eq!(parsed.listener.port, 0);
-    }
-
-    #[test]
-    fn rejects_schema_and_fields() {
-        assert!(
-            parse_config("schema_version = 2\nlog_level = 'info'")
-                .unwrap_err()
-                .contains("unsupported")
-        );
-        assert!(
-            parse_config("schema_version = 1\nlog_level = 'info'\nsecret = 'x'")
-                .unwrap_err()
-                .contains("unknown")
-        );
-        assert!(
-            parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nextra = 1")
-                .unwrap_err()
-                .contains("unknown")
-        );
-    }
-
-    #[test]
-    fn rejects_nonlocal_and_conflicting_address() {
-        for address in ["0.0.0.0", "192.0.2.1", "127.0.0.1:25565"] {
-            let input = format!(
-                "schema_version = 1\nlog_level = 'info'\n[listener]\nbind_address = '{address}'\n"
-            );
-            assert!(parse_config(&input).unwrap_err().contains("bind_address"));
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_limits_and_timeout() {
-        for (field, value) in [
-            ("port", "65536"),
-            ("port", "-1"),
-            ("max_connections", "0"),
-            ("max_connections", "65"),
-            ("max_bytes_per_connection", "0"),
-            ("max_bytes_per_connection", "65537"),
-            ("idle_timeout_ms", "9"),
-            ("idle_timeout_ms", "60001"),
-            ("max_connection_lifetime_ms", "9"),
-            ("max_connection_lifetime_ms", "60001"),
-        ] {
-            let input =
-                format!("schema_version = 1\nlog_level = 'info'\n[listener]\n{field} = {value}\n");
-            assert!(parse_config(&input).unwrap_err().contains(field));
-        }
-    }
-
-    #[test]
-    fn local_preview_allows_a_bounded_longer_session_for_large_views() {
-        let config = parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\nmax_connection_lifetime_ms = 3600000\npreview_view_distance = 32\n").unwrap();
-        assert_eq!(config.listener.max_connection_lifetime_ms, 3_600_000);
-        assert_eq!(config.listener.preview_view_distance, 32);
-        assert!(parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nmax_connection_lifetime_ms = 3600000\n").is_err());
-    }
-
-    #[test]
-    fn rejects_conflicting_timeouts() {
-        let input = "schema_version = 1\nlog_level = 'info'\n[listener]\nidle_timeout_ms = 200\nmax_connection_lifetime_ms = 100\n";
-        assert!(parse_config(input).unwrap_err().contains("cannot exceed"));
-    }
-
-    #[test]
-    fn does_not_echo_invalid_value() {
-        let error = parse_config("schema_version = 1\nlog_level = 'private-token'").unwrap_err();
-        assert!(!error.contains("private-token"));
-    }
-
-    #[test]
-    fn preview_requires_explicit_boolean_and_stays_on_loopback() {
-        let config = parse_config("schema_version = 1\nlog_level = 'info'\n").unwrap();
-        assert!(!config.listener.local_java_preview);
-        let config = parse_config(
-            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n",
-        )
-        .unwrap();
-        assert!(config.listener.local_java_preview);
-        assert!(config.listener.bind_address.is_loopback());
-        assert!(
-            parse_config(
-                "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = 'yes'\n"
-            )
-            .unwrap_err()
-            .contains("local_java_preview")
-        );
-        assert!(parse_config("schema_version = 1\nlog_level = 'info'\n[listener]\nbind_address = '0.0.0.0'\nlocal_java_preview = true\n").is_err());
-    }
-
-    #[test]
-    fn preview_terrain_defaults_to_preview_and_opts_in_experimental() {
-        let base =
-            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
-        assert_eq!(
-            parse_config(base).unwrap().listener.preview_terrain,
-            world::Terrain::Preview
-        );
-        assert_eq!(
-            parse_config(&format!("{base}preview_terrain = 'experimental'\n"))
-                .unwrap()
-                .listener
-                .preview_terrain,
-            world::Terrain::Experimental
-        );
-        // Unknown names are rejected without echoing the value.
-        let error = parse_config(&format!("{base}preview_terrain = 'vanilla'\n")).unwrap_err();
-        assert!(error.contains("preview_terrain"));
-        assert!(!error.contains("vanilla"));
-        // Setting terrain without the preview opt-in stays rejected.
-        assert!(parse_config(
-            "schema_version = 1\nlog_level = 'info'\n[listener]\npreview_terrain = 'experimental'\n"
-        )
-        .unwrap_err()
-        .contains("local_java_preview"));
-    }
-
-    #[test]
-    fn preview_play_limits_default_validate_and_require_the_preview() {
-        let base =
-            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
-        let defaults = parse_config(base).unwrap().listener;
-        assert_eq!(defaults.preview_session_lifetime_ms, 600_000);
-        assert_eq!(defaults.preview_read_bytes_per_second, 65_536);
-        let custom = parse_config(&format!(
-            "{base}preview_session_lifetime_ms = 3600000\npreview_read_bytes_per_second = 1024\n"
-        ))
-        .unwrap()
-        .listener;
-        assert_eq!(custom.preview_session_lifetime_ms, 3_600_000);
-        assert_eq!(custom.preview_read_bytes_per_second, 1024);
-        for (field, value) in [
-            ("preview_session_lifetime_ms", "9999"),
-            ("preview_session_lifetime_ms", "3600001"),
-            ("preview_read_bytes_per_second", "1023"),
-            ("preview_read_bytes_per_second", "1048577"),
-        ] {
-            let error = parse_config(&format!("{base}{field} = {value}\n")).unwrap_err();
-            assert!(error.contains(field), "{field}={value}: {error}");
-        }
-        for field in [
-            "preview_session_lifetime_ms",
-            "preview_read_bytes_per_second",
-        ] {
-            let error = parse_config(&format!(
-                "schema_version = 1\nlog_level = 'info'\n[listener]\n{field} = 60000\n"
-            ))
-            .unwrap_err();
-            assert!(error.contains(field) && error.contains("local_java_preview"));
-        }
-    }
-
-    #[test]
-    fn preview_seed_accepts_the_signed_vanilla_range() {
-        let base =
-            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
-        for seed in [i64::MIN, -1, 0, 2026, i64::MAX] {
-            let config = parse_config(&format!("{base}preview_seed = {seed}\n")).unwrap();
-            assert_eq!(config.listener.preview_seed as i64, seed);
-        }
-        assert!(
-            parse_config(&format!("{base}preview_seed = 'x'\n"))
-                .unwrap_err()
-                .contains("preview_seed")
-        );
-    }
-
-    #[test]
-    fn vanilla_preview_requires_complete_local_input_and_one_connection() {
-        let base = "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\nmax_connections = 1\npreview_registry_manifest = 'manifest.toml'\n";
-        assert!(parse_config(&format!("{base}vanilla_data_root = 'data'\n")).is_err());
-        let complete =
-            format!("{base}vanilla_data_root = 'data'\nvanilla_registry_table = 'ids.json'\n");
-        let config = parse_config(&complete).unwrap();
-        assert!(config.listener.vanilla_cache_root.is_none());
-        assert_eq!(config.listener.vanilla_generation_workers, 8);
-        assert_eq!(
-            parse_config(&format!("{complete}vanilla_generation_workers = 16\n"))
-                .unwrap()
-                .listener
-                .vanilla_generation_workers,
-            16
-        );
-        for workers in [0, 21] {
-            assert!(
-                parse_config(&format!(
-                    "{complete}vanilla_generation_workers = {workers}\n"
-                ))
-                .is_err()
-            );
-        }
-        assert!(parse_config(&format!("{base}vanilla_generation_workers = 16\n")).is_err());
-        let cached = parse_config(&format!("{complete}vanilla_cache_root = 'cache'\n")).unwrap();
-        assert_eq!(
-            cached.listener.vanilla_cache_root.as_deref(),
-            Some(Path::new("cache"))
-        );
-        assert!(parse_config(&format!("{base}vanilla_cache_root = 'cache'\n")).is_err());
-        assert_eq!(
-            config.listener.vanilla_data_root.as_deref(),
-            Some(Path::new("data"))
-        );
-        assert!(
-            parse_config(&complete.replace("max_connections = 1", "max_connections = 2")).is_err()
-        );
-        assert!(parse_config(&format!("{complete}preview_terrain = 'experimental'\n")).is_err());
-    }
-
-    #[test]
-    fn preview_compression_threshold_validates_signed_varint_and_requires_preview() {
-        let base =
-            "schema_version = 1\nlog_level = 'info'\n[listener]\nlocal_java_preview = true\n";
-        assert_eq!(
-            parse_config(base)
-                .unwrap()
-                .listener
-                .preview_compression_threshold,
-            None
-        );
-        for off in [-1, -2, i32::MIN] {
-            let config =
-                parse_config(&format!("{base}preview_compression_threshold = {off}\n")).unwrap();
-            assert_eq!(config.listener.preview_compression_threshold, None);
-        }
-        for on in [0, 256, i32::MAX] {
-            let config =
-                parse_config(&format!("{base}preview_compression_threshold = {on}\n")).unwrap();
-            assert_eq!(
-                config.listener.preview_compression_threshold,
-                Some(on as usize)
-            );
-        }
-        for bad in ["'256'", "true", "2147483648", "-2147483649"] {
-            let err = parse_config(&format!("{base}preview_compression_threshold = {bad}\n"))
-                .unwrap_err();
-            assert!(
-                err.contains("preview_compression_threshold"),
-                "{bad}: {err}"
-            );
-        }
-        let err = parse_config(
-            "schema_version = 1\nlog_level = 'info'\n[listener]\npreview_compression_threshold = 256\n",
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("preview_compression_threshold") && err.contains("local_java_preview")
-        );
-    }
-}
+mod tests;

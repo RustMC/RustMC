@@ -83,16 +83,16 @@ fn files_under(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
 
 fn names(root: &Path, registry: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let prefix = root.join("data/minecraft").join(registry);
-    Ok(files_under(&prefix)?
+    files_under(&prefix)?
         .into_iter()
         .map(|path| {
-            let relative = path.strip_prefix(&prefix).expect("path from prefix");
-            format!(
+            let relative = path.strip_prefix(&prefix)?;
+            Ok(format!(
                 "minecraft:{}",
                 relative.with_extension("").to_string_lossy()
-            )
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn resolve_tag(
@@ -241,11 +241,9 @@ fn prepare(archive: &Path, output: &Path, report: &Path) -> Result<(), Box<dyn E
             "{} = [",
             serde_json::to_string(&format!("minecraft:{registry}"))?
         ));
-        lines.extend(
-            entries
-                .iter()
-                .map(|name| format!("  {},", serde_json::to_string(name).unwrap())),
-        );
+        for name in &entries {
+            lines.push(format!("  {},", serde_json::to_string(name)?));
+        }
         lines.push("]".to_string());
     }
     lines.push("[static_registry_sizes]".to_string());

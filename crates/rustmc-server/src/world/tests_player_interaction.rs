@@ -1,3 +1,5 @@
+//! Unit tests for `world::interaction`: player block-interaction validation.
+
 use super::interaction::{
     BlockInteractionEngine, DiggingAction, DiggingStatus, Direction, InteractionRejectReason,
     InteractionResult, UseItemOnAction,
