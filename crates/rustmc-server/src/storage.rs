@@ -6,6 +6,7 @@
 //! Done: NBT reading and writing, region reading. Not done: see submodules.
 
 pub mod chunk;
+pub mod journal;
 pub mod nbt;
 pub mod region;
 pub mod region_file;
