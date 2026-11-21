@@ -77,7 +77,6 @@ pub mod enchanting;
 pub mod enchantment;
 pub mod furnace;
 pub mod grindstone;
-pub mod loot;
 pub mod recipe_data;
 
 pub use brewing::{
