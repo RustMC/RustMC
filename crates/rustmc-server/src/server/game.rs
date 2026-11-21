@@ -3,11 +3,13 @@
 //!
 //! Why: a single owner of world state needs no locks and makes every change
 //! happen in a defined order; connections only exchange messages with it.
-//! Done: joining at the terrain surface, duplicate-login replacement,
-//! keep-alive with timeout kicks, teleport confirmation, chunk streaming
-//! around each player, clean disconnect on shutdown.
-//! Not done: persistence (track C), movement validation and block play (D),
-//! chat and commands (E).
+//! Done: joining at the terrain surface or where the player left,
+//! duplicate-login replacement, keep-alive with timeout kicks, teleport
+//! confirmation, chunk streaming around each player, persistence (see
+//! `persist`), clean disconnect and save on shutdown.
+//! Not done: movement validation and block play (D), chat and commands (E).
+
+mod persist;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +19,13 @@ use std::time::{Duration, Instant};
 
 use super::config::ServerConfig;
 use super::connection::{ConnectionHandle, ConnectionId, Event, Outgoing};
+use super::join::GameMode;
 use super::join::{Spawn, join_packets};
 use super::log;
 use super::world::store::ChunkStore;
 use super::world::terrain::surface_y;
 use super::world::view::{View, chunk_of};
+use super::world::workers::ColumnSource;
 use crate::discovery_java::keepalive::KeepAliveTracker;
 use crate::java_packets::play::{clientbound, serverbound};
 use crate::java_wire::{put_nbt_text, read_f32_be, read_varint};
@@ -31,7 +35,8 @@ use crate::net::identity::{GameProfile, uuid_text};
 use crate::net::login::JoinRequest;
 use crate::preview_data::RegistryManifest;
 use crate::protocol::movement::{ServerboundMovementPacket, decode_serverbound_movement_packet};
-use crate::world::Generator;
+use crate::storage::journal::Journal;
+use crate::storage::world_files::LevelData;
 
 /// Length of one game tick at 20 ticks per second.
 pub const TICK: Duration = Duration::from_millis(50);
@@ -43,6 +48,8 @@ pub const KEEPALIVE_INTERVAL_TICKS: u64 = 100;
 pub const TICKS_PER_DAY: u64 = 24_000;
 /// Ticks between unloads of unedited columns no player views.
 pub const UNLOAD_INTERVAL_TICKS: u64 = 100;
+/// Game ticks per second.
+pub const TICKS_PER_SECOND: u64 = 20;
 /// World spawn column; players appear on the terrain surface here.
 pub const SPAWN_XZ: [f64; 2] = [0.5, 0.5];
 
@@ -62,6 +69,9 @@ struct Player {
     last_keepalive_tick: u64,
     awaiting_teleport: Option<u32>,
     position: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    game_mode: GameMode,
     view: View,
 }
 
@@ -70,10 +80,12 @@ pub struct Game {
     config: Arc<ServerConfig>,
     manifest: Arc<RegistryManifest>,
     online: Arc<AtomicUsize>,
-    generator: Generator,
+    source: Arc<ColumnSource>,
     store: ChunkStore,
+    journal: Journal,
     players: HashMap<ConnectionId, Player>,
     next_entity_id: i32,
+    seed: i64,
     tick: u64,
     day_time: u64,
 }
@@ -83,19 +95,23 @@ impl Game {
         config: Arc<ServerConfig>,
         manifest: Arc<RegistryManifest>,
         online: Arc<AtomicUsize>,
-        generator: Generator,
+        source: Arc<ColumnSource>,
         store: ChunkStore,
+        journal: Journal,
+        level: LevelData,
     ) -> Self {
         Self {
             config,
             manifest,
             online,
-            generator,
+            source,
             store,
+            journal,
             players: HashMap::new(),
             next_entity_id: 1,
-            tick: 0,
-            day_time: 0,
+            seed: level.seed,
+            tick: level.world_age,
+            day_time: level.day_time % TICKS_PER_DAY,
         }
     }
 
@@ -122,6 +138,7 @@ impl Game {
         for player in self.players.values() {
             disconnect(&player.handle, reason::SHUTDOWN);
         }
+        self.save_all();
         self.players.clear();
         self.online.store(0, Ordering::Relaxed);
     }
@@ -135,6 +152,7 @@ impl Game {
             Event::Left { id, reason } => {
                 if let Some(player) = self.players.remove(&id) {
                     self.online.store(self.players.len(), Ordering::Relaxed);
+                    self.save_player(&player);
                     log::event(
                         "player_left",
                         &[("name", &player.profile.name), ("reason", &reason)],
@@ -155,20 +173,32 @@ impl Game {
         for id in duplicates {
             if let Some(old) = self.players.remove(&id) {
                 disconnect(&old.handle, reason::DUPLICATE);
+                self.save_player(&old);
             }
         }
+        // Counted now: the join below may still fail and return early.
+        self.online.store(self.players.len(), Ordering::Relaxed);
         let entity_id = self.next_entity_id;
         self.next_entity_id = self.next_entity_id.wrapping_add(1).max(1);
         let teleport_id = 1;
-        let position = [
-            SPAWN_XZ[0],
-            f64::from(surface_y(
-                self.generator,
-                SPAWN_XZ[0].floor() as i64,
-                SPAWN_XZ[1].floor() as i64,
-            )),
-            SPAWN_XZ[1],
-        ];
+        let saved = self.load_player(&profile);
+        let (position, yaw, pitch, game_mode) = match saved {
+            Some(saved) => (saved.position, saved.yaw, saved.pitch, saved.game_mode),
+            None => (
+                [
+                    SPAWN_XZ[0],
+                    f64::from(surface_y(
+                        self.source.generator,
+                        SPAWN_XZ[0].floor() as i64,
+                        SPAWN_XZ[1].floor() as i64,
+                    )),
+                    SPAWN_XZ[1],
+                ],
+                0.0,
+                0.0,
+                self.config.game_mode,
+            ),
+        };
         // Vanilla uses the smaller of the server's and the client's distance.
         let view_distance = match join.settings.view_distance {
             0 => self.config.view_distance,
@@ -176,10 +206,10 @@ impl Game {
         };
         let spawn = Spawn {
             entity_id,
-            game_mode: self.config.game_mode,
+            game_mode,
             position,
-            yaw: 0.0,
-            pitch: 0.0,
+            yaw,
+            pitch,
             teleport_id,
             view_distance,
             max_players: self.config.max_players as u32,
@@ -220,6 +250,9 @@ impl Game {
                 last_keepalive_tick: self.tick,
                 awaiting_teleport: Some(teleport_id),
                 position,
+                yaw,
+                pitch,
+                game_mode,
                 view: View::new(chunk_of(position[0], position[2]), view_distance),
             },
         );
@@ -257,28 +290,25 @@ impl Game {
                 }
                 _ => Err(reason::BAD_PACKET),
             },
-            serverbound::MOVE_PLAYER_POS | serverbound::MOVE_PLAYER_POS_ROT => {
-                move_player(player, packet.id, body)
-            }
+            serverbound::MOVE_PLAYER_POS
+            | serverbound::MOVE_PLAYER_POS_ROT
+            | serverbound::MOVE_PLAYER_ROT => move_player(player, packet.id, body),
             _ => Ok(()),
         };
-        if let Err(text) = kick
-            && let Some(player) = self.players.remove(&id)
-        {
-            disconnect(&player.handle, text);
-            self.online.store(self.players.len(), Ordering::Relaxed);
+        if let Err(text) = kick {
+            self.remove_player(id, text);
         }
     }
 
     fn tick(&mut self) {
         self.tick += 1;
+        self.sync_journal();
         self.day_time = (self.day_time + 1) % TICKS_PER_DAY;
         let tick = self.tick;
         let mut dropped = Vec::new();
         for (id, player) in &mut self.players {
             if player.keepalive.is_timed_out(tick) {
-                disconnect(&player.handle, reason::TIMED_OUT);
-                dropped.push(*id);
+                dropped.push((*id, reason::TIMED_OUT));
                 continue;
             }
             let mut healthy = true;
@@ -301,18 +331,28 @@ impl Game {
                 healthy = batch.into_iter().all(|out| player.handle.send(out));
             }
             if !healthy {
-                disconnect(&player.handle, reason::SLOW);
-                dropped.push(*id);
+                dropped.push((*id, reason::SLOW));
             }
         }
-        for id in dropped {
-            self.players.remove(&id);
+        for (id, text) in dropped {
+            self.remove_player(id, text);
         }
-        self.online.store(self.players.len(), Ordering::Relaxed);
+        if tick.is_multiple_of(self.config.autosave_interval_seconds * TICKS_PER_SECOND) {
+            self.save_all();
+        }
         if tick.is_multiple_of(UNLOAD_INTERVAL_TICKS) {
             let players = &self.players;
             self.store
                 .unload_unviewed(|position| players.values().any(|p| p.view.contains(position)));
+        }
+    }
+
+    /// Disconnects a player with `text`, saving their state first.
+    fn remove_player(&mut self, id: ConnectionId, text: &str) {
+        if let Some(player) = self.players.remove(&id) {
+            disconnect(&player.handle, text);
+            self.save_player(&player);
+            self.online.store(self.players.len(), Ordering::Relaxed);
         }
     }
 
@@ -324,9 +364,10 @@ impl Game {
 
 /// Applies a position update and moves the player's view with it.
 fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static str> {
-    let position = match decode_serverbound_movement_packet(id, body) {
-        Ok(ServerboundMovementPacket::Pos(p)) => [p.x, p.y, p.z],
-        Ok(ServerboundMovementPacket::PosRot(p)) => [p.x, p.y, p.z],
+    let (position, rotation) = match decode_serverbound_movement_packet(id, body) {
+        Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None),
+        Ok(ServerboundMovementPacket::PosRot(p)) => ([p.x, p.y, p.z], Some((p.yaw, p.pitch))),
+        Ok(ServerboundMovementPacket::Rot(p)) => (player.position, Some((p.yaw, p.pitch))),
         _ => return Err(reason::BAD_PACKET),
     };
     if player.awaiting_teleport.is_some() {
@@ -335,6 +376,10 @@ fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static
         return Ok(());
     }
     player.position = position;
+    if let Some((yaw, pitch)) = rotation {
+        player.yaw = yaw;
+        player.pitch = pitch;
+    }
     for out in player.view.recenter(chunk_of(position[0], position[2])) {
         if !player.handle.send(out) {
             return Err(reason::SLOW);

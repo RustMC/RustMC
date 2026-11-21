@@ -1,8 +1,8 @@
 //! Small repository tools; never linked into the RustMC server.
 
-pub mod nbt;
 pub mod oracle;
-pub mod region;
+/// NBT and region readers live in the server crate, which also writes saves.
+pub use rustmc_server::storage::{nbt, region};
 pub mod save;
 
 use serde_json::Value;

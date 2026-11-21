@@ -15,6 +15,13 @@ use crate::chunk_adapter::{
 /// Highest buildable Y (exclusive) in the overworld.
 pub const MAX_Y: i32 = OVERWORLD_MIN_Y + OVERWORLD_HEIGHT as i32;
 
+/// A read view of one section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionCells<'a> {
+    Uniform(u32),
+    Mixed(&'a [u32]),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Section {
     Uniform(u32),
@@ -84,6 +91,41 @@ impl Column {
             Section::Mixed(cells) => Some(std::mem::replace(&mut cells[cell(x, row, z)], state)),
             Section::Uniform(_) => None,
         }
+    }
+
+    /// One section's cells, if `section` is in range.
+    pub fn section(&self, section: usize) -> Option<SectionCells<'_>> {
+        Some(match self.sections.get(section)? {
+            Section::Uniform(state) => SectionCells::Uniform(*state),
+            Section::Mixed(cells) => SectionCells::Mixed(cells),
+        })
+    }
+
+    /// Replaces one section; `cells` must hold 4,096 states in section order.
+    /// A section of one repeated state is stored as a single value.
+    pub fn set_section(&mut self, section: usize, cells: Vec<u32>) -> bool {
+        if cells.len() != SECTION_CELLS || section >= self.sections.len() {
+            return false;
+        }
+        self.sections[section] = match cells.first() {
+            Some(first) if cells.iter().all(|state| state == first) => Section::Uniform(*first),
+            _ => Section::Mixed(cells.into_boxed_slice()),
+        };
+        true
+    }
+
+    /// Every biome cell, in the chunk adapter's order.
+    pub fn biomes(&self) -> &[u32] {
+        &self.biomes
+    }
+
+    /// Replaces the biome cells; `biomes` must cover the whole column.
+    pub fn set_biomes(&mut self, biomes: Vec<u32>) -> bool {
+        if biomes.len() != CHUNK_BIOMES {
+            return false;
+        }
+        self.biomes = biomes;
+        true
     }
 
     /// Fills a whole section with one state.

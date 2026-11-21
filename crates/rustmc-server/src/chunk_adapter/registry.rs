@@ -316,6 +316,9 @@ pub struct RegistryTables {
     states: BTreeMap<String, StateEntry>,
     kinds_by_id: BTreeMap<u32, StateKind>,
     biomes: BTreeMap<String, u32>,
+    /// Full state key (`name[properties]`) of each id, for saving chunks.
+    state_names: BTreeMap<u32, String>,
+    biome_names: BTreeMap<u32, String>,
     air: u32,
 }
 
@@ -386,6 +389,21 @@ impl RegistryTables {
                 return Err(RegistryError::DuplicateKey(name));
             }
         }
+        // A block's default state is listed both bare and with its
+        // properties; the keyed form names the exact state.
+        let mut state_names: BTreeMap<u32, String> = BTreeMap::new();
+        for (key, entry) in &table {
+            let keep = state_names
+                .get(&entry.id)
+                .is_some_and(|current| current.contains('[') || !key.contains('['));
+            if !keep {
+                state_names.insert(entry.id, key.clone());
+            }
+        }
+        let biome_names = biome_table
+            .iter()
+            .map(|(name, id)| (*id, name.clone()))
+            .collect();
         Ok(Self {
             version: version.to_string(),
             protocol,
@@ -394,6 +412,8 @@ impl RegistryTables {
             states: table,
             kinds_by_id,
             biomes: biome_table,
+            state_names,
+            biome_names,
             air,
         })
     }
@@ -503,6 +523,16 @@ impl RegistryTables {
     }
 
     /// Resolves one biome identifier to its dynamic-registry id.
+    /// The full key (`minecraft:name[key=value,…]`) of a state id.
+    pub fn state_name(&self, id: u32) -> Option<&str> {
+        self.state_names.get(&id).map(String::as_str)
+    }
+
+    /// The identifier of a biome id.
+    pub fn biome_name(&self, id: u32) -> Option<&str> {
+        self.biome_names.get(&id).map(String::as_str)
+    }
+
     pub fn biome(&self, name: &str) -> Result<u32, RegistryError> {
         self.biomes
             .get(name)

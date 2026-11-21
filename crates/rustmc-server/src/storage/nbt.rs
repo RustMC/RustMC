@@ -1,6 +1,7 @@
-//! Minimal read-only NBT parser for Anvil region data (big-endian, named
-//! root tag). Only the tag kinds that appear in 26.3 chunk storage are
-//! supported; the parser never allocates beyond the input size.
+//! NBT for world storage (big-endian, named root tag): the reader used for
+//! vanilla saves and the writer used for RustMC's own chunk, player and level
+//! files. Only the tag kinds that appear in 26.3 storage are supported; the
+//! parser never allocates beyond the input size.
 
 use std::collections::BTreeMap;
 
@@ -149,16 +150,29 @@ impl<'a> Reader<'a> {
                 Tag::List(items)
             }
             10 => Tag::Compound(self.compound(depth)?),
+            // The declared length is checked against the bytes that remain
+            // before anything is allocated, so a corrupt length cannot ask
+            // for more memory than the input holds.
             11 => {
                 let len = self.checked_len("int array")?;
-                Tag::IntArray((0..len).map(|_| self.i32()).collect::<Result<_, _>>()?)
+                let bytes = self.take_elements(len, 4, "int array")?;
+                let (words, _) = bytes.as_chunks::<4>();
+                Tag::IntArray(words.iter().map(|w| i32::from_be_bytes(*w)).collect())
             }
             12 => {
                 let len = self.checked_len("long array")?;
-                Tag::LongArray((0..len).map(|_| self.i64()).collect::<Result<_, _>>()?)
+                let bytes = self.take_elements(len, 8, "long array")?;
+                let (words, _) = bytes.as_chunks::<8>();
+                Tag::LongArray(words.iter().map(|w| i64::from_be_bytes(*w)).collect())
             }
             other => return Err(format!("unknown NBT tag type {other}")),
         })
+    }
+    fn take_elements(&mut self, len: usize, size: usize, what: &str) -> Result<&'a [u8], String> {
+        let total = len
+            .checked_mul(size)
+            .ok_or_else(|| format!("{what} length {len} overflows"))?;
+        self.take(total)
     }
     fn checked_len(&mut self, what: &str) -> Result<usize, String> {
         let len = self.i32()?;
@@ -183,14 +197,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
 pub fn write_root(compound: &Tag, out: &mut Vec<u8>) {
     out.push(10);
     out.extend_from_slice(&0u16.to_be_bytes());
     write_payload(compound, out);
 }
 
-#[cfg(test)]
 pub fn write_payload(tag: &Tag, out: &mut Vec<u8>) {
     match tag {
         Tag::Byte(v) => out.extend_from_slice(&v.to_be_bytes()),
@@ -256,7 +268,6 @@ pub fn write_payload(tag: &Tag, out: &mut Vec<u8>) {
     }
 }
 
-#[cfg(test)]
 fn tag_kind(tag: &Tag) -> u8 {
     match tag {
         Tag::Byte(_) => 1,
@@ -274,7 +285,6 @@ fn tag_kind(tag: &Tag) -> u8 {
     }
 }
 
-#[cfg(test)]
 pub fn compound(pairs: &[(&str, Tag)]) -> Tag {
     let mut map = BTreeMap::new();
     for (k, v) in pairs {
@@ -306,6 +316,18 @@ mod tests {
         let mut bytes = Vec::new();
         write_root(&root, &mut bytes);
         assert_eq!(parse_root(&bytes).unwrap(), root);
+    }
+
+    #[test]
+    fn rejects_array_lengths_longer_than_the_input() {
+        for kind in [11u8, 12] {
+            // Root compound holding one array named "a" that claims
+            // i32::MAX elements but carries four bytes.
+            let mut bytes = vec![10, 0, 0, kind, 0, 1, b'a'];
+            bytes.extend(i32::MAX.to_be_bytes());
+            bytes.extend([0, 0, 0, 1, 0]);
+            assert!(parse_root(&bytes).is_err(), "tag {kind}");
+        }
     }
 
     #[test]

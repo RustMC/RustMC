@@ -133,14 +133,21 @@ impl View {
             .filter(|p| !self.sent.contains(p))
             .take(REQUEST_AHEAD)
             .collect();
+        // Send in strict priority order: once a position is not generated
+        // yet, later ones wait, so nearer chunks never arrive after farther
+        // ones. Missing positions are still requested so generation runs ahead.
+        let mut waiting = false;
         for position in unsent {
             match store.packet(position) {
-                Some(packet) if chunks.len() < self.batch_size => {
+                Some(packet) if !waiting && chunks.len() < self.batch_size => {
                     chunks.push(packet);
                     self.sent.insert(position);
                 }
                 Some(_) => {}
-                None => store.request(position),
+                None => {
+                    waiting = true;
+                    store.request(position);
+                }
             }
         }
         if chunks.is_empty() {
