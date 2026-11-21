@@ -176,6 +176,8 @@ impl Game {
                 self.save_player(&old);
             }
         }
+        // Counted now: the join below may still fail and return early.
+        self.online.store(self.players.len(), Ordering::Relaxed);
         let entity_id = self.next_entity_id;
         self.next_entity_id = self.next_entity_id.wrapping_add(1).max(1);
         let teleport_id = 1;

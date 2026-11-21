@@ -104,13 +104,12 @@ fn decompress(chunk: &StoredChunk) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Every chunk stored in a region file, still compressed.
-fn read_all(path: &Path) -> io::Result<BTreeMap<usize, StoredChunk>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => return Err(error),
-    };
+/// Where each stored chunk sits in a region file's bytes: the compression
+/// byte and the payload range, without copying the payload.
+fn locate_all(bytes: &[u8]) -> io::Result<BTreeMap<usize, (u8, std::ops::Range<usize>)>> {
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     if bytes.len() < HEADER {
         return Err(invalid("region file is smaller than its header"));
     }
@@ -126,16 +125,10 @@ fn read_all(path: &Path) -> io::Result<BTreeMap<usize, StoredChunk>> {
             .get(start..start + 5)
             .ok_or_else(|| invalid("chunk points past the end of the file"))?;
         let length = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
-        let payload = bytes
-            .get(start + 5..start + 4 + length)
-            .ok_or_else(|| invalid("chunk extends past the end of the file"))?;
-        chunks.insert(
-            slot,
-            StoredChunk {
-                compression: prefix[4],
-                payload: payload.to_vec(),
-            },
-        );
+        if length == 0 || start + 4 + length > bytes.len() {
+            return Err(invalid("chunk extends past the end of the file"));
+        }
+        chunks.insert(slot, (prefix[4], start + 5..start + 4 + length));
     }
     Ok(chunks)
 }
@@ -157,46 +150,60 @@ pub fn save_chunks(
     changed: BTreeMap<(usize, usize), StoredChunk>,
     timestamp: u32,
 ) -> io::Result<()> {
-    let mut chunks = read_all(path)?;
+    // The old file is read once and its kept chunks are written straight
+    // from it, so a rewrite holds one copy of the region plus the changes.
+    let old = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let mut chunks: BTreeMap<usize, (u8, &[u8])> = locate_all(&old)?
+        .into_iter()
+        .map(|(slot, (compression, range))| (slot, (compression, &old[range])))
+        .collect();
     let mut stamped = Vec::with_capacity(changed.len());
-    for ((x, z), chunk) in changed {
-        if x >= REGION_SIDE || z >= REGION_SIDE {
+    for ((x, z), chunk) in &changed {
+        if *x >= REGION_SIDE || *z >= REGION_SIDE {
             return Err(invalid("chunk position outside the region"));
         }
-        stamped.push(index(x, z));
-        chunks.insert(index(x, z), chunk);
+        stamped.push(index(*x, *z));
+        chunks.insert(index(*x, *z), (chunk.compression, chunk.payload.as_slice()));
     }
     let mut header = vec![0u8; HEADER];
-    let mut body = Vec::new();
+    let mut prefixes = Vec::with_capacity(chunks.len());
     let mut next_sector = HEADER / SECTOR;
-    for (slot, chunk) in &chunks {
-        let length = chunk.payload.len() + 1;
+    for (slot, (compression, payload)) in &chunks {
+        let length = payload.len() + 1;
         let sectors = (length + 4).div_ceil(SECTOR);
         if sectors > MAX_CHUNK_SECTORS {
             return Err(invalid("chunk needs more than 255 sectors"));
         }
         let location = ((next_sector as u32) << 8) | sectors as u32;
         header[slot * 4..slot * 4 + 4].copy_from_slice(&location.to_be_bytes());
-        if stamped.contains(slot) {
-            header[SECTOR + slot * 4..SECTOR + slot * 4 + 4]
-                .copy_from_slice(&timestamp.to_be_bytes());
-        }
-        body.extend_from_slice(&(length as u32).to_be_bytes());
-        body.push(chunk.compression);
-        body.extend_from_slice(&chunk.payload);
-        body.resize(body.len().next_multiple_of(SECTOR), 0);
+        let stamp = if stamped.contains(slot) {
+            timestamp.to_be_bytes()
+        } else {
+            // Timestamps of chunks kept from the old file are preserved.
+            let at = SECTOR + slot * 4;
+            old.get(at..at + 4)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .unwrap_or_default()
+        };
+        header[SECTOR + slot * 4..SECTOR + slot * 4 + 4].copy_from_slice(&stamp);
+        let mut prefix = (length as u32).to_be_bytes().to_vec();
+        prefix.push(*compression);
+        let padding = sectors * SECTOR - (length + 4);
+        prefixes.push((prefix, padding));
         next_sector += sectors;
     }
-    // Timestamps of chunks kept from the old file are preserved.
-    if let Ok(old) = fs::read(path)
-        && old.len() >= HEADER
-    {
-        for slot in chunks.keys().filter(|slot| !stamped.contains(slot)) {
-            let at = SECTOR + slot * 4;
-            header[at..at + 4].copy_from_slice(&old[at..at + 4]);
-        }
+    let zeros = [0u8; SECTOR];
+    let mut parts: Vec<&[u8]> = vec![&header];
+    for ((prefix, padding), (_, payload)) in prefixes.iter().zip(chunks.values()) {
+        parts.push(prefix);
+        parts.push(payload);
+        parts.push(&zeros[..*padding]);
     }
-    replace_atomically(path, &[&header, &body])
+    replace_atomically(path, &parts)
 }
 
 /// Writes `parts` to `path` so that a crash leaves either the old file or the
