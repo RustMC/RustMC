@@ -235,7 +235,8 @@ pub(super) fn test_protocol_ids() -> Arc<ProtocolIds> {
             "entries": {
                 "minecraft:speed": { "protocol_id": 0 }
             }
-        }
+        },
+        "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
     }"#;
     Arc::new(
         ProtocolIds::from_json_str(

@@ -46,7 +46,8 @@ const SYNTHETIC_REGISTRIES: &str = r#"{
             "minecraft:night_vision": { "protocol_id": 15 },
             "minecraft:saturation": { "protocol_id": 22 }
         }
-    }
+    },
+    "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
 }"#;
 
 #[test]
@@ -85,6 +86,8 @@ fn loads_only_needed_static_registries_from_disk_and_resolves_both_ways() {
     assert_eq!(ids.mob_effect_id("minecraft:saturation"), Some(22));
     assert_eq!(ids.mob_effect_name(15), Some("minecraft:night_vision"));
     assert_eq!(ids.mob_effect_name(99), None);
+    assert_eq!(ids.entity_type_id("minecraft:player"), Some(159));
+    assert_eq!(ids.entity_type_id("minecraft:unknown"), None);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -148,7 +151,8 @@ fn errors_name_the_file_for_missing_malformed_or_duplicate_registries() {
             }},
             "minecraft:data_component_type": { "entries": {} },
             "minecraft:potion": { "entries": {} },
-            "minecraft:mob_effect": { "entries": {} }
+            "minecraft:mob_effect": { "entries": {} },
+            "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
         }"#,
     )
     .expect_err("duplicate protocol_id must error");
@@ -167,7 +171,8 @@ fn errors_name_the_file_for_missing_malformed_or_duplicate_registries() {
             "minecraft:item": { "entries": {} },
             "minecraft:data_component_type": { "entries": { "minecraft:x": { "protocol_id": -1 } } },
             "minecraft:potion": { "entries": {} },
-            "minecraft:mob_effect": { "entries": {} }
+            "minecraft:mob_effect": { "entries": {} },
+            "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
         }"#,
     )
     .expect_err("negative protocol_id must error");
