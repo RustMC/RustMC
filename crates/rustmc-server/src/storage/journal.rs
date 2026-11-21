@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::region_file::replace_atomically;
+use super::region_file::{replace_atomically, sync_directory};
 
 /// Bytes per record: x, y, z (i32), state (u32) and a CRC-32 of those 16.
 pub const RECORD_BYTES: usize = 20;
@@ -71,7 +71,15 @@ impl Journal {
             Ok(mut file) => {
                 file.read_to_end(&mut bytes)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A new journal is created durably: the file through an
+                // atomic replace (which syncs its directory) and the
+                // directory's own entry in its parent, which may be new too.
+                replace_atomically(path, &[])?;
+                if let Some(parent) = path.parent().and_then(Path::parent) {
+                    sync_directory(parent)?;
+                }
+            }
             Err(error) => return Err(error),
         }
         let mut edits = Vec::new();

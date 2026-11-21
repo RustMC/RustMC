@@ -199,6 +199,15 @@ impl WorldFiles {
             return Ok(None);
         };
         let tag = parse_root(&bytes).map_err(|_| StorageError::Malformed(path.clone(), "chunk"))?;
+        // A chunk filed under another slot is damaged: serving it would key
+        // it by its own coordinates and leave the requested one missing.
+        let stored = (
+            tag.get("xPos").and_then(Tag::as_i32),
+            tag.get("zPos").and_then(Tag::as_i32),
+        );
+        if stored != (Some(chunk_x), Some(chunk_z)) {
+            return Err(StorageError::Malformed(path, "chunk coordinates"));
+        }
         decode(&tag, tables)
             .map(Some)
             .map_err(|error| StorageError::Chunk(path, error))

@@ -29,6 +29,7 @@ fn synced_edits_replay_in_order_and_reset_empties_the_journal() {
     let path = temp_path();
     let (mut journal, replay) = Journal::open(&path).expect("open");
     assert!(replay.is_empty());
+    assert!(path.exists(), "a new journal exists before its first sync");
     journal.append(edit(1, 10)).expect("append");
     journal.append(edit(-2, 20)).expect("append");
     journal.sync().expect("sync");

@@ -56,6 +56,24 @@ fn columns_save_by_region_and_load_back() {
 }
 
 #[test]
+fn a_chunk_filed_under_another_slot_is_an_error() {
+    let world = TempWorld::new();
+    let files = WorldFiles::new(&world.0);
+    let tables = tables();
+    let palette = TerrainPalette::resolve(&tables).expect("palette");
+    // Chunk (32, 0) sits in slot (0, 0) of r.1.0; renamed to r.0.0 it claims
+    // to be chunk (0, 0).
+    let column = generate(Generator::new(3), &palette, 32, 0);
+    files.save_columns([&column], &tables, 0, 0).expect("save");
+    let regions = world.0.join("dimensions/minecraft/overworld/region");
+    std::fs::rename(regions.join("r.1.0.mca"), regions.join("r.0.0.mca")).expect("rename");
+    assert!(matches!(
+        files.load_column(0, 0, &tables),
+        Err(StorageError::Malformed(_, "chunk coordinates"))
+    ));
+}
+
+#[test]
 fn players_and_level_data_round_trip_and_missing_files_are_none() {
     let world = TempWorld::new();
     let files = WorldFiles::new(&world.0);

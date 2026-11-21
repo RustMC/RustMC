@@ -221,12 +221,12 @@ pub fn replace_atomically(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
 /// Makes the rename durable. Windows cannot open a directory as a file; its
 /// rename is already flushed with the file's metadata.
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> io::Result<()> {
+pub fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> io::Result<()> {
+pub fn sync_directory(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
