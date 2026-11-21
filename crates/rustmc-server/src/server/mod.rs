@@ -154,10 +154,12 @@ pub fn run(
         Arc::clone(&config),
         manifest,
         online,
-        source,
-        store,
-        journal,
-        level,
+        game::World {
+            source,
+            store,
+            journal,
+            level,
+        },
         ids,
     );
     game.recover(&replay).map_err(ServerError::Storage)?;

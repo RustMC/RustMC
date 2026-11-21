@@ -96,17 +96,29 @@ pub struct Game {
     day_time: u64,
 }
 
+/// The world a game loop starts with: where columns come from, the columns
+/// already loaded, the edit journal and the saved level data.
+pub struct World {
+    pub source: Arc<ColumnSource>,
+    pub store: ChunkStore,
+    pub journal: Journal,
+    pub level: LevelData,
+}
+
 impl Game {
     pub fn new(
         config: Arc<ServerConfig>,
         manifest: Arc<RegistryManifest>,
         online: Arc<AtomicUsize>,
-        source: Arc<ColumnSource>,
-        store: ChunkStore,
-        journal: Journal,
-        level: LevelData,
+        world: World,
         ids: Arc<ProtocolIds>,
     ) -> Self {
+        let World {
+            source,
+            store,
+            journal,
+            level,
+        } = world;
         let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
         Self {
             ids,
