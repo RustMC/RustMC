@@ -164,16 +164,19 @@ fn crc32(parts: &[&[u8]]) -> u32 {
     hasher.finalize()
 }
 
-fn be_u32(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes(bytes.try_into().expect("slice is four bytes"))
+/// Big-endian integer from a slice the caller has already length-checked.
+fn be_u64(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0, |value, &byte| (value << 8) | u64::from(byte))
 }
 
-fn be_u64(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes(bytes.try_into().expect("slice is eight bytes"))
+fn be_u32(bytes: &[u8]) -> u32 {
+    be_u64(bytes) as u32
 }
 
 fn be_i64(bytes: &[u8]) -> i64 {
-    i64::from_be_bytes(bytes.try_into().expect("slice is eight bytes"))
+    be_u64(bytes) as i64
 }
 
 fn next_tick_after(tick: u64) -> Result<u64, WorldError> {

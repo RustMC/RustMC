@@ -1,6 +1,6 @@
 use super::entity_tracker::{
     EntityId, EntityType, MAX_TRACKING_RANGE, SpatialEntityTracker, TrackingError, TrackingEvent,
-    chunk_coords, try_chunk_coords,
+    try_chunk_coords,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -178,7 +178,7 @@ fn test_entity_chunk_boundary_migration() {
     let mut tracker = SpatialEntityTracker::new();
 
     // Add entity in chunk (0, 0)
-    assert_eq!(chunk_coords((5.0, 64.0, 5.0)), (0, 0));
+    assert_eq!(try_chunk_coords((5.0, 64.0, 5.0)), Some((0, 0)));
     let (entity_id, _) = tracker
         .add_entity(EntityType::Animal, (5.0, 64.0, 5.0))
         .unwrap();

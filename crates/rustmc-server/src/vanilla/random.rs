@@ -140,9 +140,13 @@ impl RandomSource {
     }
 
     /// Lemire's multiply-shift-with-rejection draw; bit-for-bit identical to
-    /// the vanilla bounded `nextInt`, including its rejection path.
+    /// the vanilla bounded `nextInt`, including its rejection path. Vanilla
+    /// rejects a zero bound; here it yields 0 without a draw, so malformed
+    /// data cannot stop the server.
     pub fn next_int_bounded(&mut self, bound: u32) -> u32 {
-        assert!(bound > 0, "bound must be positive");
+        if bound == 0 {
+            return 0;
+        }
         let bound = u64::from(bound);
         let mut product = u64::from(self.next_int()).wrapping_mul(bound);
         let mut fractional = product & 0xFFFF_FFFF;
@@ -271,9 +275,12 @@ impl LegacyRandom {
     }
 
     /// Java's bounded draw: power-of-two shortcut else the rejection loop
-    /// with `int` wrapping arithmetic.
+    /// with `int` wrapping arithmetic. Java rejects a bound below 1; here it
+    /// yields 0 without a draw, so malformed data cannot stop the server.
     pub fn next_int_bounded(&mut self, bound: i32) -> i32 {
-        assert!(bound > 0, "bound must be positive");
+        if bound <= 0 {
+            return 0;
+        }
         if bound & (bound - 1) == 0 {
             return ((bound as i64 * i64::from(self.next_bits(31))) >> 31) as i32;
         }

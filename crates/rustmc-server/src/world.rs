@@ -17,7 +17,7 @@ pub mod entity_tracker;
 
 pub use entity_tracker::{
     EntityId, EntityType, SpatialEntityTracker, TrackedEntity, TrackingError, TrackingEvent,
-    chunk_coords, try_chunk_coords,
+    try_chunk_coords,
 };
 
 #[cfg(test)]
@@ -896,27 +896,29 @@ impl World {
     }
 
     pub fn chunk(&mut self, chunk_x: i32, chunk_z: i32) -> &Chunk {
-        if !self.chunk_cache.contains_key(&(chunk_x, chunk_z)) {
-            let mut chunk = self.generator.generate(chunk_x, chunk_z);
-            let min_x = i64::from(chunk_x) * CHUNK_SIDE as i64;
-            let max_x = min_x + CHUNK_SIDE as i64;
-            let min_z = i64::from(chunk_z) * CHUNK_SIDE as i64;
-            let max_z = min_z + CHUNK_SIDE as i64;
-            for (&(x, y, z), &block) in &self.committed_mutations {
-                if x >= min_x && x < max_x && z >= min_z && z < max_z {
-                    chunk.set_world_block(x, y, z, block);
-                }
-            }
-            for m in &self.pending_tick_mutations {
-                if m.x >= min_x && m.x < max_x && m.z >= min_z && m.z < max_z {
-                    chunk.set_world_block(m.x, m.y, m.z, m.block);
-                }
-            }
-            self.chunk_cache.insert((chunk_x, chunk_z), chunk);
-        }
+        let generator = &self.generator;
+        let committed = &self.committed_mutations;
+        let pending = &self.pending_tick_mutations;
         self.chunk_cache
-            .get(&(chunk_x, chunk_z))
-            .expect("chunk was just inserted")
+            .entry((chunk_x, chunk_z))
+            .or_insert_with(|| {
+                let mut chunk = generator.generate(chunk_x, chunk_z);
+                let min_x = i64::from(chunk_x) * CHUNK_SIDE as i64;
+                let max_x = min_x + CHUNK_SIDE as i64;
+                let min_z = i64::from(chunk_z) * CHUNK_SIDE as i64;
+                let max_z = min_z + CHUNK_SIDE as i64;
+                for (&(x, y, z), &block) in committed {
+                    if x >= min_x && x < max_x && z >= min_z && z < max_z {
+                        chunk.set_world_block(x, y, z, block);
+                    }
+                }
+                for m in pending {
+                    if m.x >= min_x && m.x < max_x && m.z >= min_z && m.z < max_z {
+                        chunk.set_world_block(m.x, m.y, m.z, m.block);
+                    }
+                }
+                chunk
+            })
     }
 
     /// Stages a mutation for the current tick. Returns `false` when the

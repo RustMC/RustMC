@@ -129,13 +129,6 @@ pub fn try_chunk_coords(pos: (f64, f64, f64)) -> Option<(i32, i32)> {
     ))
 }
 
-/// Computes the chunk coordinates `(chunk_x, chunk_z)` for a 3D world position.
-///
-/// Panics if coordinates are non-finite or out of bounds.
-pub fn chunk_coords(pos: (f64, f64, f64)) -> (i32, i32) {
-    try_chunk_coords(pos).expect("valid world position required for chunk_coords")
-}
-
 /// Returns the squared Euclidean distance between two 3D positions.
 fn distance_sq(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
     let dx = a.0 - b.0;
