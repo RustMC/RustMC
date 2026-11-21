@@ -309,11 +309,11 @@ fn compressed_frames_round_trip_below_at_and_above_threshold() {
     assert!(rest2.is_empty());
 
     // Threshold 0 compresses even a 1-byte packet (ID only, empty body).
-    let mut zero_thr = Vec::new();
-    frame_compressed(0x03, &[], 0, &mut zero_thr).unwrap();
-    let (_, prefix) = read_varint(&zero_thr).unwrap().unwrap();
-    assert_eq!(zero_thr[prefix], 1);
-    let (id, dec, rest) = read_compressed_frame(&zero_thr, 0, 4096).unwrap();
+    let mut zero_threshold = Vec::new();
+    frame_compressed(0x03, &[], 0, &mut zero_threshold).unwrap();
+    let (_, prefix) = read_varint(&zero_threshold).unwrap().unwrap();
+    assert_eq!(zero_threshold[prefix], 1);
+    let (id, dec, rest) = read_compressed_frame(&zero_threshold, 0, 4096).unwrap();
     assert_eq!((id, dec.as_slice(), rest), (0x03, &[][..], &[][..]));
 }
 
