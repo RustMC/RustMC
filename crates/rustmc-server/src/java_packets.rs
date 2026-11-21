@@ -58,6 +58,7 @@ pub mod configuration {
         pub const SELECT_KNOWN_PACKS: u32 = 7;
     }
     pub mod clientbound {
+        pub const DISCONNECT: u32 = 2;
         pub const FINISH_CONFIGURATION: u32 = 3;
         pub const REGISTRY_DATA: u32 = 7;
         pub const UPDATE_ENABLED_FEATURES: u32 = 13;

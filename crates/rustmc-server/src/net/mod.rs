@@ -9,4 +9,5 @@ pub mod configuration;
 pub mod crypto;
 pub mod framing;
 pub mod identity;
+pub mod login;
 pub mod session_server;
