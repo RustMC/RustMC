@@ -14,3 +14,24 @@ max_connection_lifetime_ms = 10000
 # (requires `local_java_preview = true`; absent or negative `-1` disables
 # compression, `0` compresses all packets, vanilla default is `256`).
 # preview_compression_threshold = 256
+
+# The playable multiplayer server. When this table is present, `--run`
+# starts the server instead of the discovery listener. Keys follow vanilla
+# server.properties (online-mode becomes online_mode). Only
+# registry_manifest is required: the identifier manifest of the official
+# 26.3 registries, prepared locally with prepare_preview_registry.
+# [server]
+# registry_manifest = "/path/to/registries.toml"
+# bind_address = "0.0.0.0"
+# port = 25565
+# online_mode = true
+# max_players = 20
+# motd = "A Minecraft Server"
+# network_compression_threshold = 256   # -1 disables compression
+# view_distance = 10
+# game_mode = "survival"                # survival, creative, adventure, spectator
+# session_server = "https://sessionserver.mojang.com"
+# max_packet_bytes = 2097151            # one serverbound packet, decompressed
+# read_bytes_per_second = 1048576       # per connection
+# login_timeout_ms = 30000
+# outbound_queue_packets = 4096         # a slower client is disconnected
