@@ -205,7 +205,7 @@ pub fn replace_atomically(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| invalid("path has no directory"))?;
-    fs::create_dir_all(directory)?;
+    create_dir_durably(directory)?;
     let temporary = path.with_extension("tmp");
     {
         let mut file = File::create(&temporary)?;
@@ -216,6 +216,27 @@ pub fn replace_atomically(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
     }
     fs::rename(&temporary, path)?;
     sync_directory(directory)
+}
+
+/// Creates `directory` and any missing ancestors, syncing each new one's
+/// entry into its parent so a fresh world's directories survive a crash.
+pub fn create_dir_durably(directory: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = directory;
+    while !current.as_os_str().is_empty() && !current.exists() {
+        missing.push(current);
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(directory)?;
+    for created in missing.iter().rev() {
+        if let Some(parent) = created.parent().filter(|p| !p.as_os_str().is_empty()) {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
 }
 
 /// Makes the rename durable. Windows cannot open a directory as a file; its

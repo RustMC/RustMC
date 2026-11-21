@@ -290,9 +290,17 @@ impl WorldFiles {
         }))
     }
 
-    /// Saves a player's state.
+    /// Saves a player's state into their file. Tags RustMC does not model
+    /// (a vanilla save's `Inventory`, health, experience and so on) are kept;
+    /// a damaged existing file is an error rather than being overwritten.
     pub fn save_player(&self, uuid: &[u8; 16], player: &PlayerData) -> Result<(), StorageError> {
-        let tag = compound(&[
+        let path = self.player_path(uuid);
+        let mut tags = match read_gzip_nbt(&path)? {
+            Some(Tag::Compound(tags)) => tags,
+            Some(_) => return Err(StorageError::Malformed(path, "player")),
+            None => BTreeMap::new(),
+        };
+        let Tag::Compound(modelled) = compound(&[
             ("DataVersion", Tag::Int(DATA_VERSION)),
             (
                 "Pos",
@@ -304,8 +312,11 @@ impl WorldFiles {
             ),
             ("playerGameType", Tag::Int(player.game_mode as i32)),
             ("Dimension", Tag::String("minecraft:overworld".to_owned())),
-        ]);
-        write_gzip_nbt(&self.player_path(uuid), &tag)
+        ]) else {
+            return Err(StorageError::Malformed(path, "player"));
+        };
+        tags.extend(modelled);
+        write_gzip_nbt(&path, &Tag::Compound(tags))
     }
 
     /// The world's saved seed and clocks: RustMC's own level data, else a

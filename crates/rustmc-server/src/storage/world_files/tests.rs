@@ -74,6 +74,34 @@ fn a_chunk_filed_under_another_slot_is_an_error() {
 }
 
 #[test]
+fn saving_a_vanilla_player_keeps_the_tags_rustmc_does_not_model() {
+    let world = TempWorld::new();
+    let files = WorldFiles::new(&world.0);
+    let uuid = [0xcd; 16];
+    let path = world
+        .0
+        .join("players/data/cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd.dat");
+    let vanilla = compound(&[
+        ("Health", Tag::Float(17.0)),
+        ("XpLevel", Tag::Int(30)),
+        ("playerGameType", Tag::Int(0)),
+    ]);
+    write_gzip_nbt(&path, &vanilla).expect("write");
+    let player = PlayerData {
+        position: [1.0, 2.0, 3.0],
+        yaw: 0.0,
+        pitch: 0.0,
+        game_mode: GameMode::Creative,
+    };
+    files.save_player(&uuid, &player).expect("save");
+    let saved = read_gzip_nbt(&path).expect("read").expect("file");
+    assert_eq!(saved.get("Health"), Some(&Tag::Float(17.0)));
+    assert_eq!(saved.get("XpLevel"), Some(&Tag::Int(30)));
+    assert_eq!(saved.get("playerGameType"), Some(&Tag::Int(1)));
+    assert_eq!(files.load_player(&uuid).expect("load"), Some(player));
+}
+
+#[test]
 fn players_and_level_data_round_trip_and_missing_files_are_none() {
     let world = TempWorld::new();
     let files = WorldFiles::new(&world.0);

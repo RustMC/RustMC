@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::region_file::{replace_atomically, sync_directory};
+use super::region_file::{create_dir_durably, replace_atomically};
 
 /// Bytes per record: x, y, z (i32), state (u32) and a CRC-32 of those 16.
 pub const RECORD_BYTES: usize = 20;
@@ -64,7 +64,7 @@ impl Journal {
     /// every complete edit already in it, oldest first.
     pub fn open(path: &Path) -> io::Result<(Self, Vec<BlockEdit>)> {
         if let Some(directory) = path.parent() {
-            std::fs::create_dir_all(directory)?;
+            create_dir_durably(directory)?;
         }
         let mut bytes = Vec::new();
         match File::open(path) {
@@ -72,13 +72,9 @@ impl Journal {
                 file.read_to_end(&mut bytes)?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // A new journal is created durably: the file through an
-                // atomic replace (which syncs its directory) and the
-                // directory's own entry in its parent, which may be new too.
+                // A new journal is created through an atomic replace, which
+                // syncs its directory (itself created durably above).
                 replace_atomically(path, &[])?;
-                if let Some(parent) = path.parent().and_then(Path::parent) {
-                    sync_directory(parent)?;
-                }
             }
             Err(error) => return Err(error),
         }
