@@ -2,6 +2,12 @@
 
 use super::*;
 
+fn random_secret() -> [u8; SHARED_SECRET_BYTES] {
+    let mut secret = [0u8; SHARED_SECRET_BYTES];
+    random_bytes(&mut secret).expect("random");
+    secret
+}
+
 #[test]
 fn server_hash_matches_the_wiki_vectors() {
     // minecraft.wiki `Java Edition protocol/Encryption`, Authentication > Client.
@@ -39,7 +45,7 @@ fn cfb8_matches_the_crate_known_answer_and_streams_across_calls() {
     cipher.encrypt(&mut whole);
     assert_eq!(whole, expected);
 
-    let secret = [7u8; SHARED_SECRET_BYTES];
+    let secret = random_secret();
     let mut one_shot = plaintext.to_vec();
     StreamEncryptor::new(&secret).apply(&mut one_shot);
     let mut split = plaintext.to_vec();
@@ -57,7 +63,7 @@ fn cfb8_matches_the_crate_known_answer_and_streams_across_calls() {
 fn server_key_round_trips_a_shared_secret() {
     let key = ServerKey::generate().expect("key");
     assert!(key.public_der().len() > 100);
-    let secret = [9u8; SHARED_SECRET_BYTES];
+    let secret = random_secret();
     let encrypted = key.encrypt_for_test(&secret).expect("encrypt");
     assert_eq!(encrypted.len(), SERVER_KEY_BITS / 8);
     assert_eq!(key.decrypt_secret(&encrypted), Ok(secret));

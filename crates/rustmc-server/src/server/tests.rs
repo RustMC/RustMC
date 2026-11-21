@@ -263,7 +263,8 @@ fn online_player_joins_over_an_encrypted_connection() {
     let (token_len, n) = read_varint(rest).unwrap().unwrap();
     let token = rest[n..n + token_len as usize].to_vec();
     let public = rsa::PublicKey::from_public_key_der(key_der).expect("server key");
-    let secret = [0x11u8; 16];
+    let mut secret = [0u8; 16];
+    crate::net::crypto::random_bytes(&mut secret).expect("random");
     let mut body = Vec::new();
     for plain in [&secret[..], &token[..]] {
         let encrypted = public.pkcs1v15_encrypt(plain).expect("encrypt");
