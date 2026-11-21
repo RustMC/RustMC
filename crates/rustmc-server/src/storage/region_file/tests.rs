@@ -116,3 +116,55 @@ fn reads_the_same_chunks_as_the_save_reader() {
         );
     }
 }
+
+#[test]
+fn external_gzip_and_uncompressed_chunks_are_read() {
+    let dir = TempDir::new();
+    let region = dir.0.join("r.-1.2.mca");
+    let external = chunk("stored outside");
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(b"gzip chunk").expect("gzip");
+    let changed = BTreeMap::from([
+        // Local (3, 4) of region (-1, 2) is chunk (-29, 68).
+        (
+            (3, 4),
+            StoredChunk {
+                compression: ZLIB + EXTERNAL,
+                payload: Vec::new(),
+            },
+        ),
+        (
+            (0, 0),
+            StoredChunk {
+                compression: GZIP,
+                payload: gzip.finish().expect("gzip"),
+            },
+        ),
+        (
+            (1, 0),
+            StoredChunk {
+                compression: UNCOMPRESSED,
+                payload: b"plain chunk".to_vec(),
+            },
+        ),
+    ]);
+    save_chunks(&region, changed, 0).expect("save");
+    fs::write(dir.0.join("c.-29.68.mcc"), &external.payload).expect("mcc");
+    assert_eq!(
+        read_chunk(&region, 3, 4).expect("read"),
+        Some(b"stored outside".to_vec())
+    );
+    assert_eq!(
+        read_chunk(&region, 0, 0).expect("read"),
+        Some(b"gzip chunk".to_vec())
+    );
+    assert_eq!(
+        read_chunk(&region, 1, 0).expect("read"),
+        Some(b"plain chunk".to_vec())
+    );
+    fs::remove_file(dir.0.join("c.-29.68.mcc")).expect("remove");
+    assert!(
+        read_chunk(&region, 3, 4).is_err(),
+        "a missing .mcc is an error"
+    );
+}

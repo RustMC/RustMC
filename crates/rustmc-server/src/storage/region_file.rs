@@ -6,14 +6,18 @@
 //! Done: a 4 KiB-sector header read and seek per chunk; saving merges changed
 //! chunks with the file's untouched ones (their compressed bytes are kept
 //! as-is) and replaces the file by writing a temporary file, syncing it,
-//! renaming it over the old one and syncing the directory. Not done: chunks
-//! over 255 sectors (about 1 MiB compressed), which vanilla moves to separate
-//! `.mcc` files; RustMC refuses to save them.
+//! renaming it over the old one and syncing the directory; chunks vanilla
+//! moved to an external `c.X.Z.mcc` file are read from it, and zlib, gzip
+//! and uncompressed chunks are read. Not done: saving chunks over 255 sectors
+//! (about 1 MiB compressed), which vanilla moves to `.mcc` files; RustMC
+//! refuses to save them. LZ4-compressed chunks are reported as damaged.
 //!
 //! Format: minecraft.wiki `Region file format` — an 8 KiB header of 1,024
 //! big-endian locations (3-byte sector offset, 1-byte sector count) and 1,024
 //! timestamps, then chunks as a 4-byte length, a compression byte and the
-//! payload, each padded to whole 4 KiB sectors.
+//! payload, each padded to whole 4 KiB sectors; a compression byte with 128
+//! added means the payload is the whole of `c.<chunk x>.<chunk z>.mcc` in the
+//! same directory. Compression 1 is gzip, 2 zlib, 3 none, 4 LZ4.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -21,7 +25,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
+use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::ZlibEncoder;
 
 /// Bytes per region sector.
@@ -32,8 +36,14 @@ pub const REGION_SIDE: usize = 32;
 const HEADER: usize = 2 * SECTOR;
 /// Most sectors one chunk may use (the location's 1-byte count).
 const MAX_CHUNK_SECTORS: usize = 255;
+/// Compression byte for gzip.
+const GZIP: u8 = 1;
 /// Compression byte for zlib, the format vanilla 26.3 writes.
 const ZLIB: u8 = 2;
+/// Compression byte for uncompressed NBT.
+const UNCOMPRESSED: u8 = 3;
+/// Added to the compression byte when the payload is in a `.mcc` file.
+const EXTERNAL: u8 = 128;
 /// Largest decompressed chunk accepted when reading, so a damaged file
 /// cannot exhaust memory: well above any 384-block column.
 const MAX_CHUNK_NBT: u64 = 16 * 1024 * 1024;
@@ -81,27 +91,66 @@ pub fn read_chunk(path: &Path, local_x: usize, local_z: usize) -> io::Result<Opt
     }
     let mut payload = vec![0u8; length - 1];
     file.read_exact(&mut payload)?;
+    let compression = prefix[4];
+    if compression & EXTERNAL != 0 {
+        payload = read_external(path, local_x, local_z)?;
+    }
     decompress(&StoredChunk {
-        compression: prefix[4],
+        compression: compression & !EXTERNAL,
         payload,
     })
     .map(Some)
 }
 
-fn decompress(chunk: &StoredChunk) -> io::Result<Vec<u8>> {
-    match chunk.compression {
-        ZLIB => {
-            let mut out = Vec::new();
-            ZlibDecoder::new(chunk.payload.as_slice())
-                .take(MAX_CHUNK_NBT + 1)
-                .read_to_end(&mut out)?;
-            if out.len() as u64 > MAX_CHUNK_NBT {
-                return Err(invalid("chunk is larger than any column"));
-            }
-            Ok(out)
-        }
-        _ => Err(invalid("unsupported chunk compression")),
+/// The payload of a chunk vanilla stored outside its region file.
+fn read_external(region: &Path, local_x: usize, local_z: usize) -> io::Result<Vec<u8>> {
+    let name = region
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("region file name is not text"))?;
+    let coordinates: Vec<i32> = name
+        .strip_prefix("r.")
+        .and_then(|rest| rest.strip_suffix(".mca"))
+        .map(|rest| {
+            rest.split('.')
+                .filter_map(|part| part.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let [region_x, region_z] = coordinates[..] else {
+        return Err(invalid("region file name is not r.X.Z.mca"));
+    };
+    let side = REGION_SIDE as i32;
+    let chunk_x = region_x * side + local_x as i32;
+    let chunk_z = region_z * side + local_z as i32;
+    let external = region.with_file_name(format!("c.{chunk_x}.{chunk_z}.mcc"));
+    let mut payload = Vec::new();
+    File::open(&external)?
+        .take(MAX_CHUNK_NBT + 1)
+        .read_to_end(&mut payload)?;
+    if payload.len() as u64 > MAX_CHUNK_NBT {
+        return Err(invalid("external chunk is larger than any column"));
     }
+    Ok(payload)
+}
+
+fn decompress(chunk: &StoredChunk) -> io::Result<Vec<u8>> {
+    let payload = chunk.payload.as_slice();
+    let mut out = Vec::new();
+    match chunk.compression {
+        ZLIB => ZlibDecoder::new(payload)
+            .take(MAX_CHUNK_NBT + 1)
+            .read_to_end(&mut out)?,
+        GZIP => GzDecoder::new(payload)
+            .take(MAX_CHUNK_NBT + 1)
+            .read_to_end(&mut out)?,
+        UNCOMPRESSED => payload.take(MAX_CHUNK_NBT + 1).read_to_end(&mut out)?,
+        _ => return Err(invalid("unsupported chunk compression")),
+    };
+    if out.len() as u64 > MAX_CHUNK_NBT {
+        return Err(invalid("chunk is larger than any column"));
+    }
+    Ok(out)
 }
 
 /// Where each stored chunk sits in a region file's bytes: the compression
