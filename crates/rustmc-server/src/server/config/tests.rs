@@ -8,7 +8,7 @@ fn parse(text: &str) -> Result<ServerConfig, String> {
 
 #[test]
 fn defaults_follow_vanilla_server_properties() {
-    let config = parse("registry_manifest = \"registries.toml\"\nregistry_table = \"table.json\"")
+    let config = parse("registry_manifest = \"registries.toml\"\nregistry_table = \"table.json\"\nregistries_report = \"registries.json\"")
         .expect("config");
     assert_eq!(config.address.port(), 25565);
     assert!(config.online_mode);
@@ -27,6 +27,7 @@ fn every_key_parses() {
         r#"
         registry_manifest = "r.toml"
         registry_table = "t.json"
+        registries_report = "r.json"
         seed = -5
         generation_workers = 3
         world_dir = "saves/main"
@@ -64,31 +65,35 @@ fn invalid_values_are_rejected_with_the_key_name() {
         ("", "registry_manifest"),
         ("registry_manifest = \"r\"", "registry_table"),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\ngeneration_workers = 0",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"",
+            "registries_report",
+        ),
+        (
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\ngeneration_workers = 0",
             "generation_workers",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\nmax_players = 0",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\nmax_players = 0",
             "max_players",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\nview_distance = 40",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\nview_distance = 40",
             "view_distance",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\ngame_mode = \"god\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\ngame_mode = \"god\"",
             "game_mode",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\nbind_address = \"nowhere\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\nbind_address = \"nowhere\"",
             "bind_address",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\nsession_server = \"ftp://x\"",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\nsession_server = \"ftp://x\"",
             "session_server",
         ),
         (
-            "registry_manifest = \"r\"\nregistry_table = \"t\"\nunknown = 1",
+            "registry_manifest = \"r\"\nregistry_table = \"t\"\nregistries_report = \"j\"\nunknown = 1",
             "unknown",
         ),
     ] {

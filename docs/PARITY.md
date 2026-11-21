@@ -23,4 +23,8 @@ observations of real vanilla worlds; the methods and full numbers are in
 | Mob and animal AI, spawning | not started | Removed in Phase 0 ([REVIEW.md](REVIEW.md)) | |
 | Fluids | not started | Removed in Phase 0 ([REVIEW.md](REVIEW.md)) | |
 | Redstone | not started | | |
+| Block breaking and placing | partial | Packets checked against the official 26.3 packet report; reach 4.5 (Creative 5.0) per minecraft.wiki `Attribute`; end-to-end test with two clients | Default block state placed (no stair facing etc.); no dig times or tool rules; replaceable blocks such as grass are not replaced; RustMC adds a 1.0-block reach allowance |
+| Player movement | partial | Packet layouts from minecraft.wiki `Java Edition protocol/Packets` (protocol 777) | No collision with blocks; a RustMC limit of 10 blocks per packet is applied instead of vanilla's movement checks |
+| Seeing other players | partial | Player Info Update/Remove, Spawn Entity, Entity Position Sync and Set Head Rotation ids checked against the packet report; end-to-end test | No entity metadata (skin layers, poses), no swing animations, latency always 0 |
+| Saved worlds | partial | Chunk NBT read from a real 26.3 save; restart end-to-end test | Only the Overworld; entities, block entities and vanilla day time are not read or written |
 | Commands | not started | Parsing only; see [COMMANDS.md](COMMANDS.md) | |

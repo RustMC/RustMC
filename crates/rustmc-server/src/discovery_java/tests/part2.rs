@@ -235,7 +235,8 @@ pub(super) fn test_protocol_ids() -> Arc<ProtocolIds> {
             "entries": {
                 "minecraft:speed": { "protocol_id": 0 }
             }
-        }
+        },
+        "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
     }"#;
     Arc::new(
         ProtocolIds::from_json_str(
@@ -289,7 +290,8 @@ pub(super) fn creative_slot_frame(
     dynamic_ids: &DynamicRegistryIds,
 ) -> Vec<u8> {
     let mut body = window_slot.to_be_bytes().to_vec();
-    slot::encode_slot(stack, ids, dynamic_ids, &mut body).expect("encode creative slot");
+    crate::protocol::slot::encode_slot(stack, ids, dynamic_ids, &mut body)
+        .expect("encode creative slot");
     frame(play::serverbound::SET_CREATIVE_MODE_SLOT, &body)
 }
 

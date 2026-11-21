@@ -9,9 +9,14 @@
 //! `persist`), clean disconnect and save on shutdown.
 //! Not done: movement validation and block play (D), chat and commands (E).
 
+mod blocks;
+mod movement;
+mod players;
+
+pub use players::PLAYER_ENTITY_TYPE;
 mod persist;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -34,9 +39,10 @@ use crate::net::framing::Packet;
 use crate::net::identity::{GameProfile, uuid_text};
 use crate::net::login::JoinRequest;
 use crate::preview_data::RegistryManifest;
-use crate::protocol::movement::{ServerboundMovementPacket, decode_serverbound_movement_packet};
+use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
 use crate::storage::journal::Journal;
 use crate::storage::world_files::LevelData;
+use crate::world::inventory::PlayerInventory;
 
 /// Length of one game tick at 20 ticks per second.
 pub const TICK: Duration = Duration::from_millis(50);
@@ -68,11 +74,20 @@ struct Player {
     keepalive: KeepAliveTracker,
     last_keepalive_tick: u64,
     awaiting_teleport: Option<u32>,
+    /// The id of the last teleport sent.
+    next_teleport_id: u32,
     position: [f64; 3],
     yaw: f32,
     pitch: f32,
     game_mode: GameMode,
+    inventory: PlayerInventory,
     view: View,
+    entity_id: i32,
+    on_ground: bool,
+    /// Moved since other players were last told.
+    moved: bool,
+    /// Entity ids of the other players spawned on this client.
+    seen: HashSet<i32>,
 }
 
 /// The world-owning game loop.
@@ -83,6 +98,9 @@ pub struct Game {
     source: Arc<ColumnSource>,
     store: ChunkStore,
     journal: Journal,
+    ids: Arc<ProtocolIds>,
+    dynamic_ids: DynamicRegistryIds,
+    player_entity_type: Option<u32>,
     players: HashMap<ConnectionId, Player>,
     next_entity_id: i32,
     seed: i64,
@@ -90,17 +108,35 @@ pub struct Game {
     day_time: u64,
 }
 
+/// The world a game loop starts with: where columns come from, the columns
+/// already loaded, the edit journal and the saved level data.
+pub struct World {
+    pub source: Arc<ColumnSource>,
+    pub store: ChunkStore,
+    pub journal: Journal,
+    pub level: LevelData,
+}
+
 impl Game {
     pub fn new(
         config: Arc<ServerConfig>,
         manifest: Arc<RegistryManifest>,
         online: Arc<AtomicUsize>,
-        source: Arc<ColumnSource>,
-        store: ChunkStore,
-        journal: Journal,
-        level: LevelData,
+        world: World,
+        ids: Arc<ProtocolIds>,
     ) -> Self {
+        let World {
+            source,
+            store,
+            journal,
+            level,
+        } = world;
+        let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
+        let player_entity_type = ids.entity_type_id(players::PLAYER_ENTITY_TYPE);
         Self {
+            player_entity_type,
+            ids,
+            dynamic_ids,
             config,
             manifest,
             online,
@@ -153,6 +189,7 @@ impl Game {
                 if let Some(player) = self.players.remove(&id) {
                     self.online.store(self.players.len(), Ordering::Relaxed);
                     self.save_player(&player);
+                    self.depart(player.profile.uuid, player.entity_id);
                     log::event(
                         "player_left",
                         &[("name", &player.profile.name), ("reason", &reason)],
@@ -174,6 +211,7 @@ impl Game {
             if let Some(old) = self.players.remove(&id) {
                 disconnect(&old.handle, reason::DUPLICATE);
                 self.save_player(&old);
+                self.depart(old.profile.uuid, old.entity_id);
             }
         }
         // Counted now: the join below may still fail and return early.
@@ -241,25 +279,50 @@ impl Game {
                 ("view_distance", &view_distance),
             ],
         );
+        let id = handle.id;
         self.players.insert(
-            handle.id,
+            id,
             Player {
                 profile,
                 handle,
                 keepalive: KeepAliveTracker::default(),
                 last_keepalive_tick: self.tick,
                 awaiting_teleport: Some(teleport_id),
+                next_teleport_id: teleport_id,
                 position,
                 yaw,
                 pitch,
                 game_mode,
+                inventory: PlayerInventory::new(),
                 view: View::new(chunk_of(position[0], position[2]), view_distance),
+                entity_id,
+                on_ground: false,
+                moved: false,
+                seen: HashSet::new(),
             },
         );
         self.online.store(self.players.len(), Ordering::Relaxed);
+        self.announce(id);
     }
 
     fn packet(&mut self, id: ConnectionId, packet: Packet) {
+        let body = packet.body.as_slice();
+        let routed = match packet.id {
+            serverbound::SET_CREATIVE_MODE_SLOT => Some(self.creative_slot(id, body)),
+            serverbound::SET_CARRIED_ITEM => Some(self.carried_item(id, body)),
+            serverbound::PLAYER_ACTION => Some(self.player_action(id, body)),
+            serverbound::USE_ITEM_ON => Some(self.use_item_on(id, body)),
+            serverbound::MOVE_PLAYER_POS
+            | serverbound::MOVE_PLAYER_POS_ROT
+            | serverbound::MOVE_PLAYER_ROT => Some(self.move_player(id, packet.id, body)),
+            _ => None,
+        };
+        if let Some(result) = routed {
+            if let Err(text) = result {
+                self.remove_player(id, text);
+            }
+            return;
+        }
         let tick = self.tick;
         let Some(player) = self.players.get_mut(&id) else {
             return;
@@ -290,9 +353,6 @@ impl Game {
                 }
                 _ => Err(reason::BAD_PACKET),
             },
-            serverbound::MOVE_PLAYER_POS
-            | serverbound::MOVE_PLAYER_POS_ROT
-            | serverbound::MOVE_PLAYER_ROT => move_player(player, packet.id, body),
             _ => Ok(()),
         };
         if let Err(text) = kick {
@@ -337,6 +397,7 @@ impl Game {
         for (id, text) in dropped {
             self.remove_player(id, text);
         }
+        self.track_players();
         if tick.is_multiple_of(self.config.autosave_interval_seconds * TICKS_PER_SECOND) {
             self.save_all();
         }
@@ -353,6 +414,7 @@ impl Game {
             disconnect(&player.handle, text);
             self.save_player(&player);
             self.online.store(self.players.len(), Ordering::Relaxed);
+            self.depart(player.profile.uuid, player.entity_id);
         }
     }
 
@@ -360,32 +422,6 @@ impl Game {
     pub fn player_count(&self) -> usize {
         self.players.len()
     }
-}
-
-/// Applies a position update and moves the player's view with it.
-fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static str> {
-    let (position, rotation) = match decode_serverbound_movement_packet(id, body) {
-        Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None),
-        Ok(ServerboundMovementPacket::PosRot(p)) => ([p.x, p.y, p.z], Some((p.yaw, p.pitch))),
-        Ok(ServerboundMovementPacket::Rot(p)) => (player.position, Some((p.yaw, p.pitch))),
-        _ => return Err(reason::BAD_PACKET),
-    };
-    if player.awaiting_teleport.is_some() {
-        // Moves sent before the client confirmed the last teleport are
-        // stale; vanilla ignores them the same way.
-        return Ok(());
-    }
-    player.position = position;
-    if let Some((yaw, pitch)) = rotation {
-        player.yaw = yaw;
-        player.pitch = pitch;
-    }
-    for out in player.view.recenter(chunk_of(position[0], position[2])) {
-        if !player.handle.send(out) {
-            return Err(reason::SLOW);
-        }
-    }
-    Ok(())
 }
 
 /// Sends a play-phase Disconnect and closes the connection.

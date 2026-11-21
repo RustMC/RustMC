@@ -14,6 +14,17 @@
 use std::fmt;
 
 use crate::item::ItemStack;
+use crate::java_wire::read_i16_be;
+use crate::protocol::ids::{DynamicRegistryIds, ProtocolIds};
+use crate::protocol::slot::{SlotError, decode_slot};
+
+/// Why a Set Creative Mode Slot packet was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreativeSlotError {
+    /// The packet does not parse or names a window slot outside the player
+    /// inventory.
+    Malformed,
+}
 
 /// Number of hotbar slots (slots 0..=8).
 pub const HOTBAR_SLOT_COUNT: usize = 9;
@@ -190,6 +201,37 @@ impl PlayerInventory {
             36..=44 => Some((window_slot - 36) as u8),
             _ => None,
         }
+    }
+
+    /// Applies Set Creative Mode Slot: `Slot` (Short) then `Clicked Item`
+    /// (Slot). Main inventory (`9..=35`) and hotbar (`36..=44`) window slots are
+    /// stored; drops (`-1`), crafting, armor and offhand slots are accepted and
+    /// not stored. An item carrying a component RustMC does not model yet is
+    /// valid creative input: the slot is cleared rather than the player kicked.
+    ///
+    /// Sources: minecraft.wiki `Java Edition protocol/Packets` (Set Creative
+    /// Mode Slot), `Java Edition protocol/Slot data`, `Java Edition
+    /// protocol/Inventory` (Player Inventory).
+    pub fn apply_creative_slot(
+        &mut self,
+        body: &[u8],
+        ids: &ProtocolIds,
+        dynamic: &DynamicRegistryIds,
+    ) -> Result<(), CreativeSlotError> {
+        let (window_slot, rest) = read_i16_be(body).map_err(|_| CreativeSlotError::Malformed)?;
+        if window_slot != WINDOW_CREATIVE_DROP_SLOT && !WINDOW_PLAYER_SLOTS.contains(&window_slot) {
+            return Err(CreativeSlotError::Malformed);
+        }
+        let decoded = match decode_slot(rest, ids, dynamic) {
+            Ok((stack, consumed)) if consumed == rest.len() => stack,
+            Err(SlotError::UnsupportedComponent(_)) => None,
+            _ => return Err(CreativeSlotError::Malformed),
+        };
+        if let Some(index) = Self::window_slot_to_index(window_slot) {
+            self.set_slot(index, decoded)
+                .map_err(|_| CreativeSlotError::Malformed)?;
+        }
+        Ok(())
     }
 
     /// Gets a reference to the item stack at a protocol player inventory window

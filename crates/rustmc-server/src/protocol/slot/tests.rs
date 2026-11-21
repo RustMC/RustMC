@@ -51,7 +51,8 @@ const SYNTHETIC_REGISTRIES: &str = r#"{
             "minecraft:poison": { "protocol_id": 18 },
             "minecraft:saturation": { "protocol_id": 22 }
         }
-    }
+    },
+    "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
 }"#;
 
 fn synthetic_ids() -> (ProtocolIds, DynamicRegistryIds) {
@@ -478,7 +479,8 @@ fn round_trips_each_component_alone_and_all_components_together_in_ascending_id_
         },
         "minecraft:mob_effect": {
             "entries": {}
-        }
+        },
+        "minecraft:entity_type": { "entries": { "minecraft:player": { "protocol_id": 159 } } }
     }"#;
     let inverted_ids =
         ProtocolIds::from_json_str(Path::new("reports/registries.json"), inverted_json)

@@ -17,9 +17,8 @@ use crate::preview_data::RegistryManifest;
 use crate::protocol::{
     chat,
     ids::{DynamicRegistryIds, ProtocolIds},
-    slot,
 };
-use crate::world::inventory::{PlayerInventory, WINDOW_CREATIVE_DROP_SLOT, WINDOW_PLAYER_SLOTS};
+use crate::world::inventory::PlayerInventory;
 use std::sync::Arc;
 
 pub const PROTOCOL: i32 = 777;
@@ -584,34 +583,13 @@ impl Session {
                             // creative slot packets remain bounded by frame/session limits and
                             // ignored.
                             if let Some(protocol_ids) = &self.protocol_ids {
-                                let (window_slot, rest) = read_i16_be(body)?;
-                                if window_slot != WINDOW_CREATIVE_DROP_SLOT
-                                    && !WINDOW_PLAYER_SLOTS.contains(&window_slot)
-                                {
-                                    return Err(Error::Malformed);
-                                }
-                                let decoded = match slot::decode_slot(
-                                    rest,
-                                    protocol_ids,
-                                    &self.dynamic_registry_ids,
-                                ) {
-                                    Ok((stack, consumed)) if consumed == rest.len() => Some(stack),
-                                    // Creative tabs offer items with components RustMC does
-                                    // not model yet; that is valid client input, so the slot
-                                    // is no longer tracked rather than ending the session.
-                                    Err(slot::SlotError::UnsupportedComponent(_)) => None,
-                                    _ => return Err(Error::Malformed),
-                                };
-                                // Only main inventory and hotbar slots are modelled; drops
-                                // (-1), crafting, armor and offhand slots are accepted and
-                                // not stored.
-                                if let Some(slot_index) =
-                                    PlayerInventory::window_slot_to_index(window_slot)
-                                {
-                                    self.inventory
-                                        .set_slot(slot_index, decoded.flatten())
-                                        .map_err(|_| Error::Malformed)?;
-                                }
+                                self.inventory
+                                    .apply_creative_slot(
+                                        body,
+                                        protocol_ids,
+                                        &self.dynamic_registry_ids,
+                                    )
+                                    .map_err(|_| Error::Malformed)?;
                             } else if body.is_empty() {
                                 return Err(Error::Malformed);
                             }
@@ -722,7 +700,7 @@ impl Session {
     }
 }
 
-mod actions;
+pub(crate) mod actions;
 pub use actions::*;
 
 #[cfg(test)]

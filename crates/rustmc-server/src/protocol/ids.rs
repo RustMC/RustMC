@@ -31,6 +31,7 @@ const REGISTRY_ITEM: &str = "minecraft:item";
 const REGISTRY_DATA_COMPONENT_TYPE: &str = "minecraft:data_component_type";
 const REGISTRY_POTION: &str = "minecraft:potion";
 const REGISTRY_MOB_EFFECT: &str = "minecraft:mob_effect";
+const REGISTRY_ENTITY_TYPE: &str = "minecraft:entity_type";
 
 const REGISTRY_ENCHANTMENT: &str = "minecraft:enchantment";
 const REGISTRY_TRIM_PATTERN: &str = "minecraft:trim_pattern";
@@ -211,6 +212,7 @@ pub struct ProtocolIds {
     component_types: RegistryLookup,
     potions: RegistryLookup,
     mob_effects: RegistryLookup,
+    entity_types: RegistryLookup,
 }
 
 impl ProtocolIds {
@@ -218,7 +220,12 @@ impl ProtocolIds {
     /// `minecraft:item`, `minecraft:data_component_type`, `minecraft:potion`,
     /// and `minecraft:mob_effect`.
     pub fn load(root: &Path) -> Result<Self, ProtocolIdsError> {
-        let file = root.join("reports").join("registries.json");
+        Self::load_file(&root.join("reports").join("registries.json"))
+    }
+
+    /// Loads a `registries.json` report from an explicit path.
+    pub fn load_file(file: &Path) -> Result<Self, ProtocolIdsError> {
+        let file = file.to_path_buf();
         let handle = File::open(&file).map_err(|source| ProtocolIdsError::Io {
             file: file.clone(),
             source,
@@ -265,12 +272,18 @@ impl ProtocolIds {
         let potions = RegistryLookup::parse(file, REGISTRY_POTION, root_obj.get(REGISTRY_POTION))?;
         let mob_effects =
             RegistryLookup::parse(file, REGISTRY_MOB_EFFECT, root_obj.get(REGISTRY_MOB_EFFECT))?;
+        let entity_types = RegistryLookup::parse(
+            file,
+            REGISTRY_ENTITY_TYPE,
+            root_obj.get(REGISTRY_ENTITY_TYPE),
+        )?;
 
         Ok(Self {
             items,
             component_types,
             potions,
             mob_effects,
+            entity_types,
         })
     }
 
@@ -278,6 +291,12 @@ impl ProtocolIds {
     #[must_use]
     pub fn item_id(&self, name: &str) -> Option<u32> {
         self.items.id(name)
+    }
+
+    /// Returns the `minecraft:entity_type` protocol ID for `name`.
+    #[must_use]
+    pub fn entity_type_id(&self, name: &str) -> Option<u32> {
+        self.entity_types.id(name)
     }
 
     /// Returns the namespaced item identifier for `id`.

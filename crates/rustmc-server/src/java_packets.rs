@@ -101,6 +101,7 @@ pub mod play {
         pub const USE_ITEM: u32 = 67;
     }
     pub mod clientbound {
+        pub const ADD_ENTITY: u32 = 1;
         pub const BLOCK_CHANGED_ACK: u32 = 4;
         pub const BLOCK_UPDATE: u32 = 8;
         pub const CHUNK_BATCH_FINISHED: u32 = 11;
@@ -108,13 +109,18 @@ pub mod play {
         pub const CONTAINER_SET_DATA: u32 = 19;
         pub const CONTAINER_SET_SLOT: u32 = 20;
         pub const DISCONNECT: u32 = 32;
+        pub const ENTITY_POSITION_SYNC: u32 = 35;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;
         pub const GAME_EVENT: u32 = 39;
         pub const KEEP_ALIVE: u32 = 45;
         pub const LEVEL_CHUNK_WITH_LIGHT: u32 = 46;
         pub const LOGIN: u32 = 50;
         pub const PLAYER_ABILITIES: u32 = 65;
+        pub const PLAYER_INFO_REMOVE: u32 = 70;
+        pub const PLAYER_INFO_UPDATE: u32 = 71;
         pub const PLAYER_POSITION: u32 = 73;
+        pub const REMOVE_ENTITIES: u32 = 78;
+        pub const ROTATE_HEAD: u32 = 85;
         pub const SET_CHUNK_CACHE_CENTER: u32 = 96;
         pub const SET_TIME: u32 = 115;
         pub const SYSTEM_CHAT: u32 = 124;
