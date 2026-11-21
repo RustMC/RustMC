@@ -5,8 +5,6 @@ pub mod container;
 #[cfg(test)]
 mod tests_container;
 
-pub mod projectile;
-
 pub mod physics;
 pub mod time_weather;
 
