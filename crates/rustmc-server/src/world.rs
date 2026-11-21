@@ -65,14 +65,6 @@ pub const WORLD_HEIGHT: usize = 128;
 const TREE_CELL: i64 = 8;
 const TREE_REACH: i64 = 3;
 
-pub mod explosion;
-
-pub use explosion::{
-    AxisAlignedBB, BlockGrid, EntityImpact, Explosion, ExplosionDestructionMode, ExplosionWorld,
-    RAY_COUNT, RAY_POWER_DECAY_PER_STEP, RAY_STEP_DISTANCE, generate_ray_directions,
-    raycast_line_of_sight,
-};
-
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Block {
