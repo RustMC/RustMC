@@ -8,7 +8,6 @@ mod tests_container;
 pub mod fluid;
 pub mod projectile;
 
-pub mod experience;
 pub mod physics;
 #[cfg(test)]
 mod tests_fluid;
@@ -16,8 +15,6 @@ pub mod time_weather;
 
 pub mod block_entity;
 pub mod interaction;
-#[cfg(test)]
-mod tests_experience;
 
 pub use block_entity::*;
 
