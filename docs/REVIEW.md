@@ -118,3 +118,32 @@ shared world, and other players are not visible.
 - `discovery_bedrock` answers Bedrock LAN pings today. The plan defers
   Bedrock; this review keeps the live ping (small, tested) and deletes the
   unreachable Bedrock session code. Removing the ping too is one more commit.
+
+## Step 3: structure, data and panics
+
+- **File size.** Every Rust file is now at most 1,000 lines. Large modules
+  were split along their existing sections as pure moves (moved private items
+  became `pub(super)`; public paths are unchanged), and inline unit tests moved
+  to sibling `tests.rs` files. The vanilla generator split was checked for
+  byte identity: 81 chunk packets (seed 2026, radius 4) from the build before
+  and after are identical, and all 27 ignored data-root tests pass.
+- **Panics.** Production `unwrap`/`expect`/`assert!` were removed from chunk
+  caching, journal integer reads, bounded random draws and the registry tool.
+  Remaining `debug_assert!`s state internal invariants and compile out of
+  release builds; `build.rs` panics are the build-script error channel.
+- **Hard-coded limits.** Listener bounds are named range constants in
+  `lib.rs`, and `ListenerConfig::validate` replaces the runtime's duplicate
+  literal checks.
+- **Headers.** Every source file starts with a `//!` header.
+
+## Known items left for Phase 1
+
+These are not fixed in Phase 0 because the Phase 1 track that owns them
+replaces the code:
+
+| Item | Where | Owner track |
+| --- | --- | --- |
+| 25 protocol block-state IDs embedded for the synthetic terrain | `java_preview.rs` `BLOCK_STATES` | B (world) needs the full 26.3 block registry from the provisioned reports |
+| Wire helpers duplicated per packet module (VarInt, strings, framing) | `protocol/movement.rs`, `protocol/player_info/wire.rs`, `protocol/entity_spawn.rs`, `protocol/chat.rs`, `world/block_entity/nbt.rs` | A (network) moves them onto `java_wire` |
+| Vanilla plant and solidity block lists in source | `vanilla/plant_support.rs`, `vanilla/feature/state.rs` | vanilla-accurate terrain phase (opt-in, isolated) |
+| File headers state purpose; "done / not done" notes are added as each Phase 1 track rewrites a module | all | each track |
