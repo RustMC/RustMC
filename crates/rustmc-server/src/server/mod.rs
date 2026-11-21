@@ -111,6 +111,13 @@ pub fn run(
         ProtocolIds::load_file(&config.registries_report)
             .map_err(|error| ServerError::Registry(error.to_string()))?,
     );
+    if ids.entity_type_id(game::PLAYER_ENTITY_TYPE).is_none() {
+        return Err(ServerError::Registry(format!(
+            "{} has no {} entity type",
+            config.registries_report.display(),
+            game::PLAYER_ENTITY_TYPE
+        )));
+    }
     let key = Arc::new(ServerKey::generate().map_err(ServerError::Key)?);
     let verifier =
         verifier.unwrap_or_else(|| Arc::new(HttpSessionServer::new(&config.session_server)));

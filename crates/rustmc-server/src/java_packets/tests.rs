@@ -321,6 +321,42 @@ fn every_packet_id_matches_the_official_report() {
         (
             "play",
             "clientbound",
+            "minecraft:add_entity",
+            play::clientbound::ADD_ENTITY,
+        ),
+        (
+            "play",
+            "clientbound",
+            "minecraft:entity_position_sync",
+            play::clientbound::ENTITY_POSITION_SYNC,
+        ),
+        (
+            "play",
+            "clientbound",
+            "minecraft:player_info_remove",
+            play::clientbound::PLAYER_INFO_REMOVE,
+        ),
+        (
+            "play",
+            "clientbound",
+            "minecraft:player_info_update",
+            play::clientbound::PLAYER_INFO_UPDATE,
+        ),
+        (
+            "play",
+            "clientbound",
+            "minecraft:remove_entities",
+            play::clientbound::REMOVE_ENTITIES,
+        ),
+        (
+            "play",
+            "clientbound",
+            "minecraft:rotate_head",
+            play::clientbound::ROTATE_HEAD,
+        ),
+        (
+            "play",
+            "clientbound",
             "minecraft:block_changed_ack",
             play::clientbound::BLOCK_CHANGED_ACK,
         ),

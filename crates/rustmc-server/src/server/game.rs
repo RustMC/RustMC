@@ -10,9 +10,12 @@
 //! Not done: movement validation and block play (D), chat and commands (E).
 
 mod blocks;
+mod players;
+
+pub use players::PLAYER_ENTITY_TYPE;
 mod persist;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -77,6 +80,12 @@ struct Player {
     game_mode: GameMode,
     inventory: PlayerInventory,
     view: View,
+    entity_id: i32,
+    on_ground: bool,
+    /// Moved since other players were last told.
+    moved: bool,
+    /// Entity ids of the other players spawned on this client.
+    seen: HashSet<i32>,
 }
 
 /// The world-owning game loop.
@@ -89,6 +98,7 @@ pub struct Game {
     journal: Journal,
     ids: Arc<ProtocolIds>,
     dynamic_ids: DynamicRegistryIds,
+    player_entity_type: Option<u32>,
     players: HashMap<ConnectionId, Player>,
     next_entity_id: i32,
     seed: i64,
@@ -120,7 +130,9 @@ impl Game {
             level,
         } = world;
         let dynamic_ids = DynamicRegistryIds::from_manifest(&manifest);
+        let player_entity_type = ids.entity_type_id(players::PLAYER_ENTITY_TYPE);
         Self {
+            player_entity_type,
             ids,
             dynamic_ids,
             config,
@@ -175,6 +187,7 @@ impl Game {
                 if let Some(player) = self.players.remove(&id) {
                     self.online.store(self.players.len(), Ordering::Relaxed);
                     self.save_player(&player);
+                    self.depart(player.profile.uuid, player.entity_id);
                     log::event(
                         "player_left",
                         &[("name", &player.profile.name), ("reason", &reason)],
@@ -196,6 +209,7 @@ impl Game {
             if let Some(old) = self.players.remove(&id) {
                 disconnect(&old.handle, reason::DUPLICATE);
                 self.save_player(&old);
+                self.depart(old.profile.uuid, old.entity_id);
             }
         }
         let entity_id = self.next_entity_id;
@@ -261,8 +275,9 @@ impl Game {
                 ("view_distance", &view_distance),
             ],
         );
+        let id = handle.id;
         self.players.insert(
-            handle.id,
+            id,
             Player {
                 profile,
                 handle,
@@ -275,9 +290,14 @@ impl Game {
                 game_mode,
                 inventory: PlayerInventory::new(),
                 view: View::new(chunk_of(position[0], position[2]), view_distance),
+                entity_id,
+                on_ground: false,
+                moved: false,
+                seen: HashSet::new(),
             },
         );
         self.online.store(self.players.len(), Ordering::Relaxed);
+        self.announce(id);
     }
 
     fn packet(&mut self, id: ConnectionId, packet: Packet) {
@@ -372,6 +392,7 @@ impl Game {
         for (id, text) in dropped {
             self.remove_player(id, text);
         }
+        self.track_players();
         if tick.is_multiple_of(self.config.autosave_interval_seconds * TICKS_PER_SECOND) {
             self.save_all();
         }
@@ -388,6 +409,7 @@ impl Game {
             disconnect(&player.handle, text);
             self.save_player(&player);
             self.online.store(self.players.len(), Ordering::Relaxed);
+            self.depart(player.profile.uuid, player.entity_id);
         }
     }
 
@@ -399,10 +421,14 @@ impl Game {
 
 /// Applies a position update and moves the player's view with it.
 fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static str> {
-    let (position, rotation) = match decode_serverbound_movement_packet(id, body) {
-        Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None),
-        Ok(ServerboundMovementPacket::PosRot(p)) => ([p.x, p.y, p.z], Some((p.yaw, p.pitch))),
-        Ok(ServerboundMovementPacket::Rot(p)) => (player.position, Some((p.yaw, p.pitch))),
+    let (position, rotation, on_ground) = match decode_serverbound_movement_packet(id, body) {
+        Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None, p.on_ground),
+        Ok(ServerboundMovementPacket::PosRot(p)) => {
+            ([p.x, p.y, p.z], Some((p.yaw, p.pitch)), p.on_ground)
+        }
+        Ok(ServerboundMovementPacket::Rot(p)) => {
+            (player.position, Some((p.yaw, p.pitch)), p.on_ground)
+        }
         _ => return Err(reason::BAD_PACKET),
     };
     if player.awaiting_teleport.is_some() {
@@ -411,6 +437,8 @@ fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static
         return Ok(());
     }
     player.position = position;
+    player.on_ground = on_ground;
+    player.moved = true;
     if let Some((yaw, pitch)) = rotation {
         player.yaw = yaw;
         player.pitch = pitch;

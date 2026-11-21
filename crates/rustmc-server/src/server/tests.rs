@@ -645,3 +645,54 @@ fn placed_and_broken_blocks_reach_other_players_and_survive_a_restart() {
     assert_eq!(column.get(2, top, 0), Some(Block::Stone as u32));
     drop(TempDir(dir));
 }
+
+#[test]
+fn two_players_see_each_other_join_move_and_leave() {
+    let server = start(false, None);
+    let mut builder = join_playing(server.address, "Builder");
+    receive_until(&mut builder, play::clientbound::CHUNK_BATCH_FINISHED);
+    let mut watcher = join_playing(server.address, "Watcher");
+    // The joining player's tab list lists both players.
+    let info = receive_until(&mut watcher, play::clientbound::PLAYER_INFO_UPDATE);
+    let listed = crate::protocol::player_info::PlayerInfoUpdatePacket::decode_payload(&info.body)
+        .expect("player info");
+    let mut names: Vec<_> = listed.entries.iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["Builder", "Watcher"]);
+    // The earlier player learns about the new one.
+    let joined = receive_until(&mut builder, play::clientbound::PLAYER_INFO_UPDATE);
+    let joined = crate::protocol::player_info::PlayerInfoUpdatePacket::decode_payload(&joined.body)
+        .expect("player info");
+    assert_eq!(joined.entries.len(), 1);
+    assert_eq!(joined.entries[0].name, "Watcher");
+    // Each sees the other's entity once it has the chunk they stand in.
+    let spawned = receive_until(&mut watcher, play::clientbound::ADD_ENTITY);
+    let (builder_entity, n) = read_varint(&spawned.body).unwrap().unwrap();
+    assert_eq!(spawned.body[n..n + 16], offline_uuid("Builder"));
+    receive_until(&mut builder, play::clientbound::ADD_ENTITY);
+    // Movement reaches the watcher.
+    let mut moved = Vec::new();
+    for value in [3.5f64, 90.0, 4.5] {
+        moved.extend(value.to_be_bytes());
+    }
+    moved.push(1);
+    builder.send(play::serverbound::MOVE_PLAYER_POS, &moved);
+    let sync = receive_until(&mut watcher, play::clientbound::ENTITY_POSITION_SYNC);
+    let (entity, n) = read_varint(&sync.body).unwrap().unwrap();
+    assert_eq!(entity, builder_entity);
+    let (path, m) = read_varint(&sync.body[n..]).unwrap().unwrap();
+    assert_eq!(path, 0, "linear path");
+    let at = n + m;
+    let x = f64::from_be_bytes(sync.body[at..at + 8].try_into().expect("x"));
+    assert_eq!(x, 3.5);
+    // Leaving removes the entity and the tab-list entry.
+    drop(builder);
+    let gone = receive_until(&mut watcher, play::clientbound::PLAYER_INFO_REMOVE);
+    assert_eq!(gone.body[1..17], offline_uuid("Builder"));
+    let removed = receive_until(&mut watcher, play::clientbound::REMOVE_ENTITIES);
+    assert_eq!(read_varint(&removed.body).unwrap().unwrap().0, 1);
+    assert_eq!(
+        read_varint(&removed.body[1..]).unwrap().unwrap().0,
+        builder_entity
+    );
+}
