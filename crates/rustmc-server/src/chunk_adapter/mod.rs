@@ -489,6 +489,15 @@ fn build_vanilla_chunk<C>(
 
 /// Encodes one complete column as a framed 26.3 chunk packet.
 pub fn encode_chunk(chunk: &VanillaChunk, tables: &RegistryTables) -> Result<Vec<u8>, EncodeError> {
+    Ok(frame(CHUNK_PACKET, &encode_chunk_body(chunk, tables)?))
+}
+
+/// Encodes one complete column as the body of a 26.3 chunk packet, for
+/// callers that frame (and compress or encrypt) packets themselves.
+pub fn encode_chunk_body(
+    chunk: &VanillaChunk,
+    tables: &RegistryTables,
+) -> Result<Vec<u8>, EncodeError> {
     // `ClientboundLevelChunkWithLightPacket.STREAM_CODEC` = INT x, INT z,
     // chunk data, light data; the chunk coordinates are fixed-width
     // big-endian ints, not VarInts.
@@ -503,7 +512,7 @@ pub fn encode_chunk(chunk: &VanillaChunk, tables: &RegistryTables) -> Result<Vec
     // Block entities: `list(BlockEntityInfo.STREAM_CODEC)`, deferred.
     put_varint(0, &mut body);
     write_light(chunk, tables, &mut body)?;
-    Ok(frame(CHUNK_PACKET, &body))
+    Ok(body)
 }
 
 /// Highest captured row per column for one heightmap type, as the stored

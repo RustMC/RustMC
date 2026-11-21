@@ -11,6 +11,7 @@ pub mod game;
 pub mod join;
 pub mod listener;
 pub mod log;
+pub mod world;
 
 use std::fmt;
 use std::net::{SocketAddr, TcpListener};
@@ -21,6 +22,12 @@ use std::thread;
 
 use config::ServerConfig;
 use game::Game;
+use world::store::ChunkStore;
+use world::terrain::TerrainPalette;
+use world::workers::ChunkWorkers;
+
+use crate::chunk_adapter::RegistryTables;
+use crate::world::Generator;
 
 use crate::net::crypto::ServerKey;
 use crate::net::login::LoginContext;
@@ -34,6 +41,8 @@ pub const EVENTS_PER_PLAYER: usize = 64;
 #[derive(Debug)]
 pub enum ServerError {
     Manifest(String),
+    /// The registry table is missing, invalid or lacks a default-terrain name.
+    Registry(String),
     Key(crate::net::crypto::CryptoError),
     Bind(std::io::Error),
     Accept(std::io::Error),
@@ -43,6 +52,7 @@ impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Manifest(error) => write!(f, "registry manifest: {error}"),
+            Self::Registry(error) => write!(f, "registry table: {error}"),
             Self::Key(error) => write!(f, "server key: {error}"),
             Self::Bind(error) => write!(f, "cannot listen: {error}"),
             Self::Accept(error) => write!(f, "accept failed: {error}"),
@@ -63,6 +73,18 @@ pub fn run(
     let manifest = Arc::new(
         crate::preview_data::load(&config.registry_manifest).map_err(ServerError::Manifest)?,
     );
+    let table = std::fs::read_to_string(&config.registry_table)
+        .map_err(|error| ServerError::Registry(error.to_string()))?;
+    let tables = Arc::new(
+        RegistryTables::from_provisioned(&table)
+            .map_err(|error| ServerError::Registry(error.to_string()))?,
+    );
+    let palette = Arc::new(
+        TerrainPalette::resolve(&tables)
+            .map_err(|error| ServerError::Registry(error.to_string()))?,
+    );
+    // The configuration stores the signed seed; the generator hashes its bits.
+    let generator = Generator::new(config.seed as u64);
     let key = Arc::new(ServerKey::generate().map_err(ServerError::Key)?);
     let verifier =
         verifier.unwrap_or_else(|| Arc::new(HttpSessionServer::new(&config.session_server)));
@@ -90,6 +112,7 @@ pub fn run(
     );
     on_bound(address);
     let (events, queue) = sync_channel(config.max_players * EVENTS_PER_PLAYER);
+    let results = events.clone();
     let accept = {
         let config = Arc::clone(&config);
         let shutdown = Arc::clone(&shutdown);
@@ -98,7 +121,16 @@ pub fn run(
             .spawn(move || listener::accept_loop(listener, config, context, events, shutdown))
             .map_err(ServerError::Bind)?
     };
-    Game::new(Arc::clone(&config), manifest, online).run(&queue, &shutdown);
+    let workers = ChunkWorkers::spawn(
+        config.generation_workers,
+        generator,
+        palette,
+        tables.clone(),
+        results,
+    )
+    .map_err(ServerError::Bind)?;
+    let store = ChunkStore::new(workers, tables);
+    Game::new(Arc::clone(&config), manifest, online, generator, store).run(&queue, &shutdown);
     let result = accept
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("accept thread panicked")));

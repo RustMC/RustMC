@@ -70,9 +70,12 @@ impl ConnectionHandle {
     }
 }
 
-/// What a connection tells the game loop.
+/// Everything the game loop receives: connection events and finished work
+/// from the chunk workers.
 #[derive(Debug)]
 pub enum Event {
+    /// A worker finished generating and encoding a column.
+    ChunkReady(Box<super::world::store::ReadyChunk>),
     Joined {
         handle: ConnectionHandle,
         join: Box<JoinRequest>,

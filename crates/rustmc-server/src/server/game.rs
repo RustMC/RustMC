@@ -3,10 +3,11 @@
 //!
 //! Why: a single owner of world state needs no locks and makes every change
 //! happen in a defined order; connections only exchange messages with it.
-//! Done (Phase 1 A): joining, duplicate-login replacement, keep-alive with
-//! timeout kicks, teleport confirmation, clean disconnect on shutdown.
-//! Not done: terrain streaming (track B), persistence (C), movement and
-//! block play (D), chat and commands (E).
+//! Done: joining at the terrain surface, duplicate-login replacement,
+//! keep-alive with timeout kicks, teleport confirmation, chunk streaming
+//! around each player, clean disconnect on shutdown.
+//! Not done: persistence (track C), movement validation and block play (D),
+//! chat and commands (E).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,13 +19,19 @@ use super::config::ServerConfig;
 use super::connection::{ConnectionHandle, ConnectionId, Event, Outgoing};
 use super::join::{Spawn, join_packets};
 use super::log;
+use super::world::store::ChunkStore;
+use super::world::terrain::surface_y;
+use super::world::view::{View, chunk_of};
 use crate::discovery_java::keepalive::KeepAliveTracker;
 use crate::java_packets::play::{clientbound, serverbound};
-use crate::java_wire::{put_nbt_text, read_varint};
+use crate::java_wire::{put_nbt_text, read_f32_be, read_varint};
 use crate::net::crypto::random_bytes;
 use crate::net::framing::Packet;
 use crate::net::identity::{GameProfile, uuid_text};
+use crate::net::login::JoinRequest;
 use crate::preview_data::RegistryManifest;
+use crate::protocol::movement::{ServerboundMovementPacket, decode_serverbound_movement_packet};
+use crate::world::Generator;
 
 /// Length of one game tick at 20 ticks per second.
 pub const TICK: Duration = Duration::from_millis(50);
@@ -34,8 +41,10 @@ pub const TICK: Duration = Duration::from_millis(50);
 pub const KEEPALIVE_INTERVAL_TICKS: u64 = 100;
 /// Ticks in a Minecraft day.
 pub const TICKS_PER_DAY: u64 = 24_000;
-/// Height players appear at until terrain streaming chooses the surface.
-pub const SPAWN_POSITION: [f64; 3] = [0.5, 100.0, 0.5];
+/// Ticks between unloads of unedited columns no player views.
+pub const UNLOAD_INTERVAL_TICKS: u64 = 100;
+/// World spawn column; players appear on the terrain surface here.
+pub const SPAWN_XZ: [f64; 2] = [0.5, 0.5];
 
 /// Disconnect messages.
 pub mod reason {
@@ -43,6 +52,7 @@ pub mod reason {
     pub const DUPLICATE: &str = "You logged in from another location";
     pub const SHUTDOWN: &str = "Server closed";
     pub const SLOW: &str = "Connection too slow";
+    pub const BAD_PACKET: &str = "Invalid packet";
 }
 
 struct Player {
@@ -51,6 +61,8 @@ struct Player {
     keepalive: KeepAliveTracker,
     last_keepalive_tick: u64,
     awaiting_teleport: Option<u32>,
+    position: [f64; 3],
+    view: View,
 }
 
 /// The world-owning game loop.
@@ -58,6 +70,8 @@ pub struct Game {
     config: Arc<ServerConfig>,
     manifest: Arc<RegistryManifest>,
     online: Arc<AtomicUsize>,
+    generator: Generator,
+    store: ChunkStore,
     players: HashMap<ConnectionId, Player>,
     next_entity_id: i32,
     tick: u64,
@@ -69,11 +83,15 @@ impl Game {
         config: Arc<ServerConfig>,
         manifest: Arc<RegistryManifest>,
         online: Arc<AtomicUsize>,
+        generator: Generator,
+        store: ChunkStore,
     ) -> Self {
         Self {
             config,
             manifest,
             online,
+            generator,
+            store,
             players: HashMap::new(),
             next_entity_id: 1,
             tick: 0,
@@ -108,10 +126,11 @@ impl Game {
         self.online.store(0, Ordering::Relaxed);
     }
 
-    /// Handles one connection event.
+    /// Handles one inbox event.
     pub fn handle(&mut self, event: Event) {
         match event {
-            Event::Joined { handle, join } => self.join(handle, join.profile),
+            Event::ChunkReady(ready) => self.store.insert(*ready),
+            Event::Joined { handle, join } => self.join(handle, *join),
             Event::Packet { id, packet } => self.packet(id, packet),
             Event::Left { id, reason } => {
                 if let Some(player) = self.players.remove(&id) {
@@ -125,7 +144,8 @@ impl Game {
         }
     }
 
-    fn join(&mut self, handle: ConnectionHandle, profile: GameProfile) {
+    fn join(&mut self, handle: ConnectionHandle, join: JoinRequest) {
+        let profile = join.profile;
         let duplicates: Vec<ConnectionId> = self
             .players
             .iter()
@@ -140,14 +160,28 @@ impl Game {
         let entity_id = self.next_entity_id;
         self.next_entity_id = self.next_entity_id.wrapping_add(1).max(1);
         let teleport_id = 1;
+        let position = [
+            SPAWN_XZ[0],
+            f64::from(surface_y(
+                self.generator,
+                SPAWN_XZ[0].floor() as i64,
+                SPAWN_XZ[1].floor() as i64,
+            )),
+            SPAWN_XZ[1],
+        ];
+        // Vanilla uses the smaller of the server's and the client's distance.
+        let view_distance = match join.settings.view_distance {
+            0 => self.config.view_distance,
+            client => client.min(self.config.view_distance),
+        };
         let spawn = Spawn {
             entity_id,
             game_mode: self.config.game_mode,
-            position: SPAWN_POSITION,
+            position,
             yaw: 0.0,
             pitch: 0.0,
             teleport_id,
-            view_distance: self.config.view_distance,
+            view_distance,
             max_players: self.config.max_players as u32,
             online_mode: self.config.online_mode,
             day_time: self.day_time,
@@ -174,6 +208,7 @@ impl Game {
                 ("name", &profile.name),
                 ("uuid", &uuid_text(&profile.uuid)),
                 ("peer", &handle.peer),
+                ("view_distance", &view_distance),
             ],
         );
         self.players.insert(
@@ -184,6 +219,8 @@ impl Game {
                 keepalive: KeepAliveTracker::default(),
                 last_keepalive_tick: self.tick,
                 awaiting_teleport: Some(teleport_id),
+                position,
+                view: View::new(chunk_of(position[0], position[2]), view_distance),
             },
         );
         self.online.store(self.players.len(), Ordering::Relaxed);
@@ -194,27 +231,41 @@ impl Game {
         let Some(player) = self.players.get_mut(&id) else {
             return;
         };
+        let body = packet.body.as_slice();
         let kick = match packet.id {
-            serverbound::KEEP_ALIVE => match <[u8; 8]>::try_from(packet.body.as_slice()) {
+            serverbound::KEEP_ALIVE => match <[u8; 8]>::try_from(body) {
                 Ok(bytes) => player
                     .keepalive
                     .handle_response(tick, i64::from_be_bytes(bytes))
-                    .is_err(),
-                Err(_) => true,
+                    .map(|_| ())
+                    .map_err(|_| reason::TIMED_OUT),
+                Err(_) => Err(reason::BAD_PACKET),
             },
-            serverbound::ACCEPT_TELEPORTATION => match read_varint(&packet.body) {
-                Ok(Some((teleport, n))) if n == packet.body.len() => {
+            serverbound::ACCEPT_TELEPORTATION => match read_varint(body) {
+                Ok(Some((teleport, n))) if n == body.len() => {
                     if player.awaiting_teleport == Some(teleport) {
                         player.awaiting_teleport = None;
                     }
-                    false
+                    Ok(())
                 }
-                _ => true,
+                _ => Err(reason::BAD_PACKET),
             },
-            _ => false,
+            serverbound::CHUNK_BATCH_RECEIVED => match read_f32_be(body) {
+                Ok((rate, [])) => {
+                    player.view.batch_received(rate);
+                    Ok(())
+                }
+                _ => Err(reason::BAD_PACKET),
+            },
+            serverbound::MOVE_PLAYER_POS | serverbound::MOVE_PLAYER_POS_ROT => {
+                move_player(player, packet.id, body)
+            }
+            _ => Ok(()),
         };
-        if kick && let Some(player) = self.players.remove(&id) {
-            disconnect(&player.handle, reason::TIMED_OUT);
+        if let Err(text) = kick
+            && let Some(player) = self.players.remove(&id)
+        {
+            disconnect(&player.handle, text);
             self.online.store(self.players.len(), Ordering::Relaxed);
         }
     }
@@ -230,11 +281,12 @@ impl Game {
                 dropped.push(*id);
                 continue;
             }
+            let mut healthy = true;
             if !player.keepalive.has_pending_challenge()
                 && tick - player.last_keepalive_tick >= KEEPALIVE_INTERVAL_TICKS
             {
                 let mut challenge = [0u8; 8];
-                let sent = random_bytes(&mut challenge).is_ok()
+                healthy = random_bytes(&mut challenge).is_ok()
                     && player
                         .keepalive
                         .issue_challenge(tick, i64::from_be_bytes(challenge))
@@ -244,22 +296,51 @@ impl Game {
                         body: challenge.to_vec(),
                     }));
                 player.last_keepalive_tick = tick;
-                if !sent {
-                    disconnect(&player.handle, reason::SLOW);
-                    dropped.push(*id);
-                }
+            }
+            if healthy && let Some(batch) = player.view.next_batch(&mut self.store) {
+                healthy = batch.into_iter().all(|out| player.handle.send(out));
+            }
+            if !healthy {
+                disconnect(&player.handle, reason::SLOW);
+                dropped.push(*id);
             }
         }
         for id in dropped {
             self.players.remove(&id);
         }
         self.online.store(self.players.len(), Ordering::Relaxed);
+        if tick.is_multiple_of(UNLOAD_INTERVAL_TICKS) {
+            let players = &self.players;
+            self.store
+                .unload_unviewed(|position| players.values().any(|p| p.view.contains(position)));
+        }
     }
 
     /// Players currently joined.
     pub fn player_count(&self) -> usize {
         self.players.len()
     }
+}
+
+/// Applies a position update and moves the player's view with it.
+fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static str> {
+    let position = match decode_serverbound_movement_packet(id, body) {
+        Ok(ServerboundMovementPacket::Pos(p)) => [p.x, p.y, p.z],
+        Ok(ServerboundMovementPacket::PosRot(p)) => [p.x, p.y, p.z],
+        _ => return Err(reason::BAD_PACKET),
+    };
+    if player.awaiting_teleport.is_some() {
+        // Moves sent before the client confirmed the last teleport are
+        // stale; vanilla ignores them the same way.
+        return Ok(());
+    }
+    player.position = position;
+    for out in player.view.recenter(chunk_of(position[0], position[2])) {
+        if !player.handle.send(out) {
+            return Err(reason::SLOW);
+        }
+    }
+    Ok(())
 }
 
 /// Sends a play-phase Disconnect and closes the connection.

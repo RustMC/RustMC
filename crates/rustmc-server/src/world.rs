@@ -97,6 +97,38 @@ pub enum Block {
 }
 
 impl Block {
+    /// The 26.3 block state this block is drawn as: the default state,
+    /// except logs standing upright and the lower or upper grass half.
+    pub const fn state_name(self) -> &'static str {
+        match self {
+            Self::Air => "minecraft:air",
+            Self::Bedrock => "minecraft:bedrock",
+            Self::Stone => "minecraft:stone",
+            Self::Dirt => "minecraft:dirt",
+            Self::Grass => "minecraft:grass_block[snowy=false]",
+            Self::Log => "minecraft:oak_log[axis=y]",
+            Self::Leaves => "minecraft:oak_leaves",
+            Self::Sand => "minecraft:sand",
+            Self::Sandstone => "minecraft:sandstone",
+            Self::Snow => "minecraft:snow_block",
+            Self::SpruceLog => "minecraft:spruce_log[axis=y]",
+            Self::SpruceLeaves => "minecraft:spruce_leaves",
+            Self::AcaciaLog => "minecraft:acacia_log[axis=y]",
+            Self::AcaciaLeaves => "minecraft:acacia_leaves",
+            Self::JungleLog => "minecraft:jungle_log[axis=y]",
+            Self::JungleLeaves => "minecraft:jungle_leaves",
+            Self::RedSand => "minecraft:red_sand",
+            Self::RedSandstone => "minecraft:red_sandstone",
+            Self::Terracotta => "minecraft:terracotta",
+            Self::ShortGrass => "minecraft:short_grass",
+            Self::SnowLayer => "minecraft:snow[layers=1]",
+            Self::Carpet => "minecraft:white_carpet",
+            Self::TallGrassLower => "minecraft:tall_grass[half=lower]",
+            Self::TallGrassUpper => "minecraft:tall_grass[half=upper]",
+            Self::Obsidian => "minecraft:obsidian",
+        }
+    }
+
     /// Java Edition blast resistance of this block, as listed in the
     /// blast-resistance table at <https://minecraft.wiki/w/Explosion>.
     pub const fn blast_resistance(self) -> f32 {
