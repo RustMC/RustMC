@@ -107,6 +107,7 @@ pub mod play {
         pub const CHUNK_BATCH_START: u32 = 12;
         pub const CONTAINER_SET_DATA: u32 = 19;
         pub const CONTAINER_SET_SLOT: u32 = 20;
+        pub const DISCONNECT: u32 = 32;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;
         pub const GAME_EVENT: u32 = 39;
         pub const KEEP_ALIVE: u32 = 45;
@@ -120,3 +121,6 @@ pub mod play {
         pub const TAKE_ITEM_ENTITY: u32 = 127;
     }
 }
+
+#[cfg(test)]
+mod tests;
