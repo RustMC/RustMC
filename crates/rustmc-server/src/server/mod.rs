@@ -11,6 +11,7 @@ pub mod game;
 pub mod join;
 pub mod listener;
 pub mod log;
+pub mod world;
 
 use std::fmt;
 use std::net::{SocketAddr, TcpListener};
