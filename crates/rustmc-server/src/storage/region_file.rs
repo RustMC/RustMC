@@ -232,9 +232,12 @@ pub fn create_dir_durably(directory: &Path) -> io::Result<()> {
     }
     fs::create_dir_all(directory)?;
     for created in missing.iter().rev() {
-        if let Some(parent) = created.parent().filter(|p| !p.as_os_str().is_empty()) {
-            sync_directory(parent)?;
-        }
+        // A relative top-level directory's parent is the working directory.
+        let parent = match created.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        sync_directory(parent)?;
     }
     Ok(())
 }

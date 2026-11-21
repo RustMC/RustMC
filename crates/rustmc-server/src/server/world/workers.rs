@@ -40,8 +40,13 @@ impl ColumnSource {
     pub fn column(&self, x: i32, z: i32) -> Result<Column, StorageError> {
         match self.files.load_column(x, z, &self.tables)? {
             Some(column) => Ok(column),
-            None => Ok(generate(self.generator, &self.palette, x, z)),
+            None => Ok(self.generated(x, z)),
         }
+    }
+
+    /// The generated column, ignoring any saved copy.
+    pub fn generated(&self, x: i32, z: i32) -> Column {
+        generate(self.generator, &self.palette, x, z)
     }
 }
 
@@ -95,7 +100,7 @@ fn work(queue: &Mutex<Receiver<(i32, i32)>>, source: &ColumnSource, results: &Sy
                     "chunk_load_failed",
                     &[("x", &x), ("z", &z), ("error", &error)],
                 );
-                (generate(source.generator, &source.palette, x, z), true)
+                (source.generated(x, z), true)
             }
         };
         let packet = encode(&column, &source.tables);

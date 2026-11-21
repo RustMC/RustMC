@@ -496,3 +496,14 @@ fn players_and_journaled_edits_survive_a_restart() {
     assert!(replay.is_empty(), "the journal was emptied after the save");
     drop(TempDir(dir));
 }
+
+#[test]
+fn a_new_world_records_its_seed_before_anyone_joins() {
+    let dir = temp_dir();
+    let server = start_in(&dir, false, None);
+    let level = crate::storage::world_files::WorldFiles::new(&dir.join("world"))
+        .load_level()
+        .expect("load");
+    assert_eq!(level.map(|l| l.seed), Some(0));
+    drop(server);
+}

@@ -5,8 +5,8 @@
 //! even after a crash.
 //! Done: startup replay of the journal onto saved or generated columns,
 //! followed by a save; saving changed columns, every player and the level;
-//! the journal is emptied only after a save fully succeeded; per-tick journal
-//! sync. Not done: saving off the game thread (a save of many changed
+//! the journal is emptied only after a save fully succeeded and while no
+//! damaged column holds edits only it records; per-tick journal sync. Not done: saving off the game thread (a save of many changed
 //! columns pauses the tick it runs in).
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -25,11 +25,23 @@ impl Game {
         for edit in edits {
             let position = (edit.x.div_euclid(16), edit.z.div_euclid(16));
             if !self.store.is_known(position) {
-                let column = self.source.column(position.0, position.1)?;
+                // A damaged saved chunk is isolated as the workers do it:
+                // served as generated terrain, never saved, its replayed
+                // edits kept in the journal.
+                let (column, damaged) = match self.source.column(position.0, position.1) {
+                    Ok(column) => (column, false),
+                    Err(error) => {
+                        log::event(
+                            "chunk_load_failed",
+                            &[("x", &position.0), ("z", &position.1), ("error", &error)],
+                        );
+                        (self.source.generated(position.0, position.1), true)
+                    }
+                };
                 self.store.insert(ReadyChunk {
                     column,
                     packet: None,
-                    damaged: false,
+                    damaged,
                 });
             }
             self.store.set_block(edit.x, edit.y, edit.z, edit.state);
@@ -84,7 +96,12 @@ impl Game {
             log::event("save_failed", &[("what", &"level"), ("error", &error)]);
             complete = false;
         }
-        if complete && let Err(error) = self.journal.reset() {
+        // Edits on damaged columns exist only in the journal.
+        let keep_journal = self.store.has_journal_only_edits();
+        if complete
+            && !keep_journal
+            && let Err(error) = self.journal.reset()
+        {
             log::event("journal_reset_failed", &[("error", &error)]);
         }
         log::event(

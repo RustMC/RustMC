@@ -102,6 +102,43 @@ fn saving_a_vanilla_player_keeps_the_tags_rustmc_does_not_model() {
 }
 
 #[test]
+fn rewriting_a_chunk_keeps_its_unmodelled_tags() {
+    let world = TempWorld::new();
+    let files = WorldFiles::new(&world.0);
+    let tables = tables();
+    let palette = TerrainPalette::resolve(&tables).expect("palette");
+    let mut column = generate(Generator::new(3), &palette, 0, 0);
+    files.save_columns([&column], &tables, 0, 0).expect("save");
+    // Add tags a vanilla chunk carries, as if the game had written them.
+    let path = files.region_path(0, 0);
+    let mut tags = files.stored_chunk_tags(&path, 0, 0).expect("tags");
+    tags.insert(
+        "block_entities".to_owned(),
+        Tag::List(vec![compound(&[(
+            "id",
+            Tag::String("minecraft:chest".to_owned()),
+        )])]),
+    );
+    tags.insert("InhabitedTime".to_owned(), Tag::Long(900));
+    tags.insert("Heightmaps".to_owned(), compound(&[]));
+    let mut nbt = Vec::new();
+    write_root(&Tag::Compound(tags), &mut nbt);
+    let stored = compress(&nbt).expect("compress");
+    save_chunks(&path, BTreeMap::from([((0, 0), stored)]), 0).expect("write");
+    column.set(1, 80, 1, Block::Obsidian as u32);
+    files.save_columns([&column], &tables, 0, 0).expect("save");
+    let tags = files.stored_chunk_tags(&path, 0, 0).expect("tags");
+    assert!(tags.contains_key("block_entities"), "block entities kept");
+    assert_eq!(tags.get("InhabitedTime"), Some(&Tag::Long(900)));
+    assert!(!tags.contains_key("Heightmaps"), "stale heightmaps dropped");
+    let loaded = files
+        .load_column(0, 0, &tables)
+        .expect("load")
+        .expect("saved");
+    assert_eq!(loaded.get(1, 80, 1), Some(Block::Obsidian as u32));
+}
+
+#[test]
 fn players_and_level_data_round_trip_and_missing_files_are_none() {
     let world = TempWorld::new();
     let files = WorldFiles::new(&world.0);
