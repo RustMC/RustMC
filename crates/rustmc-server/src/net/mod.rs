@@ -6,5 +6,6 @@
 //! Done: see each submodule. Not done: proxy protocols, transfer packets.
 
 pub mod crypto;
+pub mod framing;
 pub mod identity;
 pub mod session_server;
