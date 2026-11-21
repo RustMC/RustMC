@@ -17,6 +17,7 @@ pub mod preview_cache;
 pub mod preview_data;
 pub mod protocol;
 pub mod runtime;
+pub mod server;
 pub mod vanilla;
 pub mod world;
 
