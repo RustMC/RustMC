@@ -83,6 +83,10 @@ pub struct WorldFiles {
     root: PathBuf,
 }
 
+/// Largest coordinate a saved player position may have: the world border's
+/// maximum distance from the origin (minecraft.wiki `World border`).
+pub const MAX_SAVED_COORDINATE: f64 = 30_000_000.0;
+
 fn read_gzip_nbt(path: &Path) -> Result<Option<Tag>, StorageError> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -276,7 +280,9 @@ impl WorldFiles {
         }
     }
 
-    /// A player's saved state, if they played here before.
+    /// A player's saved state, if they played here before. A position
+    /// beyond the world border is malformed: no player can stand there, and
+    /// chunk arithmetic around it would overflow.
     pub fn load_player(&self, uuid: &[u8; 16]) -> Result<Option<PlayerData>, StorageError> {
         let path = self.player_path(uuid);
         let Some(tag) = read_gzip_nbt(&path)? else {
@@ -287,7 +293,7 @@ impl WorldFiles {
             Some(list) => list
                 .iter()
                 .map(|v| match v {
-                    Tag::Double(d) if d.is_finite() => Ok(*d),
+                    Tag::Double(d) if d.is_finite() && d.abs() <= MAX_SAVED_COORDINATE => Ok(*d),
                     _ => Err(malformed("Pos")),
                 })
                 .collect::<Result<_, _>>()?,

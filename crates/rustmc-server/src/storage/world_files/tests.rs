@@ -209,6 +209,24 @@ fn a_vanilla_save_supplies_its_seed_and_age_and_its_level_dat_is_kept() {
 }
 
 #[test]
+fn positions_beyond_the_world_border_are_malformed() {
+    let world = TempWorld::new();
+    let files = WorldFiles::new(&world.0);
+    let uuid = [0xee; 16];
+    let player = PlayerData {
+        position: [MAX_SAVED_COORDINATE * 100.0, 64.0, 0.0],
+        yaw: 0.0,
+        pitch: 0.0,
+        game_mode: GameMode::Survival,
+    };
+    files.save_player(&uuid, &player).expect("save");
+    assert!(matches!(
+        files.load_player(&uuid),
+        Err(StorageError::Malformed(_, "Pos"))
+    ));
+}
+
+#[test]
 fn damaged_player_files_are_errors_not_defaults() {
     let world = TempWorld::new();
     let files = WorldFiles::new(&world.0);
