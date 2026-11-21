@@ -8,3 +8,12 @@
 
 __pycache__/
 *.pyc
+
+# Local, per-developer files that never belong in the repository: editor and
+# assistant configuration, and operator-provisioned game data and saves.
+/.rustmc-local/
+/.qoder/
+/.claude/
+/CLAUDE.md
+/AGENTS.md
+/AGENTS.override.md
