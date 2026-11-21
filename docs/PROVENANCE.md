@@ -1461,3 +1461,29 @@ Documented choices where `minecraft.wiki` pages or sections disagree:
 - **Loot `explosion_decay` ([`loot.rs`](https://github.com/RustMC/RustMC/blob/16d8900/crates/rustmc-server/src/world/loot.rs)):** `Item modifier` (revision `3896146`) states each item in a stack has a `1 / explosion_radius` chance to be lost, contradicting `Explosion` (revision `3903416`) and `Predicate` (revision `3888899`), which state `1 / explosion_radius` is the drop/survival probability. RustMC keeps each item in the stack with probability `1 / explosion_radius`, and applies no decay when no explosion radius is present in context.
 - **Loot `binomial_with_bonus_count` ([`loot.rs`](https://github.com/RustMC/RustMC/blob/16d8900/crates/rustmc-server/src/world/loot.rs)):** `Item modifier` (revision `3896146`) writes `"1 bonus item plus bonus determined by binomial distribution with n=level + extra, p=probability"`, whereas `Fortune` (revision `3864999`) computes the default crop drop as the base `1` plus `Binomial(n = level + extra, p = probability)` (`2.71` average for `n = 3, p = 4/7`). RustMC follows `Fortune`: `count += Binomial(n = level + extra, p = probability)` with no extra `+1` (and missing enchantment treated as level `0`).
 - **Crafting item repair ([`recipe_data.rs`](https://github.com/RustMC/RustMC/blob/16d8900/crates/rustmc-server/src/world/recipe_data.rs)):** An `Item repair` (revision `3791643`) gallery caption says combining two enchanted items in a crafting table always produces an unenchanted item, whereas the page's main `Usage` section says curse enchantments transfer; RustMC follows the `Usage` section and transfers `#minecraft:curse` enchantments while dropping non-curse enchantments and other per-stack components.
+
+## Anvil chunk storage (21 November 2026)
+
+The chunk codec in `crates/rustmc-server/src/storage/chunk.rs` follows facts
+read from the owner's own Java 26.3 single-player save (seed 2026), not from
+any server implementation. Only these shape facts were taken; no save data is
+in the repository:
+
+- `level.dat` and every chunk carry `DataVersion` 5023; chunks in region files
+  use compression type 2 (zlib).
+- Overworld regions are stored under `dimensions/minecraft/overworld/region/`
+  and player files under `players/data/<uuid>.dat`.
+- Chunks hold `xPos`, `zPos`, `yPos`, `Status`, `LastUpdate`, `InhabitedTime`,
+  `isLightOn`, `Heightmaps`, `sections`, `block_entities`, `PostProcessing`,
+  `structures`, `block_ticks` and `fluid_ticks`; RustMC writes the first seven
+  and `sections`, and leaves light and heightmaps for the game to recompute.
+- A section's `block_states.palette` is a list of bare state names when no
+  state has properties. Otherwise it is a list of compounds: `{id,
+  properties}` for states with properties, and `{"": name}` wrapping the
+  property-less ones, because an NBT list holds one tag type. Packed `data`
+  values never span two longs; block palettes use at least four bits.
+
+The ignored test `vanilla_save_chunks_decode_with_the_real_registry_table`
+decodes every chunk of the save's region `r.0.0` with the provisioned 26.3
+registry table and checks that re-encoding gives back the same blocks and
+biomes. Loading a RustMC-written world in vanilla has not been tried yet.

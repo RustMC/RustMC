@@ -5,5 +5,6 @@
 //! code.
 //! Done: NBT reading and writing, region reading. Not done: see submodules.
 
+pub mod chunk;
 pub mod nbt;
 pub mod region;
