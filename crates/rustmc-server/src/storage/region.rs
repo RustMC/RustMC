@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::ZlibDecoder;
 
-use crate::nbt;
+use super::nbt;
 
 pub struct Region {
     coords: (i32, i32),
@@ -183,8 +183,8 @@ impl RegionStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::nbt::{Tag, compound, write_root};
     use super::*;
-    use crate::nbt::{Tag, compound, write_root};
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
     use std::io::Write;

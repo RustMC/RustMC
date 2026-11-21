@@ -1,6 +1,7 @@
-//! Minimal read-only NBT parser for Anvil region data (big-endian, named
-//! root tag). Only the tag kinds that appear in 26.3 chunk storage are
-//! supported; the parser never allocates beyond the input size.
+//! NBT for world storage (big-endian, named root tag): the reader used for
+//! vanilla saves and the writer used for RustMC's own chunk, player and level
+//! files. Only the tag kinds that appear in 26.3 storage are supported; the
+//! parser never allocates beyond the input size.
 
 use std::collections::BTreeMap;
 
@@ -183,14 +184,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
 pub fn write_root(compound: &Tag, out: &mut Vec<u8>) {
     out.push(10);
     out.extend_from_slice(&0u16.to_be_bytes());
     write_payload(compound, out);
 }
 
-#[cfg(test)]
 pub fn write_payload(tag: &Tag, out: &mut Vec<u8>) {
     match tag {
         Tag::Byte(v) => out.extend_from_slice(&v.to_be_bytes()),
@@ -256,7 +255,6 @@ pub fn write_payload(tag: &Tag, out: &mut Vec<u8>) {
     }
 }
 
-#[cfg(test)]
 fn tag_kind(tag: &Tag) -> u8 {
     match tag {
         Tag::Byte(_) => 1,
@@ -274,7 +272,6 @@ fn tag_kind(tag: &Tag) -> u8 {
     }
 }
 
-#[cfg(test)]
 pub fn compound(pairs: &[(&str, Tag)]) -> Tag {
     let mut map = BTreeMap::new();
     for (k, v) in pairs {
