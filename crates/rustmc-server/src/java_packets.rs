@@ -36,10 +36,14 @@ pub mod status {
 pub mod login {
     pub mod serverbound {
         pub const HELLO: u32 = 0;
+        /// `minecraft:key` (Encryption Response).
+        pub const KEY: u32 = 1;
         pub const LOGIN_ACKNOWLEDGED: u32 = 3;
     }
     pub mod clientbound {
         pub const LOGIN_DISCONNECT: u32 = 0;
+        /// `minecraft:hello` (Encryption Request).
+        pub const HELLO: u32 = 1;
         pub const LOGIN_FINISHED: u32 = 2;
         pub const SET_COMPRESSION: u32 = 3;
     }
@@ -54,6 +58,7 @@ pub mod configuration {
         pub const SELECT_KNOWN_PACKS: u32 = 7;
     }
     pub mod clientbound {
+        pub const DISCONNECT: u32 = 2;
         pub const FINISH_CONFIGURATION: u32 = 3;
         pub const REGISTRY_DATA: u32 = 7;
         pub const UPDATE_ENABLED_FEATURES: u32 = 13;
@@ -102,6 +107,7 @@ pub mod play {
         pub const CHUNK_BATCH_START: u32 = 12;
         pub const CONTAINER_SET_DATA: u32 = 19;
         pub const CONTAINER_SET_SLOT: u32 = 20;
+        pub const DISCONNECT: u32 = 32;
         pub const FORGET_LEVEL_CHUNK: u32 = 38;
         pub const GAME_EVENT: u32 = 39;
         pub const KEEP_ALIVE: u32 = 45;
@@ -115,3 +121,6 @@ pub mod play {
         pub const TAKE_ITEM_ENTITY: u32 = 127;
     }
 }
+
+#[cfg(test)]
+mod tests;

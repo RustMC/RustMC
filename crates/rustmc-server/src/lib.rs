@@ -12,10 +12,12 @@ pub mod item;
 pub mod java_packets;
 pub mod java_preview;
 pub mod java_wire;
+pub mod net;
 pub mod preview_cache;
 pub mod preview_data;
 pub mod protocol;
 pub mod runtime;
+pub mod server;
 pub mod vanilla;
 pub mod world;
 
@@ -27,6 +29,9 @@ pub struct Config {
     pub schema_version: u32,
     pub log_level: LogLevel,
     pub listener: ListenerConfig,
+    /// The playable server; when present, `--run` starts it instead of the
+    /// discovery listener.
+    pub server: Option<server::config::ServerConfig>,
 }
 
 /// Diagnostic verbosity. Lifecycle control events are always emitted.
@@ -483,7 +488,7 @@ pub fn parse_config(input: &str) -> Result<Config, String> {
         .as_table()
         .ok_or_else(|| "configuration must be a TOML table".to_owned())?;
     for key in table.keys() {
-        if key != "schema_version" && key != "log_level" && key != "listener" {
+        if !["schema_version", "log_level", "listener", "server"].contains(&key.as_str()) {
             return Err(format!("unknown configuration field `{key}`"));
         }
     }
@@ -513,10 +518,15 @@ pub fn parse_config(input: &str) -> Result<Config, String> {
         }
     };
     let listener = parse_listener(table.get("listener"))?;
+    let server = table
+        .get("server")
+        .map(server::config::parse_server)
+        .transpose()?;
     Ok(Config {
         schema_version: 1,
         log_level,
         listener,
+        server,
     })
 }
 

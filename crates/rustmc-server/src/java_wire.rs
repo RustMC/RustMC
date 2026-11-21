@@ -89,6 +89,21 @@ pub(crate) fn put_varint(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
+/// Append a VarLong: seven bits per byte, low groups first.
+pub(crate) fn put_varlong(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
 /// Frame one uncompressed packet: VarInt length, then VarInt ID and body.
 pub(crate) fn frame(id: u32, body: &[u8]) -> Vec<u8> {
     let mut packet = Vec::new();

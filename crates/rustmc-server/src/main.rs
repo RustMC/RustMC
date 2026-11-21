@@ -16,7 +16,7 @@ use signal_hook::{
     flag,
 };
 
-const HELP: &str = "RustMC local discovery runtime (no playable world)\n\nUsage:\n  rustmc-server --help\n  rustmc-server --version\n  rustmc-server --check-config <path>\n  rustmc-server --run <path>\n\nExit codes: 0 clean stop/success, 2 usage error, 3 configuration error, 4 listener startup error, 5 running listener error.";
+const HELP: &str = "RustMC server. A config with a [server] table runs the multiplayer server; without it, the local discovery runtime.\n\nUsage:\n  rustmc-server --help\n  rustmc-server --version\n  rustmc-server --check-config <path>\n  rustmc-server --run <path>\n\nExit codes: 0 clean stop/success, 2 usage error, 3 configuration error, 4 listener startup error, 5 running listener error.";
 
 fn print_event(event: RuntimeEvent) {
     let mut stdout = io::stdout().lock();
@@ -56,6 +56,15 @@ fn run(path: &Path, started: Instant) -> i32 {
         }
     };
     control_event("config_validated", LifecycleState::Configuring, started);
+    if let Some(server) = config.server {
+        return match rustmc_server::server::run(server, shutdown, None, |_| {}) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("server error: {error}");
+                5
+            }
+        };
+    }
     match run_listener(&config.listener, &shutdown, started, |event| {
         if !event.kind.starts_with("connection_") || config.log_level.allows_connection_events() {
             print_event(event);
