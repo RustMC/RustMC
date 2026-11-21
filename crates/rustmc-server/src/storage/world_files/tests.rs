@@ -86,6 +86,46 @@ fn players_and_level_data_round_trip_and_missing_files_are_none() {
 }
 
 #[test]
+fn a_vanilla_save_supplies_its_seed_and_age_and_its_level_dat_is_kept() {
+    let world = TempWorld::new();
+    let files = WorldFiles::new(&world.0);
+    let settings = compound(&[("data", compound(&[("seed", Tag::Long(2026))]))]);
+    write_gzip_nbt(
+        &world.0.join("data/minecraft/world_gen_settings.dat"),
+        &settings,
+    )
+    .expect("settings");
+    let vanilla = compound(&[("Data", compound(&[("Time", Tag::Long(777))]))]);
+    let level_dat = world.0.join("level.dat");
+    write_gzip_nbt(&level_dat, &vanilla).expect("level");
+    let before = std::fs::read(&level_dat).expect("read");
+    assert_eq!(
+        files.load_level().expect("load"),
+        Some(LevelData {
+            seed: 2026,
+            world_age: 777,
+            day_time: 0
+        })
+    );
+    files
+        .save_level(&LevelData {
+            seed: 2026,
+            world_age: 800,
+            day_time: 10,
+        })
+        .expect("save");
+    assert_eq!(
+        std::fs::read(&level_dat).expect("read"),
+        before,
+        "vanilla level.dat untouched"
+    );
+    assert_eq!(
+        files.load_level().expect("load").map(|l| l.world_age),
+        Some(800)
+    );
+}
+
+#[test]
 fn damaged_player_files_are_errors_not_defaults() {
     let world = TempWorld::new();
     let files = WorldFiles::new(&world.0);

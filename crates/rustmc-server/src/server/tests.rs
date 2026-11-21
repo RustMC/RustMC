@@ -440,6 +440,11 @@ fn players_and_journaled_edits_survive_a_restart() {
         moved.extend(10.0f32.to_be_bytes());
         moved.push(1);
         client.send(play::serverbound::MOVE_PLAYER_POS_ROT, &moved);
+        // Turning in place sends rotation only; it must still be saved.
+        let mut turned = 135.0f32.to_be_bytes().to_vec();
+        turned.extend(5.0f32.to_be_bytes());
+        turned.push(1);
+        client.send(play::serverbound::MOVE_PLAYER_ROT, &turned);
         // A status ping completes only after the game loop handled the move.
         wait_for_online(server.address, 1);
         drop(client);
@@ -467,6 +472,15 @@ fn players_and_journaled_edits_survive_a_restart() {
         assert_eq!(spawn_position(&mut client), [100.5, 90.0, -40.5]);
     }
     let files = WorldFiles::new(&world);
+    let saved = files
+        .load_player(&offline_uuid("Saver"))
+        .expect("load")
+        .expect("saved");
+    assert_eq!(
+        (saved.yaw, saved.pitch),
+        (135.0, 5.0),
+        "rotation-only turn was saved"
+    );
     let tables =
         crate::chunk_adapter::RegistryTables::from_provisioned(&registry_table()).expect("tables");
     let column = files

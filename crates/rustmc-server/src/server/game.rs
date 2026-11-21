@@ -288,16 +288,13 @@ impl Game {
                 }
                 _ => Err(reason::BAD_PACKET),
             },
-            serverbound::MOVE_PLAYER_POS | serverbound::MOVE_PLAYER_POS_ROT => {
-                move_player(player, packet.id, body)
-            }
+            serverbound::MOVE_PLAYER_POS
+            | serverbound::MOVE_PLAYER_POS_ROT
+            | serverbound::MOVE_PLAYER_ROT => move_player(player, packet.id, body),
             _ => Ok(()),
         };
-        if let Err(text) = kick
-            && let Some(player) = self.players.remove(&id)
-        {
-            disconnect(&player.handle, text);
-            self.online.store(self.players.len(), Ordering::Relaxed);
+        if let Err(text) = kick {
+            self.remove_player(id, text);
         }
     }
 
@@ -309,8 +306,7 @@ impl Game {
         let mut dropped = Vec::new();
         for (id, player) in &mut self.players {
             if player.keepalive.is_timed_out(tick) {
-                disconnect(&player.handle, reason::TIMED_OUT);
-                dropped.push(*id);
+                dropped.push((*id, reason::TIMED_OUT));
                 continue;
             }
             let mut healthy = true;
@@ -333,14 +329,12 @@ impl Game {
                 healthy = batch.into_iter().all(|out| player.handle.send(out));
             }
             if !healthy {
-                disconnect(&player.handle, reason::SLOW);
-                dropped.push(*id);
+                dropped.push((*id, reason::SLOW));
             }
         }
-        for id in dropped {
-            self.players.remove(&id);
+        for (id, text) in dropped {
+            self.remove_player(id, text);
         }
-        self.online.store(self.players.len(), Ordering::Relaxed);
         if tick.is_multiple_of(self.config.autosave_interval_seconds * TICKS_PER_SECOND) {
             self.save_all();
         }
@@ -348,6 +342,15 @@ impl Game {
             let players = &self.players;
             self.store
                 .unload_unviewed(|position| players.values().any(|p| p.view.contains(position)));
+        }
+    }
+
+    /// Disconnects a player with `text`, saving their state first.
+    fn remove_player(&mut self, id: ConnectionId, text: &str) {
+        if let Some(player) = self.players.remove(&id) {
+            disconnect(&player.handle, text);
+            self.save_player(&player);
+            self.online.store(self.players.len(), Ordering::Relaxed);
         }
     }
 
@@ -362,6 +365,7 @@ fn move_player(player: &mut Player, id: u32, body: &[u8]) -> Result<(), &'static
     let (position, rotation) = match decode_serverbound_movement_packet(id, body) {
         Ok(ServerboundMovementPacket::Pos(p)) => ([p.x, p.y, p.z], None),
         Ok(ServerboundMovementPacket::PosRot(p)) => ([p.x, p.y, p.z], Some((p.yaw, p.pitch))),
+        Ok(ServerboundMovementPacket::Rot(p)) => (player.position, Some((p.yaw, p.pitch))),
         _ => return Err(reason::BAD_PACKET),
     };
     if player.awaiting_teleport.is_some() {
